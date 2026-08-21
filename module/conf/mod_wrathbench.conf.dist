@@ -1,0 +1,68 @@
+#
+# mod-wrathbench configuration
+#
+# Copy to mod_wrathbench.conf to override; .conf.dist is the distributed default.
+#
+
+[worldserver]
+
+########################################
+# WrathBench
+########################################
+#
+#    WrathBench.Enable
+#        Description: Enable the WrathBench control module (HTTP/WS bridge).
+#        Default:     1 - Enabled
+#                     0 - Disabled
+#
+
+WrathBench.Enable = 1
+
+#
+#    WrathBench.BindAddress
+#        Description: Address the module's HTTP/WebSocket server binds to.
+#                     The compose network is private and nothing is published to
+#                     the host, so 0.0.0.0 is reachable only from inside the
+#                     `wrathbench` network (see infra/compose.yml).
+#        Default:     "0.0.0.0"
+#
+
+WrathBench.BindAddress = "0.0.0.0"
+
+#
+#    WrathBench.Port
+#        Description: TCP port for the HTTP/WebSocket server.
+#        Default:     8086
+#
+
+WrathBench.Port = 8086
+
+#
+#    WrathBench.Threads
+#        Description: Worker threads for the HTTP/WebSocket io_context. These
+#                     threads never touch game state; all game work is marshalled
+#                     onto the world thread.
+#        Default:     2
+#
+
+WrathBench.Threads = 2
+
+#
+#    WrathBench.Account
+#        Description: Default auth account a session attaches to when the
+#                     /session request omits "account". Must already exist in the
+#                     auth DB (infra/bootstrap creates RUNNER).
+#        Default:     "RUNNER"
+#
+
+WrathBench.Account = "RUNNER"
+
+#
+#    WrathBench.AuditDir
+#        Description: Directory for per-session audit logs (JSONL, one file per
+#                     session token). Every action dispatched and event served is
+#                     logged here with a timestamp and session id (docs/CONTRACTS.md).
+#        Default:     "/azerothcore/env/dist/logs/wrathbench"
+#
+
+WrathBench.AuditDir = "/azerothcore/env/dist/logs/wrathbench"
