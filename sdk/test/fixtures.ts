@@ -557,7 +557,19 @@ export function questRewarded(questId: number, seq = 49): unknown {
   };
 }
 
-export function lootResponse(seq = 50): unknown {
+/** `result` 48 is EQUIP_ERR_INVENTORY_FULL, the bag-full refusal. */
+export function inventoryChangeFailure(seq: number, result = 48): unknown {
+  return {
+    seq,
+    opcode: "SMSG_INVENTORY_CHANGE_FAILURE",
+    opcodeId: 0x112,
+    ts: 1_700_000_000_495,
+    data: { result },
+  };
+}
+
+/** `slotType` defaults to 4 (LOOT_SLOT_TYPE_OWNER): what every solo loot carries. */
+export function lootResponse(seq = 50, slotType = 4): unknown {
   return {
     seq,
     opcode: "SMSG_LOOT_RESPONSE",
@@ -567,7 +579,27 @@ export function lootResponse(seq = 50): unknown {
       guid: CREATURE_GUID,
       lootType: 1,
       gold: 37,
-      items: [{ slot: 0, itemId: ITEM_ENTRY, count: 1, slotType: 0 }],
+      items: [{ slot: 0, itemId: ITEM_ENTRY, count: 1, slotType }],
+    },
+  };
+}
+
+/** The server confirming an item entered a bag (`received == 0` ⇒ looted). */
+export function itemPushed(seq: number, itemId = ITEM_ENTRY, count = 1): unknown {
+  return {
+    seq,
+    opcode: "SMSG_ITEM_PUSH_RESULT",
+    opcodeId: 0x166,
+    ts: 1_700_000_000_505,
+    data: {
+      playerGuid: SELF_GUID,
+      itemId,
+      count,
+      totalCount: count,
+      bagSlot: 255,
+      itemSlot: 23,
+      looted: true,
+      created: false,
     },
   };
 }

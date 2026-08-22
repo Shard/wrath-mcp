@@ -33,7 +33,17 @@ Two error channels, deliberately separated (docs/CONTRACTS.md):
 
 Module and world status. No auth, no body.
 
-Response `200`:
+Two views (2026-08). Callers on the compose network — the runner and, through
+it, the snippet sandbox — get liveness only: `ok`, `module`, `worldStopped`,
+with `sessions` / `droppedPackets` / `droppedPacketsLive` present but zeroed
+(kept so the SDK response schema parses) and no `droppedByOpcode`. The global
+session count and the drop census describe module internals and other runs'
+sessions, which the observation contract never serves to a snippet. The full
+view below is served only to loopback callers — an operator inside the
+worldserver container, e.g.
+`docker compose -f infra/compose.yml exec worldserver curl -s localhost:8086/health`.
+
+Operator (loopback) response `200`:
 ```json
 {
   "ok": true,
@@ -111,6 +121,8 @@ Errors:
   does not exist and race/class are not both in [1,11] (see above; decided at
   char-enum time, before any char-create packet is synthesized).
 - `409 {"ok":false,"error":"token_in_use"}`
+- `403 {"ok":false,"error":"account_not_permitted"}` — `account` is not on the
+  `WrathBench.Accounts` allowlist.
 - `400 {"ok":false,"error":"unknown_account"}`
 - `400 {"ok":false,"error":"socket_setup_failed"}`
 - `502 {"ok":false,"error":"char_create_failed_code_<N>","token":...}` — game-level
@@ -136,7 +148,8 @@ quest/combat extension set (2026-08, additive): `set_target`, `clear_target`,
 `quest_complete`, `quest_choose_reward`, `quest_abandon`, `loot`, `loot_item`,
 `loot_money`, `loot_release`, `loot_all`, `vendor_list`, `buy_item`,
 `sell_item`, `repair_all`, `equip_item`, `use_item`, `destroy_item`, `repop`,
-`reclaim_corpse`. Acks that the opcode was synthesized and queued; the game
+`reclaim_corpse`, `spirit_healer_activate` (2026-08, additive). Acks that the
+opcode was synthesized and queued; the game
 result (the chat echo, an arrival, or an error) arrives on the WebSocket.
 
 Common errors for every action:
@@ -182,7 +195,7 @@ Success `200` (means "queued and pathing", not "arrived"):
 { "ok": true, "action": "move_to", "token": "run-abc123", "moveId": 1 }
 ```
 
-Additional error: `400 {"ok":false,"error":"missing_position"}`.
+Additional error: `400 {"ok":false,"error":"missing_position","action":"move_to","param":"<first missing axis>"}`.
 
 The outcome arrives as a `WB_MOVE_RESULT` event carrying the same `moveId`
 (statuses below). A `move_to` issued while a previous one is still running
@@ -207,7 +220,7 @@ Request: `{ "token": "run-abc123", "action": "face", "orientation": 1.57 }`
 or `{ "token": "run-abc123", "action": "face", "x": -8900.0, "y": -130.0 }`
 
 Success `200`: `{ "ok": true, "action": "face", "token": ..., "orientation": 1.57 }`
-Additional errors: `400 {"ok":false,"error":"missing_face_target"}`,
+Additional errors: `400 {"ok":false,"error":"missing_face_target","action":"face","param":"orientation or x,y"}`,
 `409 {"ok":false,"error":"moving"}` (stop first, or supersede with `move_to`).
 
 #### Single-opcode actions (quest/combat extension, 2026-08)
@@ -251,15 +264,22 @@ them: `{ "ok": true, "action": "<name>", "token": ... }`.
 | `destroy_item` | `bag`, `slot`, `count?` | `CMSG_DESTROYITEM` | `count` 0/omitted = whole stack |
 | `repop` | — | `CMSG_REPOP_REQUEST` | release spirit while dead |
 | `reclaim_corpse` | `guid?` | `CMSG_RECLAIM_CORPSE` | resurrect at corpse; handler resolves the player's own corpse, guid optional |
+| `spirit_healer_activate` | `guid` | `CMSG_SPIRIT_HEALER_ACTIVATE` | graveyard resurrection fallback; no dedicated response opcode — the outcome arrives through already-served events (health update fields, res-sickness aura) |
 
 Validation errors (all `400`): `missing_guid`, `missing_option`,
 `missing_quest_id`, `missing_reward_index`, `missing_spell_id`,
 `missing_slot`, `missing_item`, `missing_item_guid`, `missing_bag_slot`.
 
+Every `missing_*` reply from `POST /action` echoes what it was about:
+`{"ok":false,"error":"missing_guid","action":"set_target","param":"guid"}`.
+A guid-shaped field (`guid`, `targetGuid`, `itemGuid`) that is present but not
+a decimal u64 string is `400 invalid_guid`, echoing `action`, `param` and the
+received value (truncated to 64 chars) — never silently coerced to guid 0.
+
 ### POST /characters
 
 `{ "token": <str>, "account"?: <str> }` → `200 { "ok": true, "token", "enum": { "count": <number>, "characters": [ { "guid", "name", "race", "class", "gender", "level" }, ... ] } }`.
-A parked utility session (never enters world) answers with the decoded `SMSG_CHAR_ENUM` for the account — the same data a client's character-select screen shows. Exists for the runner's episode hygiene (list-then-delete leftover characters); errors mirror `/character-delete` (`missing_token`, `token_in_use`, `unknown_account`, `account_in_use` when a live session holds the account, `504 timeout`).
+A parked utility session (never enters world) answers with the decoded `SMSG_CHAR_ENUM` for the account — the same data a client's character-select screen shows. Exists for the runner's episode hygiene (list-then-delete leftover characters); errors mirror `/character-delete` (`missing_token`, `token_in_use`, `account_not_permitted`, `unknown_account`, `account_in_use` when a live session holds the account, `504 timeout`).
 
 ### POST /character-delete
 
@@ -280,10 +300,21 @@ Request:
 { "token": "del-abc123", "account": "RUNNER", "character": "Benchy" }
 ```
 (`token` is a fresh throwaway token for this operation's audit log/event
-stream; `account` optional as in `POST /session`.)
+stream; `account` optional as in `POST /session`, but must be on the module's
+configured account allowlist (`WrathBench.Accounts`, defaulting to the single
+`WrathBench.Account`) — deletes are refused for any other account, and refused
+while a different token holds a live bench session on it. The ownership check
+is decided on the world thread where session creates are serialized (the HTTP
+thread's scan is only a fast-path pre-filter), so a delete racing a
+`POST /session` for the same account within one world tick loses: one of the
+two gets `409 account_owned_by_other_token` (delete mode) or
+`400 account_in_use` (create mode) instead of both proceeding. `POST /session`
+and `POST /characters` apply the same allowlist. Minimal ownership gate for the
+per-run account scheme; per-character credentials are the Phase-1 fix.)
 
 Success `200`: `{ "ok": true, "token": ..., "character": "Benchy", "deleted": true }`
 Errors: `400 missing_token`, `400 missing_character`, `409 token_in_use`,
+`403 account_not_permitted`, `409 account_owned_by_other_token`,
 `400 unknown_account`, `400 account_in_use`, `400 character_not_found`,
 `502 char_delete_failed_code_<N>` (N is the `SMSG_CHAR_DELETE` result code,
 e.g. guild leader / arena captain refusals), `504 timeout`.

@@ -43,7 +43,7 @@ export interface EventSummary {
 export type ChildToHost =
   | { t: "ready" }
   | EvalResultMsg
-  | { t: "pong"; id: number }
+  | { t: "pong"; id: number; logs?: LogEntry[] }
   | { t: "rpc_result"; id: number; ok: boolean; value?: unknown; error?: string }
   | { t: "hostcall"; id: number; method: "scratchpad_read" | "scratchpad_write" | "scratchpad_append"; params: { content?: string } }
   | { t: "fatal"; error: string };

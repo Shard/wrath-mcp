@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import { parseEventFrame, type GameEvent } from "../src/protocol";
 import { STREAM_GAP, type StreamEvent, type StreamGapEvent } from "../src/events";
-import { pointOf, StateCache } from "../src/state";
+import { pointOf, StateCache, type UnitFilter } from "../src/state";
 import {
   addKill,
   auraRemoved,
@@ -24,6 +24,7 @@ import {
   questCombatStream,
   questComplete,
   questProgress,
+  questRewarded,
   selfProgress,
   selfTarget,
   CREATURE_ENTRY,
@@ -54,7 +55,7 @@ function toEvents(frames: readonly unknown[]): GameEvent[] {
   });
 }
 
-const SEED = { guid: 7n, name: "Fenwick" };
+const SEED = { guid: "7", name: "Fenwick" };
 
 describe("state cache: what it learns from events", () => {
   test("char enum populates known characters and self level", () => {
@@ -78,7 +79,7 @@ describe("state cache: what it learns from events", () => {
     expect(cache.motd?.value).toEqual(["fixture line one", "fixture line two"]);
     expect(cache.chat).toHaveLength(1);
     expect(cache.chat[0]?.message).toBe("ping from the fixture");
-    expect(cache.chat[0]?.senderGuid).toBe(7n);
+    expect(cache.chat[0]?.senderGuid).toBe("7");
     expect(cache.notifications).toEqual([
       { seq: 7, ts: 1_700_000_000_070, text: "fixture notification" },
     ]);
@@ -86,8 +87,8 @@ describe("state cache: what it learns from events", () => {
 
   test("names come only from name-query hits", () => {
     const cache = StateCache.replay(toEvents(fullStream), { seed: SEED });
-    expect(cache.nameOf(9n)).toBe("Ordrick");
-    expect(cache.nameOf(10n)).toBeUndefined();
+    expect(cache.nameOf("9")).toBe("Ordrick");
+    expect(cache.nameOf("10")).toBeUndefined();
     expect(cache.names.size).toBe(1);
   });
 });
@@ -113,7 +114,7 @@ describe("state cache: what it refuses to invent", () => {
 
   test("seeding by name alone still resolves self from the char enum", () => {
     const cache = StateCache.replay(toEvents(loginSequence), { seed: { name: "Quilby" } });
-    expect(cache.self.guid).toBe(8n);
+    expect(cache.self.guid).toBe("8");
     expect(cache.self.level?.value).toBe(11);
   });
 
@@ -287,7 +288,7 @@ describe("state cache: self, from the wire", () => {
       },
     };
     const cache = StateCache.replay(toEvents([...loginSequence, impostor]), { seed: SEED });
-    expect(cache.self.guid).toBe(7n);
+    expect(cache.self.guid).toBe("7");
     expect(cache.self.health).toBeUndefined();
     expect(cache.anomalies).toHaveLength(1);
     expect(cache.anomalies[0]?.kind).toBe("self_guid_mismatch");
@@ -297,7 +298,7 @@ describe("state cache: self, from the wire", () => {
 
   test("with no seed, the self flag is what tells us who we are", () => {
     const cache = StateCache.replay(toEvents([...loginSequence, selfCreate]));
-    expect(cache.self.guid).toBe(7n);
+    expect(cache.self.guid).toBe("7");
     expect(cache.self.health?.value).toEqual({ current: 80, max: 100 });
   });
 
@@ -334,7 +335,7 @@ describe("state cache: world queries", () => {
 
   test("creaturesByEntry selects on the observed template id", () => {
     const cache = StateCache.replay(events, { seed: SEED });
-    expect(cache.creaturesByEntry(CREATURE_ENTRY).map((o) => o.guid)).toEqual([BigInt(CREATURE_GUID)]);
+    expect(cache.creaturesByEntry(CREATURE_ENTRY).map((o) => o.guid)).toEqual([CREATURE_GUID]);
     expect(cache.creaturesByEntry(1)).toHaveLength(0);
   });
 
@@ -379,13 +380,13 @@ describe("state cache: replay", () => {
 
   test("the seed is the only non-event input, and it is recorded", () => {
     const cache = StateCache.replay(toEvents(loginSequence), { seed: SEED });
-    expect(cache.seed).toEqual({ guid: 7n, name: "Fenwick" });
+    expect(cache.seed).toEqual({ guid: "7", name: "Fenwick" });
   });
 
   test("seedSelf after the fact backfills self from an already-seen char enum", () => {
     const cache = StateCache.replay(toEvents(loginSequence));
     expect(cache.self.level).toBeUndefined();
-    cache.seedSelf({ guid: 7n, name: "Fenwick" });
+    cache.seedSelf({ guid: "7", name: "Fenwick" });
     expect(cache.self.level?.value).toBe(3);
   });
 
@@ -468,6 +469,45 @@ describe("state cache: the quest log, folded out of the raw update fields", () =
     // here invents progress from the packet's `current`.
     expect(cache.quest(QUEST_ID)?.counts).toEqual([0, 0, 0, 0]);
   });
+
+  test("a turn-in is counted and listed with the reward the server named", () => {
+    const cache = withWorld([questAccepted, questRewarded(QUEST_ID)]);
+    expect(cache.questsCompleted).toBe(1);
+    expect(cache.questCompletions).toEqual([
+      { questId: QUEST_ID, xp: 400, money: 250, seq: 49, ts: 1_700_000_000_490 },
+    ]);
+  });
+
+  test("nothing is counted before a turn-in is observed", () => {
+    expect(withWorld([questAccepted]).questsCompleted).toBe(0);
+    expect(withWorld([questAccepted]).questCompletions).toEqual([]);
+  });
+
+  test("two turn-ins of the same quest are two completions, not one", () => {
+    // Repeatables exist; deduping by quest id would silently undercount them.
+    const cache = withWorld([
+      questRewarded(QUEST_ID, 60),
+      questRewarded(OTHER_QUEST_ID, 61),
+      questRewarded(QUEST_ID, 62),
+    ]);
+    expect(cache.questsCompleted).toBe(3);
+    expect(cache.questCompletions.map((q) => q.questId)).toEqual([
+      QUEST_ID,
+      OTHER_QUEST_ID,
+      QUEST_ID,
+    ]);
+  });
+
+  test("the completion list reaches the snapshot and is decoupled from it", () => {
+    const cache = StateCache.replay(toEvents([...worldStream, questRewarded(QUEST_ID)]), {
+      seed: SEED,
+    });
+    const snap = cache.snapshot();
+    expect(snap.questCompletions.map((q) => q.questId)).toEqual([QUEST_ID]);
+    for (const e of toEvents([questRewarded(OTHER_QUEST_ID, 63)])) cache.apply(e);
+    expect(snap.questCompletions).toHaveLength(1);
+    expect(cache.questsCompleted).toBe(2);
+  });
 });
 
 describe("state cache: self progress, target and inventory", () => {
@@ -492,14 +532,14 @@ describe("state cache: self progress, target and inventory", () => {
 
   test("our own targetGuid resolves to the object in view", () => {
     const cache = withWorld([selfTarget]);
-    expect(cache.self.targetGuid?.value).toBe(BigInt(CREATURE_GUID));
-    expect(cache.target?.guid).toBe(BigInt(CREATURE_GUID));
+    expect(cache.self.targetGuid?.value).toBe(CREATURE_GUID);
+    expect(cache.target?.guid).toBe(CREATURE_GUID);
     expect(cache.target?.name?.value).toBe("Thistlebore");
   });
 
   test("a target that has left view is a target we cannot see", () => {
     const cache = withWorld([selfTarget, creatureOutOfRange]);
-    expect(cache.self.targetGuid?.value).toBe(BigInt(CREATURE_GUID));
+    expect(cache.self.targetGuid?.value).toBe(CREATURE_GUID);
     expect(cache.target).toBeUndefined();
   });
 
@@ -509,7 +549,7 @@ describe("state cache: self progress, target and inventory", () => {
     const [item] = cache.inventory;
     expect(item?.slot).toBe(BACKPACK_SLOT);
     // The high half is above 2^32: a truncating join would lose it entirely.
-    expect(item?.guid).toBe(BigInt(ITEM_GUID));
+    expect(item?.guid).toBe(ITEM_GUID);
     expect(item?.itemId).toBe(ITEM_ENTRY);
     expect(item?.name).toBe("Gritstone Charm");
     expect(item?.stackCount).toBe(5);
@@ -519,9 +559,62 @@ describe("state cache: self progress, target and inventory", () => {
   test("an occupied slot whose item has not been created is still occupied", () => {
     const cache = withWorld([inventorySlot]);
     expect(cache.inventory).toHaveLength(1);
-    expect(cache.inventory[0]?.guid).toBe(BigInt(ITEM_GUID));
+    expect(cache.inventory[0]?.guid).toBe(ITEM_GUID);
     expect(cache.inventory[0]?.itemId).toBeUndefined();
     expect(cache.inventory[0]?.name).toBeUndefined();
+  });
+
+  test("a map change evicts old-map objects but keeps own items", () => {
+    const cache = withWorld([inventorySlot, itemCreate, itemQuery]);
+    expect(cache.nearby.get(CREATURE_GUID)).toBeDefined();
+    const verify = (seq: number, map: number) =>
+      toEvents([
+        {
+          seq,
+          opcode: "SMSG_LOGIN_VERIFY_WORLD",
+          opcodeId: 0x236,
+          ts: 1_700_000_000_900,
+          data: { map, x: 10, y: 20, z: 30, o: 0 },
+        },
+      ])[0]!;
+    // Same map: a re-verify is not a teleport, nothing is evicted.
+    cache.apply(verify(90, 0));
+    expect(cache.nearby.get(CREATURE_GUID)).toBeDefined();
+    // New map: the old visibility set is gone — but items travel with us,
+    // so the inventory join keeps working.
+    cache.apply(verify(91, 1));
+    expect(cache.nearby.get(CREATURE_GUID)).toBeUndefined();
+    expect(cache.nearby.get(ITEM_GUID)).toBeDefined();
+    expect(cache.inventory).toHaveLength(1);
+    expect(cache.inventory[0]?.name).toBe("Gritstone Charm");
+  });
+
+  test("bag() shapes the backpack for the item actions", () => {
+    const cache = withWorld([inventorySlot, itemCreate, itemQuery]);
+    const bag = cache.bag();
+    expect(bag.items).toEqual([
+      {
+        bag: 255,
+        slot: BACKPACK_SLOT,
+        guid: ITEM_GUID,
+        itemId: ITEM_ENTRY,
+        name: "Gritstone Charm",
+        count: 5,
+      },
+    ]);
+    expect(bag.freeSlots).toBe(15);
+  });
+
+  test("bag() reports an unjoined slot as occupied, and equipment stays out", () => {
+    // The slot's guid halves arrived but the item's create block has not:
+    // occupied is the observation, itemId/name honestly undefined.
+    const cache = withWorld([inventorySlot]);
+    const bag = cache.bag();
+    expect(bag.items).toHaveLength(1);
+    expect(bag.items[0]?.itemId).toBeUndefined();
+    expect(bag.freeSlots).toBe(15);
+    // No inventory fields at all: nothing occupied has been observed.
+    expect(withWorld([]).bag()).toEqual({ items: [], freeSlots: 16 });
   });
 
   test("a zeroed slot is empty, not an item with guid 0", () => {
@@ -537,7 +630,7 @@ describe("state cache: auras and creature movement", () => {
 
   test("aura slots accumulate and carry their durations", () => {
     const cache = withWorld([auraUpdate]);
-    const auras = cache.aurasOf(BigInt(CREATURE_GUID));
+    const auras = cache.aurasOf(CREATURE_GUID);
     expect(auras.map((a) => a.spellId)).toEqual([7777, 8888]);
     expect(auras[0]?.duration).toBe(12000);
     expect(auras[1]?.stacks).toBe(3);
@@ -545,17 +638,17 @@ describe("state cache: auras and creature movement", () => {
 
   test("a cleared slot is dropped, and the others survive", () => {
     const cache = withWorld([auraUpdate, auraRemoved]);
-    expect(cache.aurasOf(BigInt(CREATURE_GUID)).map((a) => a.slot)).toEqual([1]);
+    expect(cache.aurasOf(CREATURE_GUID).map((a) => a.slot)).toEqual([1]);
   });
 
   test("UPDATE_ALL replaces the list rather than merging into it", () => {
     const cache = withWorld([auraUpdate, auraUpdateAll]);
-    expect(cache.aurasOf(BigInt(CREATURE_GUID)).map((a) => a.spellId)).toEqual([9999]);
+    expect(cache.aurasOf(CREATURE_GUID).map((a) => a.spellId)).toEqual([9999]);
   });
 
   test("auras leave with the unit they were on", () => {
     const cache = withWorld([auraUpdate, creatureDestroy]);
-    expect(cache.aurasOf(BigInt(CREATURE_GUID))).toEqual([]);
+    expect(cache.aurasOf(CREATURE_GUID)).toEqual([]);
   });
 
   test("monster move is served as destination and duration, and nothing else", () => {
@@ -633,7 +726,7 @@ describe("WB_SESSION_STATE (reattach)", () => {
 
   test("populates self on an unseeded cache (resume into live session)", () => {
     const cache = StateCache.replay(toEvents([frame("7")]));
-    expect(cache.seed?.guid).toBe(7n);
+    expect(cache.seed?.guid).toBe("7");
     expect(cache.self.position?.value.map).toBe(0);
     expect(cache.self.position?.value.x).toBeCloseTo(-8949.9);
     expect(cache.self.level?.value).toBe(3);
@@ -650,5 +743,303 @@ describe("WB_SESSION_STATE (reattach)", () => {
     expect(cache.self.level?.value).toBeUndefined();
     expect(cache.anomalies.length).toBe(1);
     expect(cache.anomalies[0]!.kind).toBe("session_state_guid_mismatch");
+  });
+});
+
+describe("ADR-0017: guids are opaque decimal strings at the model surface", () => {
+  test("nearbyUnits guids and targetGuid are plain strings", () => {
+    const cache = StateCache.replay(toEvents(worldStream), { seed: SEED });
+    const units = cache.nearbyUnits();
+    expect(units.length).toBeGreaterThan(0);
+    for (const u of units) {
+      expect(typeof u.guid).toBe("string");
+      expect(u.guid).toMatch(/^\d+$/);
+      if (u.targetGuid !== undefined) expect(typeof u.targetGuid.value).toBe("string");
+    }
+    expect(units.map((u) => u.guid)).toContain(CREATURE_GUID);
+  });
+
+  test("JSON.stringify works on a nearby unit and on the whole snapshot self", () => {
+    const cache = StateCache.replay(toEvents(worldStream), { seed: SEED });
+    const unit = cache.nearby.get(CREATURE_GUID);
+    expect(unit).toBeDefined();
+    // The single most frequent model-facing error of the first measured night
+    // (JSON.stringify cannot serialize BigInt) must be impossible from state.
+    expect(() => JSON.stringify(unit)).not.toThrow();
+    expect(JSON.stringify({ guid: unit!.guid })).toContain(`"${CREATURE_GUID}"`);
+    const snap = cache.snapshot();
+    expect(() => JSON.stringify(snap.self)).not.toThrow();
+    expect(() => JSON.stringify(snap.inventory)).not.toThrow();
+    expect(() => JSON.stringify(snap.questLog)).not.toThrow();
+  });
+
+  test("guid strings compare with === and key Maps directly", () => {
+    const cache = StateCache.replay(toEvents(worldStream), { seed: SEED });
+    const unit = cache.nearbyUnits().find((u) => u.guid === CREATURE_GUID);
+    expect(unit).toBeDefined();
+    const byGuid = new Map(cache.nearbyUnits().map((u) => [u.guid, u]));
+    expect(byGuid.get(CREATURE_GUID)).toBe(unit!);
+  });
+});
+
+// ---------------------------------------------------------------- state.units
+//
+// The scan helper (ADR-0015, earned by roster-opus-low-20260822 turn 15, where
+// `u.fields.entry?.value` on the raw Map made a populated world look empty).
+// Fixtures here are local because they exist to make one query answer
+// interesting: several objects at known distances, in known conditions.
+
+const FAR_GUID = "1001";
+const DEAD_GUID = "1002";
+const OBJECT_GUID = "1003";
+const GHOST_GUID = "1004";
+const VENDOR_GUID = "1005";
+const FAR_ENTRY = 4242;
+const VENDOR_ENTRY = 4243;
+
+/** A create block at a chosen offset from our own login position. */
+function unitAt(
+  guid: string,
+  seq: number,
+  opts: {
+    objectType?: string;
+    dx?: number;
+    entry?: number;
+    health?: number;
+    maxHealth?: number;
+    level?: number;
+    npcFlags?: number;
+    pos?: boolean;
+  } = {},
+): unknown {
+  const fields: Record<string, number> = {};
+  if (opts.entry !== undefined) fields["entry"] = opts.entry;
+  if (opts.health !== undefined) fields["health"] = opts.health;
+  if (opts.maxHealth !== undefined) fields["maxHealth"] = opts.maxHealth;
+  if (opts.level !== undefined) fields["level"] = opts.level;
+  if (opts.npcFlags !== undefined) fields["npcFlags"] = opts.npcFlags;
+  return {
+    seq,
+    opcode: "SMSG_UPDATE_OBJECT",
+    opcodeId: 0x0a9,
+    ts: 1_700_000_000_000 + seq,
+    data: {
+      blocks: 1,
+      objects: [
+        {
+          update: "create",
+          guid,
+          objectType: opts.objectType ?? "unit",
+          ...(opts.pos === false
+            ? {}
+            : { pos: { x: -1234.5 + (opts.dx ?? 0), y: 987.25, z: 42.125, o: 0 } }),
+          fields,
+        },
+      ],
+    },
+  };
+}
+
+/** A creature query answer for one invented entry. */
+function namedEntry(entry: number, name: string, seq: number): unknown {
+  return {
+    seq,
+    opcode: "SMSG_CREATURE_QUERY_RESPONSE",
+    opcodeId: 0x061,
+    ts: 1_700_000_000_000 + seq,
+    data: { entry, found: true, name, subname: "", type: 1, rank: 0 },
+  };
+}
+
+/** worldStream (self + Thistlebore at ~35y) plus a populated neighbourhood. */
+const scanStream: unknown[] = [
+  ...worldStream,
+  unitAt(FAR_GUID, 30, { dx: 100, entry: FAR_ENTRY, health: 50, maxHealth: 50, level: 9 }),
+  namedEntry(FAR_ENTRY, "Ridgeback Boar", 31),
+  unitAt(DEAD_GUID, 32, { dx: 5, entry: FAR_ENTRY, health: 0, maxHealth: 50 }),
+  unitAt(OBJECT_GUID, 33, { dx: 10, objectType: "gameObject", entry: 7777 }),
+  unitAt(GHOST_GUID, 34, { dx: 0, entry: FAR_ENTRY, pos: false }),
+  unitAt(VENDOR_GUID, 35, { dx: 2, entry: VENDOR_ENTRY, health: 900, maxHealth: 900, npcFlags: 129 }),
+];
+
+describe("state.units(): the flat scan helper", () => {
+  const cache = () => StateCache.replay(toEvents(scanStream), { seed: SEED });
+
+  test("returns flat plain objects: no Observed wrappers, no Maps, JSON round-trips", () => {
+    const rows = cache().units();
+    expect(rows.length).toBeGreaterThan(3);
+    const json = JSON.stringify(rows);
+    expect(json).not.toContain('"value"');
+    expect(json).not.toContain('"seq"');
+    expect(json).not.toContain('"fields"');
+    expect(JSON.parse(json)).toEqual(JSON.parse(JSON.stringify(rows)));
+    const one = rows.find((r) => r.guid === CREATURE_GUID)!;
+    expect(one.entry).toBe(CREATURE_ENTRY);
+    expect(one.name).toBe("Thistlebore");
+    expect(one.type).toBe("unit");
+    expect(one.level).toBe(4);
+    expect(one.health).toBe(60);
+    expect(one.maxHealth).toBe(120);
+    expect(one.dead).toBe(false);
+    expect(typeof one.distance).toBe("number");
+    expect(typeof one.x).toBe("number");
+  });
+
+  test("never invents: unobserved fields stay undefined", () => {
+    const ghost = cache().units().find((r) => r.guid === GHOST_GUID)!;
+    expect(ghost.health).toBeUndefined();
+    expect(ghost.maxHealth).toBeUndefined();
+    expect(ghost.dead).toBeUndefined();
+    expect(ghost.level).toBeUndefined();
+    expect(ghost.distance).toBeUndefined();
+    expect(ghost.x).toBeUndefined();
+  });
+
+  test("sorted by distance ascending, unknown distances last", () => {
+    const rows = cache().units();
+    const known = rows.filter((r) => r.distance !== undefined).map((r) => r.distance!);
+    expect(known).toEqual([...known].sort((a, b) => a - b));
+    expect(rows.at(-1)!.guid).toBe(GHOST_GUID);
+    expect(rows[0]!.guid).toBe(VENDOR_GUID);
+  });
+
+  test("no self position means no distances, and the objects still list in first-sight order", () => {
+    // Every row unknown: the comparator must still be a total order, or replay
+    // would not sort the same way twice.
+    const rows = StateCache.replay(
+      toEvents([
+        creatureCreate,
+        creatureQuery,
+        unitAt(FAR_GUID, 30, { dx: 100, entry: FAR_ENTRY }),
+        unitAt(DEAD_GUID, 32, { dx: 5, entry: FAR_ENTRY }),
+      ]),
+      {},
+    ).units();
+    expect(rows.map((r) => r.guid)).toEqual([CREATURE_GUID, FAR_GUID, DEAD_GUID]);
+    expect(rows.every((r) => r.distance === undefined)).toBe(true);
+    expect(rows[0]!.name).toBe("Thistlebore");
+  });
+
+  test("items and containers are excluded; untyped objects are not", () => {
+    const withItem = StateCache.replay(toEvents([...worldStream, itemCreate, itemQuery]), { seed: SEED });
+    expect(withItem.units().map((r) => r.guid)).not.toContain(ITEM_GUID);
+    const untyped = StateCache.replay(
+      toEvents([
+        ...worldStream,
+        {
+          seq: 40,
+          opcode: "SMSG_UPDATE_OBJECT",
+          opcodeId: 0x0a9,
+          ts: 1_700_000_000_400,
+          data: { blocks: 1, objects: [{ update: "values", guid: "2002", fields: { health: 5 } }] },
+        },
+      ]),
+      { seed: SEED },
+    );
+    const row = untyped.units().find((r) => r.guid === "2002")!;
+    expect(row).toBeDefined();
+    expect(row.type).toBeUndefined();
+  });
+
+  test("entry filter takes one id or a list, and a numeric string is repaired", () => {
+    const c = cache();
+    expect(c.units({ entry: CREATURE_ENTRY }).map((r) => r.guid)).toEqual([CREATURE_GUID]);
+    expect(c.units({ entry: [CREATURE_ENTRY, VENDOR_ENTRY] }).map((r) => r.guid)).toEqual([
+      VENDOR_GUID,
+      CREATURE_GUID,
+    ]);
+    // ADR-0016 deterministic repair: "90210" has exactly one valid reading.
+    expect(c.units({ entry: String(CREATURE_ENTRY) as unknown as number })).toEqual(
+      c.units({ entry: CREATURE_ENTRY }),
+    );
+    expect(c.units({ entry: [String(FAR_ENTRY) as unknown as number] }).length).toBe(3);
+  });
+
+  test("name is a case-insensitive substring; unnamed objects never match", () => {
+    const c = cache();
+    expect(c.units({ name: "thistle" }).map((r) => r.guid)).toEqual([CREATURE_GUID]);
+    expect(c.units({ name: "BOAR" }).every((r) => r.name === "Ridgeback Boar")).toBe(true);
+    expect(c.units({ name: "boar" }).map((r) => r.guid)).not.toContain(OBJECT_GUID);
+    expect(c.units({ name: "nothing here" })).toEqual([]);
+  });
+
+  test("type filters on the observed create-block type", () => {
+    const c = cache();
+    expect(c.units({ type: "gameObject" }).map((r) => r.guid)).toEqual([OBJECT_GUID]);
+    expect(c.units({ type: "player" })).toEqual([]);
+    expect(c.units({ type: "unit" }).map((r) => r.guid)).not.toContain(OBJECT_GUID);
+  });
+
+  test("alive: true drops only the known dead; alive: false needs the observation", () => {
+    const c = cache();
+    const alive = c.units({ alive: true }).map((r) => r.guid);
+    expect(alive).not.toContain(DEAD_GUID);
+    // Health never observed is not evidence of death — the footgun this exists to kill.
+    expect(alive).toContain(GHOST_GUID);
+    expect(c.units({ alive: false }).map((r) => r.guid)).toEqual([DEAD_GUID]);
+  });
+
+  test("maxDistance is in yards and drops what has no known distance", () => {
+    const c = cache();
+    const near = c.units({ maxDistance: 20 });
+    expect(near.map((r) => r.guid)).not.toContain(FAR_GUID);
+    expect(near.map((r) => r.guid)).not.toContain(GHOST_GUID);
+    expect(near.every((r) => r.distance! <= 20)).toBe(true);
+    expect(c.units({ maxDistance: 500 }).length).toBe(c.units().length - 1);
+    expect(c.units({ maxDistance: "20" as unknown as number })).toEqual(near);
+  });
+
+  test("npc: npcFlags > 0, and unobserved flags are not an npc", () => {
+    const c = cache();
+    expect(c.units({ npc: true }).map((r) => r.guid)).toEqual([VENDOR_GUID]);
+    expect(c.units({ npc: false }).map((r) => r.guid)).not.toContain(VENDOR_GUID);
+  });
+
+  test("criteria are AND-ed", () => {
+    const c = cache();
+    expect(c.units({ entry: FAR_ENTRY, alive: true, maxDistance: 50 }).map((r) => r.guid)).toEqual([]);
+    expect(c.units({ entry: FAR_ENTRY, alive: false }).map((r) => r.guid)).toEqual([DEAD_GUID]);
+    expect(c.units({ type: "unit", name: "boar", alive: true, maxDistance: 200 }).map((r) => r.guid)).toEqual([
+      FAR_GUID,
+    ]);
+  });
+
+  test("targetGuid is flat, and no-target reads as undefined", () => {
+    const c = StateCache.replay(toEvents([...worldStream, selfTarget]), { seed: SEED });
+    const row = c.units().find((r) => r.guid === CREATURE_GUID)!;
+    expect(row.targetGuid).toBeUndefined();
+    const targeting = StateCache.replay(
+      toEvents([
+        ...worldStream,
+        {
+          seq: 41,
+          opcode: "SMSG_UPDATE_OBJECT",
+          opcodeId: 0x0a9,
+          ts: 1_700_000_000_410,
+          data: {
+            blocks: 1,
+            objects: [{ update: "values", guid: CREATURE_GUID, fields: { targetGuid: "7" } }],
+          },
+        },
+      ]),
+      { seed: SEED },
+    );
+    expect(targeting.units().find((r) => r.guid === CREATURE_GUID)!.targetGuid).toBe("7");
+  });
+
+  test("bad filter values are rejected with an actionable TypeError (ADR-0016)", () => {
+    const c = cache();
+    expect(() => c.units({ entry: "boar" as unknown as number })).toThrow(TypeError);
+    expect(() => c.units({ entry: "boar" as unknown as number })).toThrow(/received "boar" \(string\)/);
+    expect(() => c.units({ entry: 69.5 })).toThrow(/whole template id/);
+    // An enum near-miss has two readings, so it is rejected rather than picked.
+    expect(() => c.units({ type: "gameobject" as "gameObject" })).toThrow(/expected one of/);
+    expect(() => c.units({ alive: "true" as unknown as boolean })).toThrow(/expected true or false/);
+    expect(() => c.units({ minLevel: 5 } as unknown as UnitFilter)).toThrow(/unknown key "minLevel"/);
+    expect(() => c.units({ minLevel: 5 } as unknown as UnitFilter)).toThrow(/Valid keys are entry, name/);
+    expect(() => c.units(((u: unknown) => u) as unknown as UnitFilter)).toThrow(
+      /criteria object, not a predicate/,
+    );
+    expect(() => c.units({ maxDistance: -1 })).toThrow(/expected a distance >= 0/);
   });
 });

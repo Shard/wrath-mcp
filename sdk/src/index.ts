@@ -6,7 +6,7 @@
  * a major one and wants an ADR under docs/decisions/.
  */
 
-export { connect, WrathClient, WrathRequestError, WrathTransportError } from "./client";
+export { connect, KNOWN_ERROR_CODES, WrathClient, WrathRequestError, WrathTransportError } from "./client";
 export type {
   ConnectOptions,
   DeleteCharacterOptions,
@@ -23,6 +23,7 @@ export type {
   QuestAcceptResult,
   QuestOptions,
   QuestTurnInResult,
+  StoredLootItem,
   WaitForChatOptions,
   WaitForNearbyOptions,
 } from "./client";
@@ -48,6 +49,8 @@ export { pointOf, StateCache } from "./state";
 export type {
   Anomaly,
   AuraEntry,
+  BagContents,
+  BagSlotItem,
   ChatEntry,
   CharacterSummary,
   CreatureInfo,
@@ -60,13 +63,16 @@ export type {
   NotificationEntry,
   Observed,
   Point3,
+  QuestCompletion,
   QuestLogEntry,
   SelfState,
   StateCacheOptions,
   StateSeed,
   StateSnapshot,
   UnitFieldsState,
+  UnitFilter,
   UnitPosition,
+  UnitView,
   WorldPosition,
 } from "./state";
 

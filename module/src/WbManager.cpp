@@ -25,6 +25,7 @@
 #include "Item.h"
 #include "ItemTemplate.h"
 #include "Log.h"
+#include "LootMgr.h"
 #include "QuestDef.h"
 #include "ObjectGuid.h"
 #include "Opcodes.h"
@@ -48,6 +49,7 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <initializer_list>
 #include <strings.h>
 
 using boost::asio::ip::tcp;
@@ -82,8 +84,52 @@ namespace WrathBench
         _bindAddress = sConfigMgr->GetOption<std::string>("WrathBench.BindAddress", "0.0.0.0");
         _port = static_cast<uint16_t>(sConfigMgr->GetOption<uint32>("WrathBench.Port", 8086));
         _threads = std::max<unsigned>(1, sConfigMgr->GetOption<uint32>("WrathBench.Threads", 2));
-        _account = sConfigMgr->GetOption<std::string>("WrathBench.Account", "RUNNER");
+        std::string account = sConfigMgr->GetOption<std::string>("WrathBench.Account", "RUNNER");
         _auditDir = sConfigMgr->GetOption<std::string>("WrathBench.AuditDir", "/azerothcore/env/dist/logs/wrathbench");
+
+        // Account allowlist: the accounts this module serves at all. Comma
+        // separated; defaults to the single default account, so an unset
+        // option behaves as before. Built into a local first: Configure()
+        // re-runs on `.reload config` while HTTP threads read the list, so
+        // the published fields are only ever touched under _accountMutex.
+        std::vector<std::string> parsed;
+        std::string accounts = sConfigMgr->GetOption<std::string>("WrathBench.Accounts", account);
+        for (size_t start = 0; start <= accounts.size();)
+        {
+            size_t end = accounts.find(',', start);
+            if (end == std::string::npos)
+                end = accounts.size();
+            std::string name = accounts.substr(start, end - start);
+            // trim surrounding whitespace
+            while (!name.empty() && std::isspace(static_cast<unsigned char>(name.front()))) name.erase(name.begin());
+            while (!name.empty() && std::isspace(static_cast<unsigned char>(name.back()))) name.pop_back();
+            if (!name.empty())
+                parsed.push_back(name);
+            start = end + 1;
+        }
+        if (parsed.empty())
+            parsed.push_back(account);
+
+        {
+            std::lock_guard<std::mutex> lock(_accountMutex);
+            _account = std::move(account);
+            _accounts = std::move(parsed);
+        }
+    }
+
+    bool Manager::AccountPermitted(std::string const& account) const
+    {
+        std::lock_guard<std::mutex> lock(_accountMutex);
+        for (std::string const& allowed : _accounts)
+            if (strcasecmp(account.c_str(), allowed.c_str()) == 0)
+                return true;
+        return false;
+    }
+
+    std::string Manager::DefaultAccount() const
+    {
+        std::lock_guard<std::mutex> lock(_accountMutex);
+        return _account;
     }
 
     void Manager::Start()
@@ -146,9 +192,15 @@ namespace WrathBench
         for (auto& t : tasks)
             t();
 
+        int64_t const nowMs = NowMs();
+
         // Drive synthesized movement (ADR-0010). World thread: maps are not
         // mid-update here, so reading player state and QueuePacket are both safe.
-        TickMovers(NowMs());
+        TickMovers(nowMs);
+
+        // Answer pending teleports; without this every teleport (repop's
+        // graveyard port included) freezes movement forever.
+        TickTeleportAcks(nowMs);
 
         // Keep parked sockets from being reaped by the idle-connection check in
         // WorldSession::Update (it calls CloseSocket once m_timeOutTime hits 0).
@@ -179,12 +231,12 @@ namespace WrathBench
     }
 
     // ------------------------------------------------------------- HTTP
-    HttpReply Manager::HandleHttp(std::string const& method, std::string const& target, std::string const& body)
+    HttpReply Manager::HandleHttp(std::string const& method, std::string const& target, std::string const& body, bool loopbackPeer)
     {
         try
         {
             if (method == "GET" && target == "/health")
-                return HttpHealth();
+                return HttpHealth(loopbackPeer);
             if (method == "POST" && target == "/session")
                 return HttpCreateSession(body);
             if (method == "POST" && target == "/action")
@@ -216,8 +268,26 @@ namespace WrathBench
         return buf;
     }
 
-    HttpReply Manager::HttpHealth()
+    HttpReply Manager::HttpHealth(bool operatorView)
     {
+        // Non-loopback callers (runner, snippet sandbox) get liveness only:
+        // the global session count and the drop census describe module
+        // internals and other runs' sessions, which the observation contract
+        // never serves to a snippet. The counter fields stay present, zeroed,
+        // so the SDK's health schema keeps parsing; the census is read
+        // by operators via loopback curl inside the worldserver container.
+        if (!operatorView)
+        {
+            Json::Writer w;
+            w.Add("ok", true);
+            w.Add("module", "mod-wrathbench");
+            w.Add("worldStopped", World::IsStopped());
+            w.Add("sessions", 0);
+            w.Add("droppedPackets", 0);
+            w.Add("droppedPacketsLive", 0);
+            return {200, w.Str()};
+        }
+
         uint64_t sessions;
         uint64_t liveDrops = 0;
         {
@@ -263,7 +333,11 @@ namespace WrathBench
 
         auto s = std::make_shared<BenchSession>();
         s->token = token;
-        s->account = req.GetString("account", _account);
+        s->account = req.GetString("account", DefaultAccount());
+        // Same allowlist as /character-delete: the module serves only its
+        // configured bench accounts, on every surface.
+        if (!AccountPermitted(s->account))
+            return {403, Json::Writer().Add("ok", false).Add("error", "account_not_permitted").Str()};
         s->charName = req.GetString("character", "");
         // Absent or garbage race/class deliberately parse to 0, which is outside
         // the valid [1,11] range. Whether that matters is only decided at
@@ -294,13 +368,45 @@ namespace WrathBench
         return fut.get();
     }
 
+    // A guid request field must be a decimal u64 string (PROTOCOL.md). Empty
+    // means "absent" (validated separately); anything else that does not parse
+    // is a client bug — reported as 400 invalid_guid, never coerced to 0.
+    static bool GuidFieldParses(std::string const& v)
+    {
+        if (v.empty())
+            return true;
+        if (v.find_first_not_of("0123456789") != std::string::npos)
+            return false;
+        try { (void)std::stoull(v); return true; } catch (...) { return false; }
+    }
+
+    // Every missing/invalid-param reply names the action and the param it was
+    // about: a bare "missing_guid" cost live-run turns to diagnose.
+    static HttpReply MissingParam(std::string const& action, char const* code, char const* param)
+    {
+        return {400, Json::Writer().Add("ok", false).Add("error", code)
+            .Add("action", action).Add("param", param).Str()};
+    }
+
     HttpReply Manager::HttpAction(std::string const& body)
     {
         Json::Value req = Json::Parse(body);
         std::string token = req.GetString("token");
         std::string action = req.GetString("action");
         if (token.empty())
-            return {400, Json::Writer().Add("ok", false).Add("error", "missing_token").Str()};
+            return MissingParam(action, "missing_token", "token");
+
+        // Guid-shaped fields are validated wherever they appear, before any
+        // per-action branching: a truncated or non-decimal guid must never
+        // silently become guid 0 (which targets nothing).
+        for (char const* key : { "guid", "targetGuid", "itemGuid" })
+        {
+            std::string v = req.GetString(key);
+            if (!GuidFieldParses(v))
+                return {400, Json::Writer().Add("ok", false).Add("error", "invalid_guid")
+                    .Add("action", action).Add("param", key)
+                    .Add("received", v.substr(0, 64)).Str()};
+        }
 
         auto ack = std::make_shared<std::promise<HttpReply>>();
         auto fut = ack->get_future();
@@ -313,7 +419,8 @@ namespace WrathBench
         else if (action == "move_to")
         {
             if (!req.Has("x") || !req.Has("y") || !req.Has("z"))
-                return {400, Json::Writer().Add("ok", false).Add("error", "missing_position").Str()};
+                return MissingParam(action, "missing_position",
+                    !req.Has("x") ? "x" : (!req.Has("y") ? "y" : "z"));
             float x = (float)req.GetDouble("x"), y = (float)req.GetDouble("y"), z = (float)req.GetDouble("z");
             PushTask([this, token, x, y, z, ack]() { DoMoveTo(token, x, y, z, ack); });
         }
@@ -326,7 +433,7 @@ namespace WrathBench
             bool hasO = req.Has("orientation");
             bool hasXY = req.Has("x") && req.Has("y");
             if (!hasO && !hasXY)
-                return {400, Json::Writer().Add("ok", false).Add("error", "missing_face_target").Str()};
+                return MissingParam(action, "missing_face_target", "orientation or x,y");
             float o = (float)req.GetDouble("orientation");
             float x = (float)req.GetDouble("x"), y = (float)req.GetDouble("y");
             PushTask([this, token, hasO, o, hasXY, x, y, ack]() { DoFace(token, hasO, o, hasXY, x, y, ack); });
@@ -340,7 +447,8 @@ namespace WrathBench
                 "set_target", "attack_start", "interact", "gossip_hello", "gossip_select",
                 "quest_list", "quest_details", "quest_accept", "quest_complete",
                 "quest_choose_reward", "loot", "loot_all", "loot_release",
-                "vendor_list", "buy_item", "sell_item", "repair_all", nullptr };
+                "vendor_list", "buy_item", "sell_item", "repair_all",
+                "spirit_healer_activate", nullptr };
             static char const* kNoParams[] = {
                 "clear_target", "attack_stop", "loot_money", "repop", "reclaim_corpse", nullptr };
 
@@ -359,25 +467,25 @@ namespace WrathBench
                 return {400, Json::Writer().Add("ok", false).Add("error", "unsupported_action").Add("action", action).Str()};
 
             if (needsGuid && req.GetString("guid").empty())
-                return {400, Json::Writer().Add("ok", false).Add("error", "missing_guid").Str()};
+                return MissingParam(action, "missing_guid", "guid");
             if (action == "gossip_select" && (!req.Has("menuId") || !req.Has("optionId")))
-                return {400, Json::Writer().Add("ok", false).Add("error", "missing_option").Str()};
+                return MissingParam(action, "missing_option", !req.Has("menuId") ? "menuId" : "optionId");
             if ((action == "quest_details" || action == "quest_accept" || action == "quest_complete"
                  || action == "quest_choose_reward" || action == "quest_abandon") && !req.Has("questId"))
-                return {400, Json::Writer().Add("ok", false).Add("error", "missing_quest_id").Str()};
+                return MissingParam(action, "missing_quest_id", "questId");
             if (action == "quest_choose_reward" && !req.Has("rewardIndex"))
-                return {400, Json::Writer().Add("ok", false).Add("error", "missing_reward_index").Str()};
+                return MissingParam(action, "missing_reward_index", "rewardIndex");
             if ((action == "cast_spell" || action == "cancel_cast") && !req.Has("spellId"))
-                return {400, Json::Writer().Add("ok", false).Add("error", "missing_spell_id").Str()};
+                return MissingParam(action, "missing_spell_id", "spellId");
             if (action == "loot_item" && !req.Has("slot"))
-                return {400, Json::Writer().Add("ok", false).Add("error", "missing_slot").Str()};
+                return MissingParam(action, "missing_slot", "slot");
             if (action == "buy_item" && (!req.Has("itemId") || !req.Has("slot")))
-                return {400, Json::Writer().Add("ok", false).Add("error", "missing_item").Str()};
+                return MissingParam(action, "missing_item", !req.Has("itemId") ? "itemId" : "slot");
             if (action == "sell_item" && req.GetString("itemGuid").empty())
-                return {400, Json::Writer().Add("ok", false).Add("error", "missing_item_guid").Str()};
+                return MissingParam(action, "missing_item_guid", "itemGuid");
             if ((action == "equip_item" || action == "use_item" || action == "destroy_item")
                 && (!req.Has("bag") || !req.Has("slot")))
-                return {400, Json::Writer().Add("ok", false).Add("error", "missing_bag_slot").Str()};
+                return MissingParam(action, "missing_bag_slot", !req.Has("bag") ? "bag" : "slot");
 
             PushTask([this, token, action, body, ack]() { DoGameAction(token, action, body, ack); });
         }
@@ -418,9 +526,28 @@ namespace WrathBench
         if (FindByToken(token))
             return {409, Json::Writer().Add("ok", false).Add("error", "token_in_use").Str()};
 
+        std::string account = req.GetString("account", DefaultAccount());
+
+        // Minimal ownership gate for the current per-run account scheme
+        // (FOLLOW-UPS 14; per-character credentials are the real Phase-1 fix,
+        // FOLLOW-UPS 10). Deletes are only served for accounts on the
+        // configured allowlist (WrathBench.Accounts), and never while another
+        // token holds a live bench session on the account — an unauthenticated
+        // caller must not be able to delete a character out from under a
+        // running episode or on an arbitrary named account.
+        if (!AccountPermitted(account))
+            return {403, Json::Writer().Add("ok", false).Add("error", "account_not_permitted").Str()};
+        {
+            std::lock_guard<std::mutex> lock(_sessMutex);
+            for (auto& [otherToken, other] : _byToken)
+                if (!other->tearingDown.load() && otherToken != token
+                    && strcasecmp(other->account.c_str(), account.c_str()) == 0)
+                    return {409, Json::Writer().Add("ok", false).Add("error", "account_owned_by_other_token").Str()};
+        }
+
         auto s = std::make_shared<BenchSession>();
         s->token = token;
-        s->account = req.GetString("account", _account);
+        s->account = account;
         s->charName = req.GetString("character");
         s->deleteMode = true;
 
@@ -448,7 +575,9 @@ namespace WrathBench
 
         auto s = std::make_shared<BenchSession>();
         s->token = token;
-        s->account = req.GetString("account", _account);
+        s->account = req.GetString("account", DefaultAccount());
+        if (!AccountPermitted(s->account))
+            return {403, Json::Writer().Add("ok", false).Add("error", "account_not_permitted").Str()};
         s->listMode = true;
 
         auto ack = std::make_shared<std::promise<HttpReply>>();
@@ -467,9 +596,9 @@ namespace WrathBench
     // ---------------------------------------------------- world-thread work
     void Manager::DoCreateSession(std::shared_ptr<BenchSession> s, std::shared_ptr<std::promise<HttpReply>> ack)
     {
-        auto fail = [&](std::string const& err) {
+        auto fail = [&](std::string const& err, int status = 400) {
             if (!s->ackFired.exchange(true))
-                ack->set_value({400, Json::Writer().Add("ok", false).Add("error", err).Add("token", s->token).Str()});
+                ack->set_value({status, Json::Writer().Add("ok", false).Add("error", err).Add("token", s->token).Str()});
         };
 
         uint32 accountId = AccountMgr::GetId(s->account);
@@ -477,8 +606,29 @@ namespace WrathBench
             return fail("unknown_account");
         s->accountId = accountId;
 
-        // One session per account. The core's AddSession_ would otherwise kick and
-        // delete the existing session, leaving us with a dangling WorldSession*.
+        // One bench session per account, decided here on the world thread where
+        // creates are serialized. The HTTP-side scans (token_in_use, the
+        // /character-delete ownership gate) are only fast-path pre-filters:
+        // two requests for the same account arriving within one world tick
+        // both pass them, because a racing session only lands in _byToken
+        // below, and the core-side FindSession check further down cannot see
+        // it either (AddSession only queues; _sessions is drained in
+        // UpdateSessions, which runs before our task drain). Without this
+        // check a /character-delete racing a /session create could delete the
+        // character out from under the episode being created, and the core's
+        // AddSession_ would kick-and-delete one of the two WorldSessions
+        // while we still hold the pointer.
+        {
+            std::lock_guard<std::mutex> lock(_sessMutex);
+            for (auto& [otherToken, other] : _byToken)
+                if (!other->tearingDown.load() && otherToken != s->token && other->accountId == accountId)
+                    return s->deleteMode ? fail("account_owned_by_other_token", 409)
+                                         : fail("account_in_use");
+        }
+
+        // One session per account, against the core's map too. AddSession_ would
+        // otherwise kick and delete the existing session, leaving us with a
+        // dangling WorldSession*.
         if (sWorldSessionMgr->FindSession(accountId))
             return fail("account_in_use");
 
@@ -1008,6 +1158,16 @@ namespace WrathBench
             p = new WorldPacket(CMSG_REPOP_REQUEST, 1);
             *p << uint8(0);
         }
+        else if (action == "spirit_healer_activate")
+        {
+            // Graveyard fallback when the corpse is unreachable. No dedicated
+            // response opcode: the client observes the resurrection through
+            // already-served events (health/update fields, res-sickness aura,
+            // and — if the corpse graveyard differs — a teleport, acked by
+            // TickTeleportAcks).
+            p = new WorldPacket(CMSG_SPIRIT_HEALER_ACTIVATE, 8);
+            *p << uint64(guid);
+        }
         else if (action == "reclaim_corpse")
         {
             // Handler resolves the player's own corpse; the guid payload is the
@@ -1067,7 +1227,11 @@ namespace WrathBench
             return;
         }
 
-        if (!player->IsAlive())
+        // Dying mid-run stops the move — but only while the body is still on
+        // the ground. A released spirit (ghost flag) can and must move: the
+        // corpse run is the normal 3.3.5a death recovery. Conflating the two
+        // death states made every corpse run impossible (FOLLOW-UPS item 14).
+        if (!player->IsAlive() && !player->HasPlayerFlag(PLAYER_FLAGS_GHOST))
         {
             SendMovePacket(s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE,
                 player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation());
@@ -1145,6 +1309,64 @@ namespace WrathBench
             w.Add("moveId", m.moveId);
             w.Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO));
             EmitEvent(s, "WB_MOVE_PROGRESS", 0xFF02, w.Str());
+        }
+    }
+
+    // A real client answers every teleport once its loading screen is done:
+    // MSG_MOVE_TELEPORT_ACK for a same-map teleport, MSG_MOVE_WORLDPORT_ACK for
+    // a map transfer. Until that ack arrives the core discards all movement
+    // opcodes (HandleMovementOpcodes: IsBeingTeleported -> ignore) and the
+    // destination is never applied, so a session that never acks is wedged at
+    // its pre-teleport position forever — repop's graveyard teleport was the
+    // observed case (docs/FOLLOW-UPS.md item 14). The parked client has no
+    // loading screen, so the module acks on the next world tick, through the
+    // same handlers a real client's packets would hit. Like the
+    // CMSG_TIME_SYNC_RESP answer in the tap, this is module-internal client
+    // behaviour: the semaphore state is never served to the agent, and the
+    // agent never needs to know teleports exist.
+    void Manager::TickTeleportAcks(int64_t nowMs)
+    {
+        std::vector<std::shared_ptr<BenchSession>> sessions;
+        {
+            std::lock_guard<std::mutex> lock(_sessMutex);
+            for (auto& [token, s] : _byToken)
+                if (!s->tearingDown.load() && s->phase.load() == BenchSession::P_INWORLD)
+                    sessions.push_back(s);
+        }
+        for (auto& s : sessions)
+        {
+            if (!s->ws || sWorldSessionMgr->FindSession(s->accountId) != s->ws)
+                continue;
+            Player* player = s->ws->GetPlayer();
+            if (!player || !player->IsBeingTeleported())
+            {
+                s->teleportAckQueuedMs = 0;
+                continue;
+            }
+            // Pace re-sends: the queued ack is consumed on the session's next
+            // update, so retry only if the semaphore is still set well after.
+            if (s->teleportAckQueuedMs && nowMs - s->teleportAckQueuedMs < 1000)
+                continue;
+            s->teleportAckQueuedMs = nowMs;
+
+            char const* opcodeName;
+            if (player->IsBeingTeleportedNear())
+            {
+                // Mirror of the client's echo of Player::SendTeleportAckPacket.
+                // HandleMoveTeleportAck reads counter and time but uses neither.
+                WorldPacket* p = new WorldPacket(MSG_MOVE_TELEPORT_ACK, 8 + 4 + 4);
+                *p << player->GetPackGUID();
+                *p << uint32(0);            // movement order counter echo
+                *p << uint32(getMSTime());
+                s->ws->QueuePacket(p);
+                opcodeName = "MSG_MOVE_TELEPORT_ACK";
+            }
+            else
+            {
+                s->ws->QueuePacket(new WorldPacket(MSG_MOVE_WORLDPORT_ACK, 0));
+                opcodeName = "MSG_MOVE_WORLDPORT_ACK";
+            }
+            Audit(*s, "action", Json::Writer().Add("op", "teleport_ack").Add("opcode", opcodeName).Str());
         }
     }
 
@@ -2587,7 +2809,16 @@ namespace WrathBench
                         items += Json::Writer().Add("slot", (uint32)slot).Add("itemId", itemId)
                             .Add("count", cnt).Add("slotType", (uint32)slotType).Str();
                         itemEntries.push_back(itemId);
-                        if (slotType == 0)              // LOOT_SLOT_TYPE_ALLOW_LOOT
+                        // A solo looter's slots arrive as LOOT_SLOT_TYPE_OWNER,
+                        // not ALLOW_LOOT: the core marks every slot OWNER when
+                        // the looter owns the corpse outright (LootMgr.cpp,
+                        // PERMISSION_OWNER). Gating on ALLOW_LOOT alone meant
+                        // solo auto-loot released the window without storing a
+                        // single item (morning-opus-1). MASTER, ROLL_ONGOING
+                        // and LOCKED stay excluded deliberately: they are
+                        // group-distribution states a client cannot auto-store
+                        // from, and this benchmark is solo.
+                        if (slotType == LOOT_SLOT_TYPE_ALLOW_LOOT || slotType == LOOT_SLOT_TYPE_OWNER)
                             slots.push_back(slot);
                     }
                     items += "]";

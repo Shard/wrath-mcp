@@ -164,7 +164,14 @@ namespace WrathBench
     {
     public:
         HttpConnection(tcp::socket&& socket, IHttpSink* sink)
-            : _stream(std::move(socket)), _sink(sink) { }
+            : _stream(std::move(socket)), _sink(sink)
+        {
+            // Captured once at accept time; remote_endpoint can fail on an
+            // already-dead socket, which just means "not an operator".
+            beast::error_code ec;
+            auto ep = _stream.socket().remote_endpoint(ec);
+            _loopbackPeer = !ec && ep.address().is_loopback();
+        }
 
         void Run()
         {
@@ -199,7 +206,7 @@ namespace WrathBench
             }
 
             std::string method(_req.method_string());
-            HttpReply reply = _sink->HandleHttp(method, path, _req.body());
+            HttpReply reply = _sink->HandleHttp(method, path, _req.body(), _loopbackPeer);
             SendReply(reply, _req.keep_alive());
         }
 
@@ -230,6 +237,7 @@ namespace WrathBench
 
         beast::tcp_stream _stream;
         IHttpSink* _sink;
+        bool _loopbackPeer{false};
         beast::flat_buffer _buffer;
         http::request<http::string_body> _req;
     };

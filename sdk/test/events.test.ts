@@ -115,6 +115,33 @@ describe("event stream: waitFor", () => {
     ).rejects.toBeInstanceOf(EventTimeoutError);
   });
 
+  test("an exact-epoch waiter matches its own session's events", async () => {
+    const stream = offlineStream();
+    const pending = stream.waitFor((e) => e.opcode === "SMSG_MESSAGECHAT", {
+      epoch: stream.epoch,
+      timeout: 500,
+    });
+    stream.ingest(JSON.stringify(chatEcho));
+    expect((await pending).opcode).toBe("SMSG_MESSAGECHAT");
+  });
+
+  test("an exact-epoch waiter never matches a later session's colliding event", async () => {
+    const stream = offlineStream();
+    for (const f of frames(fullStream)) stream.ingest(f);
+    // Issued against the current session: correlation must be exact, because
+    // per-session ids (moveId, seq) restart when the session is recreated.
+    const pending = stream.waitFor((e) => e.opcode === "SMSG_MESSAGECHAT", {
+      epoch: stream.epoch,
+      includeBuffered: false,
+      timeout: 60,
+    });
+    // The session restarts (seq goes backwards): a byte-identical event from
+    // the NEW session must not settle the old waiter — it has no verdict.
+    for (const f of frames(loginSequence)) stream.ingest(f);
+    stream.ingest(JSON.stringify({ ...chatEcho, seq: 30 }));
+    await expect(pending).rejects.toBeInstanceOf(EventTimeoutError);
+  });
+
   test("times out with a typed error", async () => {
     const stream = offlineStream();
     await expect(stream.waitForOpcode("SMSG_MOTD", { timeout: 20 })).rejects.toBeInstanceOf(
@@ -152,6 +179,22 @@ describe("event stream: continuity", () => {
     // The session was torn down and recreated: the counter starts over.
     for (const f of frames(loginSequence)) stream.ingest(f);
     expect(stream.gaps).toBe(before);
+  });
+
+  test("a seq restart advances the session epoch (ingest-side boundary detection)", () => {
+    // The module can recreate a session under the same token without this
+    // client ever calling createSession (whose advanceEpoch would mark the
+    // boundary). The seq going backwards is the only tell, and the ingest-side
+    // bump is the only thing keeping per-session correlation ids (moveId, seq)
+    // of the old session from matching the new one's restarted counters.
+    const stream = offlineStream();
+    for (const f of frames(fullStream)) stream.ingest(f);
+    const before = stream.epoch;
+    for (const f of frames(loginSequence)) stream.ingest(f);
+    expect(stream.epoch).toBe(before + 1);
+    // Continuing forward within the new session is not another boundary.
+    stream.ingest(JSON.stringify({ ...chatEcho, seq: 30 }));
+    expect(stream.epoch).toBe(before + 1);
   });
 
   test("a frame that is not an event envelope surfaces as stream_error", () => {

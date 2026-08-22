@@ -13,7 +13,9 @@ import {
   creatureQuery,
   frames,
   gossipWithQuests,
+  inventoryChangeFailure,
   ITEM_ENTRY,
+  itemPushed,
   loginSequence,
   lootRelease,
   lootResponse,
@@ -52,11 +54,11 @@ describe("client: the happy path through the slice", () => {
 
     const session = await client.createSession({ character: "Fenwick", race: 1, class: 1, gender: 0 });
     expect(session.inWorld).toBe(true);
-    expect(session.guid).toBe(7n);
+    expect(session.guid).toBe("7");
 
     // The login events arrived while the POST was in flight; the cache has them.
     await client.events.waitForOpcode("SMSG_LOGIN_VERIFY_WORLD", { timeout: 2000 });
-    expect(client.state.self.guid).toBe(7n);
+    expect(client.state.self.guid).toBe("7");
     expect(client.state.self.name).toBe("Fenwick");
     expect(client.state.self.level?.value).toBe(3);
     expect(client.state.self.position?.value.map).toBe(0);
@@ -67,7 +69,7 @@ describe("client: the happy path through the slice", () => {
     stub.push(JSON.stringify(chatEcho));
 
     const entry = await client.waitForChat("ping from the fixture", { timeout: 2000 });
-    expect(entry.senderGuid).toBe(7n);
+    expect(entry.senderGuid).toBe("7");
     expect(entry.seq).toBe(4);
     expect(client.state.chat.at(-1)?.message).toBe("ping from the fixture");
 
@@ -144,6 +146,88 @@ describe("client: movement", () => {
       client.close();
       await stub.stop();
     }
+  });
+
+  test("a relog cannot resolve a moveTo against the previous session's stale result", async () => {
+    // The module's moveId generator is per-session and restarts when the
+    // session is recreated, so after a relog a fresh ack can reuse a moveId
+    // that a stale buffered result still carries (FOLLOW-UPS item 14: probes
+    // with 8s timeouts "resolved" in 59ms against pre-relog payloads). The
+    // stub pins moveId 1 on every ack to force exactly that collision.
+    const stub = startStub({
+      onConnect: () => frames(loginSequence),
+      routes: { action: () => json({ ok: true, action: "move_to", token: "stub", moveId: 1 }, 200) },
+    });
+    const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+    await client.createSession({ character: "Fenwick" });
+
+    // First session: a completed move leaves its result in the buffer.
+    const first = client.moveTo({ x: 1, y: 2, z: 3 }, { timeout: 2000 });
+    stub.push(JSON.stringify(moveResult("arrived", 1, 36)));
+    expect((await first).status).toBe("arrived");
+
+    // Relog: the module recreates the session; seq and moveId both restart.
+    await client.logout();
+    await client.createSession({ character: "Fenwick" });
+    for (const f of frames(loginSequence)) stub.push(f);
+
+    // The stale result (moveId 1, seq 36) is still buffered. It must not
+    // settle the new session's move: absence of a fresh result is a timeout.
+    await expect(client.moveTo({ x: 4, y: 5, z: 6 }, { timeout: 100 })).rejects.toBeInstanceOf(
+      EventTimeoutError,
+    );
+
+    // The new session's own result still resolves, buffered or live.
+    const pending = client.moveTo({ x: 4, y: 5, z: 6 }, { timeout: 2000 });
+    stub.push(JSON.stringify(moveResult("arrived", 1, 5)));
+    const result = await pending;
+    expect(result.status).toBe("arrived");
+    expect(result.seq).toBe(5);
+
+    client.close();
+    await stub.stop();
+  });
+
+  test("a moveTo left pending across a recreate cannot resolve against the new session's colliding moveId", async () => {
+    // The forward twin of the stale-buffer test above: the epoch guard must be
+    // an *exact* match, not a floor. A move still pending when its session is
+    // torn down and recreated has no verdict — the new session's first move
+    // also carries moveId 1 (the module's generator is per-session), and it
+    // must not settle the old waiter with the wrong session's position.
+    const stub = startStub({
+      onConnect: () => frames(loginSequence),
+      routes: { action: () => json({ ok: true, action: "move_to", token: "stub", moveId: 1 }, 200) },
+    });
+    const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+    await client.createSession({ character: "Fenwick" });
+
+    // A move that never gets its result before the session goes away. Settle
+    // is captured eagerly so the rejection is never left unhandled.
+    const stale = client
+      .moveTo({ x: 1, y: 2, z: 3 }, { timeout: 900 })
+      .then((r) => ({ settled: "resolved" as const, r }), (e: unknown) => ({ settled: "rejected" as const, e }));
+    // Let the ack land so the waiter is registered before the recreate.
+    await Bun.sleep(30);
+
+    // Recreate the session; seq and moveId both restart.
+    await client.logout();
+    await client.createSession({ character: "Fenwick" });
+    for (const f of frames(loginSequence)) stub.push(f);
+
+    // The NEW session's result for ITS moveId 1 arrives while the old waiter
+    // is still pending. The old moveTo must time out, not claim this verdict.
+    stub.push(JSON.stringify(moveResult("arrived", 1, 5)));
+    const outcome = await stale;
+    expect(outcome.settled).toBe("rejected");
+    if (outcome.settled === "rejected") expect(outcome.e).toBeInstanceOf(EventTimeoutError);
+
+    // The new session's own moveTo still sees that (buffered) result.
+    const fresh = await client.moveTo({ x: 1, y: 2, z: 3 }, { timeout: 2000 });
+    expect(fresh.status).toBe("arrived");
+    expect(fresh.seq).toBe(5);
+
+    client.close();
+    await stub.stop();
   });
 
   test("a request the module refuses still throws; a missing result times out", async () => {
@@ -347,7 +431,7 @@ describe("client: killTarget", () => {
     expect(result).toMatchObject({
       ok: true,
       status: "killed",
-      guid: BigInt(CREATURE_GUID),
+      guid: CREATURE_GUID,
       swings: 0,
       attacking: false,
     });
@@ -412,6 +496,51 @@ describe("client: killTarget", () => {
     const result = await fight;
     expect(result.ok).toBe(false);
     expect(result.status).toBe("lost");
+    client.close();
+    await stub.stop();
+  });
+
+  test("a guid the cache never held is not reported as 'target left view alive'", async () => {
+    // The old detail claimed a mob "left view alive" for a guid that never
+    // named anything observable — a false statement about a fight that never
+    // existed. never-seen and genuinely-lost must read differently.
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const result = await client.killTarget("999", { timeout: 5000, pollIntervalMs: 10, meleeRange: 100 });
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("lost");
+    expect(result.detail).toContain("never in view");
+    expect(result.detail).not.toContain("left view");
+    client.close();
+    await stub.stop();
+  });
+
+  test("a non-canonical guid string still finds the cached target", async () => {
+    // The nearby-cache keys are canonical decimal strings; the caller's guid
+    // is canonicalised the same way, so "0<guid>" fights the same mob instead
+    // of insta-reporting it lost.
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const fight = client.killTarget(`0${CREATURE_GUID}`, {
+      timeout: 5000,
+      pollIntervalMs: 10,
+      meleeRange: 100,
+    });
+    await untilAction(stub, "attack_start");
+    stub.push(JSON.stringify(creatureHealth(0, 61)));
+    const result = await fight;
+    expect(result.ok).toBe(true);
+    expect(result.status).toBe("killed");
+    expect(result.guid).toBe(CREATURE_GUID);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a guid string that does not parse is rejected before any opcode", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    await expect(client.killTarget("Kobold Worker")).rejects.toThrow(/killTarget\(guid\).*decimal guid string/s);
+    expect(stub.actions).toHaveLength(0);
     client.close();
     await stub.stop();
   });
@@ -617,17 +746,65 @@ describe("client: killTarget", () => {
 });
 
 describe("client: lootCorpse", () => {
-  test("an emptied corpse reports what was on it", async () => {
+  test("an emptied corpse reports what was actually stored", async () => {
     const stub = startStub({ onConnect: () => combatWorld() });
     const client = await inWorld(stub);
     const pending = client.lootCorpse(CREATURE_GUID, { timeout: 2000 });
     await untilAction(stub, "loot_all");
+    // Solo loot: the window slot arrives as LOOT_SLOT_TYPE_OWNER (4).
     stub.push(JSON.stringify(lootResponse(70)));
-    stub.push(JSON.stringify(lootRelease(71)));
+    stub.push(JSON.stringify(itemPushed(71)));
+    stub.push(JSON.stringify(lootRelease(72)));
     const loot = await pending;
     expect(loot.ok).toBe(true);
     expect(loot.gold).toBe(37);
-    expect(loot.items.map((i) => i.itemId)).toEqual([ITEM_ENTRY]);
+    expect(loot.items).toEqual([{ itemId: ITEM_ENTRY, count: 1 }]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a push that trails the release is still counted", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const pending = client.lootCorpse(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "loot_all");
+    stub.push(JSON.stringify(lootResponse(70, 0))); // ALLOW_LOOT counts too
+    stub.push(JSON.stringify(lootRelease(71)));
+    stub.push(JSON.stringify(itemPushed(72)));
+    const loot = await pending;
+    expect(loot).toMatchObject({ ok: true, status: "looted", items: [{ itemId: ITEM_ENTRY, count: 1 }] });
+    client.close();
+    await stub.stop();
+  });
+
+  test("a window whose items never reach the bag is not a success", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const pending = client.lootCorpse(CREATURE_GUID, { timeout: 300 });
+    await untilAction(stub, "loot_all");
+    stub.push(JSON.stringify(lootResponse(70)));
+    stub.push(JSON.stringify(lootRelease(71)));
+    // No SMSG_ITEM_PUSH_RESULT ever arrives: bags full, or a broken replay.
+    const loot = await pending;
+    expect(loot.ok).toBe(false);
+    if (loot.ok || loot.status !== "none_stored") throw new Error(`unexpected ${loot.status}`);
+    expect(loot.items).toEqual([]);
+    expect(loot.window.map((i) => i.itemId)).toEqual([ITEM_ENTRY]);
+    expect(loot.gold).toBe(37);
+    client.close();
+    await stub.stop();
+  });
+
+  test("group-only slot types are not expected to be stored", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const pending = client.lootCorpse(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "loot_all");
+    stub.push(JSON.stringify(lootResponse(70, 3))); // LOCKED: shown, never auto-stored
+    stub.push(JSON.stringify(lootRelease(71)));
+    const loot = await pending;
+    // Nothing was expected, so nothing missing: gold-only success, no items.
+    expect(loot).toMatchObject({ ok: true, status: "looted", gold: 37, items: [] });
     client.close();
     await stub.stop();
   });
@@ -727,17 +904,36 @@ describe("client: quests", () => {
     await stub.stop();
   });
 
-  test("a completable REQUEST_ITEMS is asked again, as the client does", async () => {
+  test("a completable REQUEST_ITEMS goes straight to the reward choice", async () => {
+    // Re-asking with quest_complete gets REQUEST_ITEMS again forever on
+    // item-delivery quests (roster-opus-20260822): the reward is chosen
+    // directly from the completable answer.
     const stub = startStub({ onConnect: () => combatWorld() });
     const client = await inWorld(stub);
     const pending = client.turnInQuest(CREATURE_GUID, QUEST_ID, 0, { timeout: 2000 });
-    const first = await untilAction(stub, "quest_complete");
+    await untilAction(stub, "quest_complete");
     stub.push(JSON.stringify(requestItems(QUEST_ID, true, 80)));
-    await untilAction(stub, "quest_complete", first + 1);
-    stub.push(JSON.stringify(offerReward(QUEST_ID, 81)));
     await untilAction(stub, "quest_choose_reward");
     stub.push(JSON.stringify(questRewarded(QUEST_ID, 82)));
     expect((await pending).ok).toBe(true);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a reward that does not fit is inventory_full, not a timeout", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const pending = client.turnInQuest(CREATURE_GUID, QUEST_ID, 0, { timeout: 2000 });
+    await untilAction(stub, "quest_complete");
+    stub.push(JSON.stringify(offerReward(QUEST_ID, 84)));
+    await untilAction(stub, "quest_choose_reward");
+    // The server refuses the hand-over: no QUEST_COMPLETE ever comes.
+    stub.push(JSON.stringify(inventoryChangeFailure(85)));
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    if (result.ok || result.status !== "inventory_full") throw new Error(`unexpected ${result.status}`);
+    expect(result.result).toBe(48);
+    expect(result.hint).toContain("free a bag slot");
     client.close();
     await stub.stop();
   });
@@ -749,7 +945,49 @@ describe("client: quests", () => {
     await untilAction(stub, "quest_complete");
     stub.push(JSON.stringify(requestItems(QUEST_ID, false, 83)));
     const result = await pending;
-    expect(result).toEqual({ ok: false, status: "not_complete", questId: QUEST_ID });
+    expect(result).toMatchObject({ ok: false, status: "not_complete", questId: QUEST_ID });
+    if (result.ok || result.status !== "not_complete") throw new Error(`unexpected ${result.status}`);
+    expect(result.hint).toContain("unfinished");
+    client.close();
+    await stub.stop();
+  });
+
+  test("a grossly out-of-range questgiver fails fast as too_far", async () => {
+    // The server silently ignores an out-of-range quest_complete; without the
+    // pre-check the call burns its whole timeout (roster-opus-20260822).
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const FAR_GUID = "17365880163140632599";
+    const far = structuredClone(creatureCreate);
+    (far.data.objects[0] as { guid: string }).guid = FAR_GUID;
+    (far.data.objects[0] as { pos: { x: number } }).pos.x = -1100.0; // ~134y off
+    far.seq = 90;
+    stub.push(JSON.stringify(far));
+    await Bun.sleep(20);
+    const result = await client.turnInQuest(FAR_GUID, QUEST_ID, 0, { timeout: 2000 });
+    expect(result).toMatchObject({ ok: false, status: "too_far", questId: QUEST_ID });
+    if (result.ok || result.status !== "too_far") throw new Error(`unexpected ${result.status}`);
+    expect(result.hint).toContain("moveTo");
+    expect(stub.actions.some((a) => a.action === "quest_complete")).toBe(false);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a refusal while the log says complete names the wrong questgiver", async () => {
+    // roster-sonnet-20260822: three not_completes against a log that said
+    // complete:true — the honest status is that another NPC ends this quest.
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    stub.push(JSON.stringify(questAccepted));
+    stub.push(JSON.stringify(questComplete));
+    await Bun.sleep(20); // let the state cache apply the log updates
+    const pending = client.turnInQuest(CREATURE_GUID, QUEST_ID, 0, { timeout: 2000 });
+    await untilAction(stub, "quest_complete");
+    stub.push(JSON.stringify(requestItems(QUEST_ID, false, 84)));
+    const result = await pending;
+    expect(result).toMatchObject({ ok: false, status: "wrong_questgiver", questId: QUEST_ID });
+    if (result.ok || result.status !== "wrong_questgiver") throw new Error(`unexpected ${result.status}`);
+    expect(result.hint).toContain("different NPC");
     client.close();
     await stub.stop();
   });
@@ -827,6 +1065,37 @@ describe("client: deleteCharacter", () => {
     expect(err).toBeInstanceOf(WrathTransportError);
     expect(err.message).toContain("Fenwick");
     expect(stub.characterDeletes).toHaveLength(3);
+    await stub.stop();
+  });
+});
+
+describe("ADR-0017: guid arguments at the client surface", () => {
+  test("a model-conjured bigint is repaired to the wire's decimal string", async () => {
+    const stub = startStub();
+    const client = await connect({ baseUrl: stub.baseUrl, token: "t", subscribeEvents: false });
+    await client.setTarget(BigInt(CREATURE_GUID) as unknown as string);
+    expect(stub.actions[0]).toMatchObject({ action: "set_target", guid: CREATURE_GUID });
+    expect(typeof stub.actions[0]?.guid).toBe("string");
+    await stub.stop();
+  });
+
+  test("killTarget returns its guid as the same opaque string, JSON-serialisable", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const fight = client.killTarget(CREATURE_GUID, {
+      timeout: 5000,
+      pollIntervalMs: 10,
+      reapproachIntervalMs: 60_000,
+      meleeRange: 100,
+    });
+    await untilAction(stub, "attack_start");
+    stub.push(JSON.stringify(creatureHealth(0, 61)));
+    const result = await fight;
+    expect(result.status).toBe("killed");
+    expect(result.guid).toBe(CREATURE_GUID);
+    expect(typeof result.guid).toBe("string");
+    expect(() => JSON.stringify(result)).not.toThrow();
+    client.close();
     await stub.stop();
   });
 });

@@ -117,6 +117,11 @@ namespace WrathBench
         MoveState move;
         uint64_t moveIdGen{0};
 
+        // Teleport-ack pacing (world thread only): when the last ack for a
+        // still-pending teleport was queued, 0 when none is pending. See
+        // TickTeleportAcks.
+        int64_t teleportAckQueuedMs{0};
+
         // Client-side object cache mirror, fed by the update-object tap. Needed
         // because UPDATETYPE_VALUES blocks carry no object type (a real client
         // resolves them against its own cache). Also tracks which name/creature
@@ -157,7 +162,7 @@ namespace WrathBench
         bool OnPacketSend(WorldSession* ws, WorldPacket const& packet);
 
         // IHttpSink (io_context threads).
-        HttpReply HandleHttp(std::string const& method, std::string const& target, std::string const& body) override;
+        HttpReply HandleHttp(std::string const& method, std::string const& target, std::string const& body, bool loopbackPeer) override;
         void OnWsOpen(std::string const& token, std::shared_ptr<IWsConn> conn) override;
         void OnWsClose(std::string const& token, IWsConn* conn) override;
 
@@ -174,7 +179,11 @@ namespace WrathBench
         HttpReply HttpDeleteSession(std::string const& body);
         HttpReply HttpCharacterDelete(std::string const& body);
         HttpReply HttpCharacterList(std::string const& body);
-        HttpReply HttpHealth();
+        // operatorView (loopback caller): include the session count and the
+        // packet-drop census. Network callers (runner, snippet sandbox) get a
+        // liveness-only view — the census is module-internal state no client
+        // could observe (docs/CONTRACTS.md).
+        HttpReply HttpHealth(bool operatorView);
 
         void DoCreateSession(std::shared_ptr<BenchSession> s, std::shared_ptr<std::promise<HttpReply>> ack);
         void DoSay(std::string token, std::string text, std::shared_ptr<std::promise<HttpReply>> ack);
@@ -193,6 +202,11 @@ namespace WrathBench
         void TickMovers(int64_t nowMs);
         void TickMover(BenchSession& s, int64_t nowMs);
         void FinishMove(BenchSession& s, char const* status);
+
+        // Answer pending teleports the way a real client does (world thread
+        // only): MSG_MOVE_TELEPORT_ACK / MSG_MOVE_WORLDPORT_ACK through the
+        // stock handlers, so the destination is applied and movement resumes.
+        void TickTeleportAcks(int64_t nowMs);
 
         // In-world session guard for action handlers. Returns the player, or
         // nullptr after setting the error reply. World thread only.
@@ -226,12 +240,30 @@ namespace WrathBench
         std::shared_ptr<BenchSession> FindByToken(std::string const& token);
         std::shared_ptr<BenchSession> FindByWs(WorldSession* ws);
 
+        // Is this account on the WrathBench.Accounts allowlist
+        // (case-insensitive)? io/world threads. Guarded by _accountMutex:
+        // Configure() rewrites the list on every config load, and the
+        // worldserver `.reload config` command re-fires that while HTTP
+        // worker threads are serving requests.
+        bool AccountPermitted(std::string const& account) const;
+
+        // The configured default account (WrathBench.Account), for requests
+        // that omit "account". io threads; guarded by _accountMutex (same
+        // reload race as the allowlist).
+        std::string DefaultAccount() const;
+
         // config
         bool _enabled{false};
         std::string _bindAddress{"0.0.0.0"};
         uint16_t _port{8086};
         unsigned _threads{2};
+        // _account/_accounts are written by Configure() (world thread, re-run
+        // on `.reload config`) and read from HTTP worker threads — always
+        // through _accountMutex. The other config fields are only consumed at
+        // Start() and are not re-applied on reload.
+        mutable std::mutex _accountMutex;
         std::string _account{"RUNNER"};
+        std::vector<std::string> _accounts; // allowlist; defaults to {_account}
         std::string _auditDir;
 
         std::unique_ptr<HttpServer> _http;

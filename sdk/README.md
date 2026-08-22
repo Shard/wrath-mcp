@@ -71,7 +71,7 @@ class WrathClient {
   loot(guid) / lootAll(guid) / lootItem(slot) / lootMoney() / lootRelease(guid)
   vendorList(guid) / buyItem(guid, itemId, slot, count?) / sellItem(guid, itemGuid, count?) / repairAll(guid)
   equipItem(bag, slot) / useItem(bag, slot, targetGuid?) / destroyItem(bag, slot, count?)
-  repop() / reclaimCorpse(guid?)
+  repop() / reclaimCorpse(guid?) / spiritHealerActivate(guid)
   deleteCharacter(name, o?: DeleteCharacterOptions): Promise<CharacterDeleteResponse>  // POST /character-delete
 
   // composed helpers — each waits for the game's verdict
@@ -87,15 +87,18 @@ class WrathClient {
 }
 ```
 
-Every action guid is a `bigint` or a decimal string; the SDK renders it the way
-the wire wants.
+Every guid — state fields, helper returns, and every guid argument — is an
+opaque decimal string (ADR-0017), which is also exactly what the wire carries:
+compare with `===`, use as Map keys, `JSON.stringify` freely. A `number` guid
+is rejected loudly (precision loss); a bigint you conjure yourself is converted
+for you.
 
 ### Combat, loot and quests
 
 ```ts
 // { ok, status, guid, swings, healthPct, attacking, detail }
 const fight = await client.killTarget(kobold.guid, { abortBelowHealthPct: 35 });
-if (fight.ok) await client.lootCorpse(kobold.guid);      // { ok, status, gold, items }
+if (fight.ok) await client.lootCorpse(kobold.guid);      // { ok, status, gold, items, window }
 if (fight.attacking) await client.attackStop();          // it left us swinging
 ```
 
@@ -123,9 +126,14 @@ again. The default `timeout` is 25s, deliberately under the runner's 30s
 snippet cap; longer fights belong in a background routine.
 
 `lootCorpse` sends `loot_all` — the module replaying the client's auto-loot
-sequence — and returns once the window has been emptied and released. A corpse
-with nothing on it releases without ever opening a window, which is
-`{ ok: false, status: "empty" }`: an answer, not a failure. Silence still
+sequence — and returns once the window has been emptied and released. Its
+`items` are what `SMSG_ITEM_PUSH_RESULT` confirmed *stored*, not what the
+window displayed (the window is an offer; the pushes are the receipt — ADR-0016
+forbids reporting a possible no-op as success). The window contents ride along
+as `window`. A corpse with nothing on it releases without ever opening a
+window, which is `{ ok: false, status: "empty" }`: an answer, not a failure.
+A window that showed items of which not one entered a bag — bags full, or a
+broken store path — is `{ ok: false, status: "none_stored" }`. Silence still
 throws `EventTimeoutError`.
 
 `acceptQuestFrom` reads the quest log *first*, because a turn-in chain may
@@ -135,7 +143,11 @@ accepts the list in either shape: a gossip-flagged questgiver answers
 `quest_list` with an `SMSG_GOSSIP_MESSAGE` carrying the quests, not an
 `SMSG_QUESTGIVER_QUEST_LIST`. `turnInQuest` handles the other branch of the
 same asymmetry: `SMSG_QUESTGIVER_REQUEST_ITEMS` that says the quest *is*
-completable is the client's cue to send the completion again.
+completable is the client's cue to send the completion again. The completion
+wait races `SMSG_INVENTORY_CHANGE_FAILURE`: a reward that does not fit is
+answered with that failure and no completion at all, so a full bag comes back
+as `{ ok: false, status: "inventory_full", hint }` instead of burning the
+whole timeout (the quest stays in the log; free a slot and turn in again).
 
 `waitForQuestObjective` waits on the **quest log**, not on an event, because at
 the pinned commit the core sends no `SMSG_QUESTUPDATE_COMPLETE` for a kill
@@ -146,9 +158,11 @@ the served quest-log state field.
 in a caller: for up to about a minute after logout the core still tracks an
 offline session for the character and silently ignores `CMSG_CHAR_DELETE`,
 which surfaces as `504 timeout` (or as an aborted request, if the module's
-internal wait outlasts `requestTimeoutMs`). Both mean "not released yet" and
-are retried with a fresh throwaway token each time; anything else the module
-says is a real answer and is thrown.
+internal wait outlasts `requestTimeoutMs`). `account_in_use` is the same
+not-yet-released transient seen from the other side. All three mean "not
+released yet" and are retried with a fresh throwaway token each time; anything
+else the module says (`character_not_found`, a `char_delete_failed_code_<N>`)
+is a real answer and is thrown.
 
 `ConnectOptions`: `baseUrl`, `token`, and optionally `eventsUrl`,
 `subscribeEvents` (default true), `requestTimeoutMs` (default 30000 — the
@@ -279,6 +293,8 @@ state.nearby        // Map<guidKey, NearbyObject>                (from SMSG_UPDA
 state.questLog      // QuestLogEntry[]   — derived from the raw quest<slot><Off> fields
 state.quest(id)     // one quest log slot, or undefined
 state.inventory     // InventoryItem[]   — invSlot halves joined to items and names
+state.bag()         // { items: [{ bag, slot, itemId, name, count, guid }], freeSlots }
+state.questCompletions, state.questsCompleted  // turn-ins seen (SMSG_QUESTGIVER_QUEST_COMPLETE)
 state.money, state.xp, state.nextLevelXp   // Observed<number> | undefined (self only)
 state.target        // the NearbyObject our own targetGuid points at, when in view
 state.aurasOf(guid) // AuraEntry[]       (from SMSG_AURA_UPDATE / _ALL)
@@ -312,6 +328,15 @@ fields and this is where they are folded.
   own create block (for `entry`), and an item query (for the name). Each leg
   can be missing, and a slot whose item has not been created for us yet is
   still reported — it *is* occupied — with `itemId` and `name` undefined.
+- `bag()` is the backpack view of `inventory`, shaped for acting on it:
+  `bag`/`slot` are exactly what `equipItem`, `useItem` and `destroyItem` take
+  (bag 255, slots 23-38), `count` is the observed stack count, and `freeSlots`
+  counts the backpack slots holding nothing. Earned surface (ADR-0015):
+  morning-opus-1 rebuilt this from push-result listeners, invSlot regexes and a
+  full relog when it was already in the cache. Two caveats: empty slots are
+  zero fields the wire compresses away, so before our own create block arrives
+  `freeSlots` reads 16; and equipped bags' contents (slots 19-22) are container
+  fields no whitelisted opcode serves — only the backpack is reported.
 - `pointOf(obj)` answers "where do I walk to reach it" from the freshest of the
   two independent sources: an oriented position (update blocks, `MSG_MOVE_*`)
   or `SMSG_MONSTER_MOVE`'s destination, which is what a player reads off a

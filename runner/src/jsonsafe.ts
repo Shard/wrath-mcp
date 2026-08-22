@@ -1,8 +1,10 @@
 /**
- * JSON that survives the game's data. Guids are bigints; JSON.stringify throws
- * on those. Everything the runner persists or shows the model goes through
- * here, so one rule applies everywhere: bigint renders as its decimal string.
- * That is lossy in type but not in value, and the trajectory stays greppable.
+ * JSON that survives arbitrary snippet data. SDK guids are plain decimal
+ * strings (ADR-0017), but a snippet can still return or log a bigint of its
+ * own making, and JSON.stringify throws on those. Everything the runner
+ * persists or shows the model goes through here, so one rule applies
+ * everywhere: bigint renders as its decimal string. That is lossy in type but
+ * not in value, and the trajectory stays greppable.
  */
 
 /** Recursively convert a value into something JSON.stringify accepts. */

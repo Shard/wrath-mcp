@@ -20,6 +20,7 @@ Not allowed, even though the server knows them:
 - Aggro and leash radii, loot tables, respawn timers, spawn coordinates, quest objective coordinates from the database, creature AI state.
 - Objects beyond update range or behind the server's visibility checks.
 - Anything about other sessions' characters beyond what a nearby player would see.
+- The module's own diagnostics: the global session count and the packet-drop census. `GET /health` serves those to loopback (operator) callers only; the network view is liveness-only (see PROTOCOL.md).
 
 Ambiguity resolves toward the client: if it is unclear whether a client could see something, it is not served until someone checks.
 
@@ -38,6 +39,7 @@ Phase 0 action set:
 - Vendor: list, buy, sell, repair.
 - Inventory: equip item, use item, destroy item.
 - Chat: say, whisper (for later multi-agent use; harmless now).
+- Death: release spirit, reclaim corpse, spirit healer resurrection (added 2026-08 as the graveyard fallback when the corpse is unreachable).
 
 Deferred: trainers, flight paths, mail, bank, group invites, trade, talents.
 
@@ -46,6 +48,34 @@ Pathing: the module resolves "move to position" into the client movement packet 
 ## Audit
 
 Every observation served and every action dispatched is logged at the module boundary with session id and timestamp. This log is both the trajectory's ground truth and the evidence that the contracts held for a given run.
+
+## Accepted risk: token-bearer control surface (pre-0.2)
+
+Stated precisely so nobody re-derives it the hard way (fan-out review 2026-08,
+finding: predictable bearer tokens; tracked as FOLLOW-UPS item 19):
+
+- `POST /action` and `DELETE /session` authenticate solely by the session
+  token in the request body. The token is a bearer capability with no binding
+  to the caller, and the runner defaults it to the run id — a
+  second-granularity timestamp (`run-YYYYMMDD-HHMMSS`), enumerable.
+- The snippet sandbox's egress allowlist permits exactly the module host, so a
+  snippet can reach these endpoints with any token. The module's distinct
+  action statuses (`404 no_session` / `409 not_in_world` / `200`) double as a
+  liveness oracle for guessing a neighbor's token.
+- Consequence: a malicious or confused snippet in run A can drive actions in,
+  or tear down, a concurrent run B on the same module. This crosses the
+  per-run isolation boundary and can silently corrupt what the harness
+  measures.
+
+This is accepted for now because every lane is operator-launched from one
+tree on a private compose network with no external callers, and the audit log
+records every dispatched action per token. It is a blocker, before any public
+or MCP-exposed deployment and before any adversarial multi-run result is
+trusted, to make tokens unguessable: a random secret issued at session create,
+returned only to the creator, required on every subsequent token-bearing call
+(module and runner change together; no backward compatibility). The account
+allowlist (`WrathBench.Accounts`) gates only session/character surfaces and is
+not caller authentication.
 
 ## Changing the contracts
 

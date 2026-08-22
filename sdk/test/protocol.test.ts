@@ -37,19 +37,19 @@ describe("HTTP response schemas", () => {
     expect(parsed).toEqual(healthResponseFixture);
   });
 
-  test("session response decodes guid to bigint", () => {
+  test("session response decodes guid to an opaque decimal string (ADR-0017)", () => {
     const parsed = sessionResponseSchema.parse(sessionResponseFixture);
-    expect(parsed.guid).toBe(7n);
+    expect(parsed.guid).toBe("7");
     expect(parsed.character).toBe("Fenwick");
     expect(parsed.inWorld).toBe(true);
   });
 
-  test("session response accepts a guid sent as a string", () => {
+  test("session response accepts a guid sent as a string, preserved exactly", () => {
     const parsed = sessionResponseSchema.parse({
       ...sessionResponseFixture,
       guid: "18446744073709551000",
     });
-    expect(parsed.guid).toBe(18446744073709551000n);
+    expect(parsed.guid).toBe("18446744073709551000");
   });
 
   test("action and delete acks round-trip", () => {
@@ -162,7 +162,7 @@ describe("event frames", () => {
       expect(parsed.ok).toBe(true);
       if (!parsed.ok) return;
       expect((parsed.event as { schemaError?: string }).schemaError).toBeUndefined();
-      expect((parsed.event.data as { guid: bigint }).guid).toBe(42n);
+      expect((parsed.event.data as { guid: string }).guid).toBe("42");
     }
     expect(isMoveOpcode("MSG_MOVE_TELEPORT_ACK")).toBe(false);
   });
@@ -180,23 +180,23 @@ describe("event frames", () => {
     }
   });
 
-  test("char enum decodes rows with bigint guids", () => {
+  test("char enum decodes rows with decimal-string guids", () => {
     const result = parseEventFrame(JSON.stringify(loginSequence[1]));
     expect(result.ok).toBe(true);
     if (!result.ok || !isEvent(result.event, "SMSG_CHAR_ENUM")) throw new Error("wrong opcode");
     const data = result.event.data;
     if (isDecodeError(data)) throw new Error("unexpected decode error");
     expect(data.count).toBe(2);
-    expect(data.characters[0]?.guid).toBe(7n);
+    expect(data.characters[0]?.guid).toBe("7");
     expect(data.characters[1]?.name).toBe("Quilby");
   });
 
-  test("chat decodes senderGuid as bigint", () => {
+  test("chat decodes senderGuid as a decimal string", () => {
     const result = parseEventFrame(JSON.stringify(chatEcho));
     if (!result.ok || !isEvent(result.event, "SMSG_MESSAGECHAT")) throw new Error("wrong opcode");
     const data = result.event.data;
     if (isDecodeError(data)) throw new Error("unexpected decode error");
-    expect(data.senderGuid).toBe(7n);
+    expect(data.senderGuid).toBe("7");
     expect(guidKey(data.senderGuid)).toBe("7");
     expect(data.message).toBe("ping from the fixture");
   });
@@ -229,8 +229,9 @@ describe("event frames", () => {
     expect(frame).toContain(`"guid":"${CREATURE_GUID}"`);
     const result = parseEventFrame(frame);
     if (!result.ok) throw new Error("update-object frame should parse");
-    const objects = (result.event.data as { objects: { guid: bigint }[] }).objects;
-    const guid = objects[0]?.guid as bigint;
+    const objects = (result.event.data as { objects: { guid: string }[] }).objects;
+    const guid = objects[0]?.guid as string;
+    expect(guid).toBe(CREATURE_GUID);
     expect(guidKey(guid)).toBe(CREATURE_GUID);
     // …and the number path is exactly what it protects against.
     expect(String(Number(CREATURE_GUID))).not.toBe(CREATURE_GUID);
@@ -254,8 +255,8 @@ describe("event frames", () => {
       "outOfRange",
       "somethingLater",
     ]);
-    const outOfRange = parsed.objects[3] as { guids: bigint[] };
-    expect(outOfRange.guids).toEqual([5n, 6n]);
+    const outOfRange = parsed.objects[3] as unknown as { guids: string[] };
+    expect(outOfRange.guids).toEqual(["5", "6"]);
   });
 
   test("a create block without a position parses — not every object has one", () => {

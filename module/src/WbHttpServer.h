@@ -49,7 +49,11 @@ namespace WrathBench
     {
     public:
         virtual ~IHttpSink() = default;
-        virtual HttpReply HandleHttp(std::string const& method, std::string const& target, std::string const& body) = 0;
+        // loopbackPeer: the TCP peer is 127.0.0.1/::1 — an operator inside the
+        // worldserver container, as opposed to a caller on the compose network
+        // (runner, snippet sandbox). Lets diagnostics endpoints serve their
+        // verbose view to operators only.
+        virtual HttpReply HandleHttp(std::string const& method, std::string const& target, std::string const& body, bool loopbackPeer) = 0;
         virtual void OnWsOpen(std::string const& token, std::shared_ptr<IWsConn> conn) = 0;
         virtual void OnWsClose(std::string const& token, IWsConn* conn) = 0;
     };

@@ -58,6 +58,18 @@ WrathBench.Threads = 2
 WrathBench.Account = "RUNNER"
 
 #
+#    WrathBench.Accounts
+#        Description: Comma-separated allowlist of auth accounts the module
+#                     serves (case-insensitive). Every surface that takes an
+#                     "account" parameter (/session, /characters,
+#                     /character-delete) refuses accounts not on this list with
+#                     403 account_not_permitted (FOLLOW-UPS 14).
+#        Default:     the WrathBench.Account value (single-account behaviour)
+#
+
+WrathBench.Accounts = "RUNNER,RUNNER2,SHAKEOUT,PROBE"
+
+#
 #    WrathBench.AuditDir
 #        Description: Directory for per-session audit logs (JSONL, one file per
 #                     session token). Every action dispatched and event served is

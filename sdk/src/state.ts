@@ -33,7 +33,7 @@
  */
 
 import {
-  guidKey,
+  formatGuid,
   isDecodeError,
   isMoveOpcode,
   type AuraData,
@@ -105,7 +105,7 @@ export interface Gauge {
 
 /** One row of `SMSG_CHAR_ENUM`. */
 export interface CharacterSummary {
-  readonly guid: bigint;
+  readonly guid: GuidKey;
   readonly name: string;
   readonly race: number;
   readonly class: number;
@@ -118,7 +118,7 @@ export interface ChatEntry {
   readonly ts: number;
   readonly type: number;
   readonly language: number;
-  readonly senderGuid: bigint;
+  readonly senderGuid: GuidKey;
   readonly message: string;
   readonly chatTag: number;
 }
@@ -154,11 +154,11 @@ export interface UnitFieldsState {
 }
 
 export interface SelfState extends UnitFieldsState {
-  guid: bigint | undefined;
+  guid: GuidKey | undefined;
   name: string | undefined;
   position: Observed<WorldPosition> | undefined;
   /** `UNIT_FIELD_TARGET` on our own block: what the client shows as selected. */
-  targetGuid: Observed<bigint> | undefined;
+  targetGuid: Observed<GuidKey> | undefined;
 }
 
 /**
@@ -189,6 +189,23 @@ export interface QuestLogEntry {
 }
 
 /**
+ * One quest turn-in the server confirmed, from `SMSG_QUESTGIVER_QUEST_COMPLETE`.
+ *
+ * The quest log cannot tell us this after the fact: a rewarded quest leaves the
+ * log entirely, so the only trace of the turn-in is the packet itself. `xp` and
+ * `money` are the reward the packet named, kept because they are what the
+ * server said, not a derivation.
+ */
+export interface QuestCompletion {
+  readonly questId: number;
+  readonly xp: number | undefined;
+  /** Copper the turn-in awarded, as the packet reported it. */
+  readonly money: number | undefined;
+  readonly seq: number;
+  readonly ts: number;
+}
+
+/**
  * One occupied inventory slot: equipment and bags are 0-22, the backpack 23-38.
  *
  * A three-way join, and each leg can be missing: the `invSlot<n>Lo`/`Hi` halves
@@ -199,12 +216,32 @@ export interface QuestLogEntry {
  */
 export interface InventoryItem {
   readonly slot: number;
-  readonly guid: bigint;
+  readonly guid: GuidKey;
   readonly itemId: number | undefined;
   readonly name: string | undefined;
   readonly stackCount: number | undefined;
   readonly seq: number;
   readonly ts: number;
+}
+
+/**
+ * One occupied backpack slot, addressed the way the item actions want it:
+ * `bag`/`slot` feed `equipItem`, `useItem` and `destroyItem` unchanged
+ * (`bag` 255 is the backpack, `slot` 23-38).
+ */
+export interface BagSlotItem {
+  readonly bag: number;
+  readonly slot: number;
+  readonly guid: GuidKey;
+  readonly itemId: number | undefined;
+  readonly name: string | undefined;
+  readonly count: number | undefined;
+}
+
+/** The backpack as `bag()` reports it. */
+export interface BagContents {
+  readonly items: readonly BagSlotItem[];
+  readonly freeSlots: number;
 }
 
 /** What an item query answered about one item entry. */
@@ -230,7 +267,7 @@ export interface AuraEntry {
   readonly flags: number | undefined;
   readonly level: number | undefined;
   readonly stacks: number | undefined;
-  readonly casterGuid: bigint | undefined;
+  readonly casterGuid: GuidKey | undefined;
   readonly maxDuration: number | undefined;
   readonly duration: number | undefined;
   readonly seq: number;
@@ -252,7 +289,7 @@ export interface CreatureInfo {
  * an `outOfRange` list or `SMSG_DESTROY_OBJECT`.
  */
 export interface NearbyObject extends UnitFieldsState {
-  readonly guid: bigint;
+  readonly guid: GuidKey;
   /** `unit`, `player`, `gameObject`, … Only a `create` block carries it. */
   objectType: Observed<string> | undefined;
   /** Creature/gameobject template id, from `OBJECT_FIELD_ENTRY`. */
@@ -262,11 +299,60 @@ export interface NearbyObject extends UnitFieldsState {
   position: Observed<UnitPosition> | undefined;
   /** From `SMSG_MONSTER_MOVE`: creatures move by spline, not by `MSG_MOVE_*`. */
   motion: Observed<Motion> | undefined;
-  targetGuid: Observed<bigint> | undefined;
+  targetGuid: Observed<GuidKey> | undefined;
   /** Seq of the event that first put this object in view. */
   firstSeq: number;
   /** Seq of the most recent event that touched this object. */
   lastSeq: number;
+}
+
+/**
+ * One object as `units()` reports it: flat, plain, JSON-safe — no `Observed`
+ * wrappers and no `Map`s, so `console.log`/`JSON.stringify` show the whole
+ * thing and a property access reaches a value rather than a wrapper.
+ *
+ * Every field is `undefined` until an event carried it (docs/CONTRACTS.md rule
+ * 1). `undefined` means unobserved, never zero and never a guess.
+ */
+export interface UnitView {
+  /** Opaque decimal-string guid (ADR-0017). */
+  readonly guid: GuidKey;
+  /** Creature/gameobject template id, from `OBJECT_FIELD_ENTRY`. */
+  readonly entry: number | undefined;
+  /** Joined from a creature or name query. Never guessed. */
+  readonly name: string | undefined;
+  /** `unit`, `player`, `gameObject`, … Only a `create` block carries it. */
+  readonly type: string | undefined;
+  readonly level: number | undefined;
+  readonly health: number | undefined;
+  readonly maxHealth: number | undefined;
+  /** `true` only when health was observed *and* is 0. Unobserved stays undefined. */
+  readonly dead: boolean | undefined;
+  /** Straight-line yards from our own last observed position. */
+  readonly distance: number | undefined;
+  readonly x: number | undefined;
+  readonly y: number | undefined;
+  readonly z: number | undefined;
+  /** What it is targeting, when observed. `"0"` (no target) reads as undefined. */
+  readonly targetGuid: GuidKey | undefined;
+}
+
+/**
+ * Criteria for `units()`. All present criteria are AND-ed; an absent one does
+ * not filter. Anything else is rejected loudly (ADR-0016).
+ */
+export interface UnitFilter {
+  /** One template id or a list of them. */
+  entry?: number | number[];
+  /** Case-insensitive substring of the joined name. Unnamed objects never match. */
+  name?: string;
+  type?: "unit" | "player" | "gameObject";
+  /** `true` drops the known-dead; `false` keeps only them. Unknown health passes `true`. */
+  alive?: boolean;
+  /** Yards. Objects with no known distance are dropped: the criterion cannot be evaluated. */
+  maxDistance?: number;
+  /** `npcFlags > 0` — a gossip/vendor/questgiver NPC, as observed. */
+  npc?: boolean;
 }
 
 /**
@@ -290,7 +376,8 @@ export interface GapRecord {
 }
 
 export interface StateSeed {
-  guid?: bigint;
+  /** Opaque decimal-string guid, as `POST /session` returned it. */
+  guid?: GuidKey;
   name?: string;
 }
 
@@ -312,6 +399,7 @@ export interface StateSnapshot {
   readonly nearby: ReadonlyMap<GuidKey, NearbyObject>;
   readonly auras: ReadonlyMap<GuidKey, readonly AuraEntry[]>;
   readonly questLog: readonly QuestLogEntry[];
+  readonly questCompletions: readonly QuestCompletion[];
   readonly inventory: readonly InventoryItem[];
   readonly money: Observed<number> | undefined;
   readonly xp: Observed<number> | undefined;
@@ -378,6 +466,15 @@ export class StateCache {
   private readonly chatBuf: ChatEntry[] = [];
   private readonly notifyBuf: NotificationEntry[] = [];
   private readonly gapBuf: GapRecord[] = [];
+  /**
+   * Turn-ins seen this cache's lifetime, oldest first. Never trimmed and never
+   * deduped: a repeatable quest turned in twice is two completions, and seq
+   * restarts when a session is recreated so seq is not an identity. Like
+   * `eventCount`, this is a lifetime counter across session recreation. It
+   * would double-count only if the stream ever replayed a window it had
+   * already served, which it does not.
+   */
+  private readonly questDoneBuf: QuestCompletion[] = [];
   private readonly anomalyBuf: Anomaly[] = [];
   private readonly chatTail: number;
   private readonly notificationTail: number;
@@ -499,6 +596,16 @@ export class StateCache {
     return out;
   }
 
+  /** Confirmed turn-ins, oldest first. Empty until one is observed. */
+  get questCompletions(): readonly QuestCompletion[] {
+    return this.questDoneBuf;
+  }
+
+  /** How many turn-ins the server has confirmed for this cache. */
+  get questsCompleted(): number {
+    return this.questDoneBuf.length;
+  }
+
   /** The quest log slot holding `questId`, if the log shows it at all. */
   quest(questId: number): QuestLogEntry | undefined {
     return this.questLog.find((q) => q.questId === questId);
@@ -514,9 +621,11 @@ export class StateCache {
       const lo = this.self.fields.get(`invSlot${slot}Lo`);
       const hi = this.self.fields.get(`invSlot${slot}Hi`);
       if (!lo && !hi) continue;
-      const guid = (BigInt(hi?.value ?? 0) << 32n) | BigInt((lo?.value ?? 0) >>> 0);
-      if (guid === 0n) continue;
-      const item = this.nearby.get(guidKey(guid));
+      // The one internal bigint use: packing the two u32 wire halves back into
+      // the u64 the item's own create block carries. formatGuid is the seam.
+      const guid = formatGuid((BigInt(hi?.value ?? 0) << 32n) | BigInt((lo?.value ?? 0) >>> 0));
+      if (guid === "0") continue;
+      const item = this.nearby.get(guid);
       const itemId = item?.entry?.value;
       out.push({
         slot,
@@ -531,24 +640,54 @@ export class StateCache {
     return out;
   }
 
+  /**
+   * The backpack, shaped for acting on it: `bag`/`slot` are exactly what
+   * `equipItem(bag, slot)`, `useItem` and `destroyItem` take (bag 255, slots
+   * 23-38), and `freeSlots` is how many of the 16 backpack slots hold nothing.
+   *
+   * A view over `inventory` — same fields, same three-way join, no new
+   * observation. Earned surface (ADR-0015): morning-opus-1 rebuilt this from
+   * ITEM_PUSH_RESULT listeners, invSlot regexes over raw updates, and a full
+   * relog to force a resend, when everything needed was already in the cache.
+   *
+   * Two honest caveats. Empty slots are zero-valued update fields and the wire
+   * compresses zeros out of create blocks, so "no field observed" reads as
+   * free — before our own create block has arrived this says 16. And the
+   * contents of *equipped* bags (slots 19-22) are container fields no
+   * whitelisted opcode serves, so only the backpack is reported.
+   */
+  bag(): BagContents {
+    const items = this.inventory
+      .filter((i) => i.slot >= BACKPACK_FIRST_SLOT)
+      .map((i) => ({
+        bag: BACKPACK_BAG,
+        slot: i.slot,
+        guid: i.guid,
+        itemId: i.itemId,
+        name: i.name,
+        count: i.stackCount,
+      }));
+    return { items, freeSlots: BACKPACK_SIZE - items.length };
+  }
+
   /** The object our own `targetGuid` points at, when it is also in view. */
   get target(): NearbyObject | undefined {
     const guid = this.self.targetGuid?.value;
-    if (guid === undefined || guid === 0n) return undefined;
-    return this.nearby.get(guidKey(guid));
+    if (guid === undefined || guid === "0") return undefined;
+    return this.nearby.get(guid);
   }
 
   /** Visible auras on a unit, by slot. Empty when none have been observed. */
-  aurasOf(guid: bigint): AuraEntry[] {
-    const slots = this.auraSlots.get(guidKey(guid));
+  aurasOf(guid: GuidKey): AuraEntry[] {
+    const slots = this.auraSlots.get(guid);
     if (!slots) return [];
     return [...slots.values()].sort((a, b) => a.slot - b.slot);
   }
 
   /** Name for a guid, if a name query ever returned one. Never guessed. */
-  nameOf(guid: bigint): string | undefined {
+  nameOf(guid: GuidKey): string | undefined {
     if (this.self.guid !== undefined && guid === this.self.guid) return this.self.name;
-    return this.names.get(guidKey(guid))?.value;
+    return this.names.get(guid)?.value;
   }
 
   snapshot(): StateSnapshot {
@@ -564,6 +703,7 @@ export class StateCache {
       nearby: new Map([...this.nearby].map(([k, v]) => [k, { ...v, fields: new Map(v.fields) }])),
       auras: new Map([...this.auraSlots].map(([k, v]) => [k, [...v.values()].sort((a, b) => a.slot - b.slot)])),
       questLog: this.questLog,
+      questCompletions: [...this.questDoneBuf],
       inventory: this.inventory,
       money: this.money,
       xp: this.xp,
@@ -625,20 +765,20 @@ export class StateCache {
         // stream cannot re-emit. Reconcile identity like the seed does; a
         // contradicting guid is an anomaly, never an overwrite.
         const d = event.data as {
-          character: string; guid: bigint; map: number; x: number; y: number;
+          character: string; guid: GuidKey; map: number; x: number; y: number;
           z: number; o: number; level: number;
         };
-        const key = guidKey(d.guid);
-        if (this.seed.guid !== undefined && guidKey(this.seed.guid) !== key) {
+        if (this.seed.guid !== undefined && this.seed.guid !== d.guid) {
           this.anomalyBuf.push({
             seq: event.seq,
             ts: event.ts,
             kind: "session_state_guid_mismatch",
-            detail: `WB_SESSION_STATE guid ${key} != seeded ${guidKey(this.seed.guid)}`,
+            detail: `WB_SESSION_STATE guid ${d.guid} != seeded ${this.seed.guid}`,
           });
           return;
         }
         if (this.seed.guid === undefined) this.seedSelf({ guid: d.guid, name: d.character });
+        this.evictOnMapChange(d.map);
         this.selfMap = d.map;
         this.self.position = {
           value: { map: d.map, x: d.x, y: d.y, z: d.z, o: d.o },
@@ -650,6 +790,7 @@ export class StateCache {
       }
       case "SMSG_LOGIN_VERIFY_WORLD": {
         const d = event.data as WorldPosition;
+        this.evictOnMapChange(d.map);
         this.selfMap = d.map;
         this.self.position = {
           value: { map: d.map, x: d.x, y: d.y, z: d.z, o: d.o },
@@ -658,12 +799,24 @@ export class StateCache {
         };
         return;
       }
+      case "SMSG_QUESTGIVER_QUEST_COMPLETE": {
+        // The turn-in receipt. The quest leaves the log when it is rewarded, so
+        // this packet is the only place the completion is ever observable.
+        const d = event.data as { questId: number; xp?: number; money?: number };
+        this.questDoneBuf.push({
+          questId: d.questId,
+          xp: d.xp,
+          money: d.money,
+          seq: event.seq,
+          ts: event.ts,
+        });
+        return;
+      }
       case "SMSG_NAME_QUERY_RESPONSE": {
-        const d = event.data as { guid: bigint; found: boolean; name?: string };
+        const d = event.data as { guid: GuidKey; found: boolean; name?: string };
         if (d.found && d.name !== undefined) {
-          const key = guidKey(d.guid);
-          this.names.set(key, { value: d.name, seq: event.seq, ts: event.ts });
-          const obj = this.nearby.get(key);
+          this.names.set(d.guid, { value: d.name, seq: event.seq, ts: event.ts });
+          const obj = this.nearby.get(d.guid);
           if (obj) this.joinName(obj);
         }
         return;
@@ -721,7 +874,7 @@ export class StateCache {
       case "SMSG_AURA_UPDATE":
       case "SMSG_AURA_UPDATE_ALL": {
         const d = event.data as AuraUpdateData;
-        const key = guidKey(d.targetGuid);
+        const key = d.targetGuid;
         // UPDATE_ALL is the full visible list, so it replaces; UPDATE names
         // only the slots that changed and merges into what is already there.
         const slots =
@@ -776,7 +929,7 @@ export class StateCache {
         return;
       }
       case "SMSG_DESTROY_OBJECT": {
-        const d = event.data as { guid: bigint };
+        const d = event.data as { guid: GuidKey };
         this.forget(d.guid);
         return;
       }
@@ -856,6 +1009,83 @@ export class StateCache {
     );
   }
 
+  /**
+   * Everything in view, flattened, sorted by distance — the scan helper.
+   *
+   * Earned surface (ADR-0015). Models kept hand-rolling this over `nearby` and
+   * tripping on the two shapes underneath it: roster-opus-low-20260822 turn 15
+   * filtered `nearbyUnits()` on `u.fields.entry?.value`, and because `fields`
+   * is a `Map` every filter returned `[]` while units stood in view — the model
+   * concluded the area was empty. roster-sonnet-20260822 re-scanned with
+   * ad-hoc filter chains 18 times. This returns plain objects with plain
+   * values, so neither footgun is reachable.
+   *
+   * A query over what the cache already holds: nothing is observed here that
+   * `nearby` did not already carry, and nothing is invented. Items and
+   * containers (our own inventory) are left out; everything else in view is
+   * included, *untyped objects too* — an object we have seen but whose create
+   * block we missed is still in view, and hiding it would make the world look
+   * emptier than it is.
+   *
+   * Positions come from `pointOf`, the same resolution `closest()` uses, so a
+   * creature mid-spline reports where it is heading. `distance` is `undefined`
+   * when either side has no known position.
+   */
+  units(filter?: UnitFilter): UnitView[] {
+    const f = normalizeUnitFilter(filter);
+    const from = this.self.position?.value;
+    const out: UnitView[] = [];
+    for (const obj of this.nearby.values()) {
+      const type = obj.objectType?.value;
+      if (type === "item" || type === "container") continue;
+
+      const point = pointOf(obj)?.value;
+      const distance =
+        from && point
+          ? Math.round(Math.hypot(point.x - from.x, point.y - from.y, point.z - from.z) * 100) / 100
+          : undefined;
+      const health = obj.fields.get("health")?.value;
+      const target = obj.targetGuid?.value;
+      const view: UnitView = {
+        guid: obj.guid,
+        entry: obj.entry?.value,
+        name: obj.name?.value,
+        type,
+        level: obj.level?.value,
+        health,
+        maxHealth: obj.fields.get("maxHealth")?.value,
+        dead: health === undefined ? undefined : health === 0,
+        distance,
+        x: point?.x,
+        y: point?.y,
+        z: point?.z,
+        targetGuid: target === undefined || target === "0" ? undefined : target,
+      };
+
+      if (f.entries && (view.entry === undefined || !f.entries.has(view.entry))) continue;
+      if (f.name !== undefined && !(view.name ?? "").toLowerCase().includes(f.name)) continue;
+      if (f.type !== undefined && view.type !== f.type) continue;
+      // Asymmetric on purpose: `alive: true` excludes only the *known* dead, so
+      // a unit whose health we have never seen still shows up. `alive: false`
+      // is a positive claim and needs the observation.
+      if (f.alive === true && view.dead === true) continue;
+      if (f.alive === false && view.dead !== true) continue;
+      if (f.maxDistance !== undefined && (distance === undefined || distance > f.maxDistance)) continue;
+      if (f.npc !== undefined) {
+        const isNpc = (obj.fields.get("npcFlags")?.value ?? 0) > 0;
+        if (isNpc !== f.npc) continue;
+      }
+      out.push(view);
+    }
+    // Nearest first; unknown distance last. Stable, so unknowns keep first-sight
+    // order and a replay of the same events sorts the same way.
+    return out.sort((a, b) => {
+      if (a.distance === undefined) return b.distance === undefined ? 0 : 1;
+      if (b.distance === undefined) return -1;
+      return a.distance - b.distance;
+    });
+  }
+
   /** Units in view whose observed template entry is `entry`. */
   creaturesByEntry(entry: number): NearbyObject[] {
     return this.nearbyUnits().filter((o) => o.entry?.value === entry);
@@ -895,7 +1125,7 @@ export class StateCache {
         this.applyCreate(block as CreateBlock, seq, ts);
         return;
       case "values": {
-        const b = block as { guid: bigint; fields?: UpdateFields };
+        const b = block as { guid: GuidKey; fields?: UpdateFields };
         if (this.isSelfGuid(b.guid)) {
           this.mergeFields(this.self, b.fields, seq, ts);
           return;
@@ -910,7 +1140,7 @@ export class StateCache {
         return;
       }
       case "movement": {
-        const b = block as { guid: bigint; pos?: PositionData; moveFlags?: number };
+        const b = block as { guid: GuidKey; pos?: PositionData; moveFlags?: number };
         if (this.isSelfGuid(b.guid)) {
           if (b.pos) this.applySelfPosition(b.pos, seq, ts);
           return;
@@ -922,7 +1152,7 @@ export class StateCache {
         return;
       }
       case "outOfRange": {
-        const b = block as { guids: bigint[] };
+        const b = block as { guids: GuidKey[] };
         for (const g of b.guids) this.forget(g);
         return;
       }
@@ -949,7 +1179,7 @@ export class StateCache {
         seq,
         ts,
         kind: "self_guid_mismatch",
-        detail: `create block flagged self carries guid ${guidKey(block.guid)}, seeded self is ${guidKey(this.self.guid)}`,
+        detail: `create block flagged self carries guid ${block.guid}, seeded self is ${this.self.guid}`,
       });
     } else if (flaggedSelf || this.isSelfGuid(block.guid)) {
       if (this.self.guid === undefined) this.self.guid = block.guid;
@@ -980,13 +1210,28 @@ export class StateCache {
    * with it: a client stops showing the buff bar of a unit it cannot see, and
    * keeping them would let a stale aura outlive its unit.
    */
-  private forget(guid: bigint): void {
-    const key = guidKey(guid);
-    this.nearby.delete(key);
-    this.auraSlots.delete(key);
+  private forget(guid: GuidKey): void {
+    this.nearby.delete(guid);
+    this.auraSlots.delete(guid);
   }
 
-  private isSelfGuid(guid: bigint): boolean {
+  /**
+   * A new map means a new visibility set: nothing seen on the old map is in
+   * view, and a client would have received out-of-range/destroy for all of it.
+   * Without this, cross-map gameObjects lingered in `nearby` at absurd
+   * distances (d≈8063 in morning-opus-1). Own items and containers are kept —
+   * they travel with the character, and the inventory join reads them.
+   */
+  private evictOnMapChange(newMap: number): void {
+    if (this.selfMap === undefined || this.selfMap === newMap) return;
+    for (const [guid, obj] of this.nearby) {
+      const t = obj.objectType?.value;
+      if (t === "item" || t === "container") continue;
+      this.forget(guid);
+    }
+  }
+
+  private isSelfGuid(guid: GuidKey): boolean {
     return this.self.guid !== undefined && guid === this.self.guid;
   }
 
@@ -1018,7 +1263,7 @@ export class StateCache {
    */
   private mergeFields(
     target: UnitFieldsState & {
-      targetGuid?: Observed<bigint> | undefined;
+      targetGuid?: Observed<GuidKey> | undefined;
       entry?: Observed<number> | undefined;
     },
     fields: UpdateFields | undefined,
@@ -1028,7 +1273,7 @@ export class StateCache {
     if (!fields) return;
     for (const [key, raw] of Object.entries(fields)) {
       if (key === "targetGuid") {
-        if (typeof raw === "bigint" && "targetGuid" in target) {
+        if (typeof raw === "string" && "targetGuid" in target) {
           target.targetGuid = { value: raw, seq, ts };
         }
         continue;
@@ -1098,7 +1343,7 @@ export class StateCache {
         return;
       }
     }
-    const byGuid = this.names.get(guidKey(obj.guid));
+    const byGuid = this.names.get(obj.guid);
     if (byGuid) obj.name = byGuid;
   }
 
@@ -1123,8 +1368,8 @@ export class StateCache {
    * Create-or-update an object in `nearby`. Every update-object and MSG_MOVE_*
    * write goes through this one seam.
    */
-  protected upsertNearby(guid: bigint, seq: number, mutate: (obj: NearbyObject) => void): NearbyObject {
-    const key = guidKey(guid);
+  protected upsertNearby(guid: GuidKey, seq: number, mutate: (obj: NearbyObject) => void): NearbyObject {
+    const key = guid;
     let obj = this.nearby.get(key);
     if (!obj) {
       obj = {
@@ -1150,6 +1395,153 @@ export class StateCache {
   }
 }
 
+// ------------------------------------------------------ units() filter input
+//
+// ADR-0016: repair only what has exactly one valid reading (a numeric string
+// where a number is expected), reject everything else with a message that says
+// what arrived, what was expected, and what to do. A silently ignored key is
+// the forbidden outcome — it returns a wrong-but-plausible answer, which is the
+// very failure this helper exists to remove.
+
+const UNIT_FILTER_KEYS = ["entry", "name", "type", "alive", "maxDistance", "npc"] as const;
+const UNIT_FILTER_TYPES = ["unit", "player", "gameObject"] as const;
+
+interface NormalizedUnitFilter {
+  entries: Set<number> | undefined;
+  name: string | undefined;
+  type: string | undefined;
+  alive: boolean | undefined;
+  maxDistance: number | undefined;
+  npc: boolean | undefined;
+}
+
+const EMPTY_UNIT_FILTER: NormalizedUnitFilter = {
+  entries: undefined,
+  name: undefined,
+  type: undefined,
+  alive: undefined,
+  maxDistance: undefined,
+  npc: undefined,
+};
+
+/** How a rejected value is quoted back to the caller. */
+function showValue(v: unknown): string {
+  if (typeof v === "string") return JSON.stringify(v);
+  if (typeof v === "function") return "a function";
+  if (Array.isArray(v)) return `[${v.map(showValue).join(", ")}]`;
+  if (v === null) return "null";
+  if (typeof v === "object") return JSON.stringify(v) ?? "an object";
+  return String(v);
+}
+
+function filterError(detail: string): TypeError {
+  return new TypeError(`state.units() filter: ${detail}`);
+}
+
+/** A finite number, repairing the one unambiguous reading: a numeric string. */
+function coerceNumber(value: unknown, key: string, expected: string): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  throw filterError(
+    `${key} received ${showValue(value)} (${typeof value}), expected ${expected}. ` +
+      `Example: state.units({ ${key}: ${key === "entry" ? "69" : "50"} }).`,
+  );
+}
+
+function coerceBoolean(value: unknown, key: string): boolean {
+  if (typeof value === "boolean") return value;
+  throw filterError(
+    `${key} received ${showValue(value)} (${typeof value}), expected true or false. ` +
+      `Example: state.units({ ${key}: true }).`,
+  );
+}
+
+/**
+ * Validate and canonicalize a filter. Returns a shape the scan can apply
+ * without re-checking anything.
+ */
+function normalizeUnitFilter(filter: UnitFilter | undefined): NormalizedUnitFilter {
+  if (filter === undefined || filter === null) return EMPTY_UNIT_FILTER;
+  if (typeof filter === "function") {
+    throw filterError(
+      "received a function. This takes a criteria object, not a predicate: " +
+        'state.units({ entry: 69, alive: true, maxDistance: 50 }). For a predicate, use state.closest(fn).',
+    );
+  }
+  if (typeof filter !== "object" || Array.isArray(filter)) {
+    throw filterError(
+      `received ${showValue(filter)} (${typeof filter}), expected an object such as ` +
+        "{ entry: 69, alive: true, maxDistance: 50 }.",
+    );
+  }
+
+  const unknown = Object.keys(filter).filter(
+    (k) => !(UNIT_FILTER_KEYS as readonly string[]).includes(k),
+  );
+  if (unknown.length > 0) {
+    throw filterError(
+      `unknown ${unknown.length === 1 ? "key" : "keys"} ${unknown.map(showValue).join(", ")}. ` +
+        `Valid keys are ${UNIT_FILTER_KEYS.join(", ")}. Drop the key or use one of those.`,
+    );
+  }
+
+  const out: NormalizedUnitFilter = { ...EMPTY_UNIT_FILTER };
+
+  if (filter.entry !== undefined) {
+    const raw = Array.isArray(filter.entry) ? filter.entry : [filter.entry];
+    if (raw.length === 0) {
+      throw filterError("entry received an empty array; pass a template id such as 69, or omit entry.");
+    }
+    const entries = new Set<number>();
+    for (const item of raw) {
+      const n = coerceNumber(item, "entry", "a creature/gameobject template id, or an array of them");
+      if (!Number.isInteger(n) || n < 0) {
+        throw filterError(
+          `entry received ${showValue(item)}, expected a non-negative whole template id such as 69.`,
+        );
+      }
+      entries.add(n);
+    }
+    out.entries = entries;
+  }
+
+  if (filter.name !== undefined) {
+    if (typeof filter.name !== "string") {
+      throw filterError(
+        `name received ${showValue(filter.name)} (${typeof filter.name}), expected a string to match as a ` +
+          'case-insensitive substring, such as { name: "boar" }.',
+      );
+    }
+    out.name = filter.name.toLowerCase();
+  }
+
+  if (filter.type !== undefined) {
+    // An enum near-miss ("gameobject", "npc") has more than one plausible
+    // reading, so ADR-0016 says reject rather than pick. No case folding here.
+    if (!(UNIT_FILTER_TYPES as readonly string[]).includes(filter.type as string)) {
+      throw filterError(
+        `type received ${showValue(filter.type)}, expected one of ${UNIT_FILTER_TYPES.map(showValue).join(", ")} ` +
+          "(exact, case-sensitive).",
+      );
+    }
+    out.type = filter.type;
+  }
+
+  if (filter.alive !== undefined) out.alive = coerceBoolean(filter.alive, "alive");
+  if (filter.npc !== undefined) out.npc = coerceBoolean(filter.npc, "npc");
+
+  if (filter.maxDistance !== undefined) {
+    const n = coerceNumber(filter.maxDistance, "maxDistance", "a distance in yards");
+    if (n < 0) throw filterError(`maxDistance received ${showValue(filter.maxDistance)}, expected a distance >= 0.`);
+    out.maxDistance = n;
+  }
+
+  return out;
+}
+
 /** Drop everything but x/y/z/o: the wire gives a nearby object nothing else. */
 function toUnitPosition(pos: PositionData): UnitPosition {
   return { x: pos.x, y: pos.y, z: pos.z, o: pos.o };
@@ -1161,6 +1553,11 @@ const QUEST_LOG_SLOTS = 25;
 const QUEST_STATE_COMPLETE = 1;
 /** Equipment + bags are 0-22, backpack 23-38 (PROTOCOL.md). */
 const INVENTORY_LAST_SLOT = 38;
+/** First/last backpack slot in the `invSlot<n>` numbering, and its size. */
+const BACKPACK_FIRST_SLOT = 23;
+const BACKPACK_SIZE = 16;
+/** `INVENTORY_SLOT_BAG_0` on the wire: the bag id the item actions take for the backpack. */
+const BACKPACK_BAG = 255;
 
 /**
  * Where an object is, from the freshest thing that said so.

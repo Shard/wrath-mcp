@@ -31,26 +31,49 @@ export const PROTOCOL_REVISION = "phase0-stage2+movement+quest-combat";
  * a high part (0xF130…) far above `Number.MAX_SAFE_INTEGER`, so a bare JSON
  * number would already be corrupted by `JSON.parse` before this schema ran.
  *
- * Numbers are still accepted, because the Stage-2 slice's small player guids
- * were emitted that way and a fixture may still use them — but a string is the
- * only form that round-trips, which is what the 2^63 test pins down.
+ * The schema emits the guid as an **opaque decimal string** (ADR-0017): that is
+ * the only representation the model surface ever carries, so `===`, Map keys,
+ * template literals and `JSON.stringify` all behave as a model expects. The
+ * round-trip through `parseGuid`/`formatGuid` canonicalises ("007" -> "7") and
+ * validates in one step — which is what the 2^63 test pins down. Numbers are
+ * still accepted on input, because the Stage-2 slice's small player guids were
+ * emitted that way and a fixture may still use them.
  */
 export const guidSchema = z
   .union([z.number(), z.string()])
-  .transform((v, ctx): bigint => {
+  .transform((v, ctx): GuidKey => {
     try {
-      return typeof v === "number" ? BigInt(Math.trunc(v)) : BigInt(v);
+      return formatGuid(typeof v === "number" ? BigInt(Math.trunc(v)) : parseGuid(v));
     } catch {
       ctx.addIssue({ code: "custom", message: `not a guid: ${String(v)}` });
       return z.NEVER;
     }
   });
 
-/** A guid rendered as a decimal string; the key type for guid-keyed maps. */
+/** A guid as the model surface carries it: an opaque decimal string. */
 export type GuidKey = string;
 
-export function guidKey(guid: bigint): GuidKey {
+// The one auditable seam between the string surface and the SDK's internal
+// bigint use (bit packing/unpacking). A bigint never escapes past this pair to
+// anything model-visible (ADR-0017).
+
+/** SDK-internal: a guid string as a u64 for bit arithmetic. Throws on non-decimal input. */
+export function parseGuid(guid: string): bigint {
+  return BigInt(guid);
+}
+
+/** SDK-internal: render a u64 back into the canonical decimal-string form. */
+export function formatGuid(guid: bigint): GuidKey {
   return guid.toString(10);
+}
+
+/**
+ * Canonical decimal-string form of a guid, whichever representation it arrives
+ * in. Retained as the public guid -> map-key conversion; for a string off
+ * today's SDK surface it canonicalises (and is usually the identity).
+ */
+export function guidKey(guid: bigint | string): GuidKey {
+  return typeof guid === "bigint" ? formatGuid(guid) : formatGuid(parseGuid(guid));
 }
 
 /**
@@ -219,7 +242,8 @@ export type ActionRequest =
   | { token: string; action: "use_item"; bag: number; slot: number; targetGuid?: string }
   | { token: string; action: "destroy_item"; bag: number; slot: number; count?: number }
   | { token: string; action: "repop" }
-  | { token: string; action: "reclaim_corpse"; guid?: string };
+  | { token: string; action: "reclaim_corpse"; guid?: string }
+  | { token: string; action: "spirit_healer_activate"; guid: string };
 
 /**
  * POST /character-delete body. Not session-scoped: the module stands up its own
