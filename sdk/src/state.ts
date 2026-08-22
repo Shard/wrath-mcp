@@ -40,8 +40,18 @@ import {
   type AuraUpdateData,
   type CreateBlock,
   type GuidKey,
+  type CooldownEventData,
+  type InitialSpellsData,
   type ItemQueryResponseData,
+  type LearnedSpellData,
   type MonsterMoveData,
+  type RemovedSpellData,
+  type SpellCooldownData,
+  type SupersededSpellData,
+  type TalentsInfoData,
+  type QuestGiverStatusData,
+  type QuestGiverStatusMultipleData,
+  type QuestQueryResponseData,
   type MoveUpdateData,
   type PositionData,
   type UpdateBlock,
@@ -69,7 +79,7 @@ export interface UnitPosition {
 }
 
 /**
- * Own position. `map` only ever comes from `SMSG_LOGIN_VERIFY_WORLD`; the x/y/z/o
+ * Own position. `map` only ever comes from `SMSG_LOGIN_VERIFY_WORLD` or `SMSG_NEW_WORLD`; the x/y/z/o
  * of later self updates are paired with the last map that packet reported,
  * which is what a client does. If no map has been observed yet, a self position
  * update is refused and recorded as an anomaly rather than defaulted.
@@ -157,6 +167,12 @@ export interface SelfState extends UnitFieldsState {
   guid: GuidKey | undefined;
   name: string | undefined;
   position: Observed<WorldPosition> | undefined;
+  /**
+   * A map transfer the server announced (`SMSG_TRANSFER_PENDING`) and has not
+   * yet completed (`SMSG_NEW_WORLD`) or abandoned (`SMSG_TRANSFER_ABORTED`).
+   * While set, `position` is the old map's last word.
+   */
+  transfer: Observed<{ readonly toMap: number }> | undefined;
   /** `UNIT_FIELD_TARGET` on our own block: what the client shows as selected. */
   targetGuid: Observed<GuidKey> | undefined;
 }
@@ -177,6 +193,16 @@ export interface SelfState extends UnitFieldsState {
 export interface QuestLogEntry {
   readonly slot: number;
   readonly questId: number;
+  /** From the quest query answer, once it has arrived. */
+  readonly title: string | undefined;
+  /**
+   * The objectives as the client's quest log renders them ("Kobold Vermin
+   * slain: 3/8"), joined from the quest query answer (`required`, `text`,
+   * `entry`) and the log's own counters (`have`). `undefined` until
+   * `SMSG_QUEST_QUERY_RESPONSE` has answered for this quest — the log alone
+   * carries no denominators, so nothing is invented before then.
+   */
+  readonly objectives: readonly QuestObjective[] | undefined;
   /** Raw `PLAYER_QUEST_LOG_x_STATE`, unmasked, as the wire carried it. */
   readonly state: number;
   /** `state & 1` — the objectives are done and the quest can be turned in. */
@@ -186,6 +212,45 @@ export interface QuestLogEntry {
   readonly timer: number | undefined;
   readonly seq: number;
   readonly ts: number;
+}
+
+/**
+ * One objective of a quest in the log, client-style. `kind` is what the
+ * required entry denotes: `kill` a creature, `interact` a gameobject (the
+ * wire's `entry | 0x80000000`), `collect` an item, `event` a scripted or
+ * exploration objective that carries text but no entry. `have` is the log's
+ * counter for creature/gameobject/event slots and the backpack stack total for
+ * items — the two places a client reads it from.
+ */
+export interface QuestObjective {
+  readonly kind: "kill" | "interact" | "collect" | "event";
+  /** Creature entry, gameobject entry, or item id, by `kind`. `undefined` for `event`. */
+  readonly entry: number | undefined;
+  /** The objective's own text from the template, when it has one. */
+  readonly text: string | undefined;
+  readonly required: number;
+  readonly have: number;
+  /** `have >= required`. */
+  readonly done: boolean;
+}
+
+/**
+ * What `SMSG_QUEST_QUERY_RESPONSE` said about one quest: the template the
+ * client renders its log from. Kept as the wire shape, minus the reward fields
+ * the module does not serve.
+ */
+export interface QuestInfo {
+  readonly questId: number;
+  readonly title: string;
+  readonly level: number | undefined;
+  readonly minLevel: number | undefined;
+  readonly objectivesText: string | undefined;
+  readonly details: string | undefined;
+  readonly completedText: string | undefined;
+  /** Four slots, as the wire carries them; unused slots have `entry` 0 and `count` 0. */
+  readonly requiredNpcOrGo: readonly { entry: number; count: number; text: string | undefined }[];
+  /** Six slots; unused slots have `itemId` 0. */
+  readonly requiredItems: readonly { itemId: number; count: number }[];
 }
 
 /**
@@ -275,12 +340,79 @@ export interface AuraEntry {
 }
 
 /** What a creature query answered about one creature entry. */
+/**
+ * One spell in the character's spellbook, from `SMSG_INITIAL_SPELLS` /
+ * `SMSG_LEARNED_SPELL`. `rank` and `name` are the client's Spell.dbc view of
+ * the id; `undefined` when the module could not resolve it.
+ */
+export interface KnownSpell {
+  readonly spellId: number;
+  readonly rank: number | undefined;
+  readonly name: string | undefined;
+  readonly seq: number;
+  readonly ts: number;
+}
+
+/**
+ * A cooldown the server announced. `readyAt` is epoch ms, computed from the
+ * event's timestamp plus the announced duration; `Infinity` for the server's
+ * "infinite" marker. It is `undefined` after a bare `SMSG_COOLDOWN_EVENT`,
+ * which tells a client to start a timer whose length it reads from its own
+ * Spell.dbc — the SDK has no such table, so the spell is known to be on
+ * cooldown but not for how long (it clears on `SMSG_CLEAR_COOLDOWN` or the
+ * next announcement for that spell).
+ */
+export interface SpellCooldown {
+  readonly spellId: number;
+  readonly readyAt: number | undefined;
+  readonly cooldownMs: number | undefined;
+  readonly seq: number;
+  readonly ts: number;
+}
+
+export interface TalentEntry {
+  readonly talentId: number;
+  /** 0-based, as on the wire: 0 means one point spent. */
+  readonly rank: number;
+}
+
+/** The player's talent state from the last `SMSG_TALENTS_INFO`. */
+export interface TalentState {
+  readonly unspentPoints: number;
+  readonly activeSpec: number;
+  readonly specCount: number;
+  /** Talents of the active spec. */
+  readonly talents: readonly TalentEntry[];
+  readonly seq: number;
+  readonly ts: number;
+}
+
 export interface CreatureInfo {
   readonly entry: number;
   readonly name: string;
   readonly subname: string | undefined;
   readonly type: number | undefined;
   readonly rank: number | undefined;
+}
+
+/** One selectable row of an open gossip menu, as `gossipSelect` resolves against. */
+export interface GossipMenuOption {
+  readonly optionId: number;
+  readonly text: string;
+}
+
+/**
+ * The gossip menu last observed open for one NPC: the fold of the last
+ * `SMSG_GOSSIP_MESSAGE` for that guid with no `SMSG_GOSSIP_COMPLETE` after it.
+ * Flat and JSON-safe. `menuId` is what a `gossip_select` must echo back, and
+ * `options` is what `gossipSelect(guid, "text")` matches text against.
+ */
+export interface GossipMenu {
+  readonly guid: GuidKey;
+  readonly menuId: number;
+  readonly options: readonly GossipMenuOption[];
+  readonly seq: number;
+  readonly ts: number;
 }
 
 /**
@@ -300,6 +432,12 @@ export interface NearbyObject extends UnitFieldsState {
   /** From `SMSG_MONSTER_MOVE`: creatures move by spline, not by `MSG_MOVE_*`. */
   motion: Observed<Motion> | undefined;
   targetGuid: Observed<GuidKey> | undefined;
+  /**
+   * The questgiver marker the client draws over this object (`!`/`?`/grey),
+   * from `SMSG_QUESTGIVER_STATUS` / `_MULTIPLE`. The wire `DIALOG_STATUS_*`
+   * u8; `questGiverStatusName` names it.
+   */
+  questGiver: Observed<number> | undefined;
   /** Seq of the event that first put this object in view. */
   firstSeq: number;
   /** Seq of the most recent event that touched this object. */
@@ -335,6 +473,51 @@ export interface UnitView {
   readonly z: number | undefined;
   /** What it is targeting, when observed. `"0"` (no target) reads as undefined. */
   readonly targetGuid: GuidKey | undefined;
+  /**
+   * The questgiver marker the client shows over this object, named:
+   * `available` (`!`), `reward` (`?` — a quest it ends is ready to turn in),
+   * `incomplete` (grey `?` — it ends a quest in the log that is not done),
+   * `none`, `unavailable`, and the rep/low-level variants. `undefined` until
+   * a status packet named this guid; `none` is the server saying it has
+   * nothing for you, which is an observation.
+   */
+  readonly questGiver: QuestGiverStatusName | undefined;
+  /** The raw `DIALOG_STATUS_*` byte behind `questGiver`. */
+  readonly questGiverStatus: number | undefined;
+}
+
+/** The `DIALOG_STATUS_*` names, 3.3.5a. `unknown` covers any byte outside 0-10. */
+export type QuestGiverStatusName =
+  | "none"
+  | "unavailable"
+  | "low_level_available"
+  | "low_level_reward_rep"
+  | "low_level_available_rep"
+  | "incomplete"
+  | "reward_rep"
+  | "available_rep"
+  | "available"
+  | "reward2"
+  | "reward"
+  | "unknown";
+
+const QUEST_GIVER_STATUS_NAMES: readonly QuestGiverStatusName[] = [
+  "none",
+  "unavailable",
+  "low_level_available",
+  "low_level_reward_rep",
+  "low_level_available_rep",
+  "incomplete",
+  "reward_rep",
+  "available_rep",
+  "available",
+  "reward2",
+  "reward",
+];
+
+/** Name a wire `DIALOG_STATUS_*` byte. */
+export function questGiverStatusName(status: number): QuestGiverStatusName {
+  return QUEST_GIVER_STATUS_NAMES[status] ?? "unknown";
 }
 
 /**
@@ -344,8 +527,18 @@ export interface UnitView {
 export interface UnitFilter {
   /** One template id or a list of them. */
   entry?: number | number[];
-  /** Case-insensitive substring of the joined name. Unnamed objects never match. */
-  name?: string;
+  /**
+   * Match the joined name, case-insensitively. Unnamed objects never match.
+   *
+   * A plain string matches as a substring, but the results are then ordered by
+   * how well each name fits the query — exact equal first, then whole-word
+   * match, then any other substring — and, within a tier, by shortest name and
+   * then nearest. So `{ name: "tree" }` returns a unit named `"tree"` ahead of
+   * `"tree stump"`, even if the stump is closer. A `RegExp`, or a string that
+   * looks like a regex literal (`"/^tree$/i"`), is matched with `RegExp.test`
+   * and the results stay in nearest-first order.
+   */
+  name?: string | RegExp;
   type?: "unit" | "player" | "gameObject";
   /** `true` drops the known-dead; `false` keeps only them. Unknown health passes `true`. */
   alive?: boolean;
@@ -353,6 +546,13 @@ export interface UnitFilter {
   maxDistance?: number;
   /** `npcFlags > 0` — a gossip/vendor/questgiver NPC, as observed. */
   npc?: boolean;
+  /**
+   * The observed questgiver marker, by name or a list of names — e.g.
+   * `{ questGiver: "reward" }` for every NPC ready to take a turn-in, or
+   * `{ questGiver: ["available", "available_rep"] }`. Objects with no observed
+   * status never match.
+   */
+  questGiver?: QuestGiverStatusName | QuestGiverStatusName[];
 }
 
 /**
@@ -400,6 +600,7 @@ export interface StateSnapshot {
   readonly auras: ReadonlyMap<GuidKey, readonly AuraEntry[]>;
   readonly questLog: readonly QuestLogEntry[];
   readonly questCompletions: readonly QuestCompletion[];
+  readonly quests: ReadonlyMap<number, Observed<QuestInfo>>;
   readonly inventory: readonly InventoryItem[];
   readonly money: Observed<number> | undefined;
   readonly xp: Observed<number> | undefined;
@@ -409,6 +610,11 @@ export interface StateSnapshot {
   readonly motd: Observed<string[]> | undefined;
   readonly gaps: readonly GapRecord[];
   readonly anomalies: readonly Anomaly[];
+  /** guid -> the gossip menu last observed open for that NPC (none after a close). */
+  readonly gossip: ReadonlyMap<GuidKey, GossipMenu>;
+  readonly spells: readonly KnownSpell[];
+  readonly cooldowns: readonly SpellCooldown[];
+  readonly talents: TalentState | undefined;
   readonly lastSeq: number;
   readonly eventCount: number;
 }
@@ -419,6 +625,7 @@ export class StateCache {
     name: undefined,
     level: undefined,
     position: undefined,
+    transfer: undefined,
     targetGuid: undefined,
     health: undefined,
     power: undefined,
@@ -452,6 +659,13 @@ export class StateCache {
   readonly nearby = new Map<GuidKey, NearbyObject>();
 
   /**
+   * questId -> quest template, from `SMSG_QUEST_QUERY_RESPONSE`. Never pruned:
+   * a template does not change, and a quest abandoned and re-accepted is the
+   * same template.
+   */
+  readonly quests = new Map<number, Observed<QuestInfo>>();
+
+  /**
    * guid -> slot -> aura. Kept per slot because `SMSG_AURA_UPDATE` is a *slot*
    * delta: it names only the slots that changed, and a slot the server clears
    * arrives as `removed` rather than as an absence.
@@ -459,6 +673,27 @@ export class StateCache {
   private readonly auraSlots = new Map<GuidKey, Map<number, AuraEntry>>();
 
   motd: Observed<string[]> | undefined;
+
+  /**
+   * guid -> the gossip menu last opened for that NPC. Set by
+   * `SMSG_GOSSIP_MESSAGE`, cleared wholesale by `SMSG_GOSSIP_COMPLETE` — which
+   * carries no guid, so the honest reading of a close is "no menu is open".
+   * Populated from that one opcode pair only; nothing here queries the server.
+   */
+  private readonly gossipMenus = new Map<GuidKey, GossipMenu>();
+
+  /**
+   * spellId -> spellbook row. Replaced wholesale by `SMSG_INITIAL_SPELLS`
+   * (the login-time book), then edited by `SMSG_LEARNED_SPELL`,
+   * `SMSG_REMOVED_SPELL` and `SMSG_SUPERCEDED_SPELL`. Empty until login has
+   * served the book: empty means unobserved, not "knows nothing".
+   */
+  private readonly spellBook = new Map<number, KnownSpell>();
+
+  /** spellId -> the last cooldown announcement for it. See `cooldowns()`. */
+  private readonly cooldownMap = new Map<number, SpellCooldown>();
+
+  private talentState: TalentState | undefined;
 
   /** The one input that did not come from an event. */
   readonly seed: StateSeed;
@@ -483,8 +718,9 @@ export class StateCache {
   eventCount = 0;
 
   /**
-   * Last map id `SMSG_LOGIN_VERIFY_WORLD` reported. The only source of a map id
-   * on the whole whitelist, and what later self positions are paired with.
+   * Last map id `SMSG_LOGIN_VERIFY_WORLD` or `SMSG_NEW_WORLD` reported: the two
+   * sources of a map id on the whole whitelist, and what later self positions
+   * are paired with.
    */
   private selfMap: number | undefined;
 
@@ -576,18 +812,22 @@ export class StateCache {
       const hi = this.self.fields.get(`quest${slot}CountsHi`);
       const timer = this.self.fields.get(`quest${slot}Time`);
       const raw = state?.value ?? 0;
+      // Two u32s, each holding two u16 objective counters (3.3.5 layout).
+      const counts: [number, number, number, number] = [
+        (lo?.value ?? 0) & 0xffff,
+        ((lo?.value ?? 0) >>> 16) & 0xffff,
+        (hi?.value ?? 0) & 0xffff,
+        ((hi?.value ?? 0) >>> 16) & 0xffff,
+      ];
+      const info = this.quests.get(id.value)?.value;
       out.push({
         slot,
         questId: id.value,
+        title: info?.title,
+        objectives: info === undefined ? undefined : this.questObjectives(info, counts),
         state: raw,
         complete: (raw & QUEST_STATE_COMPLETE) !== 0,
-        // Two u32s, each holding two u16 objective counters (3.3.5 layout).
-        counts: [
-          (lo?.value ?? 0) & 0xffff,
-          ((lo?.value ?? 0) >>> 16) & 0xffff,
-          (hi?.value ?? 0) & 0xffff,
-          ((hi?.value ?? 0) >>> 16) & 0xffff,
-        ],
+        counts,
         timer: timer?.value,
         seq: Math.max(id.seq, state?.seq ?? -1, lo?.seq ?? -1, hi?.seq ?? -1),
         ts: Math.max(id.ts, state?.ts ?? 0, lo?.ts ?? 0, hi?.ts ?? 0),
@@ -609,6 +849,47 @@ export class StateCache {
   /** The quest log slot holding `questId`, if the log shows it at all. */
   quest(questId: number): QuestLogEntry | undefined {
     return this.questLog.find((q) => q.questId === questId);
+  }
+
+  /**
+   * The objectives of one quest, client-style: the template's required
+   * entries and counts joined with the log's counters (creature/gameobject/
+   * event slots) or the backpack's stack totals (item slots). A join over two
+   * observations, nothing invented.
+   */
+  private questObjectives(info: QuestInfo, counts: readonly number[]): QuestObjective[] {
+    const out: QuestObjective[] = [];
+    info.requiredNpcOrGo.forEach((req, i) => {
+      const text = req.text === undefined || req.text === "" ? undefined : req.text;
+      if (req.entry === 0 && req.count === 0 && text === undefined) return;
+      const have = counts[i] ?? 0;
+      if (req.entry === 0) {
+        // Scripted/exploration objective: text only, credited as a count of 1.
+        const required = Math.max(req.count, 1);
+        out.push({ kind: "event", entry: undefined, text, required, have, done: have >= required });
+        return;
+      }
+      const isGo = (req.entry & 0x80000000) !== 0;
+      out.push({
+        kind: isGo ? "interact" : "kill",
+        entry: isGo ? req.entry & 0x7fffffff : req.entry,
+        text,
+        required: req.count,
+        have,
+        done: have >= req.count,
+      });
+    });
+    let bags: InventoryItem[] | undefined;
+    for (const item of info.requiredItems) {
+      if (item.itemId === 0) continue;
+      bags ??= this.inventory;
+      let have = 0;
+      for (const row of bags) {
+        if (row.itemId === item.itemId) have += row.stackCount ?? 1;
+      }
+      out.push({ kind: "collect", entry: item.itemId, text: undefined, required: item.count, have, done: have >= item.count });
+    }
+    return out;
   }
 
   /**
@@ -684,6 +965,47 @@ export class StateCache {
     return [...slots.values()].sort((a, b) => a.slot - b.slot);
   }
 
+  /**
+   * The gossip menu last observed open for `guid`, or `undefined` if none has
+   * been seen or a `SMSG_GOSSIP_COMPLETE` has since closed it. What
+   * `gossipSelect(guid, option)` resolves an option name or id against.
+   */
+  lastGossip(guid: GuidKey): GossipMenu | undefined {
+    return this.gossipMenus.get(guid);
+  }
+
+  /**
+   * The spellbook as the server served it: every spell id the character
+   * knows in its active spec, by id. Empty until `SMSG_INITIAL_SPELLS` has
+   * arrived (it is sent during login, before the world is entered).
+   */
+  spells(): KnownSpell[] {
+    return [...this.spellBook.values()].sort((a, b) => a.spellId - b.spellId);
+  }
+
+  /** One spellbook row by id, or `undefined` when the character does not know it. */
+  spell(spellId: number): KnownSpell | undefined {
+    return this.spellBook.get(spellId);
+  }
+
+  /**
+   * Cooldowns still running at `now` (default: the wall clock): every spell
+   * whose `readyAt` is in the future, plus those a `SMSG_COOLDOWN_EVENT`
+   * started without a duration (`readyAt` undefined). Expired entries are
+   * dropped from the answer, not from the cache — the server never announces
+   * an expiry, so the clock is the only judge.
+   */
+  cooldowns(now: number = Date.now()): SpellCooldown[] {
+    return [...this.cooldownMap.values()]
+      .filter((c) => c.readyAt === undefined || c.readyAt > now)
+      .sort((a, b) => a.spellId - b.spellId);
+  }
+
+  /** The last `SMSG_TALENTS_INFO` for the player, or `undefined` before one arrived. */
+  talents(): TalentState | undefined {
+    return this.talentState;
+  }
+
   /** Name for a guid, if a name query ever returned one. Never guessed. */
   nameOf(guid: GuidKey): string | undefined {
     if (this.self.guid !== undefined && guid === this.self.guid) return this.self.name;
@@ -704,6 +1026,7 @@ export class StateCache {
       auras: new Map([...this.auraSlots].map(([k, v]) => [k, [...v.values()].sort((a, b) => a.slot - b.slot)])),
       questLog: this.questLog,
       questCompletions: [...this.questDoneBuf],
+      quests: new Map(this.quests),
       inventory: this.inventory,
       money: this.money,
       xp: this.xp,
@@ -713,6 +1036,10 @@ export class StateCache {
       motd: this.motd,
       gaps: [...this.gapBuf],
       anomalies: [...this.anomalyBuf],
+      gossip: new Map(this.gossipMenus),
+      spells: this.spells(),
+      cooldowns: this.cooldowns(),
+      talents: this.talentState,
       lastSeq: this.lastSeq,
       eventCount: this.eventCount,
     };
@@ -788,7 +1115,11 @@ export class StateCache {
         this.self.level = { value: d.level, seq: event.seq, ts: event.ts };
         return;
       }
-      case "SMSG_LOGIN_VERIFY_WORLD": {
+      case "SMSG_LOGIN_VERIFY_WORLD":
+      case "SMSG_NEW_WORLD": {
+        // The two packets that carry a map id to a client: login, and every
+        // far teleport after it (a portal, a graveyard port on another map).
+        // Same fold for both; NEW_WORLD additionally closes a pending transfer.
         const d = event.data as WorldPosition;
         this.evictOnMapChange(d.map);
         this.selfMap = d.map;
@@ -797,6 +1128,16 @@ export class StateCache {
           seq: event.seq,
           ts: event.ts,
         };
+        this.self.transfer = undefined;
+        return;
+      }
+      case "SMSG_TRANSFER_PENDING": {
+        const d = event.data as { map: number };
+        this.self.transfer = { value: { toMap: d.map }, seq: event.seq, ts: event.ts };
+        return;
+      }
+      case "SMSG_TRANSFER_ABORTED": {
+        this.self.transfer = undefined;
         return;
       }
       case "SMSG_QUESTGIVER_QUEST_COMPLETE": {
@@ -810,6 +1151,113 @@ export class StateCache {
           seq: event.seq,
           ts: event.ts,
         });
+        return;
+      }
+      case "SMSG_QUESTGIVER_STATUS": {
+        const d = event.data as QuestGiverStatusData;
+        this.applyQuestGiverStatus(d.guid, d.status, event.seq, event.ts);
+        return;
+      }
+      case "SMSG_QUESTGIVER_STATUS_MULTIPLE": {
+        const d = event.data as QuestGiverStatusMultipleData;
+        for (const row of d.statuses) this.applyQuestGiverStatus(row.guid, row.status, event.seq, event.ts);
+        return;
+      }
+      case "SMSG_QUEST_QUERY_RESPONSE": {
+        const d = event.data as QuestQueryResponseData;
+        this.quests.set(d.questId, {
+          value: {
+            questId: d.questId,
+            title: d.title,
+            level: d.level,
+            minLevel: d.minLevel,
+            objectivesText: d.objectives,
+            details: d.details,
+            completedText: d.completedText,
+            requiredNpcOrGo: d.requiredNpcOrGo.map((r) => ({ entry: r.entry, count: r.count, text: r.text })),
+            requiredItems: d.requiredItems.map((r) => ({ itemId: r.itemId, count: r.count })),
+          },
+          seq: event.seq,
+          ts: event.ts,
+        });
+        return;
+      }
+      case "SMSG_INITIAL_SPELLS": {
+        const d = event.data as InitialSpellsData;
+        this.spellBook.clear();
+        for (const row of d.spells) {
+          this.spellBook.set(row.spellId, { spellId: row.spellId, rank: row.rank, name: row.name, seq: event.seq, ts: event.ts });
+        }
+        for (const cd of d.cooldowns) {
+          const infinite = cd.categoryCooldownMs === 0x80000000;
+          const ms = cd.cooldownMs || cd.categoryCooldownMs;
+          this.cooldownMap.set(cd.spellId, {
+            spellId: cd.spellId,
+            cooldownMs: infinite ? undefined : ms,
+            readyAt: infinite ? Number.POSITIVE_INFINITY : event.ts + ms,
+            seq: event.seq,
+            ts: event.ts,
+          });
+        }
+        return;
+      }
+      case "SMSG_LEARNED_SPELL": {
+        const d = event.data as LearnedSpellData;
+        this.spellBook.set(d.spellId, { spellId: d.spellId, rank: d.rank, name: d.name, seq: event.seq, ts: event.ts });
+        return;
+      }
+      case "SMSG_REMOVED_SPELL": {
+        const d = event.data as RemovedSpellData;
+        this.spellBook.delete(d.spellId);
+        return;
+      }
+      case "SMSG_SUPERCEDED_SPELL": {
+        const d = event.data as SupersededSpellData;
+        this.spellBook.delete(d.supersededSpellId);
+        this.spellBook.set(d.spellId, { spellId: d.spellId, rank: d.rank, name: d.name, seq: event.seq, ts: event.ts });
+        return;
+      }
+      case "SMSG_SPELL_COOLDOWN": {
+        const d = event.data as SpellCooldownData;
+        // Sent to this session for its own character (or its pet): a guid
+        // that is observably someone else is not our cooldown.
+        if (this.self.guid !== undefined && d.guid !== this.self.guid) return;
+        for (const cd of d.cooldowns) {
+          this.cooldownMap.set(cd.spellId, {
+            spellId: cd.spellId,
+            cooldownMs: cd.cooldownMs,
+            readyAt: event.ts + cd.cooldownMs,
+            seq: event.seq,
+            ts: event.ts,
+          });
+        }
+        return;
+      }
+      case "SMSG_COOLDOWN_EVENT": {
+        const d = event.data as CooldownEventData;
+        if (this.self.guid !== undefined && d.guid !== this.self.guid) return;
+        this.cooldownMap.set(d.spellId, { spellId: d.spellId, cooldownMs: undefined, readyAt: undefined, seq: event.seq, ts: event.ts });
+        return;
+      }
+      case "SMSG_CLEAR_COOLDOWN": {
+        const d = event.data as CooldownEventData;
+        if (this.self.guid !== undefined && d.guid !== this.self.guid) return;
+        this.cooldownMap.delete(d.spellId);
+        return;
+      }
+      case "SMSG_TALENTS_INFO": {
+        const d = event.data as TalentsInfoData;
+        if (d.pet) return; // no pet surface
+        const activeSpec = d.activeSpec ?? 0;
+        const spec = d.specs?.[activeSpec];
+        this.talentState = {
+          unspentPoints: d.unspentPoints ?? 0,
+          activeSpec,
+          specCount: d.specCount ?? 0,
+          talents: (spec?.talents ?? []).map((t) => ({ talentId: t.talentId, rank: t.rank })),
+          seq: event.seq,
+          ts: event.ts,
+        };
         return;
       }
       case "SMSG_NAME_QUERY_RESPONSE": {
@@ -934,6 +1382,7 @@ export class StateCache {
         return;
       }
       case "WB_MOVE_PROGRESS":
+      case "WB_RIDE_PROGRESS":
       case "WB_MOVE_RESULT": {
         // Our own position while moving: the module's movement engine knows it
         // locally, exactly as a running client does. `WB_MOVE_RESULT.pos` is
@@ -969,6 +1418,31 @@ export class StateCache {
       case "SMSG_MOTD": {
         const d = event.data as { lines: string[] };
         this.motd = { value: [...d.lines], seq: event.seq, ts: event.ts };
+        return;
+      }
+      case "SMSG_GOSSIP_MESSAGE": {
+        // The open menu for this NPC. Only `optionId`/`text` are folded — the
+        // two fields `gossipSelect` resolves against; the quests ride the same
+        // packet and are read straight off the event by the quest helpers.
+        const d = event.data as {
+          guid: GuidKey;
+          menuId: number;
+          options: readonly { optionId: number; text: string }[];
+        };
+        this.gossipMenus.set(d.guid, {
+          guid: d.guid,
+          menuId: d.menuId,
+          options: d.options.map((o) => ({ optionId: o.optionId, text: o.text })),
+          seq: event.seq,
+          ts: event.ts,
+        });
+        return;
+      }
+      case "SMSG_GOSSIP_COMPLETE": {
+        // The client's gossip window closed. The packet names no guid, so the
+        // only honest fold is "nothing is open" — keeping a per-guid menu alive
+        // past this would let a select fire against a stale menu.
+        this.gossipMenus.clear();
         return;
       }
       default:
@@ -1036,50 +1510,31 @@ export class StateCache {
     const from = this.self.position?.value;
     const out: UnitView[] = [];
     for (const obj of this.nearby.values()) {
-      const type = obj.objectType?.value;
-      if (type === "item" || type === "container") continue;
+      const view = toUnitView(obj, from);
+      if (view === undefined) continue;
 
-      const point = pointOf(obj)?.value;
-      const distance =
-        from && point
-          ? Math.round(Math.hypot(point.x - from.x, point.y - from.y, point.z - from.z) * 100) / 100
-          : undefined;
-      const health = obj.fields.get("health")?.value;
-      const target = obj.targetGuid?.value;
-      const view: UnitView = {
-        guid: obj.guid,
-        entry: obj.entry?.value,
-        name: obj.name?.value,
-        type,
-        level: obj.level?.value,
-        health,
-        maxHealth: obj.fields.get("maxHealth")?.value,
-        dead: health === undefined ? undefined : health === 0,
-        distance,
-        x: point?.x,
-        y: point?.y,
-        z: point?.z,
-        targetGuid: target === undefined || target === "0" ? undefined : target,
-      };
-
-      if (f.entries && (view.entry === undefined || !f.entries.has(view.entry))) continue;
-      if (f.name !== undefined && !(view.name ?? "").toLowerCase().includes(f.name)) continue;
-      if (f.type !== undefined && view.type !== f.type) continue;
-      // Asymmetric on purpose: `alive: true` excludes only the *known* dead, so
-      // a unit whose health we have never seen still shows up. `alive: false`
-      // is a positive claim and needs the observation.
-      if (f.alive === true && view.dead === true) continue;
-      if (f.alive === false && view.dead !== true) continue;
-      if (f.maxDistance !== undefined && (distance === undefined || distance > f.maxDistance)) continue;
-      if (f.npc !== undefined) {
-        const isNpc = (obj.fields.get("npcFlags")?.value ?? 0) > 0;
-        if (isNpc !== f.npc) continue;
-      }
+      if (!passesUnitFilter(view, obj, f)) continue;
       out.push(view);
     }
     // Nearest first; unknown distance last. Stable, so unknowns keep first-sight
     // order and a replay of the same events sorts the same way.
+    //
+    // A plain-string name query adds two keys ahead of distance: the match tier
+    // (exact, then whole-word, then any other substring) and the shorter name.
+    // That is what makes `{ name: "tree" }` return `"tree"` before `"tree
+    // stump"` regardless of which is nearer. Regex and non-name queries keep the
+    // pure distance order.
+    const nameQuery = f.name?.kind === "text" ? f.name.query : undefined;
     return out.sort((a, b) => {
+      if (nameQuery !== undefined) {
+        // Both names are defined here: the filter dropped every unnamed object.
+        const ta = nameTier(a.name as string, nameQuery);
+        const tb = nameTier(b.name as string, nameQuery);
+        if (ta !== tb) return ta - tb;
+        const la = (a.name as string).length;
+        const lb = (b.name as string).length;
+        if (la !== lb) return la - lb;
+      }
       if (a.distance === undefined) return b.distance === undefined ? 0 : 1;
       if (b.distance === undefined) return -1;
       return a.distance - b.distance;
@@ -1096,18 +1551,48 @@ export class StateCache {
    * from our own last observed position. `undefined` when we have no position,
    * or nothing in view has one — never a guess.
    *
+   * `filter` is either a `units()` criteria object — `closest({ entry: 196 })`,
+   * `closest({ name: "Deputy Willem", npc: true })` — with exactly the meaning
+   * and the rejection messages it has there, or a predicate over the raw
+   * object. Four of five models in the 2026-08-22 roster reached for the
+   * criteria object by analogy with `units(filter)` and got a bare V8
+   * `TypeError: filter is not a function`, which cost one of them a 15-turn
+   * detour; the analogy was right, so the surface now matches it (ADR-0015:
+   * earned by observed need).
+   *
+   * Ordering is by distance in both forms. `units({ name: "tree" })` ranks its
+   * name matches by tier first; `closest` does not, because "nearest" is the
+   * whole question it answers.
+   *
    * Distances mix the freshness of two observations (ours and theirs); both
    * carry their own `seq`, so a caller that cares can check.
    */
-  closest(filter?: (obj: NearbyObject) => boolean): NearbyObject | undefined {
+  closest(filter?: UnitFilter | ((obj: NearbyObject) => boolean)): NearbyObject | undefined {
     const from = this.self.position?.value;
     if (!from) return undefined;
+
+    // A criteria object goes through `units()`'s own normalization and its own
+    // per-object test, so `{ entry: 196 }` here means exactly what it means
+    // there — including the rejection messages for a bad key or a bad value.
+    // What is *not* borrowed is `units()`'s name-tier ordering: `closest`
+    // promises the nearest match by distance, and a best-name-first answer
+    // under that name would be a new footgun in place of the old one.
+    const criteria =
+      filter !== undefined && typeof filter !== "function" ? normalizeUnitFilter(filter) : undefined;
+    const predicate = typeof filter === "function" ? filter : undefined;
+
     let best: NearbyObject | undefined;
     let bestD2 = Infinity;
     for (const obj of this.nearby.values()) {
       const p = pointOf(obj)?.value;
       if (!p) continue;
-      if (filter && !filter(obj)) continue;
+      if (predicate && !predicate(obj)) continue;
+      if (criteria) {
+        // Items and containers (our own inventory) are not in view for
+        // `units()`, so a criteria query must not find them here either.
+        const view = toUnitView(obj, from);
+        if (view === undefined || !passesUnitFilter(view, obj, criteria)) continue;
+      }
       const d2 = (p.x - from.x) ** 2 + (p.y - from.y) ** 2 + (p.z - from.z) ** 2;
       if (d2 < bestD2) {
         bestD2 = d2;
@@ -1206,6 +1691,19 @@ export class StateCache {
   }
 
   /**
+   * Fold one questgiver marker onto the object it names. A status for a guid
+   * not yet in `nearby` still goes on an entry: the core only reports
+   * questgivers it considers visible to us, so the guid is in view even when
+   * its create block has not been folded (or was missed).
+   */
+  private applyQuestGiverStatus(guid: GuidKey, status: number, seq: number, ts: number): void {
+    if (this.isSelfGuid(guid)) return;
+    this.upsertNearby(guid, seq, (obj) => {
+      obj.questGiver = { value: status, seq, ts };
+    });
+  }
+
+  /**
    * Drop everything observed *about one object* when it leaves view. Auras go
    * with it: a client stops showing the buff bar of a unit it cannot see, and
    * keeping them would let a stale aura outlive its unit.
@@ -1246,7 +1744,7 @@ export class StateCache {
         seq,
         ts,
         kind: "self_position_without_map",
-        detail: "own position arrived before any SMSG_LOGIN_VERIFY_WORLD gave a map id",
+        detail: "own position arrived before any SMSG_LOGIN_VERIFY_WORLD / SMSG_NEW_WORLD gave a map id",
       });
       return;
     }
@@ -1383,6 +1881,7 @@ export class StateCache {
         health: undefined,
         power: undefined,
         targetGuid: undefined,
+        questGiver: undefined,
         fields: new Map<string, Observed<number>>(),
         firstSeq: seq,
         lastSeq: seq,
@@ -1395,6 +1894,77 @@ export class StateCache {
   }
 }
 
+/**
+ * One `NearbyObject` as `units()` reports it, or `undefined` when the object is
+ * not in the world view at all (our own items and bags). `from` is our own last
+ * observed position; without it `distance`/`x`/`y`/`z` stay unobserved.
+ */
+function toUnitView(obj: NearbyObject, from: UnitPosition | undefined): UnitView | undefined {
+  const type = obj.objectType?.value;
+  if (type === "item" || type === "container") return undefined;
+  const point = pointOf(obj)?.value;
+  const distance =
+    from && point
+      ? Math.round(Math.hypot(point.x - from.x, point.y - from.y, point.z - from.z) * 100) / 100
+      : undefined;
+  const health = obj.fields.get("health")?.value;
+  const target = obj.targetGuid?.value;
+  return {
+    guid: obj.guid,
+    entry: obj.entry?.value,
+    name: obj.name?.value,
+    type,
+    level: obj.level?.value,
+    health,
+    maxHealth: obj.fields.get("maxHealth")?.value,
+    dead: health === undefined ? undefined : health === 0,
+    distance,
+    x: point?.x,
+    y: point?.y,
+    z: point?.z,
+    targetGuid: target === undefined || target === "0" ? undefined : target,
+    questGiver: obj.questGiver === undefined ? undefined : questGiverStatusName(obj.questGiver.value),
+    questGiverStatus: obj.questGiver?.value,
+  };
+}
+
+/**
+ * Whether one object satisfies every present criterion. The single definition
+ * of what a `UnitFilter` *means*, shared by `units()` and `closest()` so the
+ * two can never drift; `obj` is only needed for `npc`, which reads a raw field
+ * the view does not carry.
+ */
+function passesUnitFilter(view: UnitView, obj: NearbyObject, f: NormalizedUnitFilter): boolean {
+  if (f.entries && (view.entry === undefined || !f.entries.has(view.entry))) return false;
+  if (f.name !== undefined) {
+    // Unnamed objects never match: a name criterion cannot be evaluated
+    // against a name we have not observed.
+    if (view.name === undefined) return false;
+    if (f.name.kind === "regex") {
+      if (!f.name.re.test(view.name)) return false;
+    } else if (!view.name.toLowerCase().includes(f.name.query)) {
+      return false;
+    }
+  }
+  if (f.type !== undefined && view.type !== f.type) return false;
+  // Asymmetric on purpose: `alive: true` excludes only the *known* dead, so a
+  // unit whose health we have never seen still shows up. `alive: false` is a
+  // positive claim and needs the observation.
+  if (f.alive === true && view.dead === true) return false;
+  if (f.alive === false && view.dead !== true) return false;
+  if (f.maxDistance !== undefined && (view.distance === undefined || view.distance > f.maxDistance)) {
+    return false;
+  }
+  if (f.npc !== undefined) {
+    const isNpc = (obj.fields.get("npcFlags")?.value ?? 0) > 0;
+    if (isNpc !== f.npc) return false;
+  }
+  if (f.questGiver !== undefined && (view.questGiver === undefined || !f.questGiver.has(view.questGiver))) {
+    return false;
+  }
+  return true;
+}
+
 // ------------------------------------------------------ units() filter input
 //
 // ADR-0016: repair only what has exactly one valid reading (a numeric string
@@ -1403,16 +1973,24 @@ export class StateCache {
 // the forbidden outcome — it returns a wrong-but-plausible answer, which is the
 // very failure this helper exists to remove.
 
-const UNIT_FILTER_KEYS = ["entry", "name", "type", "alive", "maxDistance", "npc"] as const;
+const UNIT_FILTER_KEYS = ["entry", "name", "type", "alive", "maxDistance", "npc", "questGiver"] as const;
 const UNIT_FILTER_TYPES = ["unit", "player", "gameObject"] as const;
+
+/**
+ * How a `name` criterion is matched, resolved once at normalization. `text`
+ * carries the lowercased query for substring matching and tier ranking; `regex`
+ * carries a compiled matcher whose results stay in nearest-first order.
+ */
+type NameMatcher = { kind: "text"; query: string } | { kind: "regex"; re: RegExp };
 
 interface NormalizedUnitFilter {
   entries: Set<number> | undefined;
-  name: string | undefined;
+  name: NameMatcher | undefined;
   type: string | undefined;
   alive: boolean | undefined;
   maxDistance: number | undefined;
   npc: boolean | undefined;
+  questGiver: Set<QuestGiverStatusName> | undefined;
 }
 
 const EMPTY_UNIT_FILTER: NormalizedUnitFilter = {
@@ -1422,6 +2000,7 @@ const EMPTY_UNIT_FILTER: NormalizedUnitFilter = {
   alive: undefined,
   maxDistance: undefined,
   npc: undefined,
+  questGiver: undefined,
 };
 
 /** How a rejected value is quoted back to the caller. */
@@ -1457,6 +2036,81 @@ function coerceBoolean(value: unknown, key: string): boolean {
     `${key} received ${showValue(value)} (${typeof value}), expected true or false. ` +
       `Example: state.units({ ${key}: true }).`,
   );
+}
+
+/** `/pat/flags` — a string spelled as a JS regex literal. Flags are the real set. */
+const REGEX_LITERAL = /^\/(.*)\/([dgimsuy]*)$/s;
+
+/**
+ * Resolve a `name` criterion into a matcher.
+ *
+ * A `RegExp`, or a string spelled as a regex literal (`"/^tree$/i"`), matches
+ * with `RegExp.test`; the caller's own flags decide case-sensitivity. Anything
+ * else is a plain case-insensitive substring query. A string that starts with
+ * `/` but is not a valid `/pat/flags` (a bad flag, a dangling slash) is a
+ * literal name, not an error — but a well-formed literal whose pattern does not
+ * compile (`"/tree(/"`) is rejected, because it has exactly one reading and
+ * that reading is broken (ADR-0016).
+ */
+function compileNameMatcher(value: unknown): NameMatcher {
+  if (value instanceof RegExp) return { kind: "regex", re: value };
+  if (typeof value === "string") {
+    const m = REGEX_LITERAL.exec(value);
+    if (m) {
+      try {
+        return { kind: "regex", re: new RegExp(m[1] as string, m[2]) };
+      } catch (e) {
+        throw filterError(
+          `name received ${showValue(value)}, which reads as a regex but did not compile ` +
+            `(${e instanceof Error ? e.message : String(e)}). Fix the pattern, or pass a plain ` +
+            'name string such as { name: "boar" }.',
+        );
+      }
+    }
+    return { kind: "text", query: value.toLowerCase() };
+  }
+  throw filterError(
+    `name received ${showValue(value)} (${typeof value}), expected a string (matched as a ` +
+      'case-insensitive substring, such as { name: "boar" }) or a RegExp (such as { name: /^tree$/i }).',
+  );
+}
+
+/** Alphanumeric runs, lowercased: splits creature names on spaces, apostrophes, hyphens. */
+function tokenize(s: string): string[] {
+  return s
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t.length > 0);
+}
+
+/** Whether `query`'s tokens appear as a contiguous run of whole words in `name`. */
+function wholeWordMatch(name: string, query: string): boolean {
+  const nt = tokenize(name);
+  const qt = tokenize(query);
+  if (qt.length === 0 || qt.length > nt.length) return false;
+  for (let i = 0; i + qt.length <= nt.length; i++) {
+    let hit = true;
+    for (let j = 0; j < qt.length; j++) {
+      if (nt[i + j] !== qt[j]) {
+        hit = false;
+        break;
+      }
+    }
+    if (hit) return true;
+  }
+  return false;
+}
+
+/**
+ * How well `name` fits a plain-string `query`, lowest is best: 0 exact,
+ * 1 whole-word, 2 any other substring. Only called for names the substring
+ * filter already admitted, so 2 is the floor.
+ */
+function nameTier(name: string, query: string): number {
+  const n = name.toLowerCase();
+  if (n === query) return 0;
+  if (wholeWordMatch(n, query)) return 1;
+  return 2;
 }
 
 /**
@@ -1508,15 +2162,7 @@ function normalizeUnitFilter(filter: UnitFilter | undefined): NormalizedUnitFilt
     out.entries = entries;
   }
 
-  if (filter.name !== undefined) {
-    if (typeof filter.name !== "string") {
-      throw filterError(
-        `name received ${showValue(filter.name)} (${typeof filter.name}), expected a string to match as a ` +
-          'case-insensitive substring, such as { name: "boar" }.',
-      );
-    }
-    out.name = filter.name.toLowerCase();
-  }
+  if (filter.name !== undefined) out.name = compileNameMatcher(filter.name);
 
   if (filter.type !== undefined) {
     // An enum near-miss ("gameobject", "npc") has more than one plausible
@@ -1532,6 +2178,27 @@ function normalizeUnitFilter(filter: UnitFilter | undefined): NormalizedUnitFilt
 
   if (filter.alive !== undefined) out.alive = coerceBoolean(filter.alive, "alive");
   if (filter.npc !== undefined) out.npc = coerceBoolean(filter.npc, "npc");
+
+  if (filter.questGiver !== undefined) {
+    // Exact names only: "?"/"!" or "turnin" have more than one reading
+    // (reward vs reward_rep vs incomplete), so ADR-0016 says reject and list.
+    const raw = Array.isArray(filter.questGiver) ? filter.questGiver : [filter.questGiver];
+    if (raw.length === 0) {
+      throw filterError('questGiver received an empty array; pass a status name such as "reward", or omit questGiver.');
+    }
+    const names = new Set<QuestGiverStatusName>();
+    for (const item of raw) {
+      if (typeof item !== "string" || !(QUEST_GIVER_STATUS_NAMES as readonly string[]).includes(item)) {
+        throw filterError(
+          `questGiver received ${showValue(item)}, expected one of ${QUEST_GIVER_STATUS_NAMES.map(showValue).join(", ")} ` +
+            '(exact, case-sensitive) or an array of them. "reward" is a turn-in ready now, "available" a quest on offer, ' +
+            '"incomplete" an ender whose quest is not done yet.',
+        );
+      }
+      names.add(item as QuestGiverStatusName);
+    }
+    out.questGiver = names;
+  }
 
   if (filter.maxDistance !== undefined) {
     const n = coerceNumber(filter.maxDistance, "maxDistance", "a distance in yards");

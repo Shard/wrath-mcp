@@ -97,7 +97,12 @@ describe("event frames", () => {
       "WB_MOVE_PROGRESS",
     "WB_SESSION_STATE",
       "WB_MOVE_RESULT",
+      "WB_RIDE_PROGRESS",
       ...MOVE_OPCODES,
+      // map transfers
+      "SMSG_TRANSFER_PENDING",
+      "SMSG_NEW_WORLD",
+      "SMSG_TRANSFER_ABORTED",
       // quest/combat extension, in PROTOCOL.md's table order
       "SMSG_ATTACKSTART",
       "SMSG_ATTACKSTOP",
@@ -113,6 +118,8 @@ describe("event frames", () => {
       "SMSG_LEVELUP_INFO",
       "SMSG_ITEM_PUSH_RESULT",
       "SMSG_QUESTGIVER_STATUS",
+      "SMSG_QUESTGIVER_STATUS_MULTIPLE",
+      "SMSG_QUEST_QUERY_RESPONSE",
       "SMSG_QUESTGIVER_QUEST_LIST",
       "SMSG_QUESTGIVER_QUEST_DETAILS",
       "SMSG_QUESTGIVER_REQUEST_ITEMS",
@@ -134,8 +141,19 @@ describe("event frames", () => {
       "SMSG_BUY_ITEM",
       "SMSG_BUY_FAILED",
       "SMSG_SELL_ITEM",
+      "SMSG_TRAINER_LIST",
+      "SMSG_TRAINER_BUY_SUCCEEDED",
+      "SMSG_TRAINER_BUY_FAILED",
       "SMSG_INVENTORY_CHANGE_FAILURE",
       "SMSG_ITEM_QUERY_SINGLE_RESPONSE",
+      "SMSG_INITIAL_SPELLS",
+      "SMSG_LEARNED_SPELL",
+      "SMSG_REMOVED_SPELL",
+      "SMSG_SUPERCEDED_SPELL",
+      "SMSG_SPELL_COOLDOWN",
+      "SMSG_COOLDOWN_EVENT",
+      "SMSG_CLEAR_COOLDOWN",
+      "SMSG_TALENTS_INFO",
       "SMSG_DEATH_RELEASE_LOC",
       "SMSG_CORPSE_RECLAIM_DELAY",
       "SMSG_DURABILITY_DAMAGE_DEATH",
@@ -144,7 +162,10 @@ describe("event frames", () => {
     ]);
     expect(isKnownOpcode("SMSG_MESSAGECHAT")).toBe(true);
     expect(isKnownOpcode("SMSG_UPDATE_OBJECT")).toBe(true);
-    expect(isKnownOpcode("SMSG_TRAINER_LIST")).toBe(false);
+    // An opcode outside the whitelist stays unknown (and still streams, as
+    // `UnknownEvent`). SMSG_TRAINER_LIST used to stand here; it is whitelisted
+    // now, so the negative case moved to one the module does not serve.
+    expect(isKnownOpcode("SMSG_TRADE_STATUS")).toBe(false);
   });
 
   test("every observed MSG_MOVE_* name shares the one movement payload", () => {

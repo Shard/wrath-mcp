@@ -9,7 +9,7 @@
  * The destination is a point on the line toward an observed creature rather
  * than a blind offset: a creature is standing on walkable ground by
  * construction, whereas an arbitrary 30y bearing lands in a wall or a lake and
- * comes back `no_path`.
+ * comes back `target_off_mesh` / `path_incomplete`.
  *
  * Not part of `bun test`: it needs a booted worldserver. Run it from inside the
  * compose network:
@@ -19,12 +19,15 @@
  * Override the target with MODULE_HOST / MODULE_PORT (default worldserver:8086).
  */
 
+import { randomBytes } from "node:crypto";
 import { connect, WrathRequestError, type NearbyObject, type WrathClient } from "../src/index";
 
 const HOST = process.env.MODULE_HOST ?? "worldserver";
 const PORT = process.env.MODULE_PORT ?? "8086";
 const BASE = `http://${HOST}:${PORT}`;
-const TOKEN = `sdk-move-${Date.now()}`;
+// Random hex, not a timestamp: session tokens under 32 chars are rejected with
+// `weak_token`, and a per-session token must be unique anyway.
+const TOKEN = `sdk-move-${randomBytes(16).toString("hex")}`;
 const CHARACTER = process.env.MOVE_CHARACTER ?? "Benchmove";
 /** How far to walk, in yards, when the geometry allows it. */
 const TARGET_DISTANCE = 30;
@@ -124,7 +127,7 @@ async function main(): Promise<void> {
 
     // 2. Walk toward an observed creature, stopping short of it. Candidates are
     //    tried farthest-first so the walk is as close to TARGET_DISTANCE as the
-    //    neighbourhood allows; a no_path just moves to the next one.
+    //    neighbourhood allows; an off-mesh/incomplete verdict just moves to the next one.
     const from = client.state.self.position?.value ?? start.value;
     const candidates = client
       .state.nearbyUnits()

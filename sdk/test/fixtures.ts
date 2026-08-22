@@ -260,6 +260,16 @@ export function moveResult(status: string, moveId = 1, seq = 19): unknown {
   };
 }
 
+export function transferPending(toMap: number, seq = 40): unknown {
+  return { seq, opcode: "SMSG_TRANSFER_PENDING", opcodeId: 0x03f, ts: 1_700_000_000_400, data: { map: toMap } };
+}
+export function newWorld(map: number, seq = 41, pos = { x: 69.25, y: 10.26, z: -4.3, o: 3.1 }): unknown {
+  return { seq, opcode: "SMSG_NEW_WORLD", opcodeId: 0x03e, ts: 1_700_000_000_410, data: { map, ...pos } };
+}
+export function transferAborted(map: number, reason: number, seq = 41): unknown {
+  return { seq, opcode: "SMSG_TRANSFER_ABORTED", opcodeId: 0x040, ts: 1_700_000_000_410, data: { map, reason } };
+}
+
 /** A player create block, named by a name query rather than a creature query. */
 export const playerCreate = {
   seq: 20,
@@ -694,6 +704,56 @@ export const questCombatStream: unknown[] = [
   monsterMove,
 ];
 
+/**
+ * A trainer's spell list. Opcode ids are the pinned core's
+ * (`Opcodes.h`: SMSG_TRAINER_LIST 0x1B1, BUY_SUCCEEDED 0x1B3, BUY_FAILED 0x1B4).
+ */
+export function trainerList(
+  spells: readonly { spellId: number; state: number; cost: number }[],
+  seq = 60,
+  guid: string = CREATURE_GUID,
+): unknown {
+  return {
+    seq,
+    opcode: "SMSG_TRAINER_LIST",
+    opcodeId: 0x1b1,
+    ts: 1_700_000_000_600,
+    data: {
+      guid,
+      trainerType: 0,
+      greeting: "fixture trainer greeting",
+      spells: spells.map((s) => ({
+        spellId: s.spellId,
+        state: s.state,
+        cost: s.cost,
+        reqLevel: 4,
+        reqSkill: 0,
+        reqSkillValue: 0,
+      })),
+    },
+  };
+}
+
+export function trainerBuySucceeded(spellId: number, seq = 61): unknown {
+  return {
+    seq,
+    opcode: "SMSG_TRAINER_BUY_SUCCEEDED",
+    opcodeId: 0x1b3,
+    ts: 1_700_000_000_610,
+    data: { guid: CREATURE_GUID, spellId },
+  };
+}
+
+export function trainerBuyFailed(spellId: number, reason: number, seq = 62): unknown {
+  return {
+    seq,
+    opcode: "SMSG_TRAINER_BUY_FAILED",
+    opcodeId: 0x1b4,
+    ts: 1_700_000_000_620,
+    data: { guid: CREATURE_GUID, spellId, reason },
+  };
+}
+
 export const sessionResponseFixture = {
   ok: true as const,
   token: "test-token",
@@ -714,4 +774,78 @@ export const healthResponseFixture = {
 
 export function frames(objects: readonly unknown[]): string[] {
   return objects.map((o) => JSON.stringify(o));
+}
+
+// ---------------------------------------------------------------- quest info
+//
+// Synthetic captures of the two packets behind FOLLOW-UPS 27/28, in the exact
+// JSON shape PROTOCOL.md gives for the module's decode.
+
+/** A kobold entry for the objectives fixture; `| 0x80000000` marks a gameobject on the wire. */
+export const KOBOLD_ENTRY = 6;
+export const GO_ENTRY = 1617;
+export const REQUIRED_ITEM = ITEM_ENTRY;
+
+/** `SMSG_QUESTGIVER_STATUS` for one guid. */
+export function questGiverStatus(guid: string, status: number, seq: number): unknown {
+  return {
+    seq,
+    opcode: "SMSG_QUESTGIVER_STATUS",
+    opcodeId: 0x183,
+    ts: 1_700_000_000_000 + seq,
+    data: { guid, status },
+  };
+}
+
+/** `SMSG_QUESTGIVER_STATUS_MULTIPLE`: every questgiver in view. */
+export function questGiverStatusMultiple(rows: readonly { guid: string; status: number }[], seq: number): unknown {
+  return {
+    seq,
+    opcode: "SMSG_QUESTGIVER_STATUS_MULTIPLE",
+    opcodeId: 0x418,
+    ts: 1_700_000_000_000 + seq,
+    data: { statuses: rows.map((r) => ({ guid: r.guid, status: r.status })) },
+  };
+}
+
+/**
+ * `SMSG_QUEST_QUERY_RESPONSE` for QUEST_ID: kill 8 kobolds (objective 0),
+ * use one gameobject (objective 1), an event objective (objective 2, text
+ * only), and collect 4 of one item. The wire carries four npc/go slots and
+ * six item slots whatever the quest uses; unused ones are zero.
+ */
+export function questQueryResponse(questId = QUEST_ID, seq = 60): unknown {
+  return {
+    seq,
+    opcode: "SMSG_QUEST_QUERY_RESPONSE",
+    opcodeId: 0x05d,
+    ts: 1_700_000_000_000 + seq,
+    data: {
+      questId,
+      method: 2,
+      level: 3,
+      minLevel: 1,
+      type: 0,
+      suggestedPlayers: 0,
+      title: "Kobold Camp Cleanup",
+      objectives: "Kill 8 Kobold Vermin, then return to Marshal McBride.",
+      details: "Kobolds have camped in the vineyard.",
+      areaDescription: "",
+      completedText: "",
+      requiredNpcOrGo: [
+        { entry: KOBOLD_ENTRY, count: 8, text: "" },
+        { entry: GO_ENTRY | 0x80000000, count: 1, text: "Unlock the chest" },
+        { entry: 0, count: 0, text: "Investigate the vineyard" },
+        { entry: 0, count: 0, text: "" },
+      ],
+      requiredItems: [
+        { itemId: REQUIRED_ITEM, count: 4 },
+        { itemId: 0, count: 0 },
+        { itemId: 0, count: 0 },
+        { itemId: 0, count: 0 },
+        { itemId: 0, count: 0 },
+        { itemId: 0, count: 0 },
+      ],
+    },
+  };
 }

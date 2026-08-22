@@ -71,6 +71,7 @@ class WrathClient {
   loot(guid) / lootAll(guid) / lootItem(slot) / lootMoney() / lootRelease(guid)
   vendorList(guid) / buyItem(guid, itemId, slot, count?) / sellItem(guid, itemGuid, count?) / repairAll(guid)
   equipItem(bag, slot) / useItem(bag, slot, targetGuid?) / destroyItem(bag, slot, count?)
+  trainerListAsync(guid) / trainerBuySpellAsync(guid, spellId)
   repop() / reclaimCorpse(guid?) / spiritHealerActivate(guid)
   deleteCharacter(name, o?: DeleteCharacterOptions): Promise<CharacterDeleteResponse>  // POST /character-delete
 
@@ -80,9 +81,12 @@ class WrathClient {
   waitForNearby(p: (o: NearbyObject) => boolean, o?: WaitForNearbyOptions): Promise<NearbyObject>
   killTarget(guid, o?: KillTargetOptions): Promise<KillResult>
   lootCorpse(guid, o?: LootOptions): Promise<LootResult>
+  questsAvailableFrom(npcGuid, o?: QuestOptions): Promise<{ ok: true; quests: readonly OfferedQuest[] }>
   acceptQuestFrom(npcGuid, questId, o?: QuestOptions): Promise<QuestAcceptResult>
   turnInQuest(npcGuid, questId, rewardIndex?, o?: QuestOptions): Promise<QuestTurnInResult>
   waitForQuestObjective(questId, o?: QuestOptions): Promise<QuestLogEntry>
+  trainerList(npcGuid, o?: TrainerOptions): Promise<TrainerListResult>
+  buySpell(npcGuid, spellId, o?: TrainerOptions): Promise<BuySpellResult>
   get selfKey(): string | undefined
 }
 ```
@@ -136,6 +140,12 @@ A window that showed items of which not one entered a bag — bags full, or a
 broken store path — is `{ ok: false, status: "none_stored" }`. Silence still
 throws `EventTimeoutError`.
 
+`questsAvailableFrom` is that same send-and-wait with none of the accepting:
+it returns whatever the NPC offers right now, `{ ok: true, quests: [...] }`,
+and an empty list is an answer rather than an error. It exists because models
+kept rebuilding it by hand over `questList` plus event scraping and getting
+confused by their own nulls (FOLLOW-UPS 9a).
+
 `acceptQuestFrom` reads the quest log *first*, because a turn-in chain may
 already have added the quest (the core auto-advances, so an explicit accept can
 be a no-op) — that is `status: "already_in_log"`. Otherwise it asks, and
@@ -153,6 +163,19 @@ whole timeout (the quest stays in the log; free a slot and turn in again).
 the pinned commit the core sends no `SMSG_QUESTUPDATE_COMPLETE` for a kill
 objective: the only thing that reports one to a client is the completion bit in
 the served quest-log state field.
+
+`trainerList` asks a trainer what it teaches and derives two things per row
+that are not on the wire: `learnable` (the server's own green state, via the
+single `TRAINER_SPELL_STATE` mapping) and `affordable` (observed money against
+`cost`, `undefined` while money is unobserved — never guessed). They are
+independent: the server's state says nothing about money, so a green spell can
+still fail to buy. The core's handler answers nothing at all when the NPC is
+out of interact range, is not a trainer, or trains another class, so all three
+arrive as an `EventTimeoutError` saying so. `buySpell` races
+`SMSG_TRAINER_BUY_SUCCEEDED` against `SMSG_TRAINER_BUY_FAILED` for the spell
+id and returns `{ status: "learned" }` or `{ status: "buy_failed", reason,
+hint }` — the raw reason plus one actionable sentence, never an exception,
+because a refusal is the game answering.
 
 `deleteCharacter` retries on its own, and that belongs in the SDK rather than
 in a caller: for up to about a minute after logout the core still tracks an
@@ -182,9 +205,12 @@ else console.log("did not get there:", result.status, "stopped at", result.posit
 
 `moveTo` issues `move_to`, then resolves on the `WB_MOVE_RESULT` carrying the
 same `moveId`. **Game outcomes are returned, not thrown** (`docs/decisions/ADR-0011`):
-`arrived` is `ok: true`; `no_path`, `too_far`, `interrupted`, `stopped` and
-`superseded` are `ok: false` with the status intact, and *every* one of them
-carries the server-confirmed position the character actually ended at. A
+`arrived` is `ok: true` (with `meshZ` when the mesh walked to a different z
+than asked); `too_far`, `no_mesh`, `target_off_mesh`, `start_off_mesh`,
+`path_incomplete` (with `reachedPos`), `interrupted`, `stopped` and
+`superseded` are `ok: false` with the status intact and a per-status `hint`,
+and *every* one of them carries the server-confirmed position the character
+actually ended at. A
 snippet that forgets a `try` should not lose a run to a wall, and "there is no
 path there" is an answer, not an error.
 

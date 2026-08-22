@@ -15,17 +15,20 @@
  * Override the target with MODULE_HOST / MODULE_PORT (default worldserver:8086).
  */
 
+import { randomBytes } from "node:crypto";
 import { connect, WrathRequestError } from "../src/index";
 
 const HOST = process.env.MODULE_HOST ?? "worldserver";
 const PORT = process.env.MODULE_PORT ?? "8086";
 const BASE = `http://${HOST}:${PORT}`;
 // The token is per-session, so it must be unique: a leaked one comes back as
-// `token_in_use`. The *character* is deliberately stable — `POST /session` is
-// create-or-reuse, so a fixed name makes re-runs idempotent instead of leaving
-// a new saved character on the account every time (the realm caps them, and
-// Phase 0 has no delete-character action). It also exercises the reuse branch.
-const TOKEN = `sdk-slice-${Date.now()}`;
+// `token_in_use`. It must also be at least 32 chars or the module rejects it
+// with `weak_token`, so it is random hex, not a timestamp. The *character* is
+// deliberately stable — `POST /session` is create-or-reuse, so a fixed name
+// makes re-runs idempotent instead of leaving a new saved character on the
+// account every time (the realm caps them, and Phase 0 has no delete-character
+// action). It also exercises the reuse branch.
+const TOKEN = `sdk-slice-${randomBytes(16).toString("hex")}`;
 const CHARACTER = process.env.SLICE_CHARACTER ?? "Benchslice";
 const SAY_TEXT = "hello from the sdk";
 

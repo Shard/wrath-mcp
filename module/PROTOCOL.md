@@ -34,7 +34,8 @@ Two error channels, deliberately separated (docs/CONTRACTS.md):
 Module and world status. No auth, no body.
 
 Two views (2026-08). Callers on the compose network — the runner and, through
-it, the snippet sandbox — get liveness only: `ok`, `module`, `worldStopped`,
+it, the snippet sandbox — get liveness plus build identity: `ok`, `module`,
+`worldStopped`, `build`, `startedAtMs`, `uptimeMs`,
 with `sessions` / `droppedPackets` / `droppedPacketsLive` present but zeroed
 (kept so the SDK response schema parses) and no `droppedByOpcode`. The global
 session count and the drop census describe module internals and other runs'
@@ -52,9 +53,23 @@ Operator (loopback) response `200`:
   "sessions": 1,
   "droppedPackets": 4213,
   "droppedPacketsLive": 37,
-  "droppedByOpcode": { "SMSG_POWER_UPDATE": 1400, "SMSG_EMOTE": 220, "0x4F2": 3 }
+  "droppedByOpcode": { "SMSG_POWER_UPDATE": 1400, "SMSG_EMOTE": 220, "0x4F2": 3 },
+  "build": "harness-0.3-41-g0bfe207",
+  "startedAtMs": 1787400000000,
+  "uptimeMs": 3600000
 }
 ```
+- `build` — the wrathbench repo's `git describe --tags --always --dirty` at
+  image build time, compiled into the module from the `WRATHBENCH_BUILD`
+  docker build-arg (`infra/build-worldserver.sh` supplies it; see
+  `module/mod-wrathbench.cmake`). `"unknown"` when the image was built without
+  it. Served to every caller (added 2026-08-22): it is ops identity, not game
+  state, and lets the fleet gate, trajectories and the dashboard name *which*
+  server they talked to.
+- `startedAtMs` — worldserver process start, epoch milliseconds (captured at
+  static initialisation). `build` + `startedAtMs` together identify "this
+  build, this boot"; the fleet's preflight gate keys on exactly that pair.
+- `uptimeMs` — milliseconds since `startedAtMs`. Telemetry, not identity.
 - `sessions` — number of live bench sessions.
 - `droppedPackets` — lifetime count of outbound packets suppressed because they
   were not on the event whitelist (survives session teardown). Whitelist tuning
@@ -117,10 +132,21 @@ reappears on the event stream in the self `SMSG_UPDATE_OBJECT` create block
 Errors:
 - `400 {"ok":false,"error":"missing_token"}`
 - `400 {"ok":false,"error":"missing_character"}`
+- `400 {"ok":false,"error":"weak_token","received":<len>,"minimum":32,"hint":...}` —
+  the token is shorter than 32 characters. The session token is a bearer
+  capability over `/action`, `/events` and `DELETE /session`, so a guessable one
+  (the old run-id default was a second-granularity timestamp) lets one run drive
+  another; length is a proxy for entropy until the module issues the secret
+  itself (FOLLOW-UPS 19). Checked before the session is registered. The
+  `/characters` and `/character-delete` utility surfaces are deliberately not
+  gated: they park at character-select, never enter world, and take no actions.
 - `400 {"ok":false,"error":"invalid_race_class","token":...}` — the character
   does not exist and race/class are not both in [1,11] (see above; decided at
   char-enum time, before any char-create packet is synthesized).
-- `409 {"ok":false,"error":"token_in_use"}`
+- `409 {"ok":false,"error":"token_in_use"}` — a session already exists under
+  this token and is still mid-login (not yet in world). A same-token create for a
+  session that is already in world does **not** get this: it succeeds
+  idempotently (see the reclaim note below).
 - `403 {"ok":false,"error":"account_not_permitted"}` — `account` is not on the
   `WrathBench.Accounts` allowlist.
 - `400 {"ok":false,"error":"unknown_account"}`
@@ -130,8 +156,29 @@ Errors:
   a `SMSG_CHAR_CREATE` event.
 - `502 {"ok":false,"error":"login_failed","token":...}`
 - `502 {"ok":false,"error":"character_missing_after_create","token":...}`
-- `504 {"ok":false,"error":"timeout","token":...}` — the flow did not reach the
-  world within 20s.
+- `504 {"ok":false,"error":"timeout","token":...}` — either the login flow did not
+  reach the world within 20s, or (see reclaim below) a stale session held the
+  account and the core had not released it within the internal reclaim wait.
+  Both are transient and retryable.
+
+Create reclaims a permitted account (2026-08). `POST /session` on an account
+that passed the allowlist **always takes ownership** instead of dead-ending on a
+stale/leaked session — the invariant is one account = one lane = one live
+episode (enforced by the fleet's duplicate-account guard and the roster's
+account-busy guard), so any session found holding the account at create time is
+stale, and reclaiming it is correct, not a race:
+- Same token, already in world for the **same** account+character: returns
+  success idempotently (the caller re-syncs state from the event stream); it does
+  not tear down and rebuild. A same-token session mid-login is `token_in_use`; a
+  same-token session in world for a **different** character/account is torn down
+  and rebuilt (never a silent wrong-character success, ADR-0016).
+- A different token (or a core-side session with no live bench token) holding the
+  account is torn down via the normal teardown path, and the create waits for the
+  core to fully release the account before entering world. If the release does not
+  complete within the reclaim wait, the create returns `504 timeout` (retryable),
+  never the old `account_in_use`. `account_in_use` no longer fires on `POST
+  /session`; it remains only on the read-only `POST /characters` and on
+  `POST /character-delete`, neither of which reclaims.
 
 The login flow the module performs internally, all through the real handlers:
 `AddSession` → `SMSG_AUTH_RESPONSE(AUTH_OK)` → `CMSG_CHAR_ENUM` →
@@ -148,7 +195,10 @@ quest/combat extension set (2026-08, additive): `set_target`, `clear_target`,
 `quest_complete`, `quest_choose_reward`, `quest_abandon`, `loot`, `loot_item`,
 `loot_money`, `loot_release`, `loot_all`, `vendor_list`, `buy_item`,
 `sell_item`, `repair_all`, `equip_item`, `use_item`, `destroy_item`, `repop`,
-`reclaim_corpse`, `spirit_healer_activate` (2026-08, additive). Acks that the
+`reclaim_corpse`, `spirit_healer_activate` (2026-08, additive), the trainer
+extension (2026-08, additive): `trainer_list`, `trainer_buy_spell`, and the
+spellbook/talent extension (2026-08, additive): `learn_talent`,
+`learn_preview_talents`, `raw`. Acks that the
 opcode was synthesized and queued; the game
 result (the chat echo, an arrival, or an error) arrives on the WebSocket.
 
@@ -250,6 +300,9 @@ them: `{ "ok": true, "action": "<name>", "token": ... }`.
 | `quest_complete` | `guid`, `questId` | `CMSG_QUESTGIVER_COMPLETE_QUEST` | server answers REQUEST_ITEMS or OFFER_REWARD |
 | `quest_choose_reward` | `guid`, `questId`, `rewardIndex` | `CMSG_QUESTGIVER_CHOOSE_REWARD` | `rewardIndex` 0-based into `choiceRewards`; 0 when there is no choice |
 | `quest_abandon` | `questId` | `CMSG_QUESTLOG_REMOVE_QUEST` | module maps quest id -> log slot (client-visible via quest-log fields); `400 quest_not_in_log` |
+| `quest_query` | `questId` | `CMSG_QUEST_QUERY` | the client's template fetch for a quest in its log; `SMSG_QUEST_QUERY_RESPONSE` follows (unknown id: silence) |
+| `questgiver_status_query` | `guid` | `CMSG_QUESTGIVER_STATUS_QUERY` | what a client sends per questgiver-flagged unit/gameobject as it comes into view; `SMSG_QUESTGIVER_STATUS` for that guid follows (not a questgiver, or not in view: silence) |
+| `questgiver_status_multiple_query` | — | `CMSG_QUESTGIVER_STATUS_MULTIPLE_QUERY` | what a client sends after its quest log changes; `SMSG_QUESTGIVER_STATUS_MULTIPLE` follows |
 | `loot` | `guid` | `CMSG_LOOT` | opens the loot window (`SMSG_LOOT_RESPONSE`) |
 | `loot_item` | `slot` | `CMSG_AUTOSTORE_LOOT_ITEM` | `slot` from `SMSG_LOOT_RESPONSE.items[]` |
 | `loot_money` | — | `CMSG_LOOT_MONEY` | |
@@ -262,19 +315,87 @@ them: `{ "ok": true, "action": "<name>", "token": ... }`.
 | `equip_item` | `bag`, `slot` | `CMSG_AUTOEQUIP_ITEM` | `bag` 255 = backpack/equipment container, `slot` 23-38 = backpack slots |
 | `use_item` | `bag`, `slot`, `targetGuid?` | `CMSG_USE_ITEM` | module fills item guid + on-use spell id from the item (client-cache knowledge); `400 no_item_at_slot`, `400 item_not_usable` |
 | `destroy_item` | `bag`, `slot`, `count?` | `CMSG_DESTROYITEM` | `count` 0/omitted = whole stack |
+| `trainer_list` | `guid` | `CMSG_TRAINER_LIST` | `SMSG_TRAINER_LIST` follows — or nothing at all when the NPC is out of interaction range, is not a trainer, or trains another class (the handler returns silently) |
+| `trainer_buy_spell` | `guid`, `spellId` | `CMSG_TRAINER_BUY_SPELL` | costs the character's own money server-side; answered by `SMSG_TRAINER_BUY_SUCCEEDED` or `SMSG_TRAINER_BUY_FAILED` |
+| `learn_talent` | `talentId`, `rank` | `CMSG_LEARN_TALENT` | `talentId` from Talent.dbc, `rank` 0-based; the handler always answers `SMSG_TALENTS_INFO`, and a granted spell arrives as `SMSG_LEARNED_SPELL`; `400 missing_talent` |
+| `learn_preview_talents` | `talents` = `[[talentId, rank], ...]` | `CMSG_LEARN_PREVIEW_TALENTS` | the preview-mode "learn" button (at most 150 pairs); `400 missing_talents`, `400 invalid_talents` |
+| `raw` | `opcode`, `payload` | the named opcode | the escape hatch (ADR-0025), below |
 | `repop` | — | `CMSG_REPOP_REQUEST` | release spirit while dead |
 | `reclaim_corpse` | `guid?` | `CMSG_RECLAIM_CORPSE` | resurrect at corpse; handler resolves the player's own corpse, guid optional |
 | `spirit_healer_activate` | `guid` | `CMSG_SPIRIT_HEALER_ACTIVATE` | graveyard resurrection fallback; no dedicated response opcode — the outcome arrives through already-served events (health update fields, res-sickness aura) |
 
 Validation errors (all `400`): `missing_guid`, `missing_option`,
-`missing_quest_id`, `missing_reward_index`, `missing_spell_id`,
-`missing_slot`, `missing_item`, `missing_item_guid`, `missing_bag_slot`.
+`missing_quest_id` (also for `quest_query`), `missing_reward_index`, `missing_spell_id`,
+`missing_slot`, `missing_item`, `missing_item_guid`, `missing_bag_slot`,
+`missing_talent`, `missing_talents`, `invalid_talents`, and for `raw`:
+`missing_opcode`, `opcode_not_allowed`, `invalid_payload`, `payload_too_large`.
 
 Every `missing_*` reply from `POST /action` echoes what it was about:
 `{"ok":false,"error":"missing_guid","action":"set_target","param":"guid"}`.
 A guid-shaped field (`guid`, `targetGuid`, `itemGuid`) that is present but not
 a decimal u64 string is `400 invalid_guid`, echoing `action`, `param` and the
 received value (truncated to 64 chars) — never silently coerced to guid 0.
+
+#### raw (escape hatch, 2026-08, ADR-0025)
+
+Send one allowlisted client opcode with a caller-built body. Exists so a
+trajectory can demonstrate the need for a surface before the module and SDK
+grow a dedicated action for it (ADR-0015); it is not a second way to do what an
+action already does.
+
+Request:
+```json
+{ "token": "...", "action": "raw", "opcode": "CMSG_TEXT_EMOTE", "payload": "2200000000000000" }
+```
+
+`opcode` is the `CMSG_*` name; `payload` is the packet body as a hex string
+(little-endian per field, as on the 3.3.5a wire; empty or omitted for a
+bodiless opcode; at most 512 bytes). The bytes are queued verbatim into the
+stock handler for that opcode — the module does not parse or repair them, and
+a body the handler cannot read is the same as a malformed client packet (the
+core logs it and, as for any client, may kick the session). Success `200`:
+`{ "ok": true, "action": "raw", "token": ... }`. The audit record carries
+`opcode` and `payload` so the exact bytes sent are reconstructable.
+
+Errors (all `400`): `missing_opcode`, `opcode_not_allowed` (echoes `opcode`
+and a hint), `invalid_payload` (not whole hex bytes), `payload_too_large`
+(echoes `received` and `maximum`).
+
+Allowlist — every entry is an opcode a stock client sends during ordinary play
+whose handler does nothing a non-GM client could not do:
+
+- talents: `CMSG_LEARN_TALENT`, `CMSG_LEARN_PREVIEW_TALENTS`
+- chat/emotes: `CMSG_MESSAGECHAT` (whisper, party, yell and the rest ride this
+  one), `CMSG_EMOTE`, `CMSG_TEXT_EMOTE`
+- inventory: `CMSG_SPLIT_ITEM`, `CMSG_SWAP_ITEM`, `CMSG_SWAP_INV_ITEM`,
+  `CMSG_AUTOSTORE_BAG_ITEM`, `CMSG_AUTOEQUIP_ITEM_SLOT`, `CMSG_READ_ITEM`,
+  `CMSG_OPEN_ITEM`, `CMSG_BUYBACK_ITEM`
+- spell/aura control: `CMSG_CANCEL_AURA`, `CMSG_CANCEL_AUTO_REPEAT_SPELL`,
+  `CMSG_CANCEL_CHANNELLING`, `CMSG_SET_SHEATHED`, `CMSG_STANDSTATECHANGE`,
+  `CMSG_RESURRECT_RESPONSE`
+- flight paths: `CMSG_TAXINODE_STATUS_QUERY`, `CMSG_TAXIQUERYAVAILABLENODES`,
+  `CMSG_ACTIVATETAXI`, `CMSG_ACTIVATETAXIEXPRESS`
+- bank: `CMSG_BANKER_ACTIVATE`, `CMSG_AUTOBANK_ITEM`, `CMSG_AUTOSTORE_BANK_ITEM`,
+  `CMSG_BUY_BANK_SLOT`
+- mail: `CMSG_SEND_MAIL`, `CMSG_GET_MAIL_LIST`, `CMSG_MAIL_TAKE_ITEM`,
+  `CMSG_MAIL_TAKE_MONEY`, `CMSG_MAIL_MARK_AS_READ`, `CMSG_MAIL_DELETE`
+- party: `CMSG_GROUP_INVITE`, `CMSG_GROUP_ACCEPT`, `CMSG_GROUP_DECLINE`,
+  `CMSG_GROUP_UNINVITE_GUID`, `CMSG_GROUP_DISBAND`, `CMSG_GROUP_SET_LEADER`,
+  `CMSG_LOOT_METHOD`
+- trade: `CMSG_INITIATE_TRADE`, `CMSG_BEGIN_TRADE`, `CMSG_ACCEPT_TRADE`,
+  `CMSG_CANCEL_TRADE`, `CMSG_SET_TRADE_ITEM`, `CMSG_CLEAR_TRADE_ITEM`,
+  `CMSG_SET_TRADE_GOLD`
+- client-cache queries: `CMSG_NAME_QUERY`, `CMSG_CREATURE_QUERY`,
+  `CMSG_GAMEOBJECT_QUERY`, `CMSG_ITEM_QUERY_SINGLE`, `CMSG_NPC_TEXT_QUERY`,
+  `CMSG_PAGE_TEXT_QUERY`, `CMSG_PLAYED_TIME`, `CMSG_QUERY_TIME`,
+  `CMSG_SET_WATCHED_FACTION`, `CMSG_SET_ACTION_BUTTON`
+
+Deliberately absent: movement opcodes (the module drives them; a stray one
+desyncs the mover), session lifecycle (login, logout, character create/delete),
+every opcode that already has an action (one audited path per opcode), and
+anything GM-gated or teleport-shaped. Answers to raw actions reach the agent
+only through the event whitelist: most of the above have no whitelisted reply
+yet, which is exactly the evidence the hatch exists to produce.
 
 ### POST /characters
 
@@ -306,11 +427,15 @@ configured account allowlist (`WrathBench.Accounts`, defaulting to the single
 while a different token holds a live bench session on it. The ownership check
 is decided on the world thread where session creates are serialized (the HTTP
 thread's scan is only a fast-path pre-filter), so a delete racing a
-`POST /session` for the same account within one world tick loses: one of the
-two gets `409 account_owned_by_other_token` (delete mode) or
-`400 account_in_use` (create mode) instead of both proceeding. `POST /session`
-and `POST /characters` apply the same allowlist. Minimal ownership gate for the
-per-run account scheme; per-character credentials are the Phase-1 fix.)
+`POST /session` for the same account within one world tick is decided
+deterministically: a `POST /character-delete` that finds another token on the
+account gets `409 account_owned_by_other_token` — character-delete never evicts a
+running episode. A `POST /session` create, by contrast, reclaims (see the create
+reclaim note above): it tears the other session down and takes ownership rather
+than returning `account_in_use`, so the create-mode side of the old race no
+longer produces `account_in_use`. `POST /session` and `POST /characters` apply
+the same allowlist. Minimal ownership gate for the per-run account scheme;
+per-character credentials are the Phase-1 fix.)
 
 Success `200`: `{ "ok": true, "token": ..., "character": "Benchy", "deleted": true }`
 Errors: `400 missing_token`, `400 missing_character`, `409 token_in_use`,
@@ -503,27 +628,84 @@ session's own identity). Their `opcodeId`s are outside the real opcode range.
 | opcode | id | `data` fields |
 |---|---|---|
 | `WB_MOVE_PROGRESS` | 0xFF02 | `{ "moveId": <number>, "pos": { "x","y","z","o" } }` — at most 1/s while moving |
-| `WB_MOVE_RESULT` | 0xFF01 | `{ "moveId": <number>, "status": <str>, "pos": { "x","y","z","o" } }` |
+| `WB_MOVE_RESULT` | 0xFF01 | `{ "moveId": <number>, "status": <str>, "pos": { "x","y","z","o" }, "meshZ": <f?>, "reachedPos": { "x","y","z" }? }` — `meshZ` only on `arrived` when the mesh z differed from the request; `reachedPos` only on `path_incomplete`; `"onTransport": { "guid": <guid-string>, "entry": <u32> }` when the character ended the move aboard a transport |
+| `WB_RIDE_PROGRESS` | 0xFF05 | `{ "transportGuid": <guid-string>, "transportEntry": <u32>, "pos": { "x","y","z","o" } }` — at most 1/s while the character rides a transport and is not walking; the server-side position the transport carried it to |
+| `WB_AREATRIGGER` | 0xFF04 | `{ "triggerId": <u32>, "moveId": <number>, "pos": { "x","y","z","o" } }` — the mover entered an `AreaTrigger.dbc` volume and sent `CMSG_AREATRIGGER` for it (see below) |
 | `WB_SESSION_STATE` | 0xFF03 | `{ "character": <str>, "guid": <guid-string>, "inWorld": true, "map": <n>, "x": <f>, "y": <f>, "z": <f>, "o": <f>, "level": <n> }` — emitted once per WS subscribe to an already-in-world session (reattach semantics in the `/events` section above). Strictly client-visible facts: what `SMSG_LOGIN_VERIFY_WORLD` plus the session's own identity would carry. |
 
 `moveId` is a plain JSON number: it is a per-session counter that cannot exceed
 2^53, so it falls under the counter exemption to the u64-as-string rule stated
 at the top of this document.
 
-`WB_MOVE_RESULT.status` is one of:
+`WB_MOVE_RESULT.status` is one of (navigation vocabulary of 2026-08, FOLLOW-UPS
+item 38 N1; the former undifferentiated `no_path` no longer exists):
 - `arrived` — the server-side character reached the destination; `pos` is the
-  server-confirmed position.
-- `no_path` — the navmesh has no complete walkable path to the point.
+  server-confirmed position. When the navmesh resolved the request to a ground
+  z more than 1y from the requested z, the result also carries `meshZ` (the z
+  actually walked to): the request's z was off, the mesh's z was used, and the
+  agent should quote `meshZ` next time.
 - `too_far` — destination beyond the single-move cap (~250yd straight-line);
   issue intermediate `move_to`s.
-- `interrupted` — the move stopped early (death, root, teleport, rejection);
-  `pos` is where the character actually is.
+- `no_mesh` — no navmesh tile is loaded under the character or under the
+  destination. A harness/data limitation, not a route problem; nothing to
+  retry from the agent's side.
+- `target_off_mesh` — the destination has no walkable polygon within the
+  mesh's search box (4y in 2D; z is searched ±50y, so a stale z alone never
+  produces this), or it sits inside geometry. Pick a point on a road, a floor,
+  or where an NPC stands.
+- `start_off_mesh` — the character itself is standing somewhere the mesh does
+  not cover (a transport deck, a bad landing). Recovery is different from
+  `target_off_mesh`: a few yards of movement, or a disembark, fixes the start.
+- `path_incomplete` — the mesh has no continuous walkable route to the
+  destination. The module already tried once to subdivide (path to where the
+  mesh got, then onward); `reachedPos` is how far the mesh could get, so the
+  agent can route around or approach from another side. Nothing moved.
+- `transferred` — a map transfer or teleport took the character mid-move
+  (an areatrigger portal, a graveyard port); the server applies the
+  destination itself. `pos` is the last old-map position; the new map and
+  arrival point follow on `SMSG_NEW_WORLD`.
+- `interrupted` — the move stopped early (death, root, rejection, or the
+  character left the map for a non-teleport reason); `pos` is where the
+  character actually is.
 - `stopped` — a `stop` action ended the move.
 - `superseded` — a newer `move_to` replaced this move.
 
 `WB_MOVE_PROGRESS.pos` is the engine's interpolated position (what a client
 would render); `WB_MOVE_RESULT.pos` is read back from the live character, so an
 `arrived` result is proof the server accepted the synthesized movement.
+
+Transports (2026-08, FOLLOW-UPS 38 N1). A client standing on a tram car or
+boat sends movement packets flagged `MOVEMENTFLAG_ONTRANSPORT` with the
+transport guid and its transport-relative offset, because its physics put it
+on the transport's model; the server then carries it as a passenger and
+nothing else does. The module does the same from the same knowledge: when
+the mover's interpolated point lies inside a transport's model bounds (the
+`GameObjectModel` the server keeps current as the transport moves), every
+synthesized packet carries the transport block. Transports have no navmesh,
+so a `move_to` within 30y whose start or destination is on one is a straight
+line (boarding or disembarking, as a client walks it); anything longer goes
+through the mesh and answers `start_off_mesh` / `target_off_mesh`. A move
+that ends aboard reports `onTransport`; while aboard and idle, the server
+moves the character and the module reports where it is as
+`WB_RIDE_PROGRESS`. No "activate transport" action exists: boarding is
+walking onto the car.
+
+Areatriggers (2026-08, FOLLOW-UPS 38 N1). A real client tests its own position
+against the `AreaTrigger.dbc` volumes it ships and sends `CMSG_AREATRIGGER`
+the moment it enters one — the player never chooses to. The module does the
+same: it reads `AreaTrigger.dbc` from the server data volume (`DataDir/dbc`,
+the same file a client has), tests the mover's interpolated position after
+each heartbeat with the same sphere/oriented-box geometry as
+`Player::IsInAreaTriggerRadius`, and queues `CMSG_AREATRIGGER` once per entry
+(re-sent after 1.5s if still inside and nothing happened, since the server
+checks its applied position and a heartbeat can lag). Each dispatch is
+audited (`op: "areatrigger"`) and mirrored as `WB_AREATRIGGER`. Consequences
+are whatever the server does for that trigger, as for a client: a map
+transfer (`SMSG_TRANSFER_PENDING` … `transferred`), exploration quest credit
+(`SMSG_QUESTUPDATE_COMPLETE`), or the inn's rest flag — all of which now
+happen without an agent action, because they happen to a client without a
+player action. Triggers fire only while a `move_to` is in progress; the
+server's own radius check rejects any hit the interpolation got wrong.
 
 ### Quest/combat extension whitelist (2026-08, additive)
 
@@ -565,6 +747,8 @@ Quests and gossip (quest/gossip text served as the client would show it):
 | opcode | id | `data` fields |
 |---|---|---|
 | `SMSG_QUESTGIVER_STATUS` | 0x183 | `{ "guid", "status": <u8> }` |
+| `SMSG_QUESTGIVER_STATUS_MULTIPLE` | 0x418 | `{ "statuses": [{ "guid", "status": <u8> }] }` — every questgiver in view; sent by the core on login, level-up and quest reward, and in answer to `questgiver_status_multiple_query`. Status values are `DIALOG_STATUS_*` (0 none, 1 unavailable, 2 low-level available, 3 low-level reward-rep, 4 low-level available-rep, 5 incomplete, 6 reward-rep, 7 available-rep, 8 available, 9 reward2 (no minimap dot), 10 reward); the SDK names them |
+| `SMSG_QUEST_QUERY_RESPONSE` | 0x05D | `{ "questId", "method", "level", "minLevel", "type", "suggestedPlayers", "title", "objectives", "details", "areaDescription", "completedText", "requiredNpcOrGo": [4 x { "entry", "count", "text" }], "requiredItems": [6 x { "itemId", "count" }] }` — decoded from `PlayerMenu::SendQuestQueryResponse` in this order: questId, method, level, minLevel, zoneOrSort, type, suggestedPlayers, rep objective faction/value x2, nextQuestInChain, xpId, rewMoney, rewMoneyMaxLevel, rewSpell, rewSpellCast, honor addition/multiplier, srcItem, flags, charTitle, playersSlain, bonusTalents, arenaPoints, repMask, 4+6 reward (item,count) pairs, 3x5 reputation ids, POI continent/x/y/pointOpt, then the five strings, then 4 x (requiredNpcOrGo, count, itemDrop, 0), 6 x (requiredItem, count), 4 x objective text (joined into `requiredNpcOrGo[i].text`). A gameobject objective arrives as `entry \| 0x80000000`, as the client expects. Reward fields are consumed and not served (they ride `QUEST_DETAILS`/`OFFER_REWARD` when the client asks) |
 | `SMSG_QUESTGIVER_QUEST_LIST` | 0x185 | `{ "guid", "greeting", "quests": [{ "questId", "icon", "level", "repeatable", "title" }] }` |
 | `SMSG_QUESTGIVER_QUEST_DETAILS` | 0x188 | `{ "guid", "questId", "title", "details", "objectives", "choiceRewards": [{ "itemId", "count" }], "rewards": [...], "money", "xp" }` |
 | `SMSG_QUESTGIVER_REQUEST_ITEMS` | 0x18B | `{ "guid", "questId", "title", "text", "requiredMoney", "requiredItems": [{ "itemId", "count" }], "completable": <bool> }` |
@@ -591,6 +775,9 @@ Loot, vendor, inventory:
 | `SMSG_BUY_ITEM` | 0x1A4 | `{ "vendorGuid", "slot", "count" }` |
 | `SMSG_BUY_FAILED` | 0x1A5 | `{ "vendorGuid", "itemId", "result": <u8> }` |
 | `SMSG_SELL_ITEM` | 0x1A1 | `{ "vendorGuid", "itemGuid", "result": <u8> }` (0 = success) |
+| `SMSG_TRAINER_LIST` | 0x1B1 | `{ "guid", "trainerType": <i32>, "spells": [{ "spellId", "state": <u8>, "cost" (copper, discounted), "reqLevel", "reqSkill" (skill line id, 0 = none), "reqSkillValue" }], "greeting" }` — `trainerType` 0 class, 1 mount, 2 tradeskill, 3 pet; `state` 0 available (green), 1 unavailable (red: level/skill/prerequisite/class), 2 known (gray). `state` says nothing about money: a green spell still fails with reason 1 if unaffordable |
+| `SMSG_TRAINER_BUY_SUCCEEDED` | 0x1B3 | `{ "guid", "spellId" }` |
+| `SMSG_TRAINER_BUY_FAILED` | 0x1B4 | `{ "guid", "spellId", "reason": <i32> }` — 0 unavailable, 1 not enough money, 2 not enough skill (also level/prerequisites) |
 | `SMSG_INVENTORY_CHANGE_FAILURE` | 0x112 | `{ "result": <u8>, "itemGuid"?, "itemGuid2"?, "requiredLevel"? }` (InventoryResult code) |
 | `SMSG_ITEM_QUERY_SINGLE_RESPONSE` | 0x058 | `{ "itemId", "found", "name"?, "quality"?, "inventoryType"?, "buyPrice"?, "sellPrice"?, "itemLevel"?, "requiredLevel"?, "class"?, "subClass"? }` |
 
@@ -599,6 +786,22 @@ entry (item create block, loot window, vendor list, item push, quest reward
 list) the module issues the `CMSG_ITEM_QUERY_SINGLE` a client cache miss would,
 and the answer arrives as `SMSG_ITEM_QUERY_SINGLE_RESPONSE`. Joining ids to
 names is the SDK's job.
+
+Spellbook, cooldowns, talents (2026-08, additive). `rank` and `name` on a spell
+row are what a client reads from its own Spell.dbc for the id (`rank` 1 when
+unranked; both absent when the id is unknown to the core) — client-cache
+knowledge, like item-template fields:
+
+| opcode | id | `data` fields |
+|---|---|---|
+| `SMSG_INITIAL_SPELLS` | 0x12A | `{ "spells": [{ "spellId", "rank"?, "name"? }], "cooldowns": [{ "spellId", "itemId", "category", "cooldownMs", "categoryCooldownMs" }] }` — the whole active-spec spellbook, sent during login before `SMSG_LOGIN_VERIFY_WORLD`; a category cooldown carries its time in `categoryCooldownMs` and 0 in `cooldownMs`; `categoryCooldownMs` 0x80000000 with `cooldownMs` 1 is the core's "infinite" marker |
+| `SMSG_LEARNED_SPELL` | 0x12B | `{ "spellId", "rank"?, "name"? }` |
+| `SMSG_REMOVED_SPELL` | 0x203 | `{ "spellId" }` |
+| `SMSG_SUPERCEDED_SPELL` | 0x12C | `{ "supersededSpellId", "spellId", "rank"?, "name"? }` — the old rank leaves the book, `spellId` replaces it (a `SMSG_LEARNED_SPELL` for the new id follows) |
+| `SMSG_SPELL_COOLDOWN` | 0x134 | `{ "guid", "flags": <u8>, "cooldowns": [{ "spellId", "cooldownMs" }] }` — cooldowns that just started for `guid` (self or pet); `flags & 1` = the GCD was triggered too; a 0 ms entry is a GCD-only marker |
+| `SMSG_COOLDOWN_EVENT` | 0x135 | `{ "spellId", "guid" }` — "start the timer you already know for this spell": the duration is Spell.dbc knowledge the module does not serve |
+| `SMSG_CLEAR_COOLDOWN` | 0x1DE | `{ "spellId", "guid" }` |
+| `SMSG_TALENTS_INFO` | 0x4C0 | `{ "pet": false, "unspentPoints", "specCount", "activeSpec", "specs": [{ "talents": [{ "talentId", "rank" }] }] }` — `rank` is 0-based; glyph slots are consumed and not served. The pet form is `{ "pet": true }` only (no pet surface). Sent on login, level-up, after every `CMSG_LEARN_TALENT`, and on spec change |
 
 Death:
 
@@ -624,6 +827,20 @@ Creature movement:
 spline path points the client receives are consumed and dropped, because
 serving them would hand the agent the server's route in machine-readable form
 (ADR-0010). A client player only sees the animation.
+
+Map transfers (navigation, 2026-08, FOLLOW-UPS 38 N1):
+
+| opcode | id | `data` fields |
+|---|---|---|
+| `SMSG_TRANSFER_PENDING` | 0x03F | `{ "map": <u32>, "transportEntry": <u32?>, "oldMap": <u32?> }` — the optional pair only when a transport carries the character across |
+| `SMSG_NEW_WORLD` | 0x03E | `{ "map": <u32>, "x", "y", "z", "o" }` — the arrival point (transport-local when aboard one) |
+| `SMSG_TRANSFER_ABORTED` | 0x040 | `{ "map": <u32>, "reason": <u8>, "arg": <u8?> }` — `arg` only for INSUF_EXPAN_LVL / DIFFICULTY / UNIQUE_MESSAGE |
+
+`SMSG_NEW_WORLD` is the only map id a client receives after login
+(`SMSG_LOGIN_VERIFY_WORLD` is never re-sent), so it is what self position's
+`map` follows from then on. The module answers the teleport itself
+(`MSG_MOVE_WORLDPORT_ACK`, see the teleport-ack note) and a `move_to` in
+flight when a transfer or teleport begins ends with status `transferred`.
 
 #### Update-field whitelist additions (quest/combat extension)
 

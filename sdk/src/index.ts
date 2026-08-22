@@ -6,15 +6,26 @@
  * a major one and wants an ADR under docs/decisions/.
  */
 
-export { connect, KNOWN_ERROR_CODES, WrathClient, WrathRequestError, WrathTransportError } from "./client";
+export {
+  connect,
+  KNOWN_ERROR_CODES,
+  TRAINER_SPELL_STATE,
+  WrathClient,
+  WrathRequestError,
+  WrathTransportError,
+} from "./client";
 export type {
+  BuySpellResult,
   ConnectOptions,
   DeleteCharacterOptions,
   ErrorCode,
   GuidArg,
+  GuidOrUnit,
   KillResult,
   KillTargetOptions,
   KnownErrorCode,
+  LearnTalentResult,
+  RawActionResponse,
   LootOptions,
   LootResult,
   MovePoint,
@@ -24,11 +35,17 @@ export type {
   QuestOptions,
   QuestTurnInResult,
   StoredLootItem,
+  TrainerListResult,
+  TrainerOptions,
+  TrainerSpell,
+  TransferResult,
   WaitForChatOptions,
   WaitForNearbyOptions,
+  WaitForTransferOptions,
 } from "./client";
 
 export {
+  EventAbortedError,
   EventStream,
   EventStreamClosedError,
   EventTimeoutError,
@@ -45,7 +62,7 @@ export type {
   WaitForOptions,
 } from "./events";
 
-export { pointOf, StateCache } from "./state";
+export { pointOf, questGiverStatusName, StateCache } from "./state";
 export type {
   Anomaly,
   AuraEntry,
@@ -56,15 +73,24 @@ export type {
   CreatureInfo,
   GapRecord,
   Gauge,
+  GossipMenu,
+  GossipMenuOption,
   InventoryItem,
   ItemInfo,
+  KnownSpell,
+  SpellCooldown,
+  TalentEntry,
+  TalentState,
   Motion,
   NearbyObject,
   NotificationEntry,
   Observed,
   Point3,
   QuestCompletion,
+  QuestGiverStatusName,
+  QuestInfo,
   QuestLogEntry,
+  QuestObjective,
   SelfState,
   StateCacheOptions,
   StateSeed,
@@ -129,6 +155,13 @@ export type {
   QuestGiverQuestListData,
   QuestGiverRequestItemsData,
   QuestGiverStatusData,
+  QuestGiverStatusMultipleData,
+  RawField,
+  RawPayload,
+  InitialSpellsData,
+  SpellCooldownData,
+  TalentsInfoData,
+  QuestQueryResponseData,
   QuestRewardItem,
   QuestUpdateAddItemData,
   QuestUpdateAddKillData,
@@ -137,6 +170,10 @@ export type {
   SpellFailureData,
   SpellGoData,
   SpellStartData,
+  TrainerBuyFailedData,
+  TrainerBuySucceededData,
+  TrainerListData,
+  TrainerSpellData,
   VendorItem,
   CreateSessionRequest,
   CreatureQueryResponseData,

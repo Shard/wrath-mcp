@@ -26,6 +26,9 @@
 import {
   actionResponseSchema,
   characterDeleteResponseSchema,
+  encodeRawPayload,
+  rawOpcodeSchema,
+  rawPayloadSchema,
   deleteSessionResponseSchema,
   errorBodySchema,
   faceResponseSchema,
@@ -52,26 +55,41 @@ import {
   type MoveResultData,
   type MoveStatus,
   type MoveToResponse,
+  type NewWorldData,
+  type TransferAbortedData,
   type OfferedQuest,
   type QuestGiverQuestCompleteData,
   type QuestGiverQuestListData,
   type QuestGiverRequestItemsData,
+  type QuestGiverStatusData,
+  type QuestGiverStatusMultipleData,
+  type RawPayload,
   type SessionResponse,
+  type TalentsInfoData,
+  type TrainerBuyFailedData,
+  type TrainerListData,
+  type TrainerSpellData,
 } from "./protocol";
 import {
+  EventAbortedError,
   EventStream,
   EventTimeoutError,
   type EventStreamOptions,
   type StreamEvent,
+  type WaitForOptions,
 } from "./events";
 import {
   pointOf,
+  questGiverStatusName,
   StateCache,
   type ChatEntry,
   type NearbyObject,
   type Point3,
   type QuestLogEntry,
+  type TalentState,
   type UnitPosition,
+  type UnitView,
+  type WorldPosition,
 } from "./state";
 import type { z } from "zod";
 
@@ -126,6 +144,69 @@ function assertGuid(guid: unknown, arg: string): asserts guid is string | bigint
 function guidArg(guid: GuidArg, arg: string): string {
   assertGuid(guid, arg);
   return typeof guid === "bigint" ? guidKey(guid) : guid;
+}
+
+/**
+ * What a composed helper accepts for the thing it acts on: the opaque guid
+ * string, or a whole unit from `state.units(...)` / `state.closest(...)`.
+ * Passing the unit is the common case — the model just found it — so the
+ * helpers read `.guid` off it rather than making the model destructure.
+ */
+export type GuidOrUnit = GuidArg | UnitView;
+
+/**
+ * Resolve a helper's target to a guid string. A `UnitView` (or any object) has
+ * its `.guid` taken; a missing or unusable one is rejected loudly with a
+ * pointer back to where units come from (ADR-0016). A non-object falls through
+ * to `guidArg`, so a bare guid string keeps its exact existing validation — and
+ * raw actions (`setTarget`, `attackStart`, `gossipSelect`) still take only that
+ * string form, on purpose: referent selection is what this bench measures.
+ */
+function guidOf(target: GuidOrUnit, arg: string): string {
+  if (target !== null && typeof target === "object") {
+    const guid = (target as { guid?: unknown }).guid;
+    if (typeof guid === "string" && guid.length > 0) return guidArg(guid, arg);
+    throw new TypeError(
+      `${arg} got an object with no usable .guid (received ${showTarget(target)}) — pass a unit from ` +
+        `state.units(...) or state.closest(...) (each carries a .guid), or the guid string itself`,
+    );
+  }
+  return guidArg(target, arg);
+}
+
+/** A one-line description of a rejected target object, for the error message. */
+function showTarget(target: object): string {
+  try {
+    const json = JSON.stringify(target);
+    if (json !== undefined) return json.length > 120 ? `${json.slice(0, 117)}...` : json;
+  } catch {
+    /* circular or otherwise unserialisable */
+  }
+  return Array.isArray(target) ? "an array" : "an object";
+}
+
+/**
+ * Deterministic repair (ADR-0016) for `moveTo(x, y, z)` written as three
+ * positional numbers instead of one `{ x, y, z }`. That shape has exactly one
+ * valid reading, and weak models write it across every family (nemotron, hy3,
+ * gpt-oss trajectories 2026-08-22). Returns the repaired point, or null when
+ * the call is not that shape — every other bad shape still hits the loud
+ * assertMovePoint reject. Only the helper `moveTo` repairs; raw `moveToAsync`
+ * stays strict (ADR-0015: raw actions do not soften).
+ */
+function repairThreeArgMove(
+  point: unknown,
+  options: unknown,
+  rest: unknown[],
+): { point: MovePoint; options: MoveToOptions } | null {
+  // point=x, options=y, rest[0]=z. A trailing rest[1] object is the real
+  // options (moveTo(x, y, z, { timeout })); anything else is ignored.
+  if (typeof point === "number" && typeof options === "number" && typeof rest[0] === "number") {
+    const trailing = rest[1];
+    const opts = trailing !== null && typeof trailing === "object" ? (trailing as MoveToOptions) : {};
+    return { point: { x: point, y: options, z: rest[0] }, options: opts };
+  }
+  return null;
 }
 
 /** Client-side position validation for move_to: each axis a finite number. */
@@ -200,6 +281,10 @@ export const KNOWN_ERROR_CODES = [
   // guid-taking actions
   "missing_guid",
   "invalid_guid",
+  // raw passthrough (ADR-0025)
+  "opcode_not_allowed",
+  "invalid_payload",
+  "payload_too_large",
 ] as const;
 
 export type KnownErrorCode = (typeof KNOWN_ERROR_CODES)[number];
@@ -296,9 +381,19 @@ const ERROR_CODE_HINTS: Record<string, string> = {
   timeout: "the module's internal wait ran out — the world may be busy; retry once before assuming failure",
   invalid_guid:
     "the guid did not parse as a decimal u64 string — pass unit.guid exactly as the state cache gave it, never a rounded number",
+  weak_token:
+    "the session token is shorter than 32 characters — the module refuses guessable tokens; " +
+    "the runner issues a random one per run, so this means a hand-passed token needs replacing",
   item_not_usable:
     "the server refused CMSG_USE_ITEM for that bag/slot — the item there has no on-use effect, " +
     "or the slot is empty or shifted (slots move after looting/selling); check state.bag()",
+  opcode_not_allowed:
+    "sdk.raw() only sends the CMSG_* names on the module's allowlist (module/PROTOCOL.md, \"raw\"); " +
+    "an opcode that already has a dedicated sdk method must go through that method",
+  invalid_payload:
+    "the raw payload did not reach the module as whole hex bytes — pass a field list like " +
+    "[{ u32: id }, { guid: unit.guid }] and let the SDK pack it",
+  payload_too_large: "a raw payload is capped at 512 bytes — no client packet on the allowlist needs more",
 };
 
 export class WrathRequestError extends Error {
@@ -331,6 +426,18 @@ export interface ConnectOptions {
   baseUrl: string;
   /** Opaque session id chosen by the caller; scopes both actions and events. */
   token: string;
+  /**
+   * The game account this run occupies, bound operator-side exactly like
+   * `token` (ADR-0016, addendum 2026-08-22). When set it is authoritative: it
+   * fills an omitted `createSession`/`deleteCharacter` account and overrides any
+   * account the model typed, so a snippet can never land on — or delete on —
+   * the wrong account (the RUNNER6→RUNNER cross-lane corruption this closes).
+   * Which account a run occupies is fleet infra, not a model decision, so the
+   * model is not told it and cannot choose it. Left undefined (standalone /
+   * MCP) the prior behavior stands: the caller's account, else the module
+   * default.
+   */
+  account?: string;
   /** Defaults to `baseUrl` with an `ws://`/`wss://` scheme. */
   eventsUrl?: string;
   /** Open the event stream during `connect`. Default true; see the note below. */
@@ -340,6 +447,16 @@ export interface ConnectOptions {
   fetchImpl?: typeof fetch;
   events?: Omit<EventStreamOptions, "url" | "token">;
   state?: { chatTail?: number; notificationTail?: number };
+  /**
+   * Default abort signal for every wait the client performs (`moveTo`,
+   * `waitForTransfer`, `killTarget`, `turnInQuest`, … — anything that awaits an
+   * event with a deadline). A function is consulted at the start of each wait,
+   * which is how the runner threads the *current snippet's* signal in without
+   * the snippet passing anything: when a snippet is abandoned, the waits it
+   * left behind reject with `EventAbortedError` instead of outliving it. An
+   * explicit `signal` on a call still wins. Undefined means no default.
+   */
+  signal?: AbortSignal | (() => AbortSignal | undefined);
 }
 
 export interface WaitForChatOptions {
@@ -388,14 +505,146 @@ export type MoveResult =
       readonly position: UnitPosition;
       readonly seq: number;
       readonly ts: number;
+      /**
+       * Present when the navmesh resolved the request to a ground z more than
+       * 1y from the z asked for: the move still arrived (x/y matched), and this
+       * is the z it actually walked to. Quote it next time.
+       */
+      readonly meshZ?: number;
+      /** Present with a hint only when `meshZ` is: what the z difference means. */
+      readonly hint?: string;
+      /**
+       * Present when the move ended aboard a transport (tram car, boat) that
+       * the server is now carrying the character on. `state.self.position`
+       * keeps updating from `WB_RIDE_PROGRESS` for the ride.
+       */
+      readonly onTransport?: { readonly guid: string; readonly entry: number };
+    }
+  | {
+      readonly ok: true;
+      readonly status: "transferred";
+      readonly moveId: number;
+      /** Where the character was on the old map when the portal took it. */
+      readonly position: UnitPosition;
+      readonly seq: number;
+      readonly ts: number;
+      /** The map and arrival point `SMSG_NEW_WORLD` announced, server-confirmed. */
+      readonly to: WorldPosition;
+      readonly hint: string;
     }
   | {
       readonly ok: false;
-      readonly status: Exclude<KnownMoveStatus, "arrived"> | (string & {});
+      readonly status: Exclude<KnownMoveStatus, "arrived" | "transferred"> | (string & {});
       readonly moveId: number;
       readonly position: UnitPosition;
       readonly seq: number;
       readonly ts: number;
+      /**
+       * `path_incomplete` only: how far the mesh could get toward the request
+       * (the module already tried one subdivision from here). Route around, or
+       * approach from another side.
+       */
+      readonly reachedPos?: Point3;
+      /** What the status means and what to try next. See `MOVE_HINTS`. */
+      readonly hint?: string;
+    };
+
+/**
+ * Per-status recovery recipes (ADR-0016 rule 2: what happened, what it means,
+ * the next step), in the result rather than in a trajectory nobody reads twice.
+ * Before the module split `no_path` into causes (FOLLOW-UPS 38 N1) one hint
+ * covered four failures and qwen (2026-08-22 roster) spent 8 turns discovering
+ * which one it had; the cause is now the module's word and the hint is only the
+ * recovery that follows from it.
+ */
+export const MOVE_HINTS: Readonly<Record<string, (point: MovePoint, data: MoveResultData) => string>> = {
+  too_far: (p, d) =>
+    `(${fmtXY(p)}) is ${Math.round(Math.hypot(p.x - d.pos.x, p.y - d.pos.y))}y away in a straight line; ` +
+    `a single moveTo covers ~250y. Walk to an intermediate point first.`,
+  no_mesh: (p) =>
+    `no navmesh is loaded under you or under (${fmtXY(p)}); this is a harness data limitation, not a route ` +
+    `problem. Nothing to retry here — choose a destination in a mapped area.`,
+  target_off_mesh: (p) =>
+    `(${fmtXY(p)}) is not on walkable ground within 4y (z is searched ±50y, so a wrong z alone is not the ` +
+    `cause). Pick a point on a road or floor, or where an NPC stands.`,
+  start_off_mesh: () =>
+    `the character is standing somewhere the navmesh does not cover (a transport deck, a ledge). Step a ` +
+    `few yards onto ordinary ground, or wait for the transport to dock, then retry.`,
+  path_incomplete: (p, d) =>
+    `the walkable mesh has no continuous route to (${fmtXY(p)})` +
+    (d.reachedPos ? `; it ends at (${fmtXY(d.reachedPos)})` : "") +
+    `. The module already tried one subdivision. Route around (a road, a ramp, a door) or approach from ` +
+    `another side.`,
+  interrupted: () =>
+    `the move stopped early (death, root, stun, or the server rejected the movement). Check state.self, ` +
+    `then retry from where you are.`,
+};
+
+function fmtXY(p: { x: number; y: number }): string {
+  return `${p.x.toFixed(1)}, ${p.y.toFixed(1)}`;
+}
+
+export interface WaitForTransferOptions {
+  /** How long to wait for `SMSG_NEW_WORLD`. Default 15000: a far teleport is a few server ticks. */
+  timeout?: number;
+  /** When given, arriving on any other map is reported as `wrong_map` rather than success. */
+  expectMap?: number;
+  /**
+   * Only consider transfer packets with `seq > sinceSeq`. Default: the
+   * stream position when the call is made, so a transfer that already
+   * completed earlier cannot be mistaken for this one. `moveTo` passes the
+   * position from before its move, because `SMSG_NEW_WORLD` can land before
+   * the `WB_MOVE_RESULT` that says `transferred`.
+   */
+  sinceSeq?: number;
+}
+
+/**
+ * The outcome of waiting for a map transfer — returned, never thrown, for the
+ * same reason as `MoveResult` (ADR-0011): every arm is the game answering, and
+ * the bounded-wait statuses FOLLOW-UPS 38 N1 asks for (`waiting`, `wrong_map`)
+ * are answers too, not absences.
+ */
+export type TransferResult =
+  | {
+      readonly ok: true;
+      readonly status: "transferred";
+      /** Server-announced arrival map and point (`SMSG_NEW_WORLD`), now on `state.self.position`. */
+      readonly to: WorldPosition;
+      readonly seq: number;
+      readonly ts: number;
+    }
+  | {
+      readonly ok: false;
+      readonly status: "aborted";
+      readonly toMap: number;
+      /** `TransferAbortReason` as the server sent it (`SMSG_TRANSFER_ABORTED.reason`). */
+      readonly reason: number;
+      readonly seq: number;
+      readonly ts: number;
+      readonly hint: string;
+    }
+  | {
+      readonly ok: false;
+      readonly status: "waiting";
+      /** The destination `SMSG_TRANSFER_PENDING` announced before the deadline ran out. */
+      readonly toMap: number;
+      readonly hint: string;
+    }
+  | {
+      readonly ok: false;
+      readonly status: "no_transfer";
+      readonly hint: string;
+    }
+  | {
+      readonly ok: false;
+      readonly status: "wrong_map";
+      readonly expected: number;
+      readonly actual: number;
+      readonly to: WorldPosition;
+      readonly seq: number;
+      readonly ts: number;
+      readonly hint: string;
     };
 
 export interface WaitForNearbyOptions {
@@ -487,6 +736,112 @@ export type KillResult =
     } & KillResultFacts);
 
 /** How each outcome reads, before the note and the armed/disarmed clause. */
+/**
+ * Straight-line yards to an object in view, rounded to 2dp — `undefined` when
+ * either side's position is unobserved. The one distance every questgiver
+ * failure message quotes. Module-level, not a method: it is an explanation
+ * detail, not new public surface (ADR-0015).
+ */
+function distanceToUnit(state: StateCache, guid: GuidArg): number | undefined {
+  const obj = state.nearby.get(guidKey(guid));
+  const pos = obj && pointOf(obj)?.value;
+  const self = state.self.position?.value;
+  if (!pos || !self) return undefined;
+  return Math.round(Math.hypot(pos.x - self.x, pos.y - self.y, pos.z - self.z) * 100) / 100;
+}
+
+/** What the core treats as interaction range for a questgiver/trainer, in yards. */
+const INTERACT_RANGE = 5;
+/** `UNIT_NPC_FLAG_QUESTGIVER`. */
+const NPC_FLAG_QUESTGIVER = 0x2;
+/** `GAMEOBJECT_TYPE_QUESTGIVER`. */
+const GO_TYPE_QUESTGIVER = 2;
+/** How long the client-parity queries wait to coalesce one burst of events. */
+const STATUS_QUERY_DEBOUNCE_MS = 150;
+
+/**
+ * The silence-explaining tail of a questgiver timeout, built from the distance
+ * the SDK already knows.
+ *
+ * The core's questgiver handlers return without sending anything when the NPC
+ * is out of range, is not the right NPC, or has nothing for this character —
+ * one silence, three causes, and the old message listed all three with equal
+ * weight. Range is the only one of the three the client can rule out locally,
+ * and in every case observed in the 2026-08-22 roster it was *not* the cause:
+ * laguna sat 0.1y from the giver of a quest McBride ends and spent 135 turns
+ * there. So when the distance says range is fine, the message says so and
+ * names what is left.
+ */
+function questgiverSilence(
+  distance: number | undefined,
+  otherCauses: string,
+  nextStep: string,
+  marker?: QuestGiverMarker,
+): string {
+  const status = marker === undefined ? "" : `${questgiverMarkerClause(marker)} `;
+  if (distance === undefined) {
+    return (
+      `the server stays silent when the NPC is out of interact range (~${INTERACT_RANGE}y), ${otherCauses}. ` +
+      `This SDK has no observed position for that guid, so it cannot tell you which — check state.units() ` +
+      `for the NPC and its distance. ${status}${nextStep}`
+    );
+  }
+  if (distance <= INTERACT_RANGE) {
+    return (
+      `distance: ${distance}y, inside interact range (~${INTERACT_RANGE}y) — so range is NOT the cause here. ` +
+      `What is left: the NPC ${otherCauses}. ${status}${nextStep}`
+    );
+  }
+  return (
+    `distance: ${distance}y, and interact range is ~${INTERACT_RANGE}y — move to the NPC first ` +
+    `(sdk.moveTo). If a closer attempt is also silent, the NPC ${otherCauses}. ${status}${nextStep}`
+  );
+}
+
+/**
+ * What the questgiver marker on an NPC says about a silent call. The marker
+ * is the server's own answer to "what does this NPC have for me", received
+ * before the call was made, so it names the cause the distance cannot.
+ */
+interface QuestGiverMarker {
+  readonly name: ReturnType<typeof questGiverStatusName>;
+  /** What the call needed the marker to be. */
+  readonly wanted: "reward" | "available";
+  readonly questId?: number;
+}
+
+function questgiverMarkerClause(m: QuestGiverMarker): string {
+  const q = m.questId === undefined ? "" : ` quest ${m.questId}`;
+  if (m.wanted === "reward") {
+    const isReward = m.name === "reward" || m.name === "reward2" || m.name === "reward_rep";
+    if (isReward) return `Its questgiver status is \`${m.name}\`, so it does end a quest that is complete — if the turn-in of${q} stays silent, the quest it ends is a different one.`;
+    if (m.name === "incomplete") return `Its questgiver status is \`incomplete\`, not \`reward\` — it ends a quest in your log whose objectives are not done yet; check state.quest(id).objectives.`;
+    return `Its questgiver status is \`${m.name}\`, not \`reward\` — it is not${q}'s ender (or the quest is not complete).`;
+  }
+  const offers = m.name === "available" || m.name === "available_rep" || m.name === "low_level_available" || m.name === "low_level_available_rep";
+  if (offers) return `Its questgiver status is \`${m.name}\`, so it is offering something — the silence is not "nothing to give".`;
+  if (m.name === "none") return `Its questgiver status is \`none\` — the server says it has no quest for you right now.`;
+  return `Its questgiver status is \`${m.name}\`, not \`available\` — it has nothing on offer for you right now.`;
+}
+
+/** The observed questgiver marker of a unit, named, or undefined when none was observed. */
+function questgiverMarkerOf(state: StateCache, guid: GuidArg, wanted: "reward" | "available", questId?: number): QuestGiverMarker | undefined {
+  const raw = state.nearby.get(guidKey(guid))?.questGiver?.value;
+  if (raw === undefined) return undefined;
+  return { name: questGiverStatusName(raw), wanted, questId };
+}
+
+/**
+ * Record the measured distance on a timeout so a caller can branch on it
+ * without parsing the message. Any other error passes through untouched.
+ */
+function withDistance<E>(error: E, distance: number | undefined): E {
+  if (error instanceof EventTimeoutError && distance !== undefined) {
+    (error as EventTimeoutError & { distance?: number }).distance = distance;
+  }
+  return error;
+}
+
 const KILL_DETAIL: Record<KillResult["status"], string> = {
   killed: "target died",
   player_died: "we died",
@@ -626,6 +981,98 @@ export type QuestTurnInResult =
       readonly hint: string;
     };
 
+// ------------------------------------------------------------------ trainers
+
+/**
+ * `SMSG_TRAINER_LIST.state`, as `Trainer::SpellState` in the pinned core.
+ *
+ * The single place the numbers are interpreted, deliberately: the module
+ * serves the server's byte verbatim, so if that enum is ever read differently
+ * a correction is this one object.
+ */
+export const TRAINER_SPELL_STATE = {
+  /** Green in a client's trainer window: the server will teach it now. */
+  learnable: 0,
+  /** Red: level, skill, prerequisite or class blocks it. */
+  unavailable: 1,
+  /** Gray: already known. */
+  known: 2,
+} as const;
+
+/**
+ * `SMSG_TRAINER_BUY_FAILED.reason`, as `Trainer::FailReason` in the pinned
+ * core, rendered the way `CHAR_RESPONSE_HINTS` renders char-create codes: the
+ * numeric reason is the server's word and always reported; this is the
+ * client-visible sentence for it. An unknown reason renders without one.
+ */
+const TRAINER_BUY_FAIL_HINTS: Record<number, string> = {
+  0: "the trainer will not teach it — wrong class or trainer, or a prerequisite is missing",
+  1: "not enough money",
+  2: "not enough skill (or level, or a missing prerequisite)",
+};
+
+/** One row of a trainer's list, plus what the SDK could derive about it. */
+export interface TrainerSpell extends TrainerSpellData {
+  /** True when `state` is green: the server will teach this right now. */
+  readonly learnable: boolean;
+  /**
+   * Whether the observed money covers `cost`. `undefined` while money is
+   * unobserved (it is a self-only PRIVATE update field, so it is absent until
+   * an update block has carried it) — never guessed.
+   */
+  readonly affordable: boolean | undefined;
+}
+
+/** What a trainer teaches. An empty `spells` is an answer, not a failure. */
+export interface TrainerListResult {
+  readonly ok: true;
+  /** 0 class, 1 mount, 2 tradeskill, 3 pet — the server's own classification. */
+  readonly trainerType: number;
+  readonly spells: readonly TrainerSpell[];
+}
+
+/**
+ * The outcome of buying one spell, as a value (ADR-0011): `buy_failed` is the
+ * server answering the question that was asked, not the call being wrong.
+ * `reason` is the raw `SMSG_TRAINER_BUY_FAILED` code.
+ */
+export type BuySpellResult =
+  | { readonly ok: true; readonly status: "learned"; readonly spellId: number }
+  | {
+      readonly ok: false;
+      readonly status: "buy_failed";
+      readonly spellId: number;
+      readonly reason: number;
+      readonly hint: string;
+    };
+
+export interface TrainerOptions {
+  timeout?: number;
+}
+
+/**
+ * The outcome of `learnTalent`, as a value (ADR-0011). The server always
+ * answers `CMSG_LEARN_TALENT` with a fresh `SMSG_TALENTS_INFO`, whether or
+ * not it learned anything; `learned` is read off that answer.
+ */
+export type LearnTalentResult =
+  | { readonly ok: true; readonly status: "learned"; readonly talentId: number; readonly rank: number; readonly talents: TalentState }
+  | {
+      readonly ok: false;
+      readonly status: "not_learned";
+      readonly talentId: number;
+      readonly rank: number;
+      readonly talents: TalentState;
+      readonly hint: string;
+    };
+
+export interface RawActionResponse extends ActionResponse {
+  /** The opcode name as sent. */
+  readonly opcode: string;
+  /** The body bytes as sent, hex. */
+  readonly payload: string;
+}
+
 /**
  * Connect to the module and (by default) subscribe to the event stream.
  *
@@ -647,11 +1094,17 @@ export class WrathClient {
   readonly events: EventStream;
   readonly state: StateCache;
 
+  /** The operator-bound game account (ADR-0016). Authoritative when set; see ConnectOptions.account. */
+  private readonly boundAccount: string | undefined;
   private readonly fetchImpl: typeof fetch;
   private readonly requestTimeoutMs: number;
+  private readonly defaultSignal: (() => AbortSignal | undefined) | undefined;
 
   constructor(options: ConnectOptions) {
     this.token = options.token;
+    this.boundAccount = options.account;
+    const sig = options.signal;
+    this.defaultSignal = sig === undefined ? undefined : typeof sig === "function" ? sig : () => sig;
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
@@ -665,6 +1118,126 @@ export class WrathClient {
     this.state = new StateCache(options.state ?? {});
     // Registered before the socket opens, so the cache sees every frame.
     this.events.onAny((event: StreamEvent) => this.state.apply(event));
+    this.events.onAny((event: StreamEvent) => this.clientParityQueries(event));
+  }
+
+  // ------------------------------------------------ client-parity queries
+  //
+  // Queries a real 3.3.5a client fires on its own, without the player doing
+  // anything, so that the state cache sees what the client's screen shows.
+  // They are issued from the event fold, bounded the way the client bounds
+  // them, and their failures are dropped: none of them is an action the model
+  // asked for, and a session that is not in world simply has nothing to ask.
+  //
+  //  - `questgiver_status_query` once per questgiver-flagged unit/gameobject
+  //    that comes into view (the client does this to draw the !/? marker),
+  //    skipped when a status for that guid already arrived in the same burst.
+  //    The core's unprompted login-time `SMSG_QUESTGIVER_STATUS_MULTIPLE` is
+  //    empty (sent before visibility is populated; verified live 2026-08-22),
+  //    so these per-guid queries are what populate the initial view.
+  //  - `questgiver_status_multiple_query` when the quest log's membership or
+  //    a quest's complete bit changes (the client re-requests every marker on
+  //    a quest-log update; counters alone do not move a marker, so they do
+  //    not trigger it).
+  //  - `quest_query` once per quest id that appears in the log (the client's
+  //    template fetch); re-issued if the quest leaves the log and returns.
+
+  private readonly statusKnown = new Set<string>();
+  private readonly statusPending = new Set<string>();
+  private statusFlushTimer: ReturnType<typeof setTimeout> | undefined;
+  private multipleTimer: ReturnType<typeof setTimeout> | undefined;
+  private questLogKey: string | undefined;
+  private readonly questQueried = new Set<number>();
+
+  private clientParityQueries(event: StreamEvent): void {
+    if (isDecodeError(event.data) || ("schemaError" in event && event.schemaError !== undefined)) return;
+    switch (event.opcode) {
+      case "SMSG_UPDATE_OBJECT": {
+        const d = event.data as { objects: readonly Record<string, unknown>[] };
+        for (const block of d.objects) {
+          if (block["update"] === "create" && block["self"] !== true) {
+            const guid = block["guid"] as string;
+            if (this.state.self.guid !== undefined && guid === this.state.self.guid) continue;
+            const fields = (block["fields"] ?? {}) as Record<string, unknown>;
+            const npcFlags = typeof fields["npcFlags"] === "number" ? fields["npcFlags"] : 0;
+            const goType = typeof fields["goType"] === "number" ? fields["goType"] : -1;
+            const isQuestGiver = (npcFlags & NPC_FLAG_QUESTGIVER) !== 0 || goType === GO_TYPE_QUESTGIVER;
+            if (isQuestGiver && !this.statusKnown.has(guid)) this.statusPending.add(guid);
+          } else if (block["update"] === "outOfRange") {
+            for (const g of block["guids"] as string[]) this.forgetStatus(g);
+          }
+        }
+        if (this.statusPending.size > 0 && this.statusFlushTimer === undefined) {
+          this.statusFlushTimer = setTimeout(() => this.flushStatusQueries(), STATUS_QUERY_DEBOUNCE_MS);
+        }
+        break;
+      }
+      case "SMSG_DESTROY_OBJECT":
+        this.forgetStatus((event.data as { guid: string }).guid);
+        break;
+      case "SMSG_QUESTGIVER_STATUS": {
+        const d = event.data as QuestGiverStatusData;
+        this.statusKnown.add(d.guid);
+        this.statusPending.delete(d.guid);
+        break;
+      }
+      case "SMSG_QUESTGIVER_STATUS_MULTIPLE": {
+        const d = event.data as QuestGiverStatusMultipleData;
+        for (const row of d.statuses) {
+          this.statusKnown.add(row.guid);
+          this.statusPending.delete(row.guid);
+        }
+        break;
+      }
+      default:
+        break;
+    }
+    this.trackQuestLog();
+  }
+
+  private forgetStatus(guid: string): void {
+    this.statusKnown.delete(guid);
+    this.statusPending.delete(guid);
+  }
+
+  private flushStatusQueries(): void {
+    this.statusFlushTimer = undefined;
+    const guids = [...this.statusPending];
+    this.statusPending.clear();
+    for (const guid of guids) {
+      if (this.statusKnown.has(guid)) continue;
+      this.statusKnown.add(guid);
+      this.fireAndForget({ action: "questgiver_status_query", guid });
+    }
+  }
+
+  private trackQuestLog(): void {
+    const log = this.state.questLog;
+    const key = log.map((q) => `${q.questId}:${q.complete ? 1 : 0}`).join(",");
+    if (key === this.questLogKey) return;
+    const first = this.questLogKey === undefined;
+    this.questLogKey = key;
+    const inLog = new Set(log.map((q) => q.questId));
+    for (const id of this.questQueried) if (!inLog.has(id)) this.questQueried.delete(id);
+    for (const id of inLog) {
+      if (this.questQueried.has(id)) continue;
+      this.questQueried.add(id);
+      if (!this.state.quests.has(id)) this.fireAndForget({ action: "quest_query", questId: id });
+    }
+    // The first fold of the log is our own create block at login; the markers
+    // for the initial view come from the per-guid spawn queries above, so no
+    // refresh is owed yet — only a later change to the log earns one.
+    if (first || this.multipleTimer !== undefined) return;
+    this.multipleTimer = setTimeout(() => {
+      this.multipleTimer = undefined;
+      this.fireAndForget({ action: "questgiver_status_multiple_query" });
+    }, STATUS_QUERY_DEBOUNCE_MS);
+  }
+
+  private fireAndForget(body: ActionBody): void {
+    this.action(body).catch(() => {
+      /* a client-parity query has no caller to report to */
+    });
   }
 
   // ------------------------------------------------------------- endpoints
@@ -701,7 +1274,15 @@ export class WrathClient {
     // here on must never match buffered events of an earlier session. Advanced
     // before the POST so the login handshake events land in the new epoch.
     this.events.advanceEpoch();
-    const body: CreateSessionRequest = { token: this.token, ...request };
+    // Account is operator infra, bound like `token`: when the run bound one it
+    // is authoritative and placed *after* the spread, so it fills an omitted
+    // account and overrides one the model typed (which it should never supply —
+    // it is not told the account). Unbound, the request's own account (else the
+    // module default) stands, preserving standalone/MCP behavior. This is what
+    // closes the RUNNER6→RUNNER cross-lane eviction: an omitted-account
+    // createSession can no longer default onto a shared account.
+    const account = this.boundAccount ?? request.account;
+    const body: CreateSessionRequest = { token: this.token, ...request, account };
     const res = await this.request("POST", "/session", body, sessionResponseSchema);
     this.state.seedSelf({ guid: res.guid, name: res.character });
     return res;
@@ -813,9 +1394,12 @@ export class WrathClient {
     return this.action({ action: "cancel_cast", spellId });
   }
 
-  /** `CMSG_GAMEOBJ_USE` — chests, doors, quest objects. */
-  interact(guid: GuidArg): Promise<ActionResponse> {
-    return this.action({ action: "interact", guid: guidArg(guid, "interact(guid)") });
+  /**
+   * `CMSG_GAMEOBJ_USE` — chests, doors, quest objects. Takes the guid string or
+   * a unit from `state.units(...)` / `state.closest(...)`.
+   */
+  interact(target: GuidOrUnit): Promise<ActionResponse> {
+    return this.action({ action: "interact", guid: guidOf(target, "interact(guid)") });
   }
 
   /** `CMSG_GOSSIP_HELLO` — opens the NPC menu (`SMSG_GOSSIP_MESSAGE`). */
@@ -823,9 +1407,37 @@ export class WrathClient {
     return this.action({ action: "gossip_hello", guid: guidArg(guid, "gossipHello(guid)") });
   }
 
-  /** `CMSG_GOSSIP_SELECT_OPTION`; ids come from `SMSG_GOSSIP_MESSAGE`. */
-  gossipSelect(guid: GuidArg, menuId: number, optionId: number): Promise<ActionResponse> {
-    return this.action({ action: "gossip_select", guid: guidArg(guid, "gossipSelect(guid, ...)"), menuId, optionId });
+  /**
+   * `CMSG_GOSSIP_SELECT_OPTION`; ids come from `SMSG_GOSSIP_MESSAGE`.
+   *
+   * Two forms. The raw form takes the numeric `menuId` and `optionId` straight
+   * off the packet. The convenience form takes just an `option` — an option's
+   * visible `text` (case-insensitive exact, or a unique substring) or its
+   * `optionId` — and resolves it against the menu last observed open for this
+   * NPC (`state.lastGossip(guid)`), filling in the `menuId` from there. The
+   * guid itself is always the raw string form: no name resolution on the
+   * referent, only on the option within an already-open menu.
+   *
+   * The convenience form throws (nothing is dispatched) when no menu is open
+   * for the guid, when the text matches no option or more than one, or when a
+   * numeric option is not on the menu — every rejection lists the options so
+   * the next call is obvious (ADR-0016). A menu is only ever read from the
+   * `SMSG_GOSSIP_MESSAGE`/`SMSG_GOSSIP_COMPLETE` fold; the server is not
+   * queried.
+   */
+  gossipSelect(guid: GuidArg, option: string | number): Promise<ActionResponse>;
+  gossipSelect(guid: GuidArg, menuId: number, optionId: number): Promise<ActionResponse>;
+  async gossipSelect(guid: GuidArg, a: string | number, b?: number): Promise<ActionResponse> {
+    const id = guidArg(guid, "gossipSelect(guid, ...)");
+    if (b !== undefined) {
+      // Raw form: caller supplied both menuId and optionId.
+      return this.action({ action: "gossip_select", guid: id, menuId: a as number, optionId: b });
+    }
+    // Convenience form: resolve against the last observed menu. `async`, so a
+    // bad option is a rejected promise like every other helper, not a
+    // synchronous throw.
+    const { menuId, optionId } = this.resolveGossipOption(id, a);
+    return this.action({ action: "gossip_select", guid: id, menuId, optionId });
   }
 
   /**
@@ -855,6 +1467,29 @@ export class WrathClient {
   /** `CMSG_QUESTGIVER_CHOOSE_REWARD`; index into `choiceRewards`, 0 when none. */
   questChooseReward(guid: GuidArg, questId: number, rewardIndex = 0): Promise<ActionResponse> {
     return this.action({ action: "quest_choose_reward", guid: guidArg(guid, "questChooseReward(guid, ...)"), questId, rewardIndex });
+  }
+
+  /**
+   * `CMSG_QUEST_QUERY` — the quest template (title, objective text, required
+   * entries and counts) via `SMSG_QUEST_QUERY_RESPONSE`, folded into
+   * `state.quests` and onto `state.quest(id).objectives`. The SDK already
+   * sends this for every quest that enters the log; call it only for a quest
+   * you do not hold.
+   */
+  questQuery(questId: number): Promise<ActionResponse> {
+    return this.action({ action: "quest_query", questId });
+  }
+
+  /**
+   * `CMSG_QUESTGIVER_STATUS_QUERY` — the !/? marker for one questgiver, via
+   * `SMSG_QUESTGIVER_STATUS`, folded onto `state.units()` as `questGiver`.
+   * The SDK already sends this for every questgiver that comes into view and
+   * refreshes all of them when the quest log changes; pass no guid to refresh
+   * everything in view now (`CMSG_QUESTGIVER_STATUS_MULTIPLE_QUERY`).
+   */
+  questGiverStatusQuery(guid?: GuidArg): Promise<ActionResponse> {
+    if (guid === undefined) return this.action({ action: "questgiver_status_multiple_query" });
+    return this.action({ action: "questgiver_status_query", guid: guidArg(guid, "questGiverStatusQuery(guid?)") });
   }
 
   /** `CMSG_QUESTLOG_REMOVE_QUEST`; the module maps quest id to log slot. */
@@ -943,6 +1578,26 @@ export class WrathClient {
     }
   }
 
+  /**
+   * `CMSG_TRAINER_LIST` — ask a trainer what it teaches (`SMSG_TRAINER_LIST`).
+   * Prefer `trainerList`, which waits for the answer.
+   */
+  trainerListAsync(guid: GuidArg): Promise<ActionResponse> {
+    return this.action({ action: "trainer_list", guid: guidArg(guid, "trainerList(npcGuid)") });
+  }
+
+  /**
+   * `CMSG_TRAINER_BUY_SPELL` — learn one spell, paid for out of the
+   * character's own money. Prefer `buySpell`, which waits for the verdict.
+   */
+  trainerBuySpellAsync(guid: GuidArg, spellId: number): Promise<ActionResponse> {
+    return this.action({
+      action: "trainer_buy_spell",
+      guid: guidArg(guid, "buySpell(npcGuid, spellId)"),
+      spellId,
+    });
+  }
+
   /** `CMSG_DESTROYITEM`; omit `count` to destroy the whole stack. */
   destroyItem(bag: number, slot: number, count?: number): Promise<ActionResponse> {
     return this.action({ action: "destroy_item", bag, slot, count });
@@ -968,6 +1623,52 @@ export class WrathClient {
    */
   spiritHealerActivate(guid: GuidArg): Promise<ActionResponse> {
     return this.action({ action: "spirit_healer_activate", guid: guidArg(guid, "spiritHealerActivate(guid)") });
+  }
+
+  /**
+   * `CMSG_LEARN_TALENT` — spend one talent point. `rank` is 0-based as on the
+   * wire (0 = the first point in that talent). Prefer `learnTalent`, which
+   * waits for the `SMSG_TALENTS_INFO` answer.
+   */
+  learnTalentAsync(talentId: number, rank: number): Promise<ActionResponse> {
+    return this.action({ action: "learn_talent", talentId, rank });
+  }
+
+  /**
+   * The raw-action escape hatch (ADR-0025, ADR-0015). Sends one client opcode
+   * from the module's allowlist (module/PROTOCOL.md, "raw") with a body you
+   * build: a hex string, bytes, or a field list the SDK packs little-endian —
+   * `[{ u32: 5 }, { guid: unit.guid }, { cstring: "text" }]`. The ack means
+   * "queued into the stock handler"; whatever the server answers arrives on
+   * the event stream only if its opcode is whitelisted there, so an
+   * unanswered raw action is the signal to ask for a surface, not a failure.
+   *
+   * Opcodes that already have a method (`castSpell`, `say`, `lootAll`, …) are
+   * not on the allowlist: one audited path per opcode.
+   */
+  raw(opcode: string, payload: RawPayload = ""): Promise<RawActionResponse> {
+    const op = rawOpcodeSchema.safeParse(opcode);
+    if (!op.success) {
+      throw new TypeError(
+        `raw(opcode, payload): opcode must be a CMSG_* name (got ${JSON.stringify(opcode)}) — ` +
+          `see module/PROTOCOL.md "raw" for the allowlist`,
+      );
+    }
+    const body = rawPayloadSchema.safeParse(payload);
+    if (!body.success) {
+      throw new TypeError(
+        `raw(${opcode}, payload): payload must be a hex string, a Uint8Array, or a list of ` +
+          `{ u8 | u16 | u32 | i32 | f32 | u64 | guid | packedGuid | cstring | bytes } fields — ` +
+          body.error.issues.map((i) => `${i.path.join(".") || "payload"}: ${i.message}`).join("; "),
+      );
+    }
+    const hexPayload = encodeRawPayload(body.data);
+    return this.request(
+      "POST",
+      "/action",
+      { token: this.token, action: "raw", opcode: op.data, payload: hexPayload },
+      actionResponseSchema,
+    ).then((ack) => ({ ...ack, opcode: op.data, payload: hexPayload }));
   }
 
   /**
@@ -1007,7 +1708,12 @@ export class WrathClient {
             // parked session the previous attempt timed out on.
             token: `${this.token}-del${attempt}`,
             character,
-            account: options.account,
+            // Bound account wins here too (ADR-0016): a run must only ever
+            // delete on its assigned account. Deleting on the wrong (idle)
+            // account is a cross-lane hazard even though character-delete
+            // refuses an account another live token holds. Unbound, the
+            // caller's option (else the module default) stands.
+            account: this.boundAccount ?? options.account,
           },
           characterDeleteResponseSchema,
         );
@@ -1048,6 +1754,11 @@ export class WrathClient {
   /** Close the event stream. Does not log the character out. */
   close(): void {
     this.events.close();
+    if (this.statusFlushTimer !== undefined) clearTimeout(this.statusFlushTimer);
+    if (this.multipleTimer !== undefined) clearTimeout(this.multipleTimer);
+    this.statusFlushTimer = undefined;
+    this.multipleTimer = undefined;
+    this.statusPending.clear();
   }
 
   // --------------------------------------------------------------- helpers
@@ -1065,7 +1776,7 @@ export class WrathClient {
     options: WaitForChatOptions = {},
   ): Promise<ChatEntry> {
     const predicate = typeof match === "string" ? (e: ChatEntry) => e.message === match : match;
-    const event = await this.events.waitFor(
+    const event = await this.waitEvent(
       (e) => {
         if (!isEvent(e, "SMSG_MESSAGECHAT") || isDecodeError(e.data)) return false;
         return predicate(toChatEntry(e.seq, e.ts, e.data));
@@ -1097,12 +1808,23 @@ export class WrathClient {
    * A `moveTo` issued while another is running supersedes it; the older call
    * resolves with `status: "superseded"`.
    */
-  async moveTo(point: MovePoint, options: MoveToOptions = {}): Promise<MoveResult> {
+  async moveTo(point: MovePoint, options: MoveToOptions = {}, ...rest: unknown[]): Promise<MoveResult> {
+    // Repair moveTo(x, y, z) → moveTo({ x, y, z }) before anything else; a
+    // legitimate two-arg call passes rest empty and is untouched.
+    const repaired = repairThreeArgMove(point, options, rest);
+    if (repaired !== null) {
+      point = repaired.point;
+      options = repaired.options;
+    }
     const epoch = this.events.epoch;
+    // Stream position before the move: a portal's SMSG_NEW_WORLD can land
+    // before the WB_MOVE_RESULT that says `transferred`, so the transfer wait
+    // has to admit packets from here on, not from the result on.
+    const sinceSeq = this.state.lastSeq;
     const ack = await this.moveToAsync(point);
     // The match is the moveId within the current session epoch, and the buffer
     // is searched: a result can land while the POST response is still in
-    // flight (an immediate `no_path` does exactly that). No `sinceSeq` bound —
+    // flight (an immediate `target_off_mesh` does exactly that). No `sinceSeq` bound —
     // `seq` restarts when a token's session is recreated, so any seq-based
     // floor can outrun the very event it is meant to admit. `moveId` alone is
     // not enough either: the module's generator is per-session and restarts on
@@ -1115,17 +1837,28 @@ export class WrathClient {
     // resolve against a LATER session's colliding moveId (the module's
     // generator restarts at 1 per session). A move whose session is gone has
     // no verdict; timing out is the honest outcome.
-    const event = await this.events.waitFor(
-      (e) =>
-        isEvent(e, "WB_MOVE_RESULT") &&
-        !isDecodeError(e.data) &&
-        (e.data as MoveResultData).moveId === ack.moveId,
-      {
-        timeout: options.timeout ?? 90_000,
-        epoch,
-        description: `the WB_MOVE_RESULT for moveId ${ack.moveId} (move_to verdict)`,
-      },
-    );
+    let event: StreamEvent;
+    try {
+      event = await this.waitEvent(
+        (e) =>
+          isEvent(e, "WB_MOVE_RESULT") &&
+          !isDecodeError(e.data) &&
+          (e.data as MoveResultData).moveId === ack.moveId,
+        {
+          timeout: options.timeout ?? 90_000,
+          epoch,
+          description: `the WB_MOVE_RESULT for moveId ${ack.moveId} (move_to verdict)`,
+        },
+      );
+    } catch (err) {
+      // An abort mid-walk (the runner abandoning the snippet that issued this
+      // move) must not leave the character walking on its own: issue the
+      // existing `stop` — no game semantics beyond "stop walking" — and let
+      // the abort propagate. Its ack is not awaited: the signal holder has
+      // already moved on, and a refusal (`no_session`, …) has nothing to add.
+      if (err instanceof EventAbortedError) void this.stop().catch(() => {});
+      throw err;
+    }
     const data = event.data as MoveResultData;
     const status: MoveStatus = data.status;
     const position: UnitPosition = {
@@ -1135,9 +1868,122 @@ export class WrathClient {
       o: data.pos.o,
     };
     const common = { moveId: data.moveId, position, seq: event.seq, ts: event.ts } as const;
-    return status === "arrived"
-      ? { ok: true, status: "arrived", ...common }
-      : { ok: false, status, ...common };
+    if (status === "arrived") {
+      const aboard = data.onTransport !== undefined ? { onTransport: data.onTransport } : {};
+      if (data.meshZ === undefined) return { ok: true, status: "arrived", ...common, ...aboard };
+      return {
+        ok: true,
+        status: "arrived",
+        ...common,
+        ...aboard,
+        meshZ: data.meshZ,
+        hint:
+          `arrived at (${fmtXY(point)}), but the ground there is at z ${data.meshZ.toFixed(1)}, not ` +
+          `${point.z.toFixed(1)}. The mesh owns z; quote ${data.meshZ.toFixed(1)} for this spot next time.`,
+      };
+    }
+    if (status === "transferred") {
+      // Postcondition, not dispatch: resolve only once the server has named
+      // the new map (FOLLOW-UPS 38 N1). A transfer that never completes is a
+      // typed `ok: false` from waitForTransfer, surfaced with the move status
+      // intact so the caller sees both facts.
+      const transfer = await this.waitForTransfer({ timeout: options.timeout ?? 90_000, sinceSeq, epoch });
+      if (transfer.ok) {
+        return {
+          ok: true,
+          status: "transferred",
+          ...common,
+          to: transfer.to,
+          hint:
+            `a portal took the character to map ${transfer.to.map} at (${fmtXY(transfer.to)}); ` +
+            `state.self.position is on the new map now. Coordinates from the old map no longer apply.`,
+        };
+      }
+      return { ok: false, status: "transferred", ...common, hint: transfer.hint };
+    }
+    const hint = MOVE_HINTS[status]?.(point, data);
+    const reachedPos = data.reachedPos ? { x: data.reachedPos.x, y: data.reachedPos.y, z: data.reachedPos.z } : undefined;
+    return {
+      ok: false,
+      status,
+      ...common,
+      ...(reachedPos !== undefined ? { reachedPos } : {}),
+      ...(hint !== undefined ? { hint } : {}),
+    };
+  }
+
+  /**
+   * Wait for a map transfer to complete, with a typed verdict.
+   *
+   * Resolves on `SMSG_NEW_WORLD` (the server's announcement of the new map
+   * and arrival point, already folded into `state.self.position`), or on
+   * `SMSG_TRANSFER_ABORTED`; a deadline with a transfer pending is `waiting`,
+   * a deadline with no transfer announced at all is `no_transfer`, and an
+   * arrival on a map other than `expectMap` is `wrong_map`. Never sleeps.
+   *
+   * Earned by the travel probe (`infra/smoke/travel.ts`, FOLLOW-UPS item 18):
+   * every version of it before this helper creep-walked into the tram portal
+   * and slept 1.5s per step to see whether a teleport had landed.
+   */
+  async waitForTransfer(options: WaitForTransferOptions & { epoch?: number } = {}): Promise<TransferResult> {
+    const sinceSeq = options.sinceSeq ?? this.state.lastSeq;
+    const epoch = options.epoch ?? this.events.epoch;
+    const timeout = options.timeout ?? 15_000;
+    const after = (e: StreamEvent) => e.seq > sinceSeq && !isDecodeError(e.data);
+    let event: StreamEvent;
+    try {
+      event = await this.waitEvent(
+        (e) => after(e) && (isEvent(e, "SMSG_NEW_WORLD") || isEvent(e, "SMSG_TRANSFER_ABORTED")),
+        { timeout, epoch, description: "SMSG_NEW_WORLD or SMSG_TRANSFER_ABORTED (map transfer verdict)" },
+      );
+    } catch (err) {
+      if (!(err instanceof EventTimeoutError)) throw err;
+      const pending = this.state.self.transfer?.value;
+      if (pending !== undefined) {
+        return {
+          ok: false,
+          status: "waiting",
+          toMap: pending.toMap,
+          hint:
+            `the server announced a transfer to map ${pending.toMap} but no SMSG_NEW_WORLD arrived within ` +
+            `${timeout}ms. The teleport is still pending server-side; call waitForTransfer() again.`,
+        };
+      }
+      return {
+        ok: false,
+        status: "no_transfer",
+        hint:
+          `no map transfer was announced within ${timeout}ms. The character did not enter a portal; ` +
+          `check state.self.position and move onto the portal (an areatrigger fires on entry).`,
+      };
+    }
+    if (isEvent(event, "SMSG_TRANSFER_ABORTED")) {
+      const d = event.data as TransferAbortedData;
+      return {
+        ok: false,
+        status: "aborted",
+        toMap: d.map,
+        reason: d.reason,
+        seq: event.seq,
+        ts: event.ts,
+        hint: `the server refused the transfer to map ${d.map} (TransferAbortReason ${d.reason}); the character stays where it was.`,
+      };
+    }
+    const d = event.data as NewWorldData;
+    const to: WorldPosition = { map: d.map, x: d.x, y: d.y, z: d.z, o: d.o };
+    if (options.expectMap !== undefined && d.map !== options.expectMap) {
+      return {
+        ok: false,
+        status: "wrong_map",
+        expected: options.expectMap,
+        actual: d.map,
+        to,
+        seq: event.seq,
+        ts: event.ts,
+        hint: `the transfer landed on map ${d.map}, not the expected ${options.expectMap}; state.self.position reflects map ${d.map}.`,
+      };
+    }
+    return { ok: true, status: "transferred", to, seq: event.seq, ts: event.ts };
   }
 
   /**
@@ -1170,7 +2016,7 @@ export class WrathClient {
     if (already) return already;
 
     let hit: NearbyObject | undefined;
-    await this.events.waitFor(
+    await this.waitEvent(
       () => {
         hit = scan();
         return hit !== undefined;
@@ -1230,8 +2076,8 @@ export class WrathClient {
    * request. The caller is expected to loot afterwards: `killTarget` does not,
    * because a fight and a corpse are two decisions.
    */
-  async killTarget(guid: GuidArg, options: KillTargetOptions = {}): Promise<KillResult> {
-    const raw = guidArg(guid, "killTarget(guid)");
+  async killTarget(target: GuidOrUnit, options: KillTargetOptions = {}): Promise<KillResult> {
+    const raw = guidOf(target, "killTarget(guid)");
     // Canonicalised ("007" -> "7"), because it is used as the nearby-cache map
     // key and the cache's own keys are canonical (guidSchema round-trips every
     // wire guid). A raw string that does not parse names nothing and would
@@ -1346,6 +2192,7 @@ export class WrathClient {
       let rearms = 0;
       let rearmNotBefore = 0;
       for (;;) {
+        this.throwIfAborted("killTarget's fight loop");
         if (targetDead()) return done("killed");
         if (selfDead()) return done("player_died");
         if (this.state.nearby.has(key)) sawTarget = true;
@@ -1413,8 +2260,8 @@ export class WrathClient {
    * is `{ ok: false, status: "empty" }` — an answer, not a failure. Silence is
    * neither, so it still throws `EventTimeoutError`.
    */
-  async lootCorpse(guid: GuidArg, options: LootOptions = {}): Promise<LootResult> {
-    const id = guidArg(guid, "lootCorpse(guid)");
+  async lootCorpse(target: GuidOrUnit, options: LootOptions = {}): Promise<LootResult> {
+    const id = guidOf(target, "lootCorpse(guid)");
     const timeout = options.timeout ?? 10_000;
     const sinceSeq = this.events.recent(1)[0]?.seq;
     // Collected live from before the action goes out, so a push can never slip
@@ -1427,7 +2274,7 @@ export class WrathClient {
     });
     try {
       await this.lootAll(id);
-      const first = await this.events.waitFor(
+      const first = await this.waitEvent(
         (e) =>
           (isEvent(e, "SMSG_LOOT_RESPONSE") || isEvent(e, "SMSG_LOOT_RELEASE_RESPONSE")) &&
           !isDecodeError(e.data) &&
@@ -1442,7 +2289,7 @@ export class WrathClient {
       // or owned outright (4, OWNER — every slot of a solo loot). Group-only
       // slot types are shown but never auto-stored.
       const expected = window.items.filter((i) => i.slotType === 0 || i.slotType === 4).length;
-      const release = await this.events.waitFor((e) => isEvent(e, "SMSG_LOOT_RELEASE_RESPONSE"), {
+      const release = await this.waitEvent((e) => isEvent(e, "SMSG_LOOT_RELEASE_RESPONSE"), {
         timeout,
         sinceSeq: first.seq + 1,
         includeBuffered: true,
@@ -1454,7 +2301,7 @@ export class WrathClient {
       let graceSince = release.seq + 1;
       while (stored.length < expected && Date.now() < deadline) {
         try {
-          const push = await this.events.waitFor(
+          const push = await this.waitEvent(
             (e) => isEvent(e, "SMSG_ITEM_PUSH_RESULT") && !isDecodeError(e.data),
             { timeout: Math.max(1, deadline - Date.now()), sinceSeq: graceSince },
           );
@@ -1482,36 +2329,187 @@ export class WrathClient {
    * turn-in chain may already have added the quest for us.
    */
   async acceptQuestFrom(
-    npcGuid: GuidArg,
+    npcGuid: GuidOrUnit,
     questId: number,
     options: QuestOptions = {},
   ): Promise<QuestAcceptResult> {
+    const npc = guidOf(npcGuid, "acceptQuestFrom(npcGuid, questId)");
     const timeout = options.timeout ?? 10_000;
     const inLog = this.state.quest(questId);
     if (inLog) {
       return { ok: true, status: "already_in_log", questId, quest: inLog, title: undefined };
     }
 
-    const sinceSeq = this.events.recent(1)[0]?.seq;
-    await this.questList(npcGuid);
-    const menu = await this.events.waitFor(
-      (e) =>
-        (isEvent(e, "SMSG_QUESTGIVER_QUEST_LIST") || isEvent(e, "SMSG_GOSSIP_MESSAGE")) &&
-        !isDecodeError(e.data) &&
-        (sinceSeq === undefined || e.seq > sinceSeq),
-      { timeout, description: "the questgiver's quest list (SMSG_QUESTGIVER_QUEST_LIST or SMSG_GOSSIP_MESSAGE)" },
-    );
-    const offered = (menu.data as QuestGiverQuestListData | GossipMessageData).quests ?? [];
+    const offered = await this.questOffer(npc, timeout);
     const wanted = offered.find((q) => q.questId === questId);
     if (!wanted) return { ok: false, status: "not_offered", questId, offered };
 
-    await this.questAccept(npcGuid, questId);
+    await this.questAccept(npc, questId);
     const quest = await this.waitForState(
       () => this.state.quest(questId),
       timeout,
       `quest ${questId} to appear in the quest log after accept`,
     );
     return { ok: true, status: "accepted", questId, quest, title: wanted.title };
+  }
+
+  /**
+   * Ask an NPC what quests it is offering, and return the list.
+   *
+   * The same `quest_list` send-and-wait `acceptQuestFrom` does — including
+   * accepting *either* answer shape, since a gossip-flagged questgiver replies
+   * with `SMSG_GOSSIP_MESSAGE` carrying the quests instead of
+   * `SMSG_QUESTGIVER_QUEST_LIST` — with none of the accepting. Models kept
+   * rebuilding exactly this by hand over `questList` plus event scraping and
+   * getting confused by their own nulls (FOLLOW-UPS 9a).
+   *
+   * An empty `quests` is an answer: the NPC has nothing for this character
+   * right now. Silence is not, so it still throws `EventTimeoutError`.
+   */
+  async questsAvailableFrom(
+    npcGuid: GuidOrUnit,
+    options: QuestOptions = {},
+  ): Promise<{ ok: true; quests: readonly OfferedQuest[] }> {
+    const npc = guidOf(npcGuid, "questsAvailableFrom(npcGuid)");
+    const quests = await this.questOffer(npc, options.timeout ?? 10_000);
+    return { ok: true, quests };
+  }
+
+  /**
+   * Ask a trainer what it teaches.
+   *
+   * Two derived fields per row, because both are questions a caller always has
+   * and neither is on the wire: `learnable` is the server's own green/red/gray
+   * state reduced to the one bit that matters, and `affordable` compares the
+   * cost against *observed* money — `undefined` while money is unobserved, not
+   * guessed. The two are independent: the server's state says nothing about
+   * money, so a green spell can still fail to buy.
+   *
+   * The core's handler returns silently when the NPC is out of interaction
+   * range, is not a trainer, or trains another class, so nothing distinguishes
+   * those from a slow answer: they all surface as `EventTimeoutError`.
+   */
+  async trainerList(npcGuid: GuidOrUnit, options: TrainerOptions = {}): Promise<TrainerListResult> {
+    const id = guidKey(guidOf(npcGuid, "trainerList(npcGuid)"));
+    const sinceSeq = this.events.recent(1)[0]?.seq;
+    await this.trainerListAsync(id);
+    const event = await this.waitEvent(
+      (e) =>
+        isEvent(e, "SMSG_TRAINER_LIST") &&
+        !isDecodeError(e.data) &&
+        (e.data as TrainerListData).guid === id &&
+        (sinceSeq === undefined || e.seq > sinceSeq),
+      {
+        timeout: options.timeout ?? 10_000,
+        description:
+          `the SMSG_TRAINER_LIST for ${id} — the server stays silent when the NPC is out of ` +
+          `interact range (~5y), is not a trainer, or trains another class`,
+      },
+    );
+    const data = event.data as TrainerListData;
+    const money = this.state.money?.value;
+    return {
+      ok: true,
+      trainerType: data.trainerType,
+      spells: data.spells.map((s) => ({
+        ...s,
+        learnable: s.state === TRAINER_SPELL_STATE.learnable,
+        affordable: money === undefined ? undefined : money >= s.cost,
+      })),
+    };
+  }
+
+  /**
+   * Spend a talent point and wait for the server's verdict.
+   *
+   * The handler answers every `CMSG_LEARN_TALENT` with `SMSG_TALENTS_INFO`,
+   * so the verdict is whether that answer shows `talentId` at `rank` (0-based,
+   * as on the wire). A refusal is a value, not a throw: the server says
+   * nothing about *why* (no points, wrong tree tier, prerequisite missing),
+   * so the hint lists what a client checks before enabling the button.
+   */
+  async learnTalent(talentId: number, rank: number, options: TrainerOptions = {}): Promise<LearnTalentResult> {
+    const sinceSeq = this.events.recent(1)[0]?.seq;
+    await this.learnTalentAsync(talentId, rank);
+    await this.waitEvent(
+      (e) =>
+        isEvent(e, "SMSG_TALENTS_INFO") &&
+        !isDecodeError(e.data) &&
+        !(e.data as TalentsInfoData).pet &&
+        (sinceSeq === undefined || e.seq > sinceSeq),
+      {
+        timeout: options.timeout ?? 10_000,
+        description: `the SMSG_TALENTS_INFO answering learn_talent(${talentId}, ${rank})`,
+      },
+    );
+    const talents = this.state.talents();
+    if (talents === undefined) {
+      throw new Error("learnTalent: SMSG_TALENTS_INFO arrived but the state cache holds no talent state");
+    }
+    const row = talents.talents.find((t) => t.talentId === talentId);
+    if (row !== undefined && row.rank >= rank) {
+      return { ok: true, status: "learned", talentId, rank, talents };
+    }
+    return {
+      ok: false,
+      status: "not_learned",
+      talentId,
+      rank,
+      talents,
+      hint:
+        `the server did not record talent ${talentId} at rank ${rank} — it needs an unspent point ` +
+        `(state.talents().unspentPoints is ${talents.unspentPoints}), the previous rank first, enough ` +
+        `points in that tree's earlier tiers, and any prerequisite talent; the server names no reason`,
+    };
+  }
+
+  /**
+   * Buy one spell from a trainer and wait for the server's verdict.
+   *
+   * Races `SMSG_TRAINER_BUY_SUCCEEDED` against `SMSG_TRAINER_BUY_FAILED` for
+   * this spell id, so a refusal costs one round trip rather than the whole
+   * timeout. The refusal is returned, not thrown: it is the game answering
+   * (ADR-0011), and `hint` names the likely causes and points back at
+   * `trainerList` (ADR-0016).
+   */
+  async buySpell(
+    npcGuid: GuidOrUnit,
+    spellId: number,
+    options: TrainerOptions = {},
+  ): Promise<BuySpellResult> {
+    const id = guidKey(guidOf(npcGuid, "buySpell(npcGuid, spellId)"));
+    const sinceSeq = this.events.recent(1)[0]?.seq;
+    await this.trainerBuySpellAsync(id, spellId);
+    const isFor = (e: StreamEvent, opcode: "SMSG_TRAINER_BUY_SUCCEEDED" | "SMSG_TRAINER_BUY_FAILED") =>
+      isEvent(e, opcode) &&
+      !isDecodeError(e.data) &&
+      (e.data as { spellId: number }).spellId === spellId;
+    const event = await this.waitEvent(
+      (e) =>
+        (isFor(e, "SMSG_TRAINER_BUY_SUCCEEDED") || isFor(e, "SMSG_TRAINER_BUY_FAILED")) &&
+        (sinceSeq === undefined || e.seq > sinceSeq),
+      {
+        timeout: options.timeout ?? 10_000,
+        description:
+          `the verdict for buying spell ${spellId} from ${id} ` +
+          `(SMSG_TRAINER_BUY_SUCCEEDED or SMSG_TRAINER_BUY_FAILED)`,
+      },
+    );
+    if (event.opcode === "SMSG_TRAINER_BUY_SUCCEEDED") {
+      return { ok: true, status: "learned", spellId };
+    }
+    const reason = (event.data as TrainerBuyFailedData).reason;
+    const named = TRAINER_BUY_FAIL_HINTS[reason];
+    return {
+      ok: false,
+      status: "buy_failed",
+      spellId,
+      reason,
+      hint:
+        `the trainer refused (reason ${reason}${named ? `: ${named}` : ""}) — the usual causes are ` +
+        `too little money and a spell that is not learnable yet; sdk.trainerList(npcGuid) reports ` +
+        `each spell's cost, learnable and affordable`,
+    };
   }
 
   /**
@@ -1526,11 +2524,12 @@ export class WrathClient {
    * done — that refusal means another NPC ends this quest.
    */
   async turnInQuest(
-    npcGuid: GuidArg,
+    npcGuid: GuidOrUnit,
     questId: number,
     rewardIndex = 0,
     options: QuestOptions = {},
   ): Promise<QuestTurnInResult> {
+    const npcId = guidOf(npcGuid, "turnInQuest(npcGuid, questId)");
     const timeout = options.timeout ?? 10_000;
     const isFor = (e: StreamEvent, opcode: "SMSG_QUESTGIVER_OFFER_REWARD" | "SMSG_QUESTGIVER_REQUEST_ITEMS") =>
       isEvent(e, opcode) &&
@@ -1542,36 +2541,42 @@ export class WrathClient {
     // the cache can prove the NPC is *grossly* far away — the 40y threshold
     // leaves cached-position staleness no room to reject a legitimate call
     // (ADR-0016); borderline cases still get the honest timeout.
-    {
-      const npc = this.state.nearby.get(guidKey(guidArg(npcGuid, "turnInQuest(npcGuid)")));
-      const self = this.state.self.position;
-      const pos = npc?.position?.value;
-      if (npc && pos && self) {
-        const distance = Math.hypot(pos.x - self.value.x, pos.y - self.value.y, pos.z - self.value.z);
-        if (distance > 40) {
-          return {
-            ok: false,
-            status: "too_far",
-            questId,
-            distance: Math.round(distance),
-            hint: `the questgiver is ${Math.round(distance)}y away — interact range is ~5y; moveTo it first`,
-          };
-        }
-      }
+    const distance = distanceToUnit(this.state, npcId);
+    if (distance !== undefined && distance > 40) {
+      return {
+        ok: false,
+        status: "too_far",
+        questId,
+        distance: Math.round(distance),
+        hint: `the questgiver is ${Math.round(distance)}y away — interact range is ~${INTERACT_RANGE}y; moveTo it first`,
+      };
     }
 
     {
       const sinceSeq = this.events.recent(1)[0]?.seq;
-      await this.questComplete(npcGuid, questId);
-      const answer = await this.events.waitFor(
-        (e) =>
-          (isFor(e, "SMSG_QUESTGIVER_OFFER_REWARD") || isFor(e, "SMSG_QUESTGIVER_REQUEST_ITEMS")) &&
-          (sinceSeq === undefined || e.seq > sinceSeq),
-        {
-          timeout,
-          description: `the turn-in answer for quest ${questId} (SMSG_QUESTGIVER_OFFER_REWARD or _REQUEST_ITEMS)`,
-        },
-      );
+      await this.questComplete(npcId, questId);
+      const answer = await this
+        .waitEvent(
+          (e) =>
+            (isFor(e, "SMSG_QUESTGIVER_OFFER_REWARD") || isFor(e, "SMSG_QUESTGIVER_REQUEST_ITEMS")) &&
+            (sinceSeq === undefined || e.seq > sinceSeq),
+          {
+            timeout,
+            description:
+              `the turn-in answer for quest ${questId} (SMSG_QUESTGIVER_OFFER_REWARD or _REQUEST_ITEMS) — ` +
+              questgiverSilence(
+                distance,
+                `does not end quest ${questId}, or the objectives are not complete`,
+                `Check state.quest(${questId}).complete, and use the search_reference tool for who ends ` +
+                  `quest ${questId} — the giver of a quest is often not its ender. ` +
+                  `state.units({ questGiver: "reward" }) lists every NPC in view ready to take a turn-in.`,
+                questgiverMarkerOf(this.state, npcId, "reward", questId),
+              ),
+          },
+        )
+        .catch((e: unknown) => {
+          throw withDistance(e, distance);
+        });
       if (answer.opcode === "SMSG_QUESTGIVER_REQUEST_ITEMS") {
         const req = answer.data as QuestGiverRequestItemsData;
         if (!req.completable) {
@@ -1593,12 +2598,12 @@ export class WrathClient {
         }
         // completable REQUEST_ITEMS: fall through and choose the reward.
       }
-      await this.questChooseReward(npcGuid, questId, rewardIndex);
+      await this.questChooseReward(npcId, questId, rewardIndex);
       // Raced against the completion: a reward that does not fit answers the
       // choose with SMSG_INVENTORY_CHANGE_FAILURE and *no* completion — before
       // this race, a full bag was indistinguishable from silence and burned
       // the whole timeout (morning-opus-1).
-      const complete = await this.events.waitFor(
+      const complete = await this.waitEvent(
         (e) =>
           (isEvent(e, "SMSG_QUESTGIVER_QUEST_COMPLETE") &&
             !isDecodeError(e.data) &&
@@ -1660,10 +2665,94 @@ export class WrathClient {
 
   // --------------------------------------------------------------- internals
 
+  /**
+   * Resolve a `gossipSelect` option (text or numeric id) against the menu last
+   * observed open for `guid`. Throws — nothing is dispatched — for a missing
+   * menu, no match, an ambiguous text, or an id that is not on the menu, each
+   * message listing the options (ADR-0016).
+   */
+  private resolveGossipOption(guid: string, option: string | number): { menuId: number; optionId: number } {
+    const menu = this.state.lastGossip(guidKey(guid));
+    if (!menu) {
+      throw new TypeError(
+        `gossipSelect(guid, option): no gossip menu has been observed open for ${guid} — open one first ` +
+          `with gossipHello(guid) (or questList), then select. If you already have the ids, use the raw ` +
+          `form gossipSelect(guid, menuId, optionId).`,
+      );
+    }
+    const list = menu.options.map((o) => `[${o.optionId}] ${JSON.stringify(o.text)}`).join(", ");
+    if (typeof option === "number") {
+      const found = menu.options.find((o) => o.optionId === option);
+      if (!found) {
+        throw new TypeError(
+          `gossipSelect(guid, ${option}): the menu currently open for ${guid} has no option ${option}. ` +
+            `Options are: ${list}.`,
+        );
+      }
+      return { menuId: menu.menuId, optionId: found.optionId };
+    }
+    const q = option.trim().toLowerCase();
+    const exact = menu.options.filter((o) => o.text.toLowerCase() === q);
+    const matched = exact.length > 0 ? exact : menu.options.filter((o) => o.text.toLowerCase().includes(q));
+    if (matched.length === 1) return { menuId: menu.menuId, optionId: matched[0]!.optionId };
+    if (matched.length === 0) {
+      throw new TypeError(
+        `gossipSelect(guid, ${JSON.stringify(option)}): no option on the menu currently open for ${guid} ` +
+          `matches. Options are: ${list}. Pass the exact text, a unique substring, or the numeric optionId.`,
+      );
+    }
+    const both = matched.map((o) => `[${o.optionId}] ${JSON.stringify(o.text)}`).join(", ");
+    throw new TypeError(
+      `gossipSelect(guid, ${JSON.stringify(option)}): matches ${matched.length} options on the menu open ` +
+        `for ${guid}: ${both}. Use the exact text, a longer unique substring, or the numeric optionId.`,
+    );
+  }
+
   /** One `POST /action`, with the session token filled in. */
   private action(body: ActionBody): Promise<ActionResponse> {
     return this.request("POST", "/action", { token: this.token, ...body }, actionResponseSchema);
   }
+
+  /**
+   * Send `quest_list` and return the offer the NPC answered with.
+   *
+   * The one place the two answer shapes are reconciled — a gossip-flagged
+   * questgiver replies `SMSG_GOSSIP_MESSAGE` with the quests embedded — shared
+   * by `questsAvailableFrom` and `acceptQuestFrom` so they can never drift.
+   *
+   * The match is on opcode and a `sinceSeq` floor, not on the event's guid:
+   * that is how `acceptQuestFrom` has always behaved, and narrowing it here
+   * would change a shipped helper. Two overlapping calls against *different*
+   * NPCs can therefore cross answers; one at a time is the contract.
+   */
+  private async questOffer(npcGuid: GuidArg, timeout: number): Promise<readonly OfferedQuest[]> {
+    const sinceSeq = this.events.recent(1)[0]?.seq;
+    const distance = distanceToUnit(this.state, npcGuid);
+    await this.questList(npcGuid);
+    const menu = await this
+      .waitEvent(
+        (e) =>
+          (isEvent(e, "SMSG_QUESTGIVER_QUEST_LIST") || isEvent(e, "SMSG_GOSSIP_MESSAGE")) &&
+          !isDecodeError(e.data) &&
+          (sinceSeq === undefined || e.seq > sinceSeq),
+        {
+          timeout,
+          description:
+            "the questgiver's quest list (SMSG_QUESTGIVER_QUEST_LIST or SMSG_GOSSIP_MESSAGE) — " +
+            questgiverSilence(
+              distance,
+              "is not a questgiver, or has nothing for this character right now",
+              'Use the search_reference tool for who offers the quest you are after; state.units({ questGiver: "available" }) lists every NPC in view with a quest on offer.',
+              questgiverMarkerOf(this.state, npcGuid, "available"),
+            ),
+        },
+      )
+      .catch((e: unknown) => {
+        throw withDistance(e, distance);
+      });
+    return (menu.data as QuestGiverQuestListData | GossipMessageData).quests ?? [];
+  }
+
 
   /**
    * `face`, with the module's refusals swallowed.
@@ -1689,6 +2778,23 @@ export class WrathClient {
     }
   }
 
+  /** The signal in force for a wait started now (see `ConnectOptions.signal`). */
+  private currentSignal(): AbortSignal | undefined {
+    return this.defaultSignal?.();
+  }
+
+  /** `events.waitFor` with the client's default signal threaded in. */
+  private waitEvent(predicate: (event: StreamEvent) => boolean, options: WaitForOptions = {}): Promise<StreamEvent> {
+    const signal = options.signal ?? this.currentSignal();
+    return this.events.waitFor(predicate, signal === undefined ? options : { ...options, signal });
+  }
+
+  /** Throw `EventAbortedError` if the default signal has already fired. */
+  private throwIfAborted(waitingFor: string): void {
+    const signal = this.currentSignal();
+    if (signal?.aborted) throw new EventAbortedError(signal.reason, waitingFor);
+  }
+
   /**
    * Wait until a predicate over the *state cache* holds. Checks immediately,
    * then re-checks on every event, which is exact because the cache is folded
@@ -1702,7 +2808,7 @@ export class WrathClient {
     const already = read();
     if (already !== undefined) return already;
     let hit: T | undefined;
-    await this.events.waitFor(
+    await this.waitEvent(
       () => {
         hit = read();
         return hit !== undefined;

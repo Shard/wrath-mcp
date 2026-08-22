@@ -17,6 +17,7 @@ import {
   itemQuery,
   monsterMove,
   monsterStopped,
+  newWorld,
   OTHER_QUEST_ID,
   QUEST_ID,
   questAccepted,
@@ -24,7 +25,15 @@ import {
   questCombatStream,
   questComplete,
   questProgress,
+  transferAborted,
+  transferPending,
   questRewarded,
+  questGiverStatus,
+  questGiverStatusMultiple,
+  questQueryResponse,
+  KOBOLD_ENTRY,
+  GO_ENTRY,
+  REQUIRED_ITEM,
   selfProgress,
   selfTarget,
   CREATURE_ENTRY,
@@ -309,6 +318,36 @@ describe("state cache: self, from the wire", () => {
     );
     expect(cache.self.position?.value).toEqual({ map: 0, x: -1205, y: 981, z: 42, o: 1.2 });
     expect(cache.self.position?.seq).toBe(19);
+  });
+
+  test("SMSG_NEW_WORLD moves self to the new map and evicts the old map's objects", () => {
+    // FOLLOW-UPS 38 N1: SMSG_LOGIN_VERIFY_WORLD is login-only, so before this
+    // a tram ride left self.position.map at the login map forever and the
+    // Ironforge crowd lingered in `nearby` on map 369.
+    const cache = StateCache.replay(
+      toEvents([...loginSequence, selfCreate, creatureCreate, transferPending(369), newWorld(369)]),
+      { seed: SEED },
+    );
+    expect(cache.self.position?.value).toEqual({ map: 369, x: 69.25, y: 10.26, z: -4.3, o: 3.1 });
+    expect(cache.self.position?.seq).toBe(41);
+    expect(cache.self.transfer).toBeUndefined();
+    expect(cache.nearbyUnits()).toEqual([]);
+    // Later own positions pair with the new map.
+    cache.apply(toEvents([moveProgress])[0]!);
+    expect(cache.self.position?.value.map).toBe(369);
+  });
+
+  test("a pending transfer is visible until NEW_WORLD completes or ABORTED cancels it", () => {
+    const pending = StateCache.replay(toEvents([...loginSequence, transferPending(369)]), { seed: SEED });
+    expect(pending.self.transfer?.value).toEqual({ toMap: 369 });
+    expect(pending.self.position?.value.map).toBe(0);
+
+    const aborted = StateCache.replay(
+      toEvents([...loginSequence, transferPending(369), transferAborted(369, 1)]),
+      { seed: SEED },
+    );
+    expect(aborted.self.transfer).toBeUndefined();
+    expect(aborted.self.position?.value.map).toBe(0);
   });
 
   test("own position with no map ever observed is refused, not defaulted", () => {
@@ -963,6 +1002,52 @@ describe("state.units(): the flat scan helper", () => {
     expect(c.units({ name: "nothing here" })).toEqual([]);
   });
 
+  // The tree/tree-stump fixture: an exact name and a longer name that contains
+  // it as a whole word, with the longer one placed *nearer*, so a pure distance
+  // sort would put the stump first.
+  const TREE_GUID = "1100";
+  const STUMP_GUID = "1101";
+  const TREE_ENTRY = 5100;
+  const STUMP_ENTRY = 5101;
+  const treeStream: unknown[] = [
+    ...worldStream,
+    unitAt(STUMP_GUID, 60, { dx: 2, objectType: "gameObject", entry: STUMP_ENTRY }),
+    namedEntry(STUMP_ENTRY, "tree stump", 61),
+    unitAt(TREE_GUID, 62, { dx: 20, objectType: "gameObject", entry: TREE_ENTRY }),
+    namedEntry(TREE_ENTRY, "tree", 63),
+  ];
+  const treeCache = () => StateCache.replay(toEvents(treeStream), { seed: SEED });
+
+  test("a plain name prefers the exact/shortest match over a longer one, even when farther", () => {
+    const rows = treeCache().units({ name: "tree" });
+    // Both match the substring, but "tree" (exact) ranks ahead of "tree stump"
+    // (whole-word) despite the stump being nearer.
+    expect(rows.map((r) => r.name)).toEqual(["tree", "tree stump"]);
+    expect(rows[0]!.guid).toBe(TREE_GUID);
+  });
+
+  test("a regex-literal string and a RegExp both match with test(), nearest-first", () => {
+    const c = treeCache();
+    // Anchored regex: only the exact "tree", not "tree stump".
+    expect(c.units({ name: "/^tree$/" }).map((r) => r.name)).toEqual(["tree"]);
+    expect(c.units({ name: /^tree$/i }).map((r) => r.name)).toEqual(["tree"]);
+    // A bare regex that matches both keeps nearest-first order (stump is nearer).
+    expect(c.units({ name: /tree/ }).map((r) => r.name)).toEqual(["tree stump", "tree"]);
+  });
+
+  test("a string starting with / but not a valid regex literal is a literal name", () => {
+    // No object is named this, so it simply finds nothing rather than throwing.
+    expect(treeCache().units({ name: "/tree" })).toEqual([]);
+  });
+
+  test("a well-formed regex literal whose pattern is broken is rejected", () => {
+    expect(() => cache().units({ name: "/tree(/" })).toThrow(/did not compile/);
+  });
+
+  test("a non-string, non-RegExp name is rejected with the ADR-0016 help", () => {
+    expect(() => cache().units({ name: 5 as unknown as string })).toThrow(/expected a string.*or a RegExp/s);
+  });
+
   test("type filters on the observed create-block type", () => {
     const c = cache();
     expect(c.units({ type: "gameObject" }).map((r) => r.guid)).toEqual([OBJECT_GUID]);
@@ -1041,5 +1126,363 @@ describe("state.units(): the flat scan helper", () => {
       /criteria object, not a predicate/,
     );
     expect(() => c.units({ maxDistance: -1 })).toThrow(/expected a distance >= 0/);
+  });
+});
+
+describe("state.closest(): criteria object or predicate", () => {
+  const cache = () => StateCache.replay(toEvents(scanStream), { seed: SEED });
+
+  test("takes a units() criteria object, the analogy four of five models drew", () => {
+    // roster 2026-08-22: state.closest({entry:196}) / {name:"Deputy Willem"}
+    // threw a bare "filter is not a function" for hy3, nemotron, laguna and
+    // ox-alpha. It now means what it means in units().
+    const c = cache();
+    expect(c.closest({ entry: VENDOR_ENTRY })?.guid).toBe(VENDOR_GUID);
+    expect(c.closest({ npc: true })?.guid).toBe(VENDOR_GUID);
+    expect(c.closest({ type: "gameObject" })?.guid).toBe(OBJECT_GUID);
+    // alive:true drops only the known-dead; the positionless ghost is not a
+    // candidate for a distance question at all.
+    expect(c.closest({ entry: FAR_ENTRY, alive: true })?.guid).toBe(FAR_GUID);
+    expect(c.closest({ entry: FAR_ENTRY, alive: false })?.guid).toBe(DEAD_GUID);
+    // maxDistance is evaluated against the same distance units() reports.
+    expect(c.closest({ entry: FAR_ENTRY, maxDistance: 1 })).toBeUndefined();
+    expect(c.closest({ entry: 999_999 })).toBeUndefined();
+  });
+
+  test("orders by distance, not by units()'s name tier", () => {
+    // units({name}) ranks an exact match ahead of a longer substring match
+    // regardless of distance; closest answers "nearest", which is the whole
+    // question it is asked.
+    const NEAR = "2001";
+    const FAR = "2002";
+    const NEAR_ENTRY = 5252;
+    const FAR_NAME_ENTRY = 5253;
+    const c = StateCache.replay(
+      toEvents([
+        ...worldStream,
+        unitAt(FAR, 40, { dx: 100, entry: FAR_NAME_ENTRY, health: 50, maxHealth: 50 }),
+        namedEntry(FAR_NAME_ENTRY, "Boar", 41),
+        unitAt(NEAR, 42, { dx: 5, entry: NEAR_ENTRY, health: 50, maxHealth: 50 }),
+        namedEntry(NEAR_ENTRY, "Boar Cub", 43),
+      ]),
+      { seed: SEED },
+    );
+    expect(c.units({ name: "boar" }).map((u) => u.guid)).toEqual([FAR, NEAR]);
+    expect(c.closest({ name: "boar" })?.guid).toBe(NEAR);
+  });
+
+  test("a predicate still works and still sees the raw object", () => {
+    const c = cache();
+    expect(c.closest((o) => o.objectType?.value === "gameObject")?.guid).toBe(OBJECT_GUID);
+    expect(c.closest()?.guid).toBeDefined();
+  });
+
+  test("a bad key is rejected with the same message units() gives", () => {
+    const c = cache();
+    expect(() => c.closest({ minLevel: 5 } as unknown as UnitFilter)).toThrow(
+      /unknown key "minLevel"/,
+    );
+    expect(() => c.closest({ minLevel: 5 } as unknown as UnitFilter)).toThrow(
+      /Valid keys are entry, name/,
+    );
+    expect(() => c.closest({ alive: "true" as unknown as boolean })).toThrow(
+      /expected true or false/,
+    );
+  });
+});
+
+describe("state cache: the gossip menu fold (item 3c)", () => {
+  const gossipMsg = (guid: string, seq: number) => ({
+    seq,
+    opcode: "SMSG_GOSSIP_MESSAGE",
+    opcodeId: 0x17d,
+    ts: 1_700_000_000_000 + seq,
+    data: {
+      guid,
+      menuId: 5,
+      textId: 1,
+      options: [
+        { optionId: 0, icon: 0, text: "Train me" },
+        { optionId: 1, icon: 0, text: "Show wares" },
+      ],
+      quests: [],
+    },
+  });
+  const gossipComplete = (seq: number) => ({
+    seq,
+    opcode: "SMSG_GOSSIP_COMPLETE",
+    opcodeId: 0x17e,
+    ts: 1_700_000_000_000 + seq,
+    data: {},
+  });
+
+  test("SMSG_GOSSIP_MESSAGE folds into lastGossip and the snapshot, options only", () => {
+    const c = StateCache.replay(toEvents([...worldStream, gossipMsg("2002", 70)]), { seed: SEED });
+    const menu = c.lastGossip("2002");
+    expect(menu?.menuId).toBe(5);
+    expect(menu?.options).toEqual([
+      { optionId: 0, text: "Train me" },
+      { optionId: 1, text: "Show wares" },
+    ]);
+    expect(c.snapshot().gossip.get("2002")?.menuId).toBe(5);
+  });
+
+  test("SMSG_GOSSIP_COMPLETE clears the open menu", () => {
+    const c = StateCache.replay(
+      toEvents([...worldStream, gossipMsg("2002", 70), gossipComplete(71)]),
+      { seed: SEED },
+    );
+    expect(c.lastGossip("2002")).toBeUndefined();
+    expect(c.snapshot().gossip.size).toBe(0);
+  });
+
+  test("guid lookups are canonical, so a non-canonical guid finds the same menu", () => {
+    const c = StateCache.replay(toEvents([...worldStream, gossipMsg("2002", 70)]), { seed: SEED });
+    // "2002" is already canonical here; the fold keys by the schema-canonical
+    // guid, which is what gossipSelect looks up with guidKey(...).
+    expect(c.lastGossip("2002")?.menuId).toBe(5);
+  });
+});
+
+describe("state cache: questgiver markers (FOLLOW-UPS 27)", () => {
+  const withWorld = (extra: readonly unknown[]) =>
+    StateCache.replay(toEvents([...worldStream, ...extra]), { seed: SEED });
+
+  test("a unit has no marker until a status packet names it", () => {
+    const c = withWorld([]);
+    const row = c.units().find((r) => r.guid === CREATURE_GUID)!;
+    expect(row.questGiver).toBeUndefined();
+    expect(row.questGiverStatus).toBeUndefined();
+    expect(c.nearby.get(CREATURE_GUID)?.questGiver).toBeUndefined();
+  });
+
+  test("SMSG_QUESTGIVER_STATUS folds onto the unit, named and raw", () => {
+    const c = withWorld([questGiverStatus(CREATURE_GUID, 10, 60)]);
+    const row = c.units().find((r) => r.guid === CREATURE_GUID)!;
+    expect(row.questGiver).toBe("reward");
+    expect(row.questGiverStatus).toBe(10);
+    expect(c.nearby.get(CREATURE_GUID)?.questGiver).toEqual({ value: 10, seq: 60, ts: 1_700_000_000_060 });
+  });
+
+  test("the latest status per guid wins, and STATUS_MULTIPLE covers several guids at once", () => {
+    const c = withWorld([
+      questGiverStatus(CREATURE_GUID, 8, 60),
+      questGiverStatusMultiple(
+        [
+          { guid: CREATURE_GUID, status: 5 },
+          { guid: PLAYER_GUID, status: 0 },
+        ],
+        61,
+      ),
+    ]);
+    const byGuid = new Map(c.units().map((r) => [r.guid, r]));
+    expect(byGuid.get(CREATURE_GUID)?.questGiver).toBe("incomplete");
+    expect(byGuid.get(PLAYER_GUID)?.questGiver).toBe("none");
+    expect(byGuid.get(PLAYER_GUID)?.questGiverStatus).toBe(0);
+  });
+
+  test("every DIALOG_STATUS byte has a name; out-of-range bytes are unknown", () => {
+    const names = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map(
+      (n) => withWorld([questGiverStatus(CREATURE_GUID, n, 60)]).units().find((r) => r.guid === CREATURE_GUID)!.questGiver,
+    );
+    expect(names).toEqual([
+      "none",
+      "unavailable",
+      "low_level_available",
+      "low_level_reward_rep",
+      "low_level_available_rep",
+      "incomplete",
+      "reward_rep",
+      "available_rep",
+      "available",
+      "reward2",
+      "reward",
+      "unknown",
+    ]);
+  });
+
+  test("a status for a guid with no create block still puts it in view, untyped", () => {
+    const GHOST = "17365880163140639999";
+    const c = withWorld([questGiverStatus(GHOST, 8, 60)]);
+    const row = c.units().find((r) => r.guid === GHOST)!;
+    expect(row.type).toBeUndefined();
+    expect(row.questGiver).toBe("available");
+  });
+
+  test("the marker leaves with the object, and a replay is identical", () => {
+    const frames = [questGiverStatus(CREATURE_GUID, 10, 60), creatureOutOfRange];
+    const c = withWorld(frames);
+    expect(c.nearby.has(CREATURE_GUID)).toBe(false);
+    const live = new StateCache({ seed: SEED });
+    for (const e of toEvents([...worldStream, ...frames])) live.apply(e);
+    expect(live.snapshot()).toEqual(c.snapshot());
+  });
+
+  test("units({ questGiver }) filters by one name or a list; unobserved never matches", () => {
+    const c = withWorld([
+      playerCreate,
+      questGiverStatusMultiple(
+        [
+          { guid: CREATURE_GUID, status: 10 },
+          { guid: PLAYER_GUID, status: 8 },
+        ],
+        60,
+      ),
+    ]);
+    expect(c.units({ questGiver: "reward" }).map((r) => r.guid)).toEqual([CREATURE_GUID]);
+    expect(c.units({ questGiver: ["reward", "available"] }).map((r) => r.guid).sort()).toEqual(
+      [CREATURE_GUID, PLAYER_GUID].sort(),
+    );
+    expect(c.units({ questGiver: "incomplete" })).toEqual([]);
+    expect(withWorld([]).units({ questGiver: "none" })).toEqual([]);
+    expect(c.closest({ questGiver: "available" })?.guid).toBe(PLAYER_GUID);
+  });
+
+  test("units({ questGiver }) rejects a name it cannot read, and says what it takes", () => {
+    const c = withWorld([]);
+    expect(() => c.units({ questGiver: "?" as never })).toThrow(/questGiver received "\?", expected one of "none", .*"reward"/);
+    expect(() => c.units({ questGiver: "Reward" as never })).toThrow(/exact, case-sensitive/);
+    expect(() => c.units({ questGiver: [] })).toThrow(/empty array/);
+    expect(() => c.units({ questGiver: 10 as never })).toThrow(/questGiver received 10/);
+  });
+});
+
+describe("state cache: quest objectives from the quest query (FOLLOW-UPS 28)", () => {
+  const withWorld = (extra: readonly unknown[]) =>
+    StateCache.replay(toEvents([...worldStream, ...extra]), { seed: SEED });
+
+  test("before the query answers, the entry has no title and objectives are undefined, not []", () => {
+    const q = withWorld([questAccepted]).quest(QUEST_ID)!;
+    expect(q.title).toBeUndefined();
+    expect(q.objectives).toBeUndefined();
+    expect(q.counts).toEqual([0, 0, 0, 0]);
+  });
+
+  test("SMSG_QUEST_QUERY_RESPONSE lands in state.quests and joins onto the log entry", () => {
+    const c = withWorld([questAccepted, questQueryResponse()]);
+    expect(c.quests.get(QUEST_ID)?.value.title).toBe("Kobold Camp Cleanup");
+    expect(c.quests.get(QUEST_ID)?.value.level).toBe(3);
+    const q = c.quest(QUEST_ID)!;
+    expect(q.title).toBe("Kobold Camp Cleanup");
+    expect(q.objectives).toEqual([
+      { kind: "kill", entry: KOBOLD_ENTRY, text: undefined, required: 8, have: 0, done: false },
+      { kind: "interact", entry: GO_ENTRY, text: "Unlock the chest", required: 1, have: 0, done: false },
+      { kind: "event", entry: undefined, text: "Investigate the vineyard", required: 1, have: 0, done: false },
+      { kind: "collect", entry: REQUIRED_ITEM, text: undefined, required: 4, have: 0, done: false },
+    ]);
+  });
+
+  test("have comes from the log counters per slot, and from the backpack for items", () => {
+    const c = withWorld([questAccepted, questQueryResponse(), questProgress, inventorySlot, itemCreate, itemQuery]);
+    const obj = c.quest(QUEST_ID)!.objectives!;
+    // counts [3, 5, 7, 9]: slot 0 kill 3/8, slot 1 go 5/1 (done), slot 2 event 7/1 (done)
+    expect(obj.map((o) => [o.kind, o.have, o.done])).toEqual([
+      ["kill", 3, false],
+      ["interact", 5, true],
+      ["event", 7, true],
+      ["collect", 5, true], // one stack of 5 Gritstone Charms in the backpack
+    ]);
+  });
+
+  test("the answer arriving before the log entry still joins; the template is never pruned", () => {
+    const c = withWorld([questQueryResponse(), questAccepted]);
+    expect(c.quest(QUEST_ID)?.title).toBe("Kobold Camp Cleanup");
+    const after = withWorld([questQueryResponse(), questAccepted, questRewarded(QUEST_ID), selfProgress]);
+    expect(after.quests.has(QUEST_ID)).toBe(true);
+  });
+
+  test("a second quest in the log without an answer stays undecorated", () => {
+    const c = withWorld([questAccepted, questChained, questQueryResponse()]);
+    expect(c.quest(OTHER_QUEST_ID)?.objectives).toBeUndefined();
+    expect(c.quest(QUEST_ID)?.objectives).toHaveLength(4);
+  });
+});
+
+describe("state cache: spellbook, cooldowns and talents (FOLLOW-UPS 39)", () => {
+  const at = (seq: number, opcode: string, opcodeId: number, data: unknown) => ({
+    seq,
+    opcode,
+    opcodeId,
+    ts: 1_700_000_000_000 + seq,
+    data,
+  });
+  const initialSpells = at(60, "SMSG_INITIAL_SPELLS", 0x12a, {
+    spells: [
+      { spellId: 100, rank: 1, name: "Fixture Strike" },
+      { spellId: 200, rank: 1 },
+    ],
+    cooldowns: [
+      { spellId: 100, itemId: 0, category: 0, cooldownMs: 30_000, categoryCooldownMs: 0 },
+      { spellId: 300, itemId: 0, category: 5, cooldownMs: 0, categoryCooldownMs: 0x80000000 },
+    ],
+  });
+  const withWorld = (extra: readonly unknown[]) =>
+    StateCache.replay(toEvents([...worldStream, ...extra]), { seed: SEED });
+
+  test("empty until SMSG_INITIAL_SPELLS; then the book and its cooldowns are what the server served", () => {
+    expect(withWorld([]).spells()).toEqual([]);
+    expect(withWorld([]).talents()).toBeUndefined();
+    const c = withWorld([initialSpells]);
+    expect(c.spells().map((s) => [s.spellId, s.rank, s.name])).toEqual([
+      [100, 1, "Fixture Strike"],
+      [200, 1, undefined],
+    ]);
+    expect(c.spell(200)?.seq).toBe(60);
+    expect(c.spell(999)).toBeUndefined();
+    const cds = c.cooldowns(1_700_000_000_060 + 1000);
+    expect(cds.map((x) => [x.spellId, x.readyAt, x.cooldownMs])).toEqual([
+      [100, 1_700_000_000_060 + 30_000, 30_000],
+      [300, Number.POSITIVE_INFINITY, undefined],
+    ]);
+    // The clock is the only judge of expiry.
+    expect(c.cooldowns(1_700_000_000_060 + 31_000).map((x) => x.spellId)).toEqual([300]);
+  });
+
+  test("learned, removed and superseded edit the book in place", () => {
+    const c = withWorld([
+      initialSpells,
+      at(61, "SMSG_LEARNED_SPELL", 0x12b, { spellId: 400, rank: 2, name: "Fixture Strike" }),
+      at(62, "SMSG_SUPERCEDED_SPELL", 0x12c, { supersededSpellId: 100, spellId: 400, rank: 2 }),
+      at(63, "SMSG_REMOVED_SPELL", 0x203, { spellId: 200 }),
+    ]);
+    expect(c.spells().map((s) => s.spellId)).toEqual([400]);
+    expect(c.spell(400)?.rank).toBe(2);
+  });
+
+  test("cooldown announcements replace, COOLDOWN_EVENT is duration-less, CLEAR drops; other guids are ignored", () => {
+    const c = withWorld([
+      initialSpells,
+      at(61, "SMSG_SPELL_COOLDOWN", 0x134, { guid: "7", flags: 1, cooldowns: [{ spellId: 100, cooldownMs: 5000 }, { spellId: 500, cooldownMs: 0 }] }),
+      at(62, "SMSG_COOLDOWN_EVENT", 0x135, { spellId: 600, guid: "7" }),
+      at(63, "SMSG_CLEAR_COOLDOWN", 0x1de, { spellId: 300, guid: "7" }),
+      at(64, "SMSG_SPELL_COOLDOWN", 0x134, { guid: "99", flags: 0, cooldowns: [{ spellId: 700, cooldownMs: 9000 }] }),
+    ]);
+    const now = 1_700_000_000_061 + 100;
+    expect(c.cooldowns(now).map((x) => [x.spellId, x.readyAt])).toEqual([
+      [100, 1_700_000_000_061 + 5000],
+      [600, undefined],
+    ]);
+  });
+
+  test("SMSG_TALENTS_INFO keeps the active spec; the pet form changes nothing", () => {
+    const c = withWorld([
+      at(61, "SMSG_TALENTS_INFO", 0x4c0, {
+        pet: false,
+        unspentPoints: 2,
+        specCount: 2,
+        activeSpec: 1,
+        specs: [{ talents: [{ talentId: 1, rank: 0 }] }, { talents: [{ talentId: 7, rank: 2 }] }],
+      }),
+      at(62, "SMSG_TALENTS_INFO", 0x4c0, { pet: true }),
+    ]);
+    expect(c.talents()).toEqual({
+      unspentPoints: 2,
+      activeSpec: 1,
+      specCount: 2,
+      talents: [{ talentId: 7, rank: 2 }],
+      seq: 61,
+      ts: 1_700_000_000_061,
+    });
+    expect(c.snapshot().talents?.unspentPoints).toBe(2);
   });
 });

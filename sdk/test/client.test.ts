@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { connect, WrathRequestError, WrathTransportError } from "../src/client";
-import { EventTimeoutError } from "../src/events";
+import { EventAbortedError, EventTimeoutError } from "../src/events";
 import {
   addKill,
   attackStopped,
@@ -20,6 +20,9 @@ import {
   lootRelease,
   lootResponse,
   moveResult,
+  newWorld,
+  transferAborted,
+  transferPending,
   offerReward,
   OTHER_QUEST_ID,
   PLAYER_GUID,
@@ -27,13 +30,20 @@ import {
   questAccepted,
   questComplete,
   questGiverList,
+  questGiverStatus,
+  questGiverStatusMultiple,
   questProgress,
+  questQueryResponse,
   questRewarded,
   requestItems,
   SELF_GUID,
   selfCreate,
   selfHealth,
+  selfProgress,
   swing,
+  trainerBuyFailed,
+  trainerBuySucceeded,
+  trainerList,
 } from "./fixtures";
 import { startStub, type StubServer } from "./server";
 
@@ -104,7 +114,113 @@ describe("client: the happy path through the slice", () => {
   });
 });
 
+describe("client: operator-bound account (ADR-0016)", () => {
+  test("a bound account fills an omitted createSession account", async () => {
+    const stub = startStub();
+    const client = await connect({
+      baseUrl: stub.baseUrl,
+      token: "t",
+      account: "RUNNER6",
+      subscribeEvents: false,
+    });
+    // The RUNNER6→RUNNER defect: the model omits the account entirely.
+    await client.createSession({ character: "Qwenlocal", race: 1, class: 2 });
+    expect(stub.sessions).toHaveLength(1);
+    expect(stub.sessions[0]?.account).toBe("RUNNER6");
+    client.close();
+    await stub.stop();
+  });
+
+  test("a bound account overrides an account the model typed", async () => {
+    const stub = startStub();
+    const client = await connect({
+      baseUrl: stub.baseUrl,
+      token: "t",
+      account: "RUNNER6",
+      subscribeEvents: false,
+    });
+    // The model should never pass an account; if it does, the bound one wins so
+    // it cannot land on someone else's lane by typing the default.
+    await client.createSession({ character: "Qwenlocal", account: "RUNNER", race: 1, class: 2 });
+    expect(stub.sessions[0]?.account).toBe("RUNNER6");
+    client.close();
+    await stub.stop();
+  });
+
+  test("with no bound account the request's own account is preserved (standalone)", async () => {
+    const stub = startStub();
+    const client = await connect({ baseUrl: stub.baseUrl, token: "t", subscribeEvents: false });
+    await client.createSession({ character: "Fenwick", account: "PROBE", race: 1, class: 1 });
+    expect(stub.sessions[0]?.account).toBe("PROBE");
+    client.close();
+    await stub.stop();
+  });
+
+  test("a bound account wins over a deleteCharacter account too", async () => {
+    const stub = startStub();
+    const client = await connect({
+      baseUrl: stub.baseUrl,
+      token: "t",
+      account: "RUNNER6",
+      subscribeEvents: false,
+    });
+    await client.deleteCharacter("Qwenlocal", { account: "RUNNER", retryDelayMs: 5 });
+    expect(stub.characterDeletes[0]?.account).toBe("RUNNER6");
+    client.close();
+    await stub.stop();
+  });
+});
+
 describe("client: movement", () => {
+  test("the default signal aborts a pending moveTo, issues one stop, and leaves later waits alive (FOLLOW-UPS 44)", async () => {
+    const stub = startStub({ onConnect: () => frames(loginSequence) });
+    // A provider, as the runner passes it: consulted at the start of each wait.
+    let current: AbortSignal | undefined;
+    const client = await connect({
+      baseUrl: stub.baseUrl,
+      token: "t",
+      events: { reconnect: false },
+      signal: () => current,
+    });
+    await client.createSession({ character: "Fenwick" });
+
+    const ac = new AbortController();
+    current = ac.signal;
+    const walk = client.moveTo({ x: 1, y: 2, z: 3 }, { timeout: 5000 });
+    await Bun.sleep(20); // let the move_to ack land so the wait is armed
+    ac.abort(new Error("snippet abandoned"));
+    await expect(walk).rejects.toBeInstanceOf(EventAbortedError);
+    await expect(walk).rejects.toThrow(/snippet abandoned/);
+    await Bun.sleep(20);
+    // Exactly one stop, after the move_to — deterministic, no game semantics.
+    expect(stub.actions.map((a) => a.action)).toEqual(["move_to", "stop"]);
+
+    // A late verdict for the aborted move is ignored; a fresh eval's signal
+    // does not inherit the old abort.
+    stub.push(JSON.stringify(moveResult("arrived", 1, 30)));
+    current = new AbortController().signal;
+    const again = client.moveTo({ x: 4, y: 5, z: 6 }, { timeout: 2000 });
+    stub.push(JSON.stringify(moveResult("arrived", 2, 31)));
+    expect((await again).status).toBe("arrived");
+    expect(stub.actions.filter((a) => a.action === "stop")).toHaveLength(1);
+
+    client.close();
+    await stub.stop();
+  });
+
+  test("a wait against an already-aborted default signal settles at once; waitForTransfer rethrows the abort", async () => {
+    const stub = startStub({ onConnect: () => frames(loginSequence) });
+    const ac = new AbortController();
+    const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false }, signal: ac.signal });
+    await client.createSession({ character: "Fenwick" });
+    ac.abort();
+    // Not a TransferResult: an abort is the absence of a verdict, never a status.
+    await expect(client.waitForTransfer({ timeout: 2000 })).rejects.toBeInstanceOf(EventAbortedError);
+    await expect(client.killTarget(CREATURE_GUID, { timeout: 2000 })).rejects.toBeInstanceOf(EventAbortedError);
+    client.close();
+    await stub.stop();
+  });
+
   test("moveTo resolves on the WB_MOVE_RESULT carrying its own moveId", async () => {
     const stub = startStub({ onConnect: () => frames(loginSequence) });
     const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
@@ -129,8 +245,33 @@ describe("client: movement", () => {
     await stub.stop();
   });
 
+  test("moveTo(x, y, z) as three positional numbers is repaired to a point", async () => {
+    // ADR-0016 deterministic repair: weak models write moveTo this way across
+    // every family (nemotron/hy3/gpt-oss, 2026-08-22). Same outcome as the
+    // object form; every other bad shape still throws.
+    const stub = startStub({ onConnect: () => frames(loginSequence) });
+    const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+    await client.createSession({ character: "Fenwick" });
+
+    // @ts-expect-error — the repaired call is untyped JS as a model writes it
+    const pending = client.moveTo(-1205, 981, 42, { timeout: 2000 });
+    stub.push(JSON.stringify(moveResult("arrived", 1, 31)));
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    expect(result.position).toEqual({ x: -1205, y: 981, z: 42, o: 1.2 });
+
+    // A genuinely broken shape is still rejected loudly.
+    // @ts-expect-error — deliberately wrong
+    await expect(client.moveTo(-1205, 981)).rejects.toBeInstanceOf(TypeError);
+    // @ts-expect-error — deliberately wrong
+    await expect(client.moveTo("here")).rejects.toBeInstanceOf(TypeError);
+
+    client.close();
+    await stub.stop();
+  });
+
   test("a game-level failure comes back as a result, not an exception", async () => {
-    for (const status of ["no_path", "too_far", "interrupted", "stopped", "superseded"] as const) {
+    for (const status of ["too_far", "no_mesh", "target_off_mesh", "start_off_mesh", "path_incomplete", "interrupted", "stopped", "superseded"] as const) {
       const stub = startStub({ onConnect: () => frames(loginSequence) });
       const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
       await client.createSession({ character: "Fenwick" });
@@ -146,6 +287,165 @@ describe("client: movement", () => {
       client.close();
       await stub.stop();
     }
+  });
+
+  test("each typed failure carries its own recovery hint; path_incomplete carries reachedPos", async () => {
+    // FOLLOW-UPS 38 N1: the module now names the cause, so the hint is only
+    // the recovery that follows from it (ADR-0016 rule 2).
+    const stub = startStub({ onConnect: () => frames(loginSequence) });
+    const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+    await client.createSession({ character: "Fenwick" });
+
+    const p1 = client.moveTo({ x: 10, y: 20, z: 30 }, { timeout: 2000 });
+    stub.push(JSON.stringify(moveResult("target_off_mesh", 1, 30)));
+    const r1 = await p1;
+    expect(r1.ok).toBe(false);
+    if (r1.ok) throw new Error("unreachable");
+    expect(r1.hint).toContain("10.0, 20.0");
+    expect(r1.hint).toContain("not on walkable ground");
+    expect(r1.reachedPos).toBeUndefined();
+
+    const p2 = client.moveTo({ x: 10, y: 20, z: 30 }, { timeout: 2000 });
+    const partial = moveResult("path_incomplete", 2, 31) as { data: Record<string, unknown> };
+    partial.data.reachedPos = { x: 5, y: 6, z: 7 };
+    stub.push(JSON.stringify(partial));
+    const r2 = await p2;
+    if (r2.ok) throw new Error("unreachable");
+    expect(r2.status).toBe("path_incomplete");
+    expect(r2.reachedPos).toEqual({ x: 5, y: 6, z: 7 });
+    expect(r2.hint).toContain("ends at (5.0, 6.0)");
+
+    const p3 = client.moveTo({ x: 10, y: 20, z: 30 }, { timeout: 2000 });
+    stub.push(JSON.stringify(moveResult("no_mesh", 3, 32)));
+    const r3 = await p3;
+    if (r3.ok) throw new Error("unreachable");
+    expect(r3.hint).toContain("harness data limitation");
+
+    const p4 = client.moveTo({ x: 10, y: 20, z: 30 }, { timeout: 2000 });
+    stub.push(JSON.stringify(moveResult("start_off_mesh", 4, 33)));
+    const r4 = await p4;
+    if (r4.ok) throw new Error("unreachable");
+    expect(r4.hint).toContain("transport deck");
+    client.close();
+    await stub.stop();
+  });
+
+  test("arrived with meshZ says which z the mesh used; a plain arrived carries neither", async () => {
+    const stub = startStub({ onConnect: () => frames(loginSequence) });
+    const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+    await client.createSession({ character: "Fenwick" });
+
+    const p1 = client.moveTo({ x: -1205, y: 981, z: 80 }, { timeout: 2000 });
+    const withZ = moveResult("arrived", 1, 30) as { data: Record<string, unknown> };
+    withZ.data.meshZ = 42;
+    stub.push(JSON.stringify(withZ));
+    const r1 = await p1;
+    expect(r1.ok).toBe(true);
+    if (!r1.ok || r1.status !== "arrived") throw new Error("unreachable");
+    expect(r1.meshZ).toBe(42);
+    expect(r1.hint).toContain("z 42.0, not 80.0");
+
+    const p2 = client.moveTo({ x: 1, y: 2, z: 3 }, { timeout: 2000 });
+    stub.push(JSON.stringify(moveResult("arrived", 2, 31)));
+    const r2 = await p2;
+    if (!r2.ok || r2.status !== "arrived") throw new Error("unreachable");
+    expect(r2.meshZ).toBeUndefined();
+    expect(r2.hint).toBeUndefined();
+
+    // Aboard a transport at the end of the move: the module says which.
+    const p4 = client.moveTo({ x: 4.5, y: 8.4, z: -4.3 }, { timeout: 2000 });
+    const aboard = moveResult("arrived", 3, 33) as { data: Record<string, unknown> };
+    aboard.data.onTransport = { guid: "12345", entry: 176081 };
+    stub.push(JSON.stringify(aboard));
+    const r4 = await p4;
+    if (!r4.ok || r4.status !== "arrived") throw new Error("unreachable");
+    expect(r4.onTransport).toEqual({ guid: "12345", entry: 176081 });
+
+    // A status the SDK has no recipe for passes through with no hint invented.
+    const p3 = client.moveTo({ x: 1, y: 2, z: 3 }, { timeout: 2000 });
+    stub.push(JSON.stringify(moveResult("stopped", 4, 34)));
+    const r3 = await p3;
+    if (r3.ok) throw new Error("unreachable");
+    expect(r3.hint).toBeUndefined();
+    client.close();
+    await stub.stop();
+  });
+
+  test("transferred resolves on SMSG_NEW_WORLD, even one that landed before the move result", async () => {
+    // FOLLOW-UPS 38 N1: the postcondition is the server naming the new map,
+    // never the dispatch. The server sends NEW_WORLD in the tick the portal
+    // fires; the module's `transferred` result follows on the next world tick.
+    const stub = startStub({ onConnect: () => frames(loginSequence) });
+    const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+    await client.createSession({ character: "Fenwick" });
+
+    const pending = client.moveTo({ x: -4839, y: -1330, z: 508 }, { timeout: 2000 });
+    stub.push(JSON.stringify(transferPending(369, 30)));
+    stub.push(JSON.stringify(newWorld(369, 31)));
+    stub.push(JSON.stringify(moveResult("transferred", 1, 32)));
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    if (!result.ok || result.status !== "transferred") throw new Error("unreachable");
+    expect(result.to).toEqual({ map: 369, x: 69.25, y: 10.26, z: -4.3, o: 3.1 });
+    expect(result.position.x).toBe(-1205); // old-map position from the result
+    expect(result.hint).toContain("map 369");
+    expect(client.state.self.position?.value.map).toBe(369);
+    client.close();
+    await stub.stop();
+  });
+
+  test("transferred with the transfer still pending at the deadline is ok:false, status intact", async () => {
+    const stub = startStub({ onConnect: () => frames(loginSequence) });
+    const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+    await client.createSession({ character: "Fenwick" });
+
+    const pending = client.moveTo({ x: 1, y: 2, z: 3 }, { timeout: 300 });
+    stub.push(JSON.stringify(transferPending(369, 30)));
+    stub.push(JSON.stringify(moveResult("transferred", 1, 31)));
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("transferred");
+    if (result.ok) throw new Error("unreachable");
+    expect(result.hint).toContain("map 369");
+    expect(result.hint).toContain("waitForTransfer");
+    client.close();
+    await stub.stop();
+  });
+
+  test("waitForTransfer: aborted, wrong_map, no_transfer, and a stale NEW_WORLD is not this transfer", async () => {
+    const stub = startStub({ onConnect: () => frames(loginSequence) });
+    const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+    await client.createSession({ character: "Fenwick" });
+
+    // An earlier, completed transfer sits in the buffer; it must not answer a later wait.
+    stub.push(JSON.stringify(newWorld(1, 30)));
+    await client.events.waitFor((e) => e.seq === 30, { timeout: 1000 });
+    const none = await client.waitForTransfer({ timeout: 200 });
+    expect(none.status).toBe("no_transfer");
+
+    const p1 = client.waitForTransfer({ timeout: 1000 });
+    stub.push(JSON.stringify(transferPending(369, 31)));
+    stub.push(JSON.stringify(transferAborted(369, 1, 32)));
+    const r1 = await p1;
+    expect(r1.ok).toBe(false);
+    if (r1.status !== "aborted") throw new Error("unreachable");
+    expect(r1.reason).toBe(1);
+    expect(client.state.self.transfer).toBeUndefined();
+
+    const p2 = client.waitForTransfer({ timeout: 1000, expectMap: 369 });
+    stub.push(JSON.stringify(newWorld(0, 33)));
+    const r2 = await p2;
+    if (r2.status !== "wrong_map") throw new Error("unreachable");
+    expect(r2.expected).toBe(369);
+    expect(r2.actual).toBe(0);
+
+    const p3 = client.waitForTransfer({ timeout: 200 });
+    stub.push(JSON.stringify(transferPending(369, 34)));
+    const r3 = await p3;
+    if (r3.status !== "waiting") throw new Error("unreachable");
+    expect(r3.toMap).toBe(369);
+    client.close();
+    await stub.stop();
   });
 
   test("a relog cannot resolve a moveTo against the previous session's stale result", async () => {
@@ -540,6 +840,38 @@ describe("client: killTarget", () => {
     const stub = startStub({ onConnect: () => combatWorld() });
     const client = await inWorld(stub);
     await expect(client.killTarget("Kobold Worker")).rejects.toThrow(/killTarget\(guid\).*decimal guid string/s);
+    expect(stub.actions).toHaveLength(0);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a UnitView from state.units(...) can be passed straight in (item 3b)", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const unit = client.state.units().find((u) => u.guid === CREATURE_GUID)!;
+    expect(unit).toBeDefined();
+    const fight = client.killTarget(unit, {
+      timeout: 5000,
+      pollIntervalMs: 10,
+      meleeRange: 100,
+    });
+    await untilAction(stub, "attack_start");
+    stub.push(JSON.stringify(creatureHealth(0, 61)));
+    const result = await fight;
+    expect(result.ok).toBe(true);
+    expect(result.status).toBe("killed");
+    expect(result.guid).toBe(CREATURE_GUID);
+    expect(stub.actions[0]?.guid).toBe(CREATURE_GUID);
+    client.close();
+    await stub.stop();
+  });
+
+  test("passing a plain object with no .guid is rejected with a pointer to state.units", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    await expect(client.killTarget({ name: "boar" } as never)).rejects.toThrow(
+      /killTarget\(guid\).*no usable \.guid.*state\.units/s,
+    );
     expect(stub.actions).toHaveLength(0);
     client.close();
     await stub.stop();
@@ -973,6 +1305,58 @@ describe("client: quests", () => {
     await stub.stop();
   });
 
+  test("a turn-in timeout quotes the distance and rules range out when it is close", async () => {
+    // laguna-s-2.1 stood 0.1y from the *giver* of quest 783 (McBride ends it)
+    // and re-read "the NPC may be out of interact range" for 135 turns. The
+    // SDK knows the distance locally, so the message stops offering range as a
+    // live possibility when it is not one.
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const NEAR_GUID = "17365880163140632777";
+    const self = client.state.self.position?.value;
+    if (!self) throw new Error("no login position");
+    const near = structuredClone(creatureCreate);
+    (near.data.objects[0] as { guid: string }).guid = NEAR_GUID;
+    (near.data.objects[0] as { pos: { x: number; y: number; z: number } }).pos = {
+      ...(near.data.objects[0] as { pos: { x: number; y: number; z: number; o: number } }).pos,
+      x: self.x + 0.8,
+      y: self.y,
+      z: self.z,
+    };
+    near.seq = 91;
+    stub.push(JSON.stringify(near));
+    await Bun.sleep(20);
+
+    const err = (await client
+      .turnInQuest(NEAR_GUID, QUEST_ID, 0, { timeout: 150 })
+      .catch((e: unknown) => e)) as Error & { distance?: number };
+    expect(err).toBeInstanceOf(EventTimeoutError);
+    expect(err.message).toContain("distance: 0.8y");
+    expect(err.message).toContain("range is NOT the cause");
+    expect(err.message).toContain(`does not end quest ${QUEST_ID}`);
+    expect(err.message).toContain("search_reference");
+    expect(err.distance).toBe(0.8);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a quest-list timeout quotes the distance and says to close it when it is far", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    await Bun.sleep(20);
+    const err = (await client
+      .questsAvailableFrom(CREATURE_GUID, { timeout: 150 })
+      .catch((e: unknown) => e)) as Error & { distance?: number };
+    expect(err).toBeInstanceOf(EventTimeoutError);
+    // creatureCreate stands ~35y from the login position.
+    expect(err.message).toMatch(/distance: 3\d(\.\d+)?y/);
+    expect(err.message).toContain("interact range is ~5y");
+    expect(err.message).toContain("move to the NPC first");
+    expect(err.distance).toBeGreaterThan(30);
+    client.close();
+    await stub.stop();
+  });
+
   test("a refusal while the log says complete names the wrong questgiver", async () => {
     // roster-sonnet-20260822: three not_completes against a log that said
     // complete:true — the honest status is that another NPC ends this quest.
@@ -1017,6 +1401,179 @@ describe("client: quests", () => {
     await expect(client.waitForQuestObjective(QUEST_ID, { timeout: 40 })).rejects.toBeInstanceOf(
       EventTimeoutError,
     );
+    client.close();
+    await stub.stop();
+  });
+});
+
+describe("client: questsAvailableFrom", () => {
+  test("reads the offer out of a gossip menu", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const pending = client.questsAvailableFrom(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify(gossipWithQuests([QUEST_ID, OTHER_QUEST_ID], 91)));
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    expect(result.quests.map((q) => q.questId)).toEqual([QUEST_ID, OTHER_QUEST_ID]);
+    expect(result.quests[0]?.title).toBe(`fixture quest ${QUEST_ID}`);
+    expect(result.quests[0]?.icon).toBe(2);
+    client.close();
+    await stub.stop();
+  });
+
+  test("reads the plain questgiver list too", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const pending = client.questsAvailableFrom(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify(questGiverList([QUEST_ID], 92)));
+    const result = await pending;
+    expect(result.quests.map((q) => q.questId)).toEqual([QUEST_ID]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("an empty offer is an answer, not an error", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const pending = client.questsAvailableFrom(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify(gossipWithQuests([], 93)));
+    const result = await pending;
+    expect(result).toEqual({ ok: true, quests: [] });
+    client.close();
+    await stub.stop();
+  });
+
+  test("silence throws rather than reporting an empty offer", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    await expect(
+      client.questsAvailableFrom(CREATURE_GUID, { timeout: 40 }),
+    ).rejects.toBeInstanceOf(EventTimeoutError);
+    client.close();
+    await stub.stop();
+  });
+});
+
+describe("client: trainers", () => {
+  test("trainerList derives learnable and affordable per spell", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    // Coinage is a self-only PRIVATE field; it only exists once observed.
+    stub.push(JSON.stringify(selfProgress)); // money 12345
+    await Bun.sleep(20);
+    const pending = client.trainerList(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "trainer_list");
+    stub.push(
+      JSON.stringify(
+        trainerList([
+          { spellId: 100, state: 0, cost: 100 },
+          { spellId: 200, state: 0, cost: 999_999 },
+          { spellId: 300, state: 1, cost: 10 },
+          { spellId: 400, state: 2, cost: 10 },
+        ]),
+      ),
+    );
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    expect(result.trainerType).toBe(0);
+    expect(result.spells.map((s) => s.learnable)).toEqual([true, true, false, false]);
+    expect(result.spells.map((s) => s.affordable)).toEqual([true, false, true, true]);
+    // The wire fields survive untouched alongside the derived ones.
+    expect(result.spells[0]).toMatchObject({ spellId: 100, cost: 100, reqLevel: 4, reqSkill: 0 });
+    client.close();
+    await stub.stop();
+  });
+
+  test("affordable is undefined while money is unobserved, never guessed", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    expect(client.state.money).toBeUndefined();
+    const pending = client.trainerList(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "trainer_list");
+    stub.push(JSON.stringify(trainerList([{ spellId: 100, state: 0, cost: 100 }])));
+    const result = await pending;
+    expect(result.spells[0]?.affordable).toBeUndefined();
+    expect(result.spells[0]?.learnable).toBe(true);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a trainer list for another NPC does not answer this one", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const pending = client.trainerList(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "trainer_list");
+    stub.push(JSON.stringify(trainerList([{ spellId: 1, state: 0, cost: 1 }], 63, SELF_GUID)));
+    stub.push(JSON.stringify(trainerList([{ spellId: 100, state: 0, cost: 5 }], 64)));
+    const result = await pending;
+    expect(result.spells.map((s) => s.spellId)).toEqual([100]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a silent trainer times out with what was awaited", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const err = await client.trainerList(CREATURE_GUID, { timeout: 40 }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(EventTimeoutError);
+    expect((err as EventTimeoutError).waitingFor).toContain("SMSG_TRAINER_LIST");
+    client.close();
+    await stub.stop();
+  });
+
+  test("buySpell reports the spell the server said it taught", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const pending = client.buySpell(CREATURE_GUID, 100, { timeout: 2000 });
+    await untilAction(stub, "trainer_buy_spell");
+    // A verdict for a different spell must not settle this one.
+    stub.push(JSON.stringify(trainerBuySucceeded(999, 65)));
+    stub.push(JSON.stringify(trainerBuySucceeded(100, 66)));
+    expect(await pending).toEqual({ ok: true, status: "learned", spellId: 100 });
+    client.close();
+    await stub.stop();
+  });
+
+  test("a refusal is a value carrying the server's reason and a hint", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const pending = client.buySpell(CREATURE_GUID, 100, { timeout: 2000 });
+    await untilAction(stub, "trainer_buy_spell");
+    stub.push(JSON.stringify(trainerBuyFailed(100, 1, 67)));
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.status).toBe("buy_failed");
+    expect(result.reason).toBe(1);
+    expect(result.hint).toContain("not enough money");
+    expect(result.hint).toContain("trainerList");
+    client.close();
+    await stub.stop();
+  });
+
+  test("an unknown reason code still reports the number", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const pending = client.buySpell(CREATURE_GUID, 100, { timeout: 2000 });
+    await untilAction(stub, "trainer_buy_spell");
+    stub.push(JSON.stringify(trainerBuyFailed(100, 77, 68)));
+    const result = await pending;
+    if (result.ok) throw new Error("unreachable");
+    expect(result.reason).toBe(77);
+    expect(result.hint).toContain("reason 77");
+    client.close();
+    await stub.stop();
+  });
+
+  test("no verdict at all throws rather than inventing one", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const err = await client.buySpell(CREATURE_GUID, 100, { timeout: 40 }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(EventTimeoutError);
+    expect((err as EventTimeoutError).waitingFor).toContain("SMSG_TRAINER_BUY_SUCCEEDED");
     client.close();
     await stub.stop();
   });
@@ -1096,6 +1653,356 @@ describe("ADR-0017: guid arguments at the client surface", () => {
     expect(typeof result.guid).toBe("string");
     expect(() => JSON.stringify(result)).not.toThrow();
     client.close();
+    await stub.stop();
+  });
+});
+
+describe("client: gossipSelect by observed option text (item 3c)", () => {
+  const gossipMenu = (seq: number): string =>
+    JSON.stringify({
+      seq,
+      opcode: "SMSG_GOSSIP_MESSAGE",
+      opcodeId: 0x17d,
+      ts: 1_700_000_000_000 + seq,
+      data: {
+        guid: CREATURE_GUID,
+        menuId: 7,
+        textId: 100,
+        options: [
+          { optionId: 1, icon: 0, text: "Train me" },
+          { optionId: 2, icon: 0, text: "Make me a Guild Master" },
+          { optionId: 3, icon: 0, text: "I want to train in a new skill" },
+        ],
+        quests: [],
+      },
+    });
+  const gossipComplete = (seq: number): string =>
+    JSON.stringify({
+      seq,
+      opcode: "SMSG_GOSSIP_COMPLETE",
+      opcodeId: 0x17e,
+      ts: 1_700_000_000_000 + seq,
+      data: {},
+    });
+
+  async function withMenu() {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    stub.push(gossipMenu(200));
+    await client.events.waitForOpcode("SMSG_GOSSIP_MESSAGE", { timeout: 2000 });
+    return { stub, client };
+  }
+
+  test("resolves an exact option text to its optionId and the menu's menuId", async () => {
+    const { stub, client } = await withMenu();
+    await client.gossipSelect(CREATURE_GUID, "Train me");
+    const sent = stub.actions.at(-1)!;
+    expect(sent.action).toBe("gossip_select");
+    expect(sent).toMatchObject({ guid: CREATURE_GUID, menuId: 7, optionId: 1 });
+    client.close();
+    await stub.stop();
+  });
+
+  test("resolves a unique substring, case-insensitively", async () => {
+    const { stub, client } = await withMenu();
+    await client.gossipSelect(CREATURE_GUID, "guild master");
+    expect(stub.actions.at(-1)).toMatchObject({ menuId: 7, optionId: 2 });
+    client.close();
+    await stub.stop();
+  });
+
+  test("an ambiguous substring rejects with both matching texts and dispatches nothing", async () => {
+    const { stub, client } = await withMenu();
+    const before = stub.actions.length;
+    await expect(client.gossipSelect(CREATURE_GUID, "train")).rejects.toThrow(
+      /Train me[\s\S]*I want to train in a new skill|I want to train in a new skill[\s\S]*Train me/,
+    );
+    expect(stub.actions.length).toBe(before);
+    client.close();
+    await stub.stop();
+  });
+
+  test("an unmatched text rejects with the option list", async () => {
+    const { stub, client } = await withMenu();
+    await expect(client.gossipSelect(CREATURE_GUID, "nonsense")).rejects.toThrow(/no option.*matches.*Train me/s);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a numeric option uses the menu's menuId and must be on the menu", async () => {
+    const { stub, client } = await withMenu();
+    await client.gossipSelect(CREATURE_GUID, 2);
+    expect(stub.actions.at(-1)).toMatchObject({ menuId: 7, optionId: 2 });
+    await expect(client.gossipSelect(CREATURE_GUID, 9)).rejects.toThrow(/no option 9/);
+    client.close();
+    await stub.stop();
+  });
+
+  test("the raw menuId+optionId form is unchanged", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    // No menu observed, yet the raw form still dispatches: it does not consult the fold.
+    await client.gossipSelect(CREATURE_GUID, 42, 3);
+    expect(stub.actions.at(-1)).toMatchObject({ action: "gossip_select", menuId: 42, optionId: 3 });
+    client.close();
+    await stub.stop();
+  });
+
+  test("with no menu open, the by-text form rejects with a pointer to gossipHello", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    await expect(client.gossipSelect(CREATURE_GUID, "Train me")).rejects.toThrow(
+      /no gossip menu.*gossipHello/s,
+    );
+    client.close();
+    await stub.stop();
+  });
+
+  test("a gossip complete closes the menu, so a later by-text select rejects", async () => {
+    const { stub, client } = await withMenu();
+    stub.push(gossipComplete(201));
+    await client.events.waitForOpcode("SMSG_GOSSIP_COMPLETE", { timeout: 2000 });
+    await expect(client.gossipSelect(CREATURE_GUID, "Train me")).rejects.toThrow(/no gossip menu/);
+    client.close();
+    await stub.stop();
+  });
+});
+
+// ------------------------------------------------ client-parity queries (27/28)
+
+describe("client: questgiver status and quest query, issued the way a client does", () => {
+  /** A questgiver-flagged create block for a fresh guid, near our own position. */
+  function questGiverCreate(guid: string, seq: number, fields: Record<string, number> = { npcFlags: 2 }) {
+    const block = structuredClone(creatureCreate);
+    (block.data.objects[0] as { guid: string }).guid = guid;
+    (block.data.objects[0] as { fields: Record<string, number> }).fields = { entry: 823, ...fields };
+    block.seq = seq;
+    return block;
+  }
+  const GIVER = "17365880163140632801";
+  const GUARD = "17365880163140632802";
+
+  test("a questgiver-flagged unit coming into view is queried once; a guard is not", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    stub.push(JSON.stringify(questGiverCreate(GIVER, 91)));
+    stub.push(JSON.stringify(questGiverCreate(GUARD, 92, { npcFlags: 0 })));
+    const at = await untilAction(stub, "questgiver_status_query");
+    expect(stub.actions[at]).toMatchObject({ action: "questgiver_status_query", guid: GIVER });
+    await Bun.sleep(200);
+    expect(stub.actions.filter((a) => a.action === "questgiver_status_query")).toHaveLength(1);
+    // The answer folds onto the unit.
+    stub.push(JSON.stringify(questGiverStatus(GIVER, 8, 93)));
+    await Bun.sleep(20);
+    expect(client.state.units({ questGiver: "available" }).map((r) => r.guid)).toEqual([GIVER]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a questgiver gameobject is queried too; a status already in the burst suppresses the query", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const GO = "17365880163140632803";
+    stub.push(JSON.stringify(questGiverCreate(GO, 91, { goType: 2 })));
+    // The login STATUS_MULTIPLE names GIVER in the same burst as its create.
+    stub.push(JSON.stringify(questGiverCreate(GIVER, 92)));
+    stub.push(JSON.stringify(questGiverStatusMultiple([{ guid: GIVER, status: 10 }], 93)));
+    await untilAction(stub, "questgiver_status_query");
+    await Bun.sleep(200);
+    const sent = stub.actions.filter((a) => a.action === "questgiver_status_query").map((a) => a.guid);
+    expect(sent).toEqual([GO]);
+    expect(client.state.units({ questGiver: "reward" }).map((r) => r.guid)).toEqual([GIVER]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a unit that leaves view and returns is queried again", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    stub.push(JSON.stringify(questGiverCreate(GIVER, 91)));
+    await untilAction(stub, "questgiver_status_query");
+    const gone = structuredClone(creatureOutOfRange) as { seq: number; data: { objects: { guids: string[] }[] } };
+    gone.seq = 92;
+    gone.data.objects[0]!.guids = [GIVER];
+    stub.push(JSON.stringify(gone));
+    await Bun.sleep(20);
+    stub.push(JSON.stringify(questGiverCreate(GIVER, 93)));
+    await untilAction(stub, "questgiver_status_query", 1);
+    expect(stub.actions.filter((a) => a.action === "questgiver_status_query")).toHaveLength(2);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a quest entering the log is queried once; completion refreshes every marker; re-accept re-queries", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    // The login fold of the (empty) quest log does not ask for markers: the
+    // core sends STATUS_MULTIPLE unprompted at login.
+    await Bun.sleep(200);
+    expect(stub.actions.map((a) => a.action)).not.toContain("questgiver_status_multiple_query");
+
+    stub.push(JSON.stringify(questAccepted));
+    const q = await untilAction(stub, "quest_query");
+    expect(stub.actions[q]).toMatchObject({ action: "quest_query", questId: QUEST_ID });
+    await untilAction(stub, "questgiver_status_multiple_query");
+    stub.push(JSON.stringify(questQueryResponse()));
+    await Bun.sleep(20);
+    expect(client.state.quest(QUEST_ID)?.title).toBe("Kobold Camp Cleanup");
+
+    // Counters moving do not refresh markers; the complete bit does.
+    const before = stub.actions.length;
+    stub.push(JSON.stringify(questProgress));
+    await Bun.sleep(200);
+    expect(stub.actions.length).toBe(before);
+    stub.push(JSON.stringify(questComplete));
+    await untilAction(stub, "questgiver_status_multiple_query", before);
+    expect(stub.actions.filter((a) => a.action === "quest_query")).toHaveLength(1);
+
+    // Abandon (slot emptied) then re-accept: the template is cached, so no
+    // second quest_query — but the marker refresh fires for each log change.
+    const empty = structuredClone(questAccepted) as { seq: number; data: { objects: { fields: Record<string, number> }[] } };
+    empty.seq = 40;
+    empty.data.objects[0]!.fields = { quest0Id: 0, quest0State: 0 };
+    stub.push(JSON.stringify(empty));
+    await Bun.sleep(200);
+    const re = structuredClone(questAccepted) as { seq: number };
+    re.seq = 41;
+    stub.push(JSON.stringify(re));
+    await Bun.sleep(200);
+    expect(stub.actions.filter((a) => a.action === "quest_query")).toHaveLength(1);
+    expect(client.state.quest(QUEST_ID)?.objectives).toHaveLength(4);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a turn-in silence names the observed marker when it is not `reward`", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const self = client.state.self.position?.value;
+    if (!self) throw new Error("no login position");
+    const near = questGiverCreate(GIVER, 91);
+    (near.data.objects[0] as { pos: { x: number; y: number; z: number; o: number } }).pos = { x: self.x + 0.8, y: self.y, z: self.z, o: 0 };
+    stub.push(JSON.stringify(near));
+    stub.push(JSON.stringify(questGiverStatus(GIVER, 8, 92)));
+    await Bun.sleep(20);
+    const err = (await client.turnInQuest(GIVER, QUEST_ID, 0, { timeout: 150 }).catch((e: unknown) => e)) as Error;
+    expect(err).toBeInstanceOf(EventTimeoutError);
+    expect(err.message).toContain("range is NOT the cause");
+    expect(err.message).toContain("questgiver status is `available`, not `reward`");
+    expect(err.message).toContain(`not quest ${QUEST_ID}'s ender`);
+    expect(err.message).toContain('state.units({ questGiver: "reward" })');
+    client.close();
+    await stub.stop();
+  });
+
+  test("a quest-list silence names a `none` marker, and says nothing when no marker was observed", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    stub.push(JSON.stringify(questGiverStatus(CREATURE_GUID, 0, 91)));
+    await Bun.sleep(20);
+    const err = (await client.questsAvailableFrom(CREATURE_GUID, { timeout: 150 }).catch((e: unknown) => e)) as Error;
+    expect(err).toBeInstanceOf(EventTimeoutError);
+    expect(err.message).toContain("questgiver status is `none`");
+    const bare = (await client.questsAvailableFrom(PLAYER_GUID, { timeout: 150 }).catch((e: unknown) => e)) as Error;
+    expect(bare.message).not.toContain("questgiver status");
+    client.close();
+    await stub.stop();
+  });
+
+  test("the raw queries are on the client for a caller who wants one now", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    await client.questQuery(QUEST_ID);
+    await client.questGiverStatusQuery(CREATURE_GUID);
+    await client.questGiverStatusQuery();
+    expect(stub.actions.map((a) => a.action)).toEqual([
+      "quest_query",
+      "questgiver_status_query",
+      "questgiver_status_multiple_query",
+    ]);
+    expect(stub.actions[0]).toMatchObject({ questId: QUEST_ID });
+    expect(stub.actions[1]).toMatchObject({ guid: CREATURE_GUID });
+    client.close();
+    await stub.stop();
+  });
+});
+
+describe("client: talents and the raw escape hatch (FOLLOW-UPS 39, ADR-0025)", () => {
+  const talentsInfo = (seq: number, talents: { talentId: number; rank: number }[], unspent = 0) =>
+    JSON.stringify({
+      seq,
+      opcode: "SMSG_TALENTS_INFO",
+      opcodeId: 0x4c0,
+      ts: 1_700_000_000_000 + seq,
+      data: { pet: false, unspentPoints: unspent, specCount: 1, activeSpec: 0, specs: [{ talents }] },
+    });
+
+  test("learnTalent reads the verdict off the SMSG_TALENTS_INFO answer", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const pending = client.learnTalent(42, 0, { timeout: 2000 });
+    const at = await untilAction(stub, "learn_talent");
+    expect(stub.actions[at]).toMatchObject({ action: "learn_talent", talentId: 42, rank: 0 });
+    stub.push(talentsInfo(60, [{ talentId: 42, rank: 0 }]));
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    expect(result.talents.talents).toEqual([{ talentId: 42, rank: 0 }]);
+
+    const refused = client.learnTalent(43, 1, { timeout: 2000 });
+    await untilAction(stub, "learn_talent", at + 1);
+    stub.push(talentsInfo(61, [{ talentId: 42, rank: 0 }], 0));
+    const r2 = await refused;
+    expect(r2.ok).toBe(false);
+    if (!r2.ok) expect(r2.hint).toContain("unspentPoints is 0");
+    await stub.stop();
+  });
+
+  test("raw packs a field list little-endian and sends the allowlisted opcode by name", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const ack = await client.raw("CMSG_TEXT_EMOTE", [
+      { u32: 0x0102 },
+      { u8: 7 },
+      { guid: "4294967296" }, // 0x1_0000_0000
+      { packedGuid: "4294967296" },
+      { cstring: "hi" },
+      { i32: -1 },
+      { u16: 0xabcd },
+      { bytes: "ff" },
+    ]);
+    expect(ack.opcode).toBe("CMSG_TEXT_EMOTE");
+    expect(ack.payload).toBe("02010000" + "07" + "0000000001000000" + "1001" + "686900" + "ffffffff" + "cdab" + "ff");
+    expect(stub.actions.at(-1)).toMatchObject({ action: "raw", opcode: "CMSG_TEXT_EMOTE", payload: ack.payload });
+
+    // Bodiless, hex, and bytes forms.
+    expect((await client.raw("CMSG_GROUP_DISBAND")).payload).toBe("");
+    expect((await client.raw("CMSG_GROUP_DISBAND", "ABCD")).payload).toBe("abcd");
+    expect((await client.raw("CMSG_GROUP_DISBAND", Uint8Array.from([1, 255]))).payload).toBe("01ff");
+    await stub.stop();
+  });
+
+  test("raw rejects a non-opcode name and a malformed payload before anything is sent", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const before = stub.actions.length;
+    expect(() => client.raw("say", "")).toThrow(/CMSG_\* name/);
+    expect(() => client.raw("CMSG_EMOTE", "abc")).toThrow(/hex string/);
+    expect(() => client.raw("CMSG_EMOTE", [{ u8: 300 }])).toThrow(/payload/);
+    expect(() => client.raw("CMSG_EMOTE", [{ u9: 3 } as never])).toThrow(/field/);
+    expect(stub.actions.length).toBe(before);
+    await stub.stop();
+  });
+
+  test("the module's raw refusals render hints", async () => {
+    const stub = startStub({
+      onConnect: () => combatWorld(),
+      failAction: (a) =>
+        a === "raw" ? json({ ok: false, error: "opcode_not_allowed", action: "raw", opcode: "CMSG_EMOTE" }, 400) : undefined,
+    });
+    const client = await inWorld(stub);
+    const err = await client.raw("CMSG_EMOTE", [{ u32: 1 }]).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(WrathRequestError);
+    expect((err as WrathRequestError).message).toContain("allowlist");
     await stub.stop();
   });
 });

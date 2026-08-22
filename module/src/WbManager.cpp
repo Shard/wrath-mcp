@@ -29,10 +29,16 @@
 #include "QuestDef.h"
 #include "ObjectGuid.h"
 #include "Opcodes.h"
+#include "Map.h"
+#include "MapCollisionData.h"
 #include "PathGenerator.h"
 #include "Player.h"
 #include "SharedDefines.h"
+#include "SpellInfo.h"
+#include "SpellMgr.h"
 #include "Timer.h"
+#include "Transport.h"
+#include "GameObjectModel.h"
 #include "UpdateData.h"
 #include "UpdateFields.h"
 #include "World.h"
@@ -60,6 +66,22 @@ namespace WrathBench
     {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    // Build identity served on /health to every caller. WRATHBENCH_BUILD is the
+    // repo's `git describe --tags --always --dirty` at image build time (docker
+    // build-arg -> cmake -> define, see module/mod-wrathbench.cmake); absent
+    // when built outside that path. Process start is captured at static init.
+#ifndef WRATHBENCH_BUILD
+#define WRATHBENCH_BUILD "unknown"
+#endif
+    static int64_t const kStartedAtMs = NowMs();
+
+    static void AddBuildIdentity(Json::Writer& w)
+    {
+        w.Add("build", WRATHBENCH_BUILD);
+        w.Add("startedAtMs", kStartedAtMs);
+        w.Add("uptimeMs", NowMs() - kStartedAtMs);
     }
 
     static std::string Sanitize(std::string const& token)
@@ -146,6 +168,13 @@ namespace WrathBench
             LOG_WARN("module", "wrathbench: could not create audit dir '{}': {}", _auditDir, e.what());
         }
 
+        // The client's own AreaTrigger.dbc, read from the data volume the
+        // worldserver already mounts (DataDir). A missing file disables
+        // automatic areatrigger dispatch and says so; it never stops the module.
+        std::string dbcPath = sWorld->GetDataPath() + "dbc/AreaTrigger.dbc";
+        if (!LoadAreaTriggerDbc(dbcPath))
+            LOG_ERROR("module", "wrathbench: AreaTrigger.dbc not loaded from '{}'; portals and explore triggers will not fire for bench characters", dbcPath);
+
         _http = std::make_unique<HttpServer>(_bindAddress, _port, this, _threads);
         try
         {
@@ -197,6 +226,7 @@ namespace WrathBench
         // Drive synthesized movement (ADR-0010). World thread: maps are not
         // mid-update here, so reading player state and QueuePacket are both safe.
         TickMovers(nowMs);
+        TickRiders(nowMs);
 
         // Answer pending teleports; without this every teleport (repop's
         // graveyard port included) freezes movement forever.
@@ -285,6 +315,7 @@ namespace WrathBench
             w.Add("sessions", 0);
             w.Add("droppedPackets", 0);
             w.Add("droppedPacketsLive", 0);
+            AddBuildIdentity(w);
             return {200, w.Str()};
         }
 
@@ -318,6 +349,7 @@ namespace WrathBench
         w.Add("droppedPackets", _totalDrops.load()); // lifetime
         w.Add("droppedPacketsLive", liveDrops);      // across current sessions
         w.Raw("droppedByOpcode", byOpcode.Str());    // lifetime, top 30 by count
+        AddBuildIdentity(w);
         return {200, w.Str()};
     }
 
@@ -328,8 +360,31 @@ namespace WrathBench
         if (token.empty())
             return {400, Json::Writer().Add("ok", false).Add("error", "missing_token").Str()};
 
-        if (FindByToken(token))
-            return {409, Json::Writer().Add("ok", false).Add("error", "token_in_use").Str()};
+        // Minimum-entropy gate (FOLLOW-UPS 19, docs/CONTRACTS.md accepted risk).
+        // The session token is a bearer capability over /action, /events and
+        // DELETE /session, and the historical default was the run id — a
+        // second-granularity timestamp another run could enumerate. Length is a
+        // proxy for entropy, not a substitute for a random secret issued by the
+        // module (still item 19), but it takes guessable tokens off the table.
+        // Checked before the session is registered so a rejected token leaves
+        // nothing behind. Hint per ADR-0016: a human reading it should know
+        // what to do.
+        static constexpr size_t kMinTokenChars = 32;
+        if (token.size() < kMinTokenChars)
+            return {400, Json::Writer().Add("ok", false).Add("error", "weak_token")
+                .Add("received", (uint32_t)token.size())
+                .Add("minimum", (uint32_t)kMinTokenChars)
+                .Add("hint", "session tokens are bearer capabilities and must be at least 32 characters; "
+                             "the runner generates one per run — pass that token through instead of a "
+                             "hand-written or run-id-derived string, or append random hex to it")
+                .Str()};
+
+        // Same-token handling (idempotent create / self-reclaim) is decided on
+        // the world thread in DoCreateSession, where TeardownByToken is legal and
+        // the create is serialized — not here on the io thread. _byToken[token]
+        // is written only after those checks, so there is no clobber of an
+        // existing record. (POST /characters and /character-delete keep their
+        // io-thread token_in_use pre-filter below: they never reclaim.)
 
         auto s = std::make_shared<BenchSession>();
         s->token = token;
@@ -378,6 +433,105 @@ namespace WrathBench
         if (v.find_first_not_of("0123456789") != std::string::npos)
             return false;
         try { (void)std::stoull(v); return true; } catch (...) { return false; }
+    }
+
+    // The raw-action allowlist (ADR-0025, PROTOCOL.md "raw"). Every entry is a
+    // client opcode a stock 3.3.5a client sends from ordinary play, whose
+    // handler does nothing a non-GM client could not do, and which has NO
+    // dedicated action yet — the hatch exists so a trajectory can show the
+    // need for a surface before the module and SDK grow one (ADR-0015).
+    // Deliberately absent: movement (the module drives it; a stray packet
+    // desyncs the mover), session lifecycle (login/logout/char create), every
+    // opcode that already has an action (one audited path per opcode), and
+    // anything GM-gated or teleport-shaped.
+    struct RawOpcode { char const* name; uint16 op; };
+    static RawOpcode const kRawAllowlist[] = {
+        // talents (also first-class actions; listed so a caller can build the
+        // preview packet by hand)
+        { "CMSG_LEARN_TALENT", CMSG_LEARN_TALENT },
+        { "CMSG_LEARN_PREVIEW_TALENTS", CMSG_LEARN_PREVIEW_TALENTS },
+        // chat and emotes (whisper/party/yell ride CMSG_MESSAGECHAT)
+        { "CMSG_MESSAGECHAT", CMSG_MESSAGECHAT },
+        { "CMSG_EMOTE", CMSG_EMOTE },
+        { "CMSG_TEXT_EMOTE", CMSG_TEXT_EMOTE },
+        // inventory management (bags, splitting, swapping)
+        { "CMSG_SPLIT_ITEM", CMSG_SPLIT_ITEM },
+        { "CMSG_SWAP_ITEM", CMSG_SWAP_ITEM },
+        { "CMSG_SWAP_INV_ITEM", CMSG_SWAP_INV_ITEM },
+        { "CMSG_AUTOSTORE_BAG_ITEM", CMSG_AUTOSTORE_BAG_ITEM },
+        { "CMSG_AUTOEQUIP_ITEM_SLOT", CMSG_AUTOEQUIP_ITEM_SLOT },
+        { "CMSG_READ_ITEM", CMSG_READ_ITEM },
+        { "CMSG_OPEN_ITEM", CMSG_OPEN_ITEM },
+        { "CMSG_BUYBACK_ITEM", CMSG_BUYBACK_ITEM },
+        // spell/aura control
+        { "CMSG_CANCEL_AURA", CMSG_CANCEL_AURA },
+        { "CMSG_CANCEL_AUTO_REPEAT_SPELL", CMSG_CANCEL_AUTO_REPEAT_SPELL },
+        { "CMSG_CANCEL_CHANNELLING", CMSG_CANCEL_CHANNELLING },
+        { "CMSG_SET_SHEATHED", CMSG_SET_SHEATHED },
+        { "CMSG_STANDSTATECHANGE", CMSG_STANDSTATECHANGE },
+        { "CMSG_RESURRECT_RESPONSE", CMSG_RESURRECT_RESPONSE },
+        // flight paths
+        { "CMSG_TAXINODE_STATUS_QUERY", CMSG_TAXINODE_STATUS_QUERY },
+        { "CMSG_TAXIQUERYAVAILABLENODES", CMSG_TAXIQUERYAVAILABLENODES },
+        { "CMSG_ACTIVATETAXI", CMSG_ACTIVATETAXI },
+        { "CMSG_ACTIVATETAXIEXPRESS", CMSG_ACTIVATETAXIEXPRESS },
+        // bank
+        { "CMSG_BANKER_ACTIVATE", CMSG_BANKER_ACTIVATE },
+        { "CMSG_AUTOBANK_ITEM", CMSG_AUTOBANK_ITEM },
+        { "CMSG_AUTOSTORE_BANK_ITEM", CMSG_AUTOSTORE_BANK_ITEM },
+        { "CMSG_BUY_BANK_SLOT", CMSG_BUY_BANK_SLOT },
+        // mail
+        { "CMSG_SEND_MAIL", CMSG_SEND_MAIL },
+        { "CMSG_GET_MAIL_LIST", CMSG_GET_MAIL_LIST },
+        { "CMSG_MAIL_TAKE_ITEM", CMSG_MAIL_TAKE_ITEM },
+        { "CMSG_MAIL_TAKE_MONEY", CMSG_MAIL_TAKE_MONEY },
+        { "CMSG_MAIL_MARK_AS_READ", CMSG_MAIL_MARK_AS_READ },
+        { "CMSG_MAIL_DELETE", CMSG_MAIL_DELETE },
+        // party
+        { "CMSG_GROUP_INVITE", CMSG_GROUP_INVITE },
+        { "CMSG_GROUP_ACCEPT", CMSG_GROUP_ACCEPT },
+        { "CMSG_GROUP_DECLINE", CMSG_GROUP_DECLINE },
+        { "CMSG_GROUP_UNINVITE_GUID", CMSG_GROUP_UNINVITE_GUID },
+        { "CMSG_GROUP_DISBAND", CMSG_GROUP_DISBAND },
+        { "CMSG_GROUP_SET_LEADER", CMSG_GROUP_SET_LEADER },
+        { "CMSG_LOOT_METHOD", CMSG_LOOT_METHOD },
+        // trade
+        { "CMSG_INITIATE_TRADE", CMSG_INITIATE_TRADE },
+        { "CMSG_BEGIN_TRADE", CMSG_BEGIN_TRADE },
+        { "CMSG_ACCEPT_TRADE", CMSG_ACCEPT_TRADE },
+        { "CMSG_CANCEL_TRADE", CMSG_CANCEL_TRADE },
+        { "CMSG_SET_TRADE_ITEM", CMSG_SET_TRADE_ITEM },
+        { "CMSG_CLEAR_TRADE_ITEM", CMSG_CLEAR_TRADE_ITEM },
+        { "CMSG_SET_TRADE_GOLD", CMSG_SET_TRADE_GOLD },
+        // client-cache queries a real client issues on its own
+        { "CMSG_NAME_QUERY", CMSG_NAME_QUERY },
+        { "CMSG_CREATURE_QUERY", CMSG_CREATURE_QUERY },
+        { "CMSG_GAMEOBJECT_QUERY", CMSG_GAMEOBJECT_QUERY },
+        { "CMSG_ITEM_QUERY_SINGLE", CMSG_ITEM_QUERY_SINGLE },
+        { "CMSG_NPC_TEXT_QUERY", CMSG_NPC_TEXT_QUERY },
+        { "CMSG_PAGE_TEXT_QUERY", CMSG_PAGE_TEXT_QUERY },
+        { "CMSG_PLAYED_TIME", CMSG_PLAYED_TIME },
+        { "CMSG_QUERY_TIME", CMSG_QUERY_TIME },
+        { "CMSG_SET_WATCHED_FACTION", CMSG_SET_WATCHED_FACTION },
+        { "CMSG_SET_ACTION_BUTTON", CMSG_SET_ACTION_BUTTON },
+        { nullptr, 0 },
+    };
+    static constexpr size_t kRawPayloadMaxBytes = 512;
+
+    static bool RawOpcodeAllowed(std::string const& name)
+    {
+        for (RawOpcode const* e = kRawAllowlist; e->name; ++e)
+            if (name == e->name)
+                return true;
+        return false;
+    }
+
+    static uint16 RawOpcodeValue(std::string const& name)
+    {
+        for (RawOpcode const* e = kRawAllowlist; e->name; ++e)
+            if (name == e->name)
+                return e->op;
+        return 0;
     }
 
     // Every missing/invalid-param reply names the action and the param it was
@@ -448,9 +602,11 @@ namespace WrathBench
                 "quest_list", "quest_details", "quest_accept", "quest_complete",
                 "quest_choose_reward", "loot", "loot_all", "loot_release",
                 "vendor_list", "buy_item", "sell_item", "repair_all",
-                "spirit_healer_activate", nullptr };
+                "trainer_list", "trainer_buy_spell",
+                "spirit_healer_activate", "questgiver_status_query", nullptr };
             static char const* kNoParams[] = {
-                "clear_target", "attack_stop", "loot_money", "repop", "reclaim_corpse", nullptr };
+                "clear_target", "attack_stop", "loot_money", "repop", "reclaim_corpse",
+                "questgiver_status_multiple_query", nullptr };
 
             bool known = false;
             bool needsGuid = false;
@@ -462,7 +618,8 @@ namespace WrathBench
             if (!known)
                 known = action == "cast_spell" || action == "cancel_cast" || action == "quest_abandon"
                      || action == "loot_item" || action == "equip_item" || action == "use_item"
-                     || action == "destroy_item";
+                     || action == "destroy_item" || action == "quest_query"
+                     || action == "learn_talent" || action == "learn_preview_talents" || action == "raw";
             if (!known)
                 return {400, Json::Writer().Add("ok", false).Add("error", "unsupported_action").Add("action", action).Str()};
 
@@ -471,11 +628,13 @@ namespace WrathBench
             if (action == "gossip_select" && (!req.Has("menuId") || !req.Has("optionId")))
                 return MissingParam(action, "missing_option", !req.Has("menuId") ? "menuId" : "optionId");
             if ((action == "quest_details" || action == "quest_accept" || action == "quest_complete"
-                 || action == "quest_choose_reward" || action == "quest_abandon") && !req.Has("questId"))
+                 || action == "quest_choose_reward" || action == "quest_abandon" || action == "quest_query")
+                && !req.Has("questId"))
                 return MissingParam(action, "missing_quest_id", "questId");
             if (action == "quest_choose_reward" && !req.Has("rewardIndex"))
                 return MissingParam(action, "missing_reward_index", "rewardIndex");
-            if ((action == "cast_spell" || action == "cancel_cast") && !req.Has("spellId"))
+            if ((action == "cast_spell" || action == "cancel_cast" || action == "trainer_buy_spell")
+                && !req.Has("spellId"))
                 return MissingParam(action, "missing_spell_id", "spellId");
             if (action == "loot_item" && !req.Has("slot"))
                 return MissingParam(action, "missing_slot", "slot");
@@ -486,6 +645,32 @@ namespace WrathBench
             if ((action == "equip_item" || action == "use_item" || action == "destroy_item")
                 && (!req.Has("bag") || !req.Has("slot")))
                 return MissingParam(action, "missing_bag_slot", !req.Has("bag") ? "bag" : "slot");
+            if (action == "learn_talent" && (!req.Has("talentId") || !req.Has("rank")))
+                return MissingParam(action, "missing_talent", !req.Has("talentId") ? "talentId" : "rank");
+            if (action == "learn_preview_talents" && !req.Has("talents"))
+                return MissingParam(action, "missing_talents", "talents");
+            if (action == "raw")
+            {
+                // The escape hatch (ADR-0025): an allowlisted client opcode by
+                // name plus a caller-built hex payload. Everything about it is
+                // checked here so a bad request never reaches the world thread.
+                std::string opcode = req.GetString("opcode");
+                if (opcode.empty())
+                    return MissingParam(action, "missing_opcode", "opcode");
+                if (!RawOpcodeAllowed(opcode))
+                    return {400, Json::Writer().Add("ok", false).Add("error", "opcode_not_allowed")
+                        .Add("action", action).Add("opcode", opcode)
+                        .Add("hint", "only the CMSG_* names in PROTOCOL.md's raw allowlist can be sent; opcodes that already have an action must use that action").Str()};
+                std::string payload = req.GetString("payload");
+                if (payload.size() % 2 != 0 || payload.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
+                    return {400, Json::Writer().Add("ok", false).Add("error", "invalid_payload")
+                        .Add("action", action).Add("param", "payload")
+                        .Add("hint", "payload is a hex string of the packet body bytes, little-endian per field, even length; empty for a bodiless opcode").Str()};
+                if (payload.size() > kRawPayloadMaxBytes * 2)
+                    return {400, Json::Writer().Add("ok", false).Add("error", "payload_too_large")
+                        .Add("action", action).Add("received", (uint64_t)(payload.size() / 2))
+                        .Add("maximum", (uint64_t)kRawPayloadMaxBytes).Str()};
+            }
 
             PushTask([this, token, action, body, ack]() { DoGameAction(token, action, body, ack); });
         }
@@ -606,31 +791,140 @@ namespace WrathBench
             return fail("unknown_account");
         s->accountId = accountId;
 
-        // One bench session per account, decided here on the world thread where
-        // creates are serialized. The HTTP-side scans (token_in_use, the
-        // /character-delete ownership gate) are only fast-path pre-filters:
-        // two requests for the same account arriving within one world tick
-        // both pass them, because a racing session only lands in _byToken
-        // below, and the core-side FindSession check further down cannot see
-        // it either (AddSession only queues; _sessions is drained in
-        // UpdateSessions, which runs before our task drain). Without this
-        // check a /character-delete racing a /session create could delete the
-        // character out from under the episode being created, and the core's
-        // AddSession_ would kick-and-delete one of the two WorldSessions
-        // while we still hold the pointer.
+        // --- Same-token create (idempotent liftoff / self-reclaim) ---------
+        // A repeated createSession under the same token must never dead-end. If
+        // that token already owns a live in-world session for the SAME account
+        // and character, return success idempotently — the caller re-syncs its
+        // state from the event stream (the trap this whole change fixes was a
+        // model boxed into calling createSession with no accepting answer). A
+        // session still mid-login is genuinely in flight (token_in_use). Any
+        // other same-token state — in world under a different character/account,
+        // or already tearing down — means the old record is stale, so tear it
+        // down and rebuild. Success is never returned for a character the caller
+        // did not ask for (ADR-0016: no silent wrong behavior). deleteMode and
+        // listMode reject same-token upstream (HttpCharacterDelete/List) and
+        // never reach here as duplicates.
+        if (!s->deleteMode && !s->listMode)
         {
-            std::lock_guard<std::mutex> lock(_sessMutex);
-            for (auto& [otherToken, other] : _byToken)
-                if (!other->tearingDown.load() && otherToken != s->token && other->accountId == accountId)
-                    return s->deleteMode ? fail("account_owned_by_other_token", 409)
-                                         : fail("account_in_use");
+            std::shared_ptr<BenchSession> existing;
+            {
+                std::lock_guard<std::mutex> lock(_sessMutex);
+                auto it = _byToken.find(s->token);
+                if (it != _byToken.end() && it->second != s)
+                    existing = it->second;
+            }
+            if (existing)
+            {
+                bool const sameChar = strcasecmp(existing->charName.c_str(), s->charName.c_str()) == 0;
+                bool const sameAcct = existing->accountId == accountId;
+                int const ph = existing->phase.load();
+                if (!existing->tearingDown.load() && ph == BenchSession::P_INWORLD
+                    && !existing->deleteMode && !existing->listMode && sameChar && sameAcct)
+                {
+                    // account/charName/targetGuidRaw are create-time-stable and
+                    // published before P_INWORLD, so reading them here is safe.
+                    if (!s->ackFired.exchange(true))
+                        ack->set_value({200, Json::Writer().Add("ok", true).Add("token", existing->token)
+                            .Add("account", existing->account).Add("character", existing->charName)
+                            .AddGuid("guid", existing->targetGuidRaw).Add("inWorld", true).Str()});
+                    // No new module session is created, so the SDK's per-session
+                    // event stream never restarts — without this the caller would
+                    // get ok:inWorld beside an empty state cache (the trap in a new
+                    // skin). Emit the same reattach snapshot the WS-reattach path
+                    // uses (ADR-0014); the SDK advances its event epoch before the
+                    // POST, so this lands in the new epoch, not the discarded one.
+                    EmitSessionState(existing);
+                    return;
+                }
+                if (!existing->tearingDown.load() && ph != BenchSession::P_INWORLD)
+                    return fail("token_in_use", 409);   // genuinely mid-login; do not disrupt it
+                // Stale or mismatched: reclaim our own token via the teardown
+                // path. The account-reclaim wait below then covers the core
+                // release before we rebuild.
+                TeardownByToken(s->token);
+            }
         }
 
-        // One session per account, against the core's map too. AddSession_ would
-        // otherwise kick and delete the existing session, leaving us with a
-        // dangling WorldSession*.
-        if (sWorldSessionMgr->FindSession(accountId))
-            return fail("account_in_use");
+        // --- Account ownership: reclaim (create) or refuse (delete/list) ---
+        // One account = one lane = one live episode, enforced upstream (the
+        // fleet's duplicate-account guard and the roster's account-busy guard),
+        // so any OTHER session found holding this *permitted* account (the
+        // allowlist was already checked in HttpCreateSession) at create time is a
+        // stale/leaked session from a prior episode — not a legitimate concurrent
+        // run, so reclaiming it is correct, not a race. A normal create therefore
+        // takes ownership: tear the holder down via the existing teardown path
+        // (never hand-rolled), then re-queue this create until the core has fully
+        // released the account (FindSession null). Waiting for the release means
+        // AddSession_ never has to kick a live session out from under a
+        // WorldSession* we still hold — the dangling-pointer hazard the original
+        // account_in_use guard existed to avoid, preserved here. deleteMode and
+        // listMode keep the stricter refusal: character-delete must never evict a
+        // running episode, and /characters is a read-only utility.
+        {
+            std::vector<std::string> holders;
+            bool held = false;
+            {
+                std::lock_guard<std::mutex> lock(_sessMutex);
+                for (auto& [otherToken, other] : _byToken)
+                    if (!other->tearingDown.load() && otherToken != s->token && other->accountId == accountId)
+                    {
+                        held = true;
+                        holders.push_back(otherToken);
+                    }
+            }
+            if (held && (s->deleteMode || s->listMode))
+                return s->deleteMode ? fail("account_owned_by_other_token", 409)
+                                     : fail("account_in_use");
+
+            // A core-side session on the account (a holder mid-teardown, or a
+            // logged-out session still inside its post-logout grace window —
+            // FindSession lingers up to ~a minute, the same window the runner's
+            // deleteCharacter loop retries) also blocks a safe AddSession.
+            bool const coreHeld = sWorldSessionMgr->FindSession(accountId) != nullptr;
+            if (coreHeld && (s->deleteMode || s->listMode))
+                return fail("account_in_use");
+
+            if (held || coreHeld)   // create only past here
+            {
+                for (auto const& t : holders)
+                {
+                    // Audit the eviction on the leaked session's own log (its
+                    // stream is still open until its shared_ptr drops) so the
+                    // reclaim is visible from both sides of the handoff.
+                    if (auto victim = TeardownByToken(t))   // idempotent: already-tearing-down holders are skipped
+                    {
+                        Audit(*victim, "action", Json::Writer().Add("op", "session_reclaimed")
+                            .Add("account", s->account).Add("byToken", s->token).Str());
+                        LOG_INFO("module", "wrathbench: reclaiming leaked account '{}' (session token '{}') for create token '{}'",
+                            s->account, t, s->token);
+                    }
+                }
+
+                int64_t const now = NowMs();
+                if (s->createDeadlineMs == 0)
+                    // Budget only part of HttpCreateSession's 20s wait for the
+                    // release: the login flow that follows (auth -> char-enum ->
+                    // PLAYER_LOGIN -> LOGIN_VERIFY_WORLD, several world ticks) must
+                    // finish inside the same 20s, and overrunning it trips the 20s
+                    // teardown path (which would now kill the session we just
+                    // built). Leave ~9s of headroom for login.
+                    s->createDeadlineMs = now + 11000;
+                if (now < s->createDeadlineMs)
+                {
+                    // Retry on the next world tick: UpdateSessions (which drains
+                    // before this task queue) needs ticks to run LogoutPlayer and
+                    // drop the old WorldSession from the core session map.
+                    PushTask([this, s, ack]() { DoCreateSession(s, ack); });
+                    return;
+                }
+                // The core did not release the account within the wait. The
+                // teardown is already in flight, so this is a transient the
+                // caller should retry into — report it as `timeout` (the same
+                // code, and actionable retry hint, the 20s HTTP wait uses),
+                // never the old dead-end account_in_use.
+                return fail("timeout", 504);
+            }
+        }
 
         QueryResult info = LoginDatabase.Query(
             "SELECT expansion, flags, mutetime, locale, recruiter, totaltime FROM account WHERE id = {}", accountId);
@@ -757,22 +1051,204 @@ namespace WrathBench
         return Json::Writer().Add("x", (double)x).Add("y", (double)y).Add("z", (double)z).Add("o", (double)o).Str();
     }
 
+    // Which transport (tram car, boat, zeppelin) is this point standing on, if
+    // any? A client's physics puts it on the transport's model; the module uses
+    // the same model's world-space bounds (GameObjectModel::GetBounds, kept
+    // current by UpdateModelPosition as the transport moves). When the model is
+    // not loaded for a transport, a coarse radius around the transport's
+    // position stands in (documented in ADR-0026). World thread only.
+    static Transport* FindTransportAt(Map* map, float x, float y, float z)
+    {
+        if (!map)
+            return nullptr;
+        for (Transport* t : map->GetAllTransports())
+        {
+            if (!t || !t->IsInWorld())
+                continue;
+            if (t->m_model)
+            {
+                G3D::AABox const& b = t->m_model->GetBounds();
+                if (x >= b.low().x - 0.5f && x <= b.high().x + 0.5f
+                    && y >= b.low().y - 0.5f && y <= b.high().y + 0.5f
+                    && z >= b.low().z - 2.0f && z <= b.high().z + 2.0f)
+                    return t;
+            }
+            else if (t->GetExactDist2d(x, y) <= 12.0f && std::fabs(t->GetPositionZ() - z) <= 20.0f)
+                return t;
+        }
+        return nullptr;
+    }
+
     // Synthesize one client movement packet (MovementInfo layout mirrors
     // WorldSession::ReadMovementInfo: flags u32, flags2 u16, time u32, xyzo,
-    // fallTime u32; no transport/swim/fall extras for ground movement). The
-    // module's clock doubles as the "client" clock; CMSG_TIME_SYNC_RESP below
-    // keeps the session's clock delta near zero so these timestamps are accepted.
+    // [ONTRANSPORT: packGUID transport, local xyzo, u32 transport time, i8 seat,]
+    // fallTime u32; no swim/fall extras for ground movement). The module's
+    // clock doubles as the "client" clock; CMSG_TIME_SYNC_RESP below keeps the
+    // session's clock delta near zero so these timestamps are accepted. When
+    // the point is on a transport the packet says so the way a client's would:
+    // the server then carries the character as a passenger (FOLLOW-UPS 38 N1).
     static void SendMovePacket(BenchSession& s, Player* player, uint16 opcode, uint32 moveFlags,
-        float x, float y, float z, float o)
+        float x, float y, float z, float o, Transport* transport = nullptr)
     {
-        WorldPacket* p = new WorldPacket(opcode, 8 + 4 + 2 + 4 + 16 + 4);
+        if (transport)
+            moveFlags |= MOVEMENTFLAG_ONTRANSPORT;
+        WorldPacket* p = new WorldPacket(opcode, 8 + 4 + 2 + 4 + 16 + 8 + 16 + 4 + 1 + 4);
         *p << player->GetPackGUID();
         *p << uint32(moveFlags);
         *p << uint16(0);            // flags2
         *p << uint32(getMSTime());
         *p << float(x) << float(y) << float(z) << float(o);
+        if (transport)
+        {
+            float lx = x, ly = y, lz = z, lo = o;
+            transport->CalculatePassengerOffset(lx, ly, lz, &lo);
+            *p << transport->GetPackGUID();
+            *p << float(lx) << float(ly) << float(lz) << float(lo);
+            *p << uint32(transport->GetPathProgress());
+            *p << int8(-1);         // seat: none (not a vehicle)
+        }
         *p << uint32(0);            // fallTime
         s.ws->QueuePacket(p);
+    }
+
+    // Does the navmesh have a tile loaded under this point? Mirrors
+    // PathGenerator::HaveTile, which is private; a missing tile is the case the
+    // core folds into PATHFIND_NORMAL|PATHFIND_NOT_USING_PATH (a straight-line
+    // "shortcut" the module must never walk).
+    static bool HaveNavTile(dtNavMesh const* navMesh, float x, float y, float z)
+    {
+        if (!navMesh)
+            return false;
+        float point[3] = { y, z, x };
+        int tx = -1, ty = -1;
+        navMesh->calcTileLoc(point, &tx, &ty);
+        if (tx < 0 || ty < 0)
+            return false;
+        return navMesh->getTileAt(tx, ty, 0) != nullptr;
+    }
+
+    static bool IsCompletePath(PathType type, Movement::PointsArray const& pts)
+    {
+        return (type & PATHFIND_NORMAL)
+            && !(type & (PATHFIND_NOPATH | PATHFIND_INCOMPLETE | PATHFIND_SHORT | PATHFIND_FARFROMPOLY | PATHFIND_NOT_USING_PATH))
+            && pts.size() >= 2;
+    }
+
+    // The cause ladder behind a move_to (PROTOCOL.md, WB_MOVE_RESULT.status).
+    // Returns status == nullptr with `points` filled on success. Order matters:
+    // no_mesh must be tested before CalculatePath, because the core hides a
+    // missing tile inside NORMAL|NOT_USING_PATH; the endpoint check is 2D so
+    // that a stale z in the request is the mesh's problem (meshZ), not the
+    // agent's.
+    Manager::PathResolve Manager::ResolvePath(Player* player, float x, float y, float z)
+    {
+        PathResolve r;
+        dtNavMesh const* navMesh = player->GetMap()->GetMapCollisionData().GetMMapData().GetNavMesh();
+        if (!HaveNavTile(navMesh, player->GetPositionX(), player->GetPositionY(), player->GetPositionZ())
+            || !HaveNavTile(navMesh, x, y, z))
+        {
+            r.status = "no_mesh";
+            return r;
+        }
+
+        PathGenerator gen(player);
+        bool built = gen.CalculatePath(x, y, z, false);
+        PathType type = gen.GetPathType();
+        Movement::PointsArray const& pts = gen.GetPath();
+
+        if (!built || (type & PATHFIND_NOT_USING_PATH))
+        {
+            // No poly under one end. The core does not say which, so ask it
+            // about the start alone: a path from the character to itself is
+            // NORMAL when the start is on the mesh.
+            PathGenerator probe(player);
+            probe.CalculatePath(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), false);
+            r.status = (probe.GetPathType() & PATHFIND_NOT_USING_PATH) ? "start_off_mesh" : "target_off_mesh";
+            return r;
+        }
+        if (type & PATHFIND_FARFROMPOLY_START)
+        {
+            r.status = "start_off_mesh";
+            return r;
+        }
+        if (type & PATHFIND_FARFROMPOLY_END)
+        {
+            r.status = "target_off_mesh";
+            return r;
+        }
+
+        auto endpointOk = [&](PathGenerator const& g) {
+            G3D::Vector3 const& end = g.GetActualEndPosition();
+            float dx = end.x - x, dy = end.y - y;
+            return dx * dx + dy * dy <= 16.0f; // navmesh end within 4y of the request, 2D
+        };
+
+        if (IsCompletePath(type, pts))
+        {
+            if (!endpointOk(gen))
+            {
+                r.status = "target_off_mesh";
+                return r;
+            }
+            for (auto const& v : pts)
+                r.points.push_back({v.x, v.y, v.z});
+        }
+        else
+        {
+            // Partial path (INCOMPLETE / SHORT / NOPATH). One module-side
+            // subdivision retry: path from where the mesh got to, onward to the
+            // target, and splice. The z-ladder and midpoint retries models used
+            // to hand-roll (travel.ts) live here now — pathing detail, not a
+            // decision the agent should have to make.
+            bool nonTrivial = pts.size() >= 2;
+            if (nonTrivial)
+            {
+                G3D::Vector3 const& a = pts.front();
+                G3D::Vector3 const& b = pts.back();
+                nonTrivial = (a - b).squaredLength() > 1.0f;
+            }
+            if (nonTrivial)
+            {
+                G3D::Vector3 const& mid = pts.back();
+                PathGenerator leg2(player);
+                bool built2 = leg2.CalculatePath(mid.x, mid.y, mid.z, x, y, z, false);
+                if (built2 && IsCompletePath(leg2.GetPathType(), leg2.GetPath()) && endpointOk(leg2))
+                {
+                    for (auto const& v : pts)
+                        r.points.push_back({v.x, v.y, v.z});
+                    Movement::PointsArray const& pts2 = leg2.GetPath();
+                    for (size_t i = 1; i < pts2.size(); ++i) // pts2[0] == mid
+                        r.points.push_back({pts2[i].x, pts2[i].y, pts2[i].z});
+                }
+                else
+                {
+                    r.status = "path_incomplete";
+                    r.hasReached = true;
+                    r.reachedX = mid.x; r.reachedY = mid.y; r.reachedZ = mid.z;
+                    return r;
+                }
+            }
+            else
+            {
+                r.status = "path_incomplete";
+                r.hasReached = true;
+                r.reachedX = player->GetPositionX(); r.reachedY = player->GetPositionY(); r.reachedZ = player->GetPositionZ();
+                return r;
+            }
+        }
+
+        if (r.points.size() < 2)
+        {
+            r.status = "path_incomplete";
+            return r;
+        }
+        float endZ = r.points.back().z;
+        if (std::fabs(endZ - z) > 1.0f)
+        {
+            r.hasMeshZ = true;
+            r.meshZ = endZ;
+        }
+        return r;
     }
 
     void Manager::FinishMove(BenchSession& s, char const* status)
@@ -790,7 +1266,20 @@ namespace WrathBench
         // ground truth that the synthesized movement was actually applied.
         Player* player = (s.ws && sWorldSessionMgr->FindSession(s.accountId) == s.ws) ? s.ws->GetPlayer() : nullptr;
         if (player)
+        {
             w.Raw("pos", PosJson(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation()));
+            // Aboard a transport at the end of the move: the server is carrying
+            // the character (it accepted ONTRANSPORT packets), so say which.
+            if (Transport* t = player->GetTransport())
+                w.Raw("onTransport", Json::Writer().AddGuid("guid", (uint64_t)t->GetGUID().GetRawValue())
+                    .Add("entry", t->GetEntry()).Str());
+        }
+        // The z the mesh resolved the request to, when it differed from the
+        // request by more than 1y: the honest signal that the agent's z was off
+        // and the module walked to the ground instead.
+        if (m.hasMeshZ)
+            w.Add("meshZ", (double)m.meshZ);
+        m.hasMeshZ = false;
         EmitEvent(s, "WB_MOVE_RESULT", 0xFF01, w.Str());
     }
 
@@ -826,30 +1315,52 @@ namespace WrathBench
         if (player->GetExactDist2d(x, y) > 250.0f)
             return failEvent("too_far");
 
-        // The one sanctioned mmaps use (docs/CONTRACTS.md "Pathing"). PathGenerator
-        // runs against the player's map; world thread, maps are not mid-update here.
-        PathGenerator gen(player);
-        bool built = gen.CalculatePath(x, y, z, false);
-        PathType type = gen.GetPathType();
-        Movement::PointsArray const& pts = gen.GetPath();
-        bool good = built && (type & PATHFIND_NORMAL)
-            && !(type & (PATHFIND_NOPATH | PATHFIND_INCOMPLETE | PATHFIND_SHORT | PATHFIND_FARFROMPOLY))
-            && pts.size() >= 2;
-        if (good)
+        // Resolve the request against the server's mmaps (the one sanctioned
+        // navmesh use, docs/CONTRACTS.md "Pathing") into either a walkable
+        // polyline or one typed cause. FOLLOW-UPS item 38 N1: the old single
+        // `no_path` hid four different failures, and one of them (a 3D endpoint
+        // check against a request whose z was merely stale) was self-inflicted.
+        // Transports have no navmesh: a client walks straight onto (or off) a
+        // docked tram car or boat. When either end of a short move is on a
+        // transport's model, the path is that straight line and the movement
+        // packets carry the transport offset (SendMovePacket). Longer moves
+        // go through the mesh and fail with the honest start_off_mesh /
+        // target_off_mesh, whose hints say to board or disembark first.
+        PathResolve r;
         {
-            G3D::Vector3 const& end = gen.GetActualEndPosition();
-            float dx = end.x - x, dy = end.y - y, dz = end.z - z;
-            if (dx * dx + dy * dy + dz * dz > 16.0f) // navmesh end > 4y from request
-                good = false;
+            Map* map = player->GetMap();
+            Transport* startT = player->GetTransport();
+            if (!startT)
+                startT = FindTransportAt(map, player->GetPositionX(), player->GetPositionY(), player->GetPositionZ());
+            Transport* targetT = FindTransportAt(map, x, y, z);
+            if ((startT || targetT) && player->GetExactDist2d(x, y) <= 30.0f)
+            {
+                r.points.push_back({player->GetPositionX(), player->GetPositionY(), player->GetPositionZ()});
+                r.points.push_back({x, y, z});
+                Audit(*s, "action", Json::Writer().Add("op", "move_transport_leg")
+                    .Add("moveId", moveId)
+                    .Add("boarding", targetT != nullptr).Add("leaving", startT != nullptr && !targetT).Str());
+            }
+            else
+                r = ResolvePath(player, x, y, z);
         }
-        if (!good)
-            return failEvent("no_path");
+        if (r.status != nullptr)
+        {
+            Json::Writer w;
+            w.Add("moveId", moveId).Add("status", r.status);
+            w.Raw("pos", PosJson(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation()));
+            if (r.hasReached)
+                w.Raw("reachedPos", Json::Writer().Add("x", (double)r.reachedX).Add("y", (double)r.reachedY).Add("z", (double)r.reachedZ).Str());
+            EmitEvent(*s, "WB_MOVE_RESULT", 0xFF01, w.Str());
+            return;
+        }
+        std::vector<WbVec> const& pts = r.points;
+        m.meshZ = r.meshZ;
+        m.hasMeshZ = r.hasMeshZ;
 
         int64_t now = NowMs();
         m.points.clear();
-        m.points.reserve(pts.size());
-        for (auto const& v : pts)
-            m.points.push_back({v.x, v.y, v.z});
+        m.points = pts;
         m.seg = 0;
         m.segDone = 0.0f;
         m.lastMs = now;
@@ -861,7 +1372,8 @@ namespace WrathBench
         m.stopping = false;
         m.active = true;
 
-        SendMovePacket(*s, player, MSG_MOVE_START_FORWARD, MOVEMENTFLAG_FORWARD, m.curX, m.curY, m.curZ, m.curO);
+        SendMovePacket(*s, player, MSG_MOVE_START_FORWARD, MOVEMENTFLAG_FORWARD, m.curX, m.curY, m.curZ, m.curO,
+            FindTransportAt(player->GetMap(), m.curX, m.curY, m.curZ));
         Audit(*s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_START_FORWARD")
             .Add("moveId", moveId).Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO)).Str());
     }
@@ -880,13 +1392,15 @@ namespace WrathBench
             MoveState& m = s->move;
             // Stop where the "client" is (the interpolated position); the server
             // accepts it the same way it accepts any client stop mid-run.
-            SendMovePacket(*s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, m.curX, m.curY, m.curZ, m.curO);
+            SendMovePacket(*s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, m.curX, m.curY, m.curZ, m.curO,
+                FindTransportAt(player->GetMap(), m.curX, m.curY, m.curZ));
             FinishMove(*s, "stopped");
         }
         else
         {
             SendMovePacket(*s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE,
-                player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation());
+                player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation(),
+                player->GetTransport());
         }
         ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "stop").Add("token", token).Str()});
     }
@@ -1047,6 +1561,31 @@ namespace WrathBench
             *p << uint8(slot);
             auditW.Add("questId", questId).Add("slot", (uint32)slot);
         }
+        else if (action == "quest_query")
+        {
+            // The client's template fetch for a quest in its log (title,
+            // objective text, required entries/counts). Answered by
+            // SMSG_QUEST_QUERY_RESPONSE; an unknown id is silently dropped by
+            // the core, exactly as for a client.
+            uint32 questId = static_cast<uint32>(req.GetInt("questId"));
+            p = new WorldPacket(CMSG_QUEST_QUERY, 4);
+            *p << uint32(questId);
+            auditW.Add("questId", questId);
+        }
+        else if (action == "questgiver_status_query")
+        {
+            // What a client sends for each questgiver-flagged unit/gameobject
+            // that comes into view, to draw the !/? marker. Answered by
+            // SMSG_QUESTGIVER_STATUS for that guid.
+            p = new WorldPacket(CMSG_QUESTGIVER_STATUS_QUERY, 8);
+            *p << uint64(guid);
+        }
+        else if (action == "questgiver_status_multiple_query")
+        {
+            // What a client sends after its quest log changes, to refresh every
+            // marker in view. Answered by SMSG_QUESTGIVER_STATUS_MULTIPLE.
+            p = new WorldPacket(CMSG_QUESTGIVER_STATUS_MULTIPLE_QUERY, 0);
+        }
         else if (action == "loot" || action == "loot_all")
         {
             if (action == "loot_all")
@@ -1101,6 +1640,27 @@ namespace WrathBench
         {
             p = new WorldPacket(CMSG_REPAIR_ITEM, 8 + 8 + 1);
             *p << uint64(guid) << uint64(0) << uint8(0);     // item guid 0 = repair all
+        }
+        else if (action == "trainer_list")
+        {
+            // CMSG_TRAINER_LIST is the same Hello shape as gossip/vendor: one
+            // guid. The server answers SMSG_TRAINER_LIST, or nothing at all if
+            // the NPC is out of interaction range, is not a trainer, or trains
+            // another class (NPCHandler::HandleTrainerListOpcode returns
+            // silently on all three) — the ack means "opcode queued" only.
+            p = new WorldPacket(CMSG_TRAINER_LIST, 8);
+            *p << uint64(guid);
+        }
+        else if (action == "trainer_buy_spell")
+        {
+            // uint64 trainer guid + int32 spell id, exactly what
+            // WorldPackets::NPC::TrainerBuySpell::Read consumes. The spell is
+            // paid for out of the character's own money server-side; a failure
+            // arrives as SMSG_TRAINER_BUY_FAILED with a reason.
+            uint32 spellId = static_cast<uint32>(req.GetInt("spellId"));
+            p = new WorldPacket(CMSG_TRAINER_BUY_SPELL, 8 + 4);
+            *p << uint64(guid) << uint32(spellId);
+            auditW.Add("spellId", spellId);
         }
         else if (action == "equip_item")
         {
@@ -1175,12 +1735,175 @@ namespace WrathBench
             p = new WorldPacket(CMSG_RECLAIM_CORPSE, 8);
             *p << uint64(guid);
         }
+        else if (action == "learn_talent")
+        {
+            // uint32 talent id (Talent.dbc) + uint32 requested rank (0-based),
+            // exactly what HandleLearnTalentOpcode reads. The handler answers
+            // with SMSG_TALENTS_INFO whether or not the talent was learned; the
+            // spell it grants arrives as SMSG_LEARNED_SPELL.
+            uint32 talentId = static_cast<uint32>(req.GetInt("talentId"));
+            uint32 rank = static_cast<uint32>(req.GetInt("rank"));
+            p = new WorldPacket(CMSG_LEARN_TALENT, 8);
+            *p << uint32(talentId) << uint32(rank);
+            auditW.Add("talentId", talentId).Add("rank", rank);
+        }
+        else if (action == "learn_preview_talents")
+        {
+            // uint32 count, then (uint32 talentId, uint32 rank) pairs — the
+            // client's "learn" button in preview mode. `talents` is the raw
+            // JSON array text [[id, rank], ...] (the flat parser keeps nested
+            // values verbatim); the module only reads digit pairs out of it.
+            std::string raw = req.GetString("talents");
+            std::vector<std::pair<uint32, uint32>> pairs;
+            std::vector<uint32> nums;
+            size_t i = 0;
+            while (i < raw.size())
+            {
+                if (std::isdigit(static_cast<unsigned char>(raw[i])))
+                {
+                    size_t j = i;
+                    while (j < raw.size() && std::isdigit(static_cast<unsigned char>(raw[j]))) ++j;
+                    try { nums.push_back(static_cast<uint32>(std::stoul(raw.substr(i, j - i)))); } catch (...) {}
+                    i = j;
+                }
+                else
+                    ++i;
+            }
+            if (nums.empty() || nums.size() % 2 != 0 || nums.size() / 2 > 150)
+                return err(400, "invalid_talents");
+            for (size_t k = 0; k < nums.size(); k += 2)
+                pairs.emplace_back(nums[k], nums[k + 1]);
+            p = new WorldPacket(CMSG_LEARN_PREVIEW_TALENTS, 4 + 8 * pairs.size());
+            *p << uint32(pairs.size());
+            for (auto const& [id, rank] : pairs)
+                *p << uint32(id) << uint32(rank);
+            auditW.Add("count", (uint64_t)pairs.size()).Raw("talents", raw.empty() ? "[]" : raw);
+        }
+        else if (action == "raw")
+        {
+            // The escape hatch (ADR-0025): validated on the io thread (opcode
+            // on the allowlist, payload well-formed hex, size-capped); here it
+            // is only decoded and queued into the stock handler like any other
+            // client packet. The audit record carries opcode and payload so
+            // the exact bytes "the client" sent are reconstructable.
+            std::string opcode = req.GetString("opcode");
+            std::string payload = req.GetString("payload");
+            uint16 op = RawOpcodeValue(opcode);
+            if (!op)
+                return err(400, "opcode_not_allowed");
+            p = new WorldPacket(op, payload.size() / 2);
+            for (size_t i = 0; i + 1 < payload.size(); i += 2)
+                *p << uint8(std::stoul(payload.substr(i, 2), nullptr, 16));
+            auditW.Add("opcode", opcode).Add("payload", payload);
+        }
         else
             return err(400, "unsupported_action");
 
         s->ws->QueuePacket(p);
         Audit(*s, "action", auditW.Str());
         ack->set_value({200, Json::Writer().Add("ok", true).Add("action", action).Add("token", token).Str()});
+    }
+
+    // WDBC reader for AreaTrigger.dbc (3.3.5a: 10 fields of 4 bytes — id,
+    // mapId, x, y, z, radius, boxLength, boxWidth, boxHeight, boxYaw). Header:
+    // "WDBC", u32 recordCount, u32 fieldCount, u32 recordSize, u32 stringBlock.
+    bool Manager::LoadAreaTriggerDbc(std::string const& path)
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (!in)
+            return false;
+        char magic[4];
+        uint32 recordCount = 0, fieldCount = 0, recordSize = 0, stringSize = 0;
+        in.read(magic, 4);
+        in.read(reinterpret_cast<char*>(&recordCount), 4);
+        in.read(reinterpret_cast<char*>(&fieldCount), 4);
+        in.read(reinterpret_cast<char*>(&recordSize), 4);
+        in.read(reinterpret_cast<char*>(&stringSize), 4);
+        if (!in || std::memcmp(magic, "WDBC", 4) != 0 || fieldCount < 10 || recordSize < 40)
+        {
+            LOG_ERROR("module", "wrathbench: '{}' is not a 3.3.5a AreaTrigger.dbc (fields {}, record size {})", path, fieldCount, recordSize);
+            return false;
+        }
+        std::vector<char> rec(recordSize);
+        size_t loaded = 0;
+        for (uint32 i = 0; i < recordCount; ++i)
+        {
+            in.read(rec.data(), recordSize);
+            if (!in)
+                break;
+            uint32 id, map;
+            float f[8];
+            std::memcpy(&id, rec.data(), 4);
+            std::memcpy(&map, rec.data() + 4, 4);
+            std::memcpy(f, rec.data() + 8, sizeof(f));
+            AreaTriggerRec r;
+            r.id = id;
+            r.x = f[0]; r.y = f[1]; r.z = f[2];
+            r.radius = f[3];
+            r.boxLength = f[4]; r.boxWidth = f[5]; r.boxHeight = f[6]; r.boxYaw = f[7];
+            _areaTriggers[map].push_back(r);
+            ++loaded;
+        }
+        _areaTriggersLoaded = loaded > 0;
+        LOG_INFO("module", "wrathbench: loaded {} areatriggers across {} maps from '{}'", loaded, _areaTriggers.size(), path);
+        return _areaTriggersLoaded;
+    }
+
+    // Same geometry as Player::IsInAreaTriggerRadius with delta 0 (the 5y
+    // tavern delta is server-side only): a sphere when radius > 0, otherwise
+    // an oriented box with half-extents length/2, width/2, height/2 around
+    // (x, y, z, yaw).
+    static bool InsideAreaTrigger(AreaTriggerRec const& t, float x, float y, float z)
+    {
+        if (t.radius > 0.0f)
+        {
+            float dx = x - t.x, dy = y - t.y, dz = z - t.z;
+            return dx * dx + dy * dy + dz * dz <= t.radius * t.radius;
+        }
+        Position center(t.x, t.y, t.z, t.boxYaw);
+        Position p(x, y, z, 0.0f);
+        return p.IsWithinBox(center, t.boxLength / 2.0f, t.boxWidth / 2.0f, t.boxHeight / 2.0f);
+    }
+
+    void Manager::CheckAreaTriggers(BenchSession& s, Player* player, float x, float y, float z, int64_t nowMs)
+    {
+        if (!_areaTriggersLoaded)
+            return;
+        auto it = _areaTriggers.find(player->GetMapId());
+        if (it == _areaTriggers.end())
+            return;
+        uint32 inside = 0;
+        for (AreaTriggerRec const& t : it->second)
+        {
+            if (InsideAreaTrigger(t, x, y, z))
+            {
+                inside = t.id;
+                break;
+            }
+        }
+        if (inside == 0)
+        {
+            s.lastTriggerId = 0; // left every volume: re-arm
+            return;
+        }
+        // Fire once on entry. Re-send while still inside if nothing happened
+        // within 1.5s: the server checks the *applied* position, the module the
+        // interpolated one, and a heartbeat can lag by up to 500ms.
+        if (inside == s.lastTriggerId && nowMs - s.lastTriggerSentMs < 1500)
+            return;
+        if (inside == s.lastTriggerId && s.pendingTransferMap.load() != 0)
+            return; // the server acted on it; a transfer is in flight
+        s.lastTriggerId = inside;
+        s.lastTriggerSentMs = nowMs;
+
+        WorldPacket* p = new WorldPacket(CMSG_AREATRIGGER, 4);
+        *p << uint32(inside);
+        s.ws->QueuePacket(p);
+        Audit(s, "action", Json::Writer().Add("op", "areatrigger").Add("triggerId", inside).Add("moveId", s.move.moveId).Str());
+        Json::Writer w;
+        w.Add("triggerId", inside).Add("moveId", s.move.moveId);
+        w.Raw("pos", PosJson(x, y, z, s.move.curO));
+        EmitEvent(s, "WB_AREATRIGGER", 0xFF04, w.Str());
     }
 
     void Manager::TickMovers(int64_t nowMs)
@@ -1210,9 +1933,28 @@ namespace WrathBench
             return;
         }
         Player* player = s.ws->GetPlayer();
-        if (!player || !player->IsInWorld())
+        if (!player)
         {
             m.active = false;
+            return;
+        }
+
+        // A map transfer or a teleport ends the move: the server discards
+        // every movement opcode until the ack (TickTeleportAcks) and applies the
+        // destination itself. `transferred` rather than `interrupted`, so the
+        // agent knows a portal took it (FOLLOW-UPS 38 N1); the SDK then waits
+        // for SMSG_NEW_WORLD and resolves on the new map. The 15y desync guard
+        // below must not run here: the far-teleport position jump would race it.
+        if (s.pendingTransferMap.load() != 0 || player->IsBeingTeleported())
+        {
+            FinishMove(s, "transferred");
+            return;
+        }
+        if (!player->IsInWorld())
+        {
+            // Removed from the map for a reason that is not a teleport (logout
+            // in flight): the move has no server verdict left to wait for.
+            FinishMove(s, "interrupted");
             return;
         }
 
@@ -1234,7 +1976,8 @@ namespace WrathBench
         if (!player->IsAlive() && !player->HasPlayerFlag(PLAYER_FLAGS_GHOST))
         {
             SendMovePacket(s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE,
-                player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation());
+                player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation(),
+                player->GetTransport());
             FinishMove(s, "interrupted");
             return;
         }
@@ -1274,7 +2017,8 @@ namespace WrathBench
             // Geometric end of path: send the stop at the exact destination and
             // wait for the server to confirm.
             m.curX = m.destX; m.curY = m.destY; m.curZ = m.destZ;
-            SendMovePacket(s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, m.destX, m.destY, m.destZ, m.curO);
+            SendMovePacket(s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, m.destX, m.destY, m.destZ, m.curO,
+                FindTransportAt(player->GetMap(), m.destX, m.destY, m.destZ));
             Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_STOP")
                 .Add("moveId", m.moveId).Raw("pos", PosJson(m.destX, m.destY, m.destZ, m.curO)).Str());
             m.stopping = true;
@@ -1290,15 +2034,25 @@ namespace WrathBench
             if (player->GetExactDist2d(m.curX, m.curY) > 15.0f)
             {
                 SendMovePacket(s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE,
-                    player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation());
+                    player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation(),
+                    player->GetTransport());
                 FinishMove(s, "interrupted");
                 return;
             }
-            SendMovePacket(s, player, MSG_MOVE_HEARTBEAT, MOVEMENTFLAG_FORWARD, m.curX, m.curY, m.curZ, m.curO);
+            SendMovePacket(s, player, MSG_MOVE_HEARTBEAT, MOVEMENTFLAG_FORWARD, m.curX, m.curY, m.curZ, m.curO,
+                FindTransportAt(player->GetMap(), m.curX, m.curY, m.curZ));
             m.lastPacketMs = nowMs;
             Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_HEARTBEAT")
                 .Add("moveId", m.moveId).Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO)).Str());
         }
+
+        // Areatrigger volumes, as a client: the movement engine knows its own
+        // position and the DBC, and fires CMSG_AREATRIGGER on entering one
+        // without the player choosing to. After the heartbeat, so the server's
+        // applied position is as close as possible to the one tested here.
+        CheckAreaTriggers(s, player, m.curX, m.curY, m.curZ, nowMs);
+        if (!m.active)
+            return; // (defensive: a synchronous finish is not expected here)
 
         // Progress events: the position the module's client-side movement engine
         // is at — knowledge a real client has locally.
@@ -1309,6 +2063,42 @@ namespace WrathBench
             w.Add("moveId", m.moveId);
             w.Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO));
             EmitEvent(s, "WB_MOVE_PROGRESS", 0xFF02, w.Str());
+        }
+    }
+
+    // While a character rides a transport and is not walking, the server moves
+    // it (StaticTransport/MotionTransport::UpdatePassengerPositions) and tells
+    // the client nothing — a client computes its own position from the
+    // transport's animation. The module has the same knowledge server-side, so
+    // it reports the character's own position once a second as WB_RIDE_PROGRESS,
+    // the riding counterpart of WB_MOVE_PROGRESS. World thread only.
+    void Manager::TickRiders(int64_t nowMs)
+    {
+        std::vector<std::shared_ptr<BenchSession>> sessions;
+        {
+            std::lock_guard<std::mutex> lock(_sessMutex);
+            for (auto& [token, s] : _byToken)
+                if (!s->tearingDown.load() && s->phase.load() == BenchSession::P_INWORLD && !s->move.active)
+                    sessions.push_back(s);
+        }
+        for (auto& s : sessions)
+        {
+            if (!s->ws || sWorldSessionMgr->FindSession(s->accountId) != s->ws)
+                continue;
+            Player* player = s->ws->GetPlayer();
+            Transport* t = (player && player->IsInWorld()) ? player->GetTransport() : nullptr;
+            if (!t)
+            {
+                s->lastRideEmitMs = 0;
+                continue;
+            }
+            if (s->lastRideEmitMs && nowMs - s->lastRideEmitMs < 1000)
+                continue;
+            s->lastRideEmitMs = nowMs;
+            Json::Writer w;
+            w.AddGuid("transportGuid", (uint64_t)t->GetGUID().GetRawValue()).Add("transportEntry", t->GetEntry());
+            w.Raw("pos", PosJson(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation()));
+            EmitEvent(*s, "WB_RIDE_PROGRESS", 0xFF05, w.Str());
         }
     }
 
@@ -1719,26 +2509,33 @@ namespace WrathBench
         auto s = FindByToken(token);
         if (!s || s->phase.load() != BenchSession::P_INWORLD || s->tearingDown.load())
             return;
-        PushTask([this, s]() {
-            if (s->tearingDown.load() || s->phase.load() != BenchSession::P_INWORLD)
-                return;
-            if (!s->ws || sWorldSessionMgr->FindSession(s->accountId) != s->ws)
-                return;
-            Player* player = s->ws->GetPlayer();
-            if (!player || !player->IsInWorld())
-                return;
-            Json::Writer w;
-            w.Add("character", s->charName)
-             .AddGuid("guid", (uint64_t)player->GetGUID().GetRawValue())
-             .Add("inWorld", true)
-             .Add("map", player->GetMapId())
-             .Add("x", (double)player->GetPositionX())
-             .Add("y", (double)player->GetPositionY())
-             .Add("z", (double)player->GetPositionZ())
-             .Add("o", (double)player->GetOrientation())
-             .Add("level", (uint32)player->GetLevel());
-            EmitEvent(*s, "WB_SESSION_STATE", 0xFF03, w.Str());
-        });
+        PushTask([this, s]() { EmitSessionState(s); });
+    }
+
+    // Emit one synthetic WB_SESSION_STATE carrying the session's own
+    // client-visible state (ADR-0014). World thread only: reads the Player. The
+    // guards mirror the reattach path — the session may tear down or lose the
+    // core WorldSession between the caller's check and this run.
+    void Manager::EmitSessionState(std::shared_ptr<BenchSession> const& s)
+    {
+        if (!s || s->tearingDown.load() || s->phase.load() != BenchSession::P_INWORLD)
+            return;
+        if (!s->ws || sWorldSessionMgr->FindSession(s->accountId) != s->ws)
+            return;
+        Player* player = s->ws->GetPlayer();
+        if (!player || !player->IsInWorld())
+            return;
+        Json::Writer w;
+        w.Add("character", s->charName)
+         .AddGuid("guid", (uint64_t)player->GetGUID().GetRawValue())
+         .Add("inWorld", true)
+         .Add("map", player->GetMapId())
+         .Add("x", (double)player->GetPositionX())
+         .Add("y", (double)player->GetPositionY())
+         .Add("z", (double)player->GetPositionZ())
+         .Add("o", (double)player->GetOrientation())
+         .Add("level", (uint32)player->GetLevel());
+        EmitEvent(*s, "WB_SESSION_STATE", 0xFF03, w.Str());
     }
 
     void Manager::OnWsClose(std::string const& token, IWsConn* conn)
@@ -2202,6 +2999,27 @@ namespace WrathBench
         }
     }
 
+    // What a client reads from its own Spell.dbc for a spell id: the rank in
+    // the chain (1 when unranked) and the display name. Client-cache knowledge,
+    // exactly like the item-template fields on CMSG_ITEM_QUERY_SINGLE.
+    static void AddSpellFields(Json::Writer& w, uint32 spellId)
+    {
+        SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+        if (!info)
+            return;
+        w.Add("rank", (uint32)info->GetRank());
+        if (info->SpellName[0])
+            w.Add("name", info->SpellName[0]);
+    }
+
+    static std::string SpellJson(uint32 spellId)
+    {
+        Json::Writer w;
+        w.Add("spellId", spellId);
+        AddSpellFields(w, spellId);
+        return w.Str();
+    }
+
     // =================================================================
     // Whitelisted SMSG decoders. Field layouts mirror the server-side
     // builders in AzerothCore at the pinned commit; see module/PROTOCOL.md.
@@ -2549,6 +3367,140 @@ namespace WrathBench
                     w.AddGuid("targetGuid", (uint64_t)target).Raw("auras", auras);
                     break;
                 }
+                // ------------------------------------------- spellbook/talents
+                case SMSG_INITIAL_SPELLS:
+                {
+                    // Player::SendInitialSpells: u8 0, u16 count, (u32 spellId,
+                    // u16 0) x count, u16 cooldownCount, (u32 spellId, u16
+                    // itemId, u16 category, u32 cooldownMs, u32
+                    // categoryCooldownMs) x cooldownCount. Rank and name are
+                    // what a client reads from its own Spell.dbc for each id.
+                    name = "SMSG_INITIAL_SPELLS";
+                    uint8 unk; p >> unk;
+                    uint16 count; p >> count;
+                    std::string spells = "[";
+                    for (uint16 i = 0; i < count; ++i)
+                    {
+                        uint32 spellId; uint16 slot; p >> spellId >> slot;
+                        if (i) spells += ',';
+                        spells += SpellJson(spellId);
+                    }
+                    spells += "]";
+                    uint16 cdCount = 0;
+                    if (p.rpos() + 2 <= p.size()) p >> cdCount;
+                    std::string cds = "[";
+                    bool firstCd = true;
+                    for (uint16 i = 0; i < cdCount && p.rpos() + 16 <= p.size(); ++i)
+                    {
+                        uint32 spellId, cd, catCd; uint16 itemId, category;
+                        p >> spellId >> itemId >> category >> cd >> catCd;
+                        if (!firstCd) cds += ',';
+                        firstCd = false;
+                        cds += Json::Writer().Add("spellId", spellId).Add("itemId", (uint32)itemId)
+                            .Add("category", (uint32)category).Add("cooldownMs", cd).Add("categoryCooldownMs", catCd).Str();
+                    }
+                    cds += "]";
+                    w.Raw("spells", spells).Raw("cooldowns", cds);
+                    break;
+                }
+                case SMSG_LEARNED_SPELL:
+                {
+                    name = "SMSG_LEARNED_SPELL";
+                    uint32 spellId; p >> spellId;
+                    w.Add("spellId", spellId);
+                    AddSpellFields(w, spellId);
+                    break;
+                }
+                case SMSG_REMOVED_SPELL:
+                {
+                    name = "SMSG_REMOVED_SPELL";
+                    uint32 spellId; p >> spellId;
+                    w.Add("spellId", spellId);
+                    break;
+                }
+                case SMSG_SUPERCEDED_SPELL:
+                {
+                    // Player::addSpell: the old (lower-rank) id, then the new
+                    // one that replaces it in the spellbook.
+                    name = "SMSG_SUPERCEDED_SPELL";
+                    uint32 oldId, newId; p >> oldId >> newId;
+                    w.Add("supersededSpellId", oldId).Add("spellId", newId);
+                    AddSpellFields(w, newId);
+                    break;
+                }
+                case SMSG_SPELL_COOLDOWN:
+                {
+                    // Unit::BuildCooldownPacket: u64 guid, u8 flags (1 =
+                    // include GCD), then (u32 spellId, u32 cooldownMs) pairs.
+                    name = "SMSG_SPELL_COOLDOWN";
+                    uint64 guid; uint8 flags; p >> guid >> flags;
+                    std::string cds = "[";
+                    bool first = true;
+                    while (p.rpos() + 8 <= p.size())
+                    {
+                        uint32 spellId, cd; p >> spellId >> cd;
+                        if (!first) cds += ',';
+                        first = false;
+                        cds += Json::Writer().Add("spellId", spellId).Add("cooldownMs", cd).Str();
+                    }
+                    cds += "]";
+                    w.AddGuid("guid", (uint64_t)guid).Add("flags", (uint32)flags).Raw("cooldowns", cds);
+                    break;
+                }
+                case SMSG_COOLDOWN_EVENT:
+                {
+                    // Player::SendCooldownEvent: the client starts the
+                    // cooldown timer it already knows for this spell.
+                    name = "SMSG_COOLDOWN_EVENT";
+                    uint32 spellId; uint64 guid; p >> spellId >> guid;
+                    w.Add("spellId", spellId).AddGuid("guid", (uint64_t)guid);
+                    break;
+                }
+                case SMSG_CLEAR_COOLDOWN:
+                {
+                    name = "SMSG_CLEAR_COOLDOWN";
+                    uint32 spellId; uint64 guid; p >> spellId >> guid;
+                    w.Add("spellId", spellId).AddGuid("guid", (uint64_t)guid);
+                    break;
+                }
+                case SMSG_TALENTS_INFO:
+                {
+                    // Player::BuildPlayerTalentsInfoData (pet variant is
+                    // served as { pet: true } only — no pet surface yet):
+                    // u32 unspent, u8 specCount, u8 activeSpec, per spec: u8
+                    // talentCount, (u32 talentId, u8 rank) x count, u8
+                    // glyphCount, u16 x glyphCount.
+                    name = "SMSG_TALENTS_INFO";
+                    uint8 pet; p >> pet;
+                    if (pet)
+                    {
+                        w.Add("pet", true);
+                        break;
+                    }
+                    uint32 unspent; uint8 specCount, activeSpec;
+                    p >> unspent >> specCount >> activeSpec;
+                    std::string specs = "[";
+                    for (uint8 si = 0; si < specCount && si < 2; ++si)
+                    {
+                        uint8 talentCount; p >> talentCount;
+                        std::string talents = "[";
+                        for (uint8 ti = 0; ti < talentCount; ++ti)
+                        {
+                            uint32 talentId; uint8 rank; p >> talentId >> rank;
+                            if (ti) talents += ',';
+                            talents += Json::Writer().Add("talentId", talentId).Add("rank", (uint32)rank).Str();
+                        }
+                        talents += "]";
+                        uint8 glyphCount; p >> glyphCount;
+                        for (uint8 gi = 0; gi < glyphCount; ++gi) { uint16 g; p >> g; }
+                        if (si) specs += ',';
+                        specs += Json::Writer().Raw("talents", talents).Str();
+                    }
+                    specs += "]";
+                    w.Add("pet", false).Add("unspentPoints", unspent).Add("specCount", (uint32)specCount)
+                     .Add("activeSpec", (uint32)activeSpec).Raw("specs", specs);
+                    break;
+                }
                 // -------------------------------------------------- progress
                 case SMSG_LOG_XPGAIN:
                 {
@@ -2589,6 +3541,85 @@ namespace WrathBench
                     uint64 guid; p >> guid;
                     uint8 status; p >> status;
                     w.AddGuid("guid", (uint64_t)guid).Add("status", (uint32)status);
+                    break;
+                }
+                case SMSG_QUESTGIVER_STATUS_MULTIPLE:
+                {
+                    // Player::SendQuestGiverStatusMultiple: u32 count, then
+                    // (u64 guid, u8 status) per questgiver in view. Sent by the
+                    // core on login, level-up and quest reward, and in answer
+                    // to CMSG_QUESTGIVER_STATUS_MULTIPLE_QUERY.
+                    name = "SMSG_QUESTGIVER_STATUS_MULTIPLE";
+                    uint32 count; p >> count;
+                    std::string statuses = "[";
+                    for (uint32 i = 0; i < count; ++i)
+                    {
+                        uint64 guid; uint8 status;
+                        p >> guid >> status;
+                        if (i) statuses += ',';
+                        statuses += Json::Writer().AddGuid("guid", (uint64_t)guid).Add("status", (uint32)status).Str();
+                    }
+                    statuses += "]";
+                    w.Raw("statuses", statuses);
+                    break;
+                }
+                case SMSG_QUEST_QUERY_RESPONSE:
+                {
+                    // PlayerMenu::SendQuestQueryResponse (3.3.5a layout; field
+                    // order cited in PROTOCOL.md). Only what the client's quest
+                    // log renders is named: title/objective text, level, and
+                    // the per-objective required entries and counts. Rewards
+                    // are skipped over (they arrive on QUEST_DETAILS /
+                    // OFFER_REWARD when the client asks for them).
+                    name = "SMSG_QUEST_QUERY_RESPONSE";
+                    uint32 questId, method; int32 level; uint32 minLevel, zoneOrSort, type, suggested;
+                    p >> questId >> method >> level >> minLevel >> zoneOrSort >> type >> suggested;
+                    uint32 repFaction, repValue, repFaction2, repValue2, nextQuest, xpId;
+                    p >> repFaction >> repValue >> repFaction2 >> repValue2 >> nextQuest >> xpId;
+                    uint32 rewMoney, rewMoneyMaxLevel, rewSpell; int32 rewSpellCast;
+                    p >> rewMoney >> rewMoneyMaxLevel >> rewSpell >> rewSpellCast;
+                    uint32 honorAdd; float honorMult; uint32 srcItem, flags, titleId, playersSlain, bonusTalents, arenaPoints, repMask;
+                    p >> honorAdd >> honorMult >> srcItem >> flags >> titleId >> playersSlain >> bonusTalents >> arenaPoints >> repMask;
+                    // QUEST_REWARDS_COUNT (4) + QUEST_REWARD_CHOICES_COUNT (6) item/count pairs
+                    for (int i = 0; i < 4 + 6; ++i) { uint32 a, b; p >> a >> b; }
+                    // QUEST_REPUTATIONS_COUNT (5) x3 (faction id, value id, override)
+                    for (int i = 0; i < 5 * 3; ++i) { uint32 a; p >> a; }
+                    uint32 poiContinent; float poiX, poiY; uint32 pointOpt;
+                    p >> poiContinent >> poiX >> poiY >> pointOpt;
+                    std::string title, objectives, details, areaDescription, completedText;
+                    p >> title >> objectives >> details >> areaDescription >> completedText;
+                    // QUEST_OBJECTIVES_COUNT (4): required npc-or-go (go as id|0x80000000), count, item drop, 0
+                    uint32 reqEntry[4], reqCount[4];
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        uint32 itemDrop, unk;
+                        p >> reqEntry[i] >> reqCount[i] >> itemDrop >> unk;
+                    }
+                    // QUEST_ITEM_OBJECTIVES_COUNT (6): required item id, count
+                    std::string reqItems = "[";
+                    for (int i = 0; i < 6; ++i)
+                    {
+                        uint32 itemId, cnt; p >> itemId >> cnt;
+                        if (i) reqItems += ',';
+                        reqItems += Json::Writer().Add("itemId", itemId).Add("count", cnt).Str();
+                        if (itemId)
+                            itemEntries.push_back(itemId);
+                    }
+                    reqItems += "]";
+                    std::string reqNpcOrGo = "[";
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        std::string text; p >> text;
+                        if (i) reqNpcOrGo += ',';
+                        reqNpcOrGo += Json::Writer().Add("entry", reqEntry[i]).Add("count", reqCount[i])
+                            .Add("text", text).Str();
+                    }
+                    reqNpcOrGo += "]";
+                    w.Add("questId", questId).Add("method", method).Add("level", level).Add("minLevel", minLevel)
+                     .Add("type", type).Add("suggestedPlayers", suggested)
+                     .Add("title", title).Add("objectives", objectives).Add("details", details)
+                     .Add("areaDescription", areaDescription).Add("completedText", completedText)
+                     .Raw("requiredNpcOrGo", reqNpcOrGo).Raw("requiredItems", reqItems);
                     break;
                 }
                 case SMSG_QUESTGIVER_QUEST_LIST:
@@ -2922,6 +3953,66 @@ namespace WrathBench
                     w.AddGuid("vendorGuid", (uint64_t)guid).Add("itemId", itemId).Add("result", (uint32)result);
                     break;
                 }
+                // --------------------------------------------------- trainer
+                // Field order follows WorldPackets::NPC::TrainerList::Write on
+                // the pinned core (src/server/game/Server/Packets/NPCPackets.cpp).
+                case SMSG_TRAINER_LIST:
+                {
+                    name = "SMSG_TRAINER_LIST";
+                    uint64 guid; p >> guid;
+                    int32 trainerType; p >> trainerType;  // Trainer::Type: 0 class, 1 mount, 2 tradeskill, 3 pet
+                    int32 count; p >> count;
+                    std::string spells = "[";
+                    bool firstSpell = true;
+                    for (int32 i = 0; i < count && p.rpos() < p.size(); ++i)
+                    {
+                        int32 spellId; p >> spellId;
+                        // Trainer::SpellState, what the client colours the row
+                        // with: 0 available (green, trainable now), 1
+                        // unavailable (red — level, skill, prerequisite spell or
+                        // class/race), 2 known (gray, already learned). Money is
+                        // NOT part of this state: a green spell still fails to
+                        // buy with reason 1 if the character cannot afford it.
+                        uint8 state; p >> state;
+                        int32 cost; p >> cost;              // copper, reputation discount already applied
+                        p.rpos(p.rpos() + 8);               // PointCost[2]: talent points (always 0) + profession-slot flag
+                        uint8 reqLevel; p >> reqLevel;
+                        int32 reqSkill; p >> reqSkill;      // skill line id, 0 = none
+                        int32 reqSkillValue; p >> reqSkillValue;
+                        p.rpos(p.rpos() + 12);              // ReqAbility[3]: prerequisite spell ids, summarised by state
+                        if (!firstSpell) spells += ',';
+                        spells += Json::Writer().Add("spellId", spellId).Add("state", (uint32)state)
+                            .Add("cost", cost).Add("reqLevel", (uint32)reqLevel)
+                            .Add("reqSkill", reqSkill).Add("reqSkillValue", reqSkillValue).Str();
+                        firstSpell = false;
+                    }
+                    spells += "]";
+                    std::string greeting;
+                    if (p.rpos() < p.size()) p >> greeting; // trainer window text
+                    w.AddGuid("guid", (uint64_t)guid).Add("trainerType", trainerType)
+                     .Raw("spells", spells).Add("greeting", greeting);
+                    break;
+                }
+                case SMSG_TRAINER_BUY_SUCCEEDED:
+                {
+                    name = "SMSG_TRAINER_BUY_SUCCEEDED";
+                    uint64 guid; p >> guid;
+                    int32 spellId; p >> spellId;
+                    w.AddGuid("guid", (uint64_t)guid).Add("spellId", spellId);
+                    break;
+                }
+                case SMSG_TRAINER_BUY_FAILED:
+                {
+                    name = "SMSG_TRAINER_BUY_FAILED";
+                    uint64 guid; p >> guid;
+                    int32 spellId; p >> spellId;
+                    // Trainer::FailReason: 0 unavailable (not on this trainer's
+                    // list / not trainable), 1 not enough money, 2 not enough
+                    // skill (also the catch-all for level and prerequisites).
+                    int32 reason; p >> reason;
+                    w.AddGuid("guid", (uint64_t)guid).Add("spellId", spellId).Add("reason", reason);
+                    break;
+                }
                 case SMSG_SELL_ITEM:
                 {
                     name = "SMSG_SELL_ITEM";
@@ -3000,6 +4091,50 @@ namespace WrathBench
                     name = "SMSG_CHAR_DELETE";
                     uint8 result = 0; if (p.size() >= 1) p >> result;
                     w.Add("result", (uint32)result);
+                    break;
+                }
+                // ------------------------------------------- map transfers
+                case SMSG_TRANSFER_PENDING:
+                {
+                    // Player::TeleportTo (far): u32 mapId, then (u32
+                    // transportEntry, u32 oldMapId) only when the character is
+                    // being carried across by a transport.
+                    name = "SMSG_TRANSFER_PENDING";
+                    uint32 mapId; p >> mapId;
+                    w.Add("map", mapId);
+                    if (p.rpos() + 8 <= p.size())
+                    {
+                        uint32 transportEntry, oldMap; p >> transportEntry >> oldMap;
+                        w.Add("transportEntry", transportEntry).Add("oldMap", oldMap);
+                    }
+                    s.pendingTransferMap.store(mapId);
+                    break;
+                }
+                case SMSG_NEW_WORLD:
+                {
+                    // Player::TeleportTo (far): u32 mapId, xyzo of the arrival
+                    // point (transport-local when aboard one). This is the
+                    // client's only map id after login (SMSG_LOGIN_VERIFY_WORLD
+                    // is never re-sent), so the SDK keys self.position.map on it.
+                    name = "SMSG_NEW_WORLD";
+                    uint32 mapId; float x, y, z, o; p >> mapId >> x >> y >> z >> o;
+                    w.Add("map", mapId).Add("x", (double)x).Add("y", (double)y).Add("z", (double)z).Add("o", (double)o);
+                    s.pendingTransferMap.store(0);
+                    break;
+                }
+                case SMSG_TRANSFER_ABORTED:
+                {
+                    // Player::SendTransferAborted: u32 mapId, u8 reason, u8 arg
+                    // only for INSUF_EXPAN_LVL / DIFFICULTY / UNIQUE_MESSAGE.
+                    name = "SMSG_TRANSFER_ABORTED";
+                    uint32 mapId; uint8 reason; p >> mapId >> reason;
+                    w.Add("map", mapId).Add("reason", (uint32)reason);
+                    if (p.rpos() + 1 <= p.size())
+                    {
+                        uint8 arg; p >> arg;
+                        w.Add("arg", (uint32)arg);
+                    }
+                    s.pendingTransferMap.store(0);
                     break;
                 }
                 // ---------------------------------------- creature movement

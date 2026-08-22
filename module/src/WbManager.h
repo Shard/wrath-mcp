@@ -53,6 +53,16 @@ namespace WrathBench
         float x{0}, y{0}, z{0};
     };
 
+    // One AreaTrigger.dbc record (3.3.5a). Client-side knowledge: the volumes
+    // a client tests its own position against to send CMSG_AREATRIGGER.
+    struct AreaTriggerRec
+    {
+        uint32 id{0};
+        float x{0}, y{0}, z{0};
+        float radius{0};            // > 0: sphere; else oriented box below
+        float boxLength{0}, boxWidth{0}, boxHeight{0}, boxYaw{0};
+    };
+
     // Per-session synthesized-movement state (ADR-0010). Touched only on the
     // world thread (DoMoveTo/DoStop/DoFace and the Update tick), so unlocked.
     struct MoveState
@@ -69,6 +79,8 @@ namespace WrathBench
         int64_t stopDeadlineMs{0};  // arrival-confirm timeout once stopping
         float curX{0}, curY{0}, curZ{0}, curO{0}; // interpolated client-side position
         float destX{0}, destY{0}, destZ{0};
+        bool hasMeshZ{false};       // the mesh resolved the request to a different z
+        float meshZ{0};
     };
 
     // Per-token headless session. See ADR-0009 for the parked-socket design.
@@ -103,6 +115,12 @@ namespace WrathBench
         std::atomic<int> phase{P_AUTH};
         uint64_t targetGuidRaw{0};
 
+        // Account-reclaim wait (create only, world thread only). When a create
+        // has to evict a stale/leaked session holding the account, DoCreateSession
+        // tears it down and re-queues itself until the core releases the account;
+        // this is the wall-clock deadline for that wait, set on the first entry.
+        int64_t createDeadlineMs{0};
+
         // Ack for the in-flight /session request. Set exactly once, by whichever
         // of the kickoff task (sync failure) or the tap (async completion) reaches
         // the terminal state first.
@@ -116,6 +134,22 @@ namespace WrathBench
         // Movement synthesis (world thread only).
         MoveState move;
         uint64_t moveIdGen{0};
+
+        // Areatrigger edge detection (world thread only): the trigger volume the
+        // mover last reported being inside (0 = none), and when the module last
+        // queued CMSG_AREATRIGGER for it, so a trigger the server did not act on
+        // (heartbeat lag: the server checks its applied position, the module its
+        // interpolated one) is re-sent while the character is still inside.
+        uint32 lastTriggerId{0};
+        int64_t lastTriggerSentMs{0};
+
+        // WB_RIDE_PROGRESS pacing while aboard a transport (world thread only).
+        int64_t lastRideEmitMs{0};
+
+        // Map transfer in flight: the destination map from SMSG_TRANSFER_PENDING,
+        // cleared by SMSG_NEW_WORLD / SMSG_TRANSFER_ABORTED. Set on tap threads,
+        // read by the mover on the world thread, hence atomic.
+        std::atomic<uint32> pendingTransferMap{0};
 
         // Teleport-ack pacing (world thread only): when the last ack for a
         // still-pending teleport was queued, 0 when none is pending. See
@@ -198,9 +232,37 @@ namespace WrathBench
         void DoStop(std::string token, std::shared_ptr<std::promise<HttpReply>> ack);
         void DoFace(std::string token, bool hasO, float o, bool hasXY, float x, float y, std::shared_ptr<std::promise<HttpReply>> ack);
 
+        // Outcome of resolving a move_to against the navmesh (world thread).
+        // status is nullptr on success, else one of the typed causes in
+        // PROTOCOL.md (WB_MOVE_RESULT.status).
+        struct PathResolve
+        {
+            char const* status{nullptr};
+            std::vector<WbVec> points;
+            bool hasMeshZ{false};
+            float meshZ{0};
+            bool hasReached{false};     // path_incomplete: how far the mesh got
+            float reachedX{0}, reachedY{0}, reachedZ{0};
+        };
+        PathResolve ResolvePath(Player* player, float x, float y, float z);
+
+        // AreaTrigger.dbc as the client ships it (FOLLOW-UPS 38 N1): the
+        // module reads the DBC from the server data volume so the mover can
+        // send CMSG_AREATRIGGER on entering a volume, exactly as a client does
+        // without the player choosing to. The server still applies its own
+        // IsInAreaTriggerRadius check, so a wrong client-side hit is harmless.
+        bool LoadAreaTriggerDbc(std::string const& path);
+        // Edge-triggered: queues CMSG_AREATRIGGER (and emits WB_AREATRIGGER)
+        // when the interpolated position enters a volume the session was not
+        // already inside. World thread only.
+        void CheckAreaTriggers(BenchSession& s, Player* player, float x, float y, float z, int64_t nowMs);
+        std::unordered_map<uint32, std::vector<AreaTriggerRec>> _areaTriggers; // by map
+        bool _areaTriggersLoaded{false};
+
         // Mover (world thread only; see ADR-0010).
         void TickMovers(int64_t nowMs);
         void TickMover(BenchSession& s, int64_t nowMs);
+        void TickRiders(int64_t nowMs);
         void FinishMove(BenchSession& s, char const* status);
 
         // Answer pending teleports the way a real client does (world thread
@@ -233,6 +295,11 @@ namespace WrathBench
 
         // Tap helpers (world/map thread).
         void EmitEvent(BenchSession& s, std::string const& opcodeName, uint16_t opcodeId, std::string const& dataJson);
+        // Emit one synthetic WB_SESSION_STATE for an in-world session (ADR-0014):
+        // the client-visible self state a fresh SMSG_LOGIN_VERIFY_WORLD carries.
+        // World thread only (reads Player). Reused by the WS-reattach path and by
+        // an idempotent same-token createSession so the caller re-syncs state.
+        void EmitSessionState(std::shared_ptr<BenchSession> const& s);
         void Audit(BenchSession& s, char const* kind, std::string const& json);
         void SucceedAck(BenchSession& s);
         void FailAck(BenchSession& s, std::string const& message, int status = 502);

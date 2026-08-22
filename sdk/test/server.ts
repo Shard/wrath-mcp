@@ -33,6 +33,16 @@ export interface CharacterDeleteBody {
   account?: string;
 }
 
+/** One `POST /session` body, as the SDK sent it. */
+export interface CreateSessionBody {
+  token?: string;
+  character?: string;
+  account?: string;
+  race?: number;
+  class?: number;
+  gender?: number;
+}
+
 /** One dispatched action body, as the SDK sent it. */
 export interface RecordedAction {
   action: string;
@@ -50,6 +60,8 @@ export interface StubServer {
   sockets: ServerWebSocket<{ token: string }>[];
   /** Every `POST /action` body the SDK sent, in order. */
   actions: RecordedAction[];
+  /** Every `POST /session` body the SDK sent, in order. */
+  sessions: CreateSessionBody[];
   /** Every `POST /character-delete` body, in order. */
   characterDeletes: CharacterDeleteBody[];
   stop(): Promise<void>;
@@ -67,6 +79,7 @@ export function startStub(options: StubOptions = {}): StubServer {
   let connections = 0;
   let moveIdGen = 0;
   const actions: RecordedAction[] = [];
+  const sessions: CreateSessionBody[] = [];
   const characterDeletes: CharacterDeleteBody[] = [];
 
   const server = Bun.serve<{ token: string }, never>({
@@ -92,17 +105,20 @@ export function startStub(options: StubOptions = {}): StubServer {
         );
       }
       if (url.pathname === "/session" && req.method === "POST") {
-        return (
-          options.routes?.session?.() ??
-          json({
-            ok: true,
-            token: "stub",
-            account: "RUNNER",
-            character: "Fenwick",
-            guid: 7,
-            inWorld: true,
-          })
-        );
+        return req.json().then((body) => {
+          sessions.push(body as CreateSessionBody);
+          return (
+            options.routes?.session?.() ??
+            json({
+              ok: true,
+              token: "stub",
+              account: (body as CreateSessionBody).account ?? "RUNNER",
+              character: (body as CreateSessionBody).character ?? "Fenwick",
+              guid: 7,
+              inWorld: true,
+            })
+          );
+        });
       }
       if (url.pathname === "/session" && req.method === "DELETE") {
         return options.routes?.deleteSession?.() ?? json({ ok: true, token: "stub" });
@@ -181,6 +197,7 @@ export function startStub(options: StubOptions = {}): StubServer {
       return [...sockets];
     },
     actions,
+    sessions,
     characterDeletes,
     async stop() {
       await server.stop(true);
