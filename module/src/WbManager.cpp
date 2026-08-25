@@ -1,18 +1,19 @@
 /*
  * This file is part of mod-wrathbench, an AzerothCore module.
+ * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * This program is free software: you can redistribute it and/or modify it
- * under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or (at your
- * option) any later version.
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
  *
  * This program is distributed in the hope that it will be useful, but WITHOUT
  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License
- * for more details.
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program. If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU General Public License along
+ * with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include "WbManager.h"
@@ -56,6 +57,7 @@
 #include <cstring>
 #include <filesystem>
 #include <initializer_list>
+#include <iterator>
 #include <strings.h>
 
 using boost::asio::ip::tcp;
@@ -174,6 +176,12 @@ namespace WrathBench
         std::string dbcPath = sWorld->GetDataPath() + "dbc/AreaTrigger.dbc";
         if (!LoadAreaTriggerDbc(dbcPath))
             LOG_ERROR("module", "wrathbench: AreaTrigger.dbc not loaded from '{}'; portals and explore triggers will not fire for bench characters", dbcPath);
+        std::string areaPath = sWorld->GetDataPath() + "dbc/AreaTable.dbc";
+        if (!LoadAreaTableDbc(areaPath))
+            LOG_ERROR("module", "wrathbench: AreaTable.dbc not loaded from '{}'; WB_AREA will carry ids without names", areaPath);
+        std::string achPath = sWorld->GetDataPath() + "dbc/Achievement.dbc";
+        if (!LoadAchievementDbc(achPath))
+            LOG_ERROR("module", "wrathbench: Achievement.dbc not loaded from '{}'; achievement events will carry ids without names or points", achPath);
 
         _http = std::make_unique<HttpServer>(_bindAddress, _port, this, _threads);
         try
@@ -227,10 +235,13 @@ namespace WrathBench
         // mid-update here, so reading player state and QueuePacket are both safe.
         TickMovers(nowMs);
         TickRiders(nowMs);
+        TickTransports(nowMs);
 
         // Answer pending teleports; without this every teleport (repop's
         // graveyard port included) freezes movement forever.
         TickTeleportAcks(nowMs);
+        TickCorpseQuery();
+        TickAreas();
 
         // Keep parked sockets from being reaped by the idle-connection check in
         // WorldSession::Update (it calls CloseSocket once m_timeOutTime hits 0).
@@ -514,6 +525,9 @@ namespace WrathBench
         { "CMSG_QUERY_TIME", CMSG_QUERY_TIME },
         { "CMSG_SET_WATCHED_FACTION", CMSG_SET_WATCHED_FACTION },
         { "CMSG_SET_ACTION_BUTTON", CMSG_SET_ACTION_BUTTON },
+        // a ghost asking where its corpse is (the module asks once per death
+        // on the client's behalf; this lets a snippet re-ask)
+        { "MSG_CORPSE_QUERY", MSG_CORPSE_QUERY },
         { nullptr, 0 },
     };
     static constexpr size_t kRawPayloadMaxBytes = 512;
@@ -576,7 +590,12 @@ namespace WrathBench
                 return MissingParam(action, "missing_position",
                     !req.Has("x") ? "x" : (!req.Has("y") ? "y" : "z"));
             float x = (float)req.GetDouble("x"), y = (float)req.GetDouble("y"), z = (float)req.GetDouble("z");
-            PushTask([this, token, x, y, z, ack]() { DoMoveTo(token, x, y, z, ack); });
+            // Optional: the guid of the unit the point was read from. Only a
+            // planning hint (the z of a patrolling NPC is resolved to the
+            // ground under it before pathing, see ResolvePath); never a
+            // lookup, the request still walks to x,y.
+            std::string guid = req.GetString("guid");
+            PushTask([this, token, x, y, z, guid, ack]() { DoMoveTo(token, x, y, z, guid, ack); });
         }
         else if (action == "stop")
         {
@@ -1134,13 +1153,47 @@ namespace WrathBench
             && pts.size() >= 2;
     }
 
+    // A mesh path that falls is a ledge, not a route (ADR-0027 amendment,
+    // nav-probe c4 on map 369: a polyline segment with dz -7.64 over 1.0y of
+    // 2D travel was walked, `arrived` was reported from a 2D-only check, and
+    // the next move from down there was `start_off_mesh`). A segment is a
+    // drop when it is both tall (> 2.0y, so stairs and stale-z corrections
+    // stay `meshZ`) and steeper than a ramp (|dz| > 1.2 x its 2D length).
+    // Deliberately not the core's SetSlopeCheck: that is a pathing-time
+    // preference, this is a verdict on the route the mesh already chose.
+    static constexpr float DROP_MIN_DZ = 2.0f;
+    static constexpr float DROP_SLOPE = 1.2f;
+    static bool IsDropSegment(WbVec const& a, WbVec const& b, float* dzOut)
+    {
+        float dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+        float d2 = std::sqrt(dx * dx + dy * dy);
+        if (dzOut) *dzOut = dz;
+        return std::fabs(dz) > DROP_MIN_DZ && std::fabs(dz) > DROP_SLOPE * d2;
+    }
+
+    // Audit shape of a resolved polyline (op: move_path), capped so a 200-point
+    // sweep does not flood the log; `truncated` says when the cap bit.
+    static std::string PathPointsJson(std::vector<WbVec> const& pts, size_t cap = 64)
+    {
+        std::ostringstream ss;
+        ss << '[';
+        size_t n = std::min(pts.size(), cap);
+        for (size_t i = 0; i < n; ++i)
+        {
+            if (i) ss << ',';
+            ss << Json::Writer().Add("x", (double)pts[i].x).Add("y", (double)pts[i].y).Add("z", (double)pts[i].z).Str();
+        }
+        ss << ']';
+        return ss.str();
+    }
+
     // The cause ladder behind a move_to (PROTOCOL.md, WB_MOVE_RESULT.status).
     // Returns status == nullptr with `points` filled on success. Order matters:
     // no_mesh must be tested before CalculatePath, because the core hides a
     // missing tile inside NORMAL|NOT_USING_PATH; the endpoint check is 2D so
     // that a stale z in the request is the mesh's problem (meshZ), not the
     // agent's.
-    Manager::PathResolve Manager::ResolvePath(Player* player, float x, float y, float z)
+    Manager::PathResolve Manager::ResolvePathAt(Player* player, float x, float y, float z, float reqZ)
     {
         PathResolve r;
         dtNavMesh const* navMesh = player->GetMap()->GetMapCollisionData().GetMMapData().GetNavMesh();
@@ -1242,11 +1295,70 @@ namespace WrathBench
             r.status = "path_incomplete";
             return r;
         }
+        // Per-segment drop guard over the whole polyline (the main path and,
+        // when spliced, the leg2 continuation): the walk is not dispatched.
+        // `points` is kept so the move_path audit shows the route that fell.
+        for (size_t i = 0; i + 1 < r.points.size(); ++i)
+        {
+            float dz = 0.0f;
+            if (IsDropSegment(r.points[i], r.points[i + 1], &dz))
+            {
+                r.status = "drop";
+                r.hasReached = true;
+                r.reachedX = r.points[i].x; r.reachedY = r.points[i].y; r.reachedZ = r.points[i].z;
+                r.hasDrop = true;
+                r.dropDz = dz;
+                return r;
+            }
+        }
         float endZ = r.points.back().z;
-        if (std::fabs(endZ - z) > 1.0f)
+        if (std::fabs(endZ - reqZ) > 1.0f)
         {
             r.hasMeshZ = true;
             r.meshZ = endZ;
+        }
+        return r;
+    }
+
+    // The z-ladder in front of the cause ladder (FOLLOW-UPS 46 part 3). A unit
+    // target's z comes from the unit's own movement packets, and a patrolling or
+    // sloped NPC's z can sit outside the core's default poly-search extents
+    // while the ground under it is perfectly walkable ("Ironforge Mountaineer"
+    // at (-5909, -68), nav-probe c3/c4: `target_off_mesh` for a point an NPC
+    // stands on). The ground height at x,y is terrain and model geometry a
+    // client has too (Map::GetHeight over maps/vmaps/GO models), so the module
+    // resolves it before pathing: first for a unit target, as a fallback after
+    // a `target_off_mesh` for any point. A target the mesh rejects at both its
+    // own z and the ground z is still `target_off_mesh`; `meshZ` is always
+    // relative to the z the agent asked for.
+    Manager::PathResolve Manager::ResolvePath(Player* player, float x, float y, float z, bool unitTarget, bool* usedGroundZ, float* groundZOut)
+    {
+        if (usedGroundZ) *usedGroundZ = false;
+        float groundZ = player->GetMap()->GetHeight(player->GetPhaseMask(), x, y, z, true);
+        bool haveGround = groundZ > INVALID_HEIGHT && std::fabs(groundZ - z) > 0.5f;
+        if (groundZOut) *groundZOut = haveGround ? groundZ : z;
+
+        auto isTargetOffMesh = [](PathResolve const& r) { return r.status && std::strcmp(r.status, "target_off_mesh") == 0; };
+
+        if (unitTarget && haveGround)
+        {
+            PathResolve r = ResolvePathAt(player, x, y, groundZ, z);
+            if (!isTargetOffMesh(r))
+            {
+                if (usedGroundZ) *usedGroundZ = true;
+                return r;
+            }
+            return ResolvePathAt(player, x, y, z, z);
+        }
+        PathResolve r = ResolvePathAt(player, x, y, z, z);
+        if (isTargetOffMesh(r) && haveGround)
+        {
+            PathResolve r2 = ResolvePathAt(player, x, y, groundZ, z);
+            if (!isTargetOffMesh(r2))
+            {
+                if (usedGroundZ) *usedGroundZ = true;
+                return r2;
+            }
         }
         return r;
     }
@@ -1280,21 +1392,45 @@ namespace WrathBench
         if (m.hasMeshZ)
             w.Add("meshZ", (double)m.meshZ);
         m.hasMeshZ = false;
+        // A ledge found while walking (TickMover's defensive check): the edge
+        // is where the mover stopped, dz is the step it refused to take.
+        if (m.hasDrop)
+        {
+            w.Raw("reachedPos", Json::Writer().Add("x", (double)m.curX).Add("y", (double)m.curY).Add("z", (double)m.curZ).Str());
+            w.Add("dz", (double)m.dropDz);
+            w.Raw("target", Json::Writer().Add("x", (double)m.reqX).Add("y", (double)m.reqY).Add("z", (double)m.reqZ).Str());
+        }
+        m.hasDrop = false;
         EmitEvent(s, "WB_MOVE_RESULT", 0xFF01, w.Str());
     }
 
-    void Manager::DoMoveTo(std::string token, float x, float y, float z, std::shared_ptr<std::promise<HttpReply>> ack)
+    void Manager::DoMoveTo(std::string token, float x, float y, float z, std::string guid, std::shared_ptr<std::promise<HttpReply>> ack)
     {
         auto s = FindByToken(token);
         Player* player = CheckActionSession(s, ack);
         if (!player)
             return;
 
-        Audit(*s, "action", Json::Writer().Add("op", "move_to")
-            .Add("x", (double)x).Add("y", (double)y).Add("z", (double)z).Str());
+        {
+            Json::Writer a;
+            a.Add("op", "move_to").Add("x", (double)x).Add("y", (double)y).Add("z", (double)z);
+            if (!guid.empty())
+                a.Add("guid", guid);
+            Audit(*s, "action", a.Str());
+        }
 
         if (s->move.active)
+        {
+            // A client whose run is redirected stops first: without this the
+            // server's last movement word stays MOVEMENTFLAG_FORWARD when the
+            // new request fails at planning, isMoving() stays true and every
+            // later cast fails SPELL_FAILED_MOVING (FOLLOW-UPS 46 part 3,
+            // ~10 minutes of Hearthstone casts in nav-probe c3).
+            MoveState& old = s->move;
+            SendMovePacket(*s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, old.curX, old.curY, old.curZ, old.curO,
+                FindTransportAt(player->GetMap(), old.curX, old.curY, old.curZ));
             FinishMove(*s, "superseded");
+        }
 
         uint64_t moveId = ++s->moveIdGen;
         MoveState& m = s->move;
@@ -1306,6 +1442,13 @@ namespace WrathBench
             .Add("token", token).Add("moveId", moveId).Str()});
 
         auto failEvent = [&](char const* status) {
+            // Nothing moved; if the server still has the character flagged as
+            // moving (a superseded run it has not yet seen stop), end it the
+            // way a client's run ends. A no-op for a character already still.
+            if (player->isMoving())
+                SendMovePacket(*s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE,
+                    player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation(),
+                    player->GetTransport());
             Json::Writer w;
             w.Add("moveId", moveId).Add("status", status);
             w.Raw("pos", PosJson(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation()));
@@ -1342,21 +1485,44 @@ namespace WrathBench
                     .Add("boarding", targetT != nullptr).Add("leaving", startT != nullptr && !targetT).Str());
             }
             else
-                r = ResolvePath(player, x, y, z);
+            {
+                bool usedGroundZ = false; float groundZ = z;
+                r = ResolvePath(player, x, y, z, !guid.empty(), &usedGroundZ, &groundZ);
+                if (usedGroundZ)
+                    Audit(*s, "action", Json::Writer().Add("op", "move_ground_z").Add("moveId", moveId)
+                        .Add("unitTarget", !guid.empty()).Add("z", (double)z).Add("groundZ", (double)groundZ).Str());
+            }
         }
+        // The resolved polyline, at dispatch, so a diagnosis reads the route
+        // the mesh chose instead of reconstructing it from heartbeats.
+        Audit(*s, "action", Json::Writer().Add("op", "move_path").Add("moveId", moveId)
+            .Add("status", r.status ? r.status : "ok")
+            .Add("pointCount", (uint64_t)r.points.size()).Add("truncated", r.points.size() > 64)
+            .Raw("points", PathPointsJson(r.points)).Str());
         if (r.status != nullptr)
         {
+            if (player->isMoving()) // see failEvent
+                SendMovePacket(*s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE,
+                    player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation(),
+                    player->GetTransport());
             Json::Writer w;
             w.Add("moveId", moveId).Add("status", r.status);
             w.Raw("pos", PosJson(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation()));
             if (r.hasReached)
                 w.Raw("reachedPos", Json::Writer().Add("x", (double)r.reachedX).Add("y", (double)r.reachedY).Add("z", (double)r.reachedZ).Str());
+            if (r.hasDrop)
+            {
+                w.Add("dz", (double)r.dropDz);
+                w.Raw("target", Json::Writer().Add("x", (double)x).Add("y", (double)y).Add("z", (double)z).Str());
+            }
             EmitEvent(*s, "WB_MOVE_RESULT", 0xFF01, w.Str());
             return;
         }
         std::vector<WbVec> const& pts = r.points;
         m.meshZ = r.meshZ;
         m.hasMeshZ = r.hasMeshZ;
+        m.reqX = x; m.reqY = y; m.reqZ = z;
+        m.hasDrop = false;
 
         int64_t now = NowMs();
         m.points.clear();
@@ -1849,6 +2015,179 @@ namespace WrathBench
         return _areaTriggersLoaded;
     }
 
+    // WDBC reader for AreaTable.dbc (3.3.5a: 36 fields of 4 bytes, record
+    // size 144 — verified against the shipped file: id, mapId, parentAreaId,
+    // exploreFlag, flags, soundProviderPref, soundProviderPrefUnderwater,
+    // ambienceId, zoneMusic, introSound, explorationLevel, name[16 locales +
+    // flags] from field 11 with enUS first, ...). Only id, mapId, parentAreaId
+    // and the enUS name are kept. Same header as AreaTrigger.dbc above.
+    bool Manager::LoadAreaTableDbc(std::string const& path)
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (!in)
+            return false;
+        char magic[4];
+        uint32 recordCount = 0, fieldCount = 0, recordSize = 0, stringSize = 0;
+        in.read(magic, 4);
+        in.read(reinterpret_cast<char*>(&recordCount), 4);
+        in.read(reinterpret_cast<char*>(&fieldCount), 4);
+        in.read(reinterpret_cast<char*>(&recordSize), 4);
+        in.read(reinterpret_cast<char*>(&stringSize), 4);
+        if (!in || std::memcmp(magic, "WDBC", 4) != 0 || fieldCount != 36 || recordSize != 144)
+        {
+            LOG_ERROR("module", "wrathbench: '{}' is not a 3.3.5a AreaTable.dbc (fields {}, record size {})", path, fieldCount, recordSize);
+            return false;
+        }
+        std::vector<char> recs(size_t(recordCount) * recordSize);
+        in.read(recs.data(), recs.size());
+        std::vector<char> strings(stringSize);
+        in.read(strings.data(), stringSize);
+        if (!in)
+        {
+            LOG_ERROR("module", "wrathbench: '{}' truncated ({} records, {} string bytes expected)", path, recordCount, stringSize);
+            return false;
+        }
+        size_t loaded = 0;
+        for (uint32 i = 0; i < recordCount; ++i)
+        {
+            char const* rec = recs.data() + size_t(i) * recordSize;
+            uint32 id, map, parent, nameOff;
+            std::memcpy(&id, rec, 4);
+            std::memcpy(&map, rec + 4, 4);
+            std::memcpy(&parent, rec + 8, 4);
+            std::memcpy(&nameOff, rec + 11 * 4, 4);
+            AreaTableRec r;
+            r.mapId = map;
+            r.parentAreaId = parent;
+            if (nameOff < stringSize)
+                r.name = std::string(strings.data() + nameOff, strnlen(strings.data() + nameOff, stringSize - nameOff));
+            _areaTable[id] = std::move(r);
+            ++loaded;
+        }
+        _areaTableLoaded = loaded > 0;
+        LOG_INFO("module", "wrathbench: loaded {} areas from '{}'", loaded, path);
+        return _areaTableLoaded;
+    }
+
+    // WDBC reader for Achievement.dbc (3.3.5a: 62 fields of 4 bytes, record
+    // size 248 — verified against the shipped file: id, faction, map,
+    // previous, name[16 locales + flags] from field 4 with enUS first,
+    // description[17] from 21, category at 38, points at 39, uiOrder, flags,
+    // icon, reward[17], minCriteria, sharesCriteria). Only id, enUS name,
+    // points and category are kept. Same header as AreaTrigger.dbc above.
+    bool Manager::LoadAchievementDbc(std::string const& path)
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (!in)
+            return false;
+        char magic[4];
+        uint32 recordCount = 0, fieldCount = 0, recordSize = 0, stringSize = 0;
+        in.read(magic, 4);
+        in.read(reinterpret_cast<char*>(&recordCount), 4);
+        in.read(reinterpret_cast<char*>(&fieldCount), 4);
+        in.read(reinterpret_cast<char*>(&recordSize), 4);
+        in.read(reinterpret_cast<char*>(&stringSize), 4);
+        if (!in || std::memcmp(magic, "WDBC", 4) != 0 || fieldCount != 62 || recordSize != 248)
+        {
+            LOG_ERROR("module", "wrathbench: '{}' is not a 3.3.5a Achievement.dbc (fields {}, record size {})", path, fieldCount, recordSize);
+            return false;
+        }
+        std::vector<char> recs(size_t(recordCount) * recordSize);
+        in.read(recs.data(), recs.size());
+        std::vector<char> strings(stringSize);
+        in.read(strings.data(), stringSize);
+        if (!in)
+        {
+            LOG_ERROR("module", "wrathbench: '{}' truncated ({} records, {} string bytes expected)", path, recordCount, stringSize);
+            return false;
+        }
+        size_t loaded = 0;
+        for (uint32 i = 0; i < recordCount; ++i)
+        {
+            char const* rec = recs.data() + size_t(i) * recordSize;
+            uint32 id, nameOff, category, points;
+            std::memcpy(&id, rec, 4);
+            std::memcpy(&nameOff, rec + 4 * 4, 4);
+            std::memcpy(&category, rec + 38 * 4, 4);
+            std::memcpy(&points, rec + 39 * 4, 4);
+            AchievementRec r;
+            r.points = points;
+            r.categoryId = category;
+            if (nameOff < stringSize)
+                r.name = std::string(strings.data() + nameOff, strnlen(strings.data() + nameOff, stringSize - nameOff));
+            _achievements[id] = std::move(r);
+            ++loaded;
+        }
+        _achievementsLoaded = loaded > 0;
+        LOG_INFO("module", "wrathbench: loaded {} achievements from '{}'", loaded, path);
+        return _achievementsLoaded;
+    }
+
+    // The wire carries dates as the client's packed bitfield
+    // (ByteBuffer::AppendPackedTime: (year-2000)<<24 | month<<20 | (day-1)<<14
+    // | weekday<<11 | hour<<6 | minute). Both the raw field and a readable
+    // "YYYY-MM-DD HH:MM" are served; the reading is a client-local decode.
+    std::string Manager::AchievementJson(uint32 id, uint32 packedDate) const
+    {
+        char when[24];
+        std::snprintf(when, sizeof(when), "%04u-%02u-%02u %02u:%02u",
+            2000u + ((packedDate >> 24) & 0x1F), ((packedDate >> 20) & 0xF) + 1, ((packedDate >> 14) & 0x3F) + 1,
+            (packedDate >> 6) & 0x1F, packedDate & 0x3F);
+        Json::Writer w;
+        w.Add("achievementId", id).Add("date", packedDate).Add("time", when);
+        auto it = _achievements.find(id);
+        if (it != _achievements.end())
+            w.Add("name", it->second.name).Add("points", it->second.points).Add("categoryId", it->second.categoryId);
+        return w.Str();
+    }
+
+    void Manager::AddAreaFields(Json::Writer& w, Player* player)
+    {
+        uint32 zoneId = 0, areaId = 0;
+        player->GetZoneAndAreaId(zoneId, areaId);
+        auto nameOf = [this](uint32 id) -> std::string {
+            auto it = _areaTable.find(id);
+            return it == _areaTable.end() ? std::string() : it->second.name;
+        };
+        w.Add("mapId", player->GetMapId())
+         .Add("zoneId", zoneId).Add("zoneName", nameOf(zoneId))
+         .Add("areaId", areaId).Add("areaName", nameOf(areaId));
+    }
+
+    // A client computes the zone/subzone it is in from its own map files and
+    // names them from AreaTable.dbc, and redraws on every change whether it
+    // walked, was teleported or transferred. The server keeps the same pair
+    // on the Player from the same terrain data, so reading it is the same
+    // observation. Edge-triggered per session; the first in-world tick counts
+    // as a change so login announces where the character is.
+    void Manager::TickAreas()
+    {
+        std::vector<std::shared_ptr<BenchSession>> sessions;
+        {
+            std::lock_guard<std::mutex> lock(_sessMutex);
+            for (auto& [token, s] : _byToken)
+                if (!s->tearingDown.load() && s->phase.load() == BenchSession::P_INWORLD)
+                    sessions.push_back(s);
+        }
+        for (auto& s : sessions)
+        {
+            if (!s->ws || sWorldSessionMgr->FindSession(s->accountId) != s->ws)
+                continue;
+            Player* player = s->ws->GetPlayer();
+            if (!player || !player->IsInWorld() || player->IsBeingTeleported())
+                continue;
+            uint32 zoneId = 0, areaId = 0;
+            player->GetZoneAndAreaId(zoneId, areaId);
+            if (zoneId == s->lastZoneId && areaId == s->lastAreaId)
+                continue;
+            s->lastZoneId = zoneId;
+            s->lastAreaId = areaId;
+            Json::Writer w;
+            AddAreaFields(w, player);
+            EmitEvent(*s, "WB_AREA", 0xFF07, w.Str());
+        }
+    }
+
     // Same geometry as Player::IsInAreaTriggerRadius with delta 0 (the 5y
     // tavern delta is server-side only): a sphere when radius > 0, otherwise
     // an oriented box with half-extents length/2, width/2, height/2 around
@@ -1869,41 +2208,68 @@ namespace WrathBench
     {
         if (!_areaTriggersLoaded)
             return;
-        auto it = _areaTriggers.find(player->GetMapId());
+        uint32 const mapId = player->GetMapId();
+        if (mapId != s.insideTriggersMap)
+        {
+            // A map change (transfer, far teleport) leaves every volume.
+            s.insideTriggers.clear();
+            s.insideTriggersMap = mapId;
+        }
+        auto it = _areaTriggers.find(mapId);
         if (it == _areaTriggers.end())
+        {
+            s.insideTriggers.clear();
             return;
-        uint32 inside = 0;
+        }
+        std::vector<uint32> nowInside;
         for (AreaTriggerRec const& t : it->second)
-        {
             if (InsideAreaTrigger(t, x, y, z))
-            {
-                inside = t.id;
-                break;
-            }
-        }
-        if (inside == 0)
-        {
-            s.lastTriggerId = 0; // left every volume: re-arm
-            return;
-        }
-        // Fire once on entry. Re-send while still inside if nothing happened
-        // within 1.5s: the server checks the *applied* position, the module the
-        // interpolated one, and a heartbeat can lag by up to 500ms.
-        if (inside == s.lastTriggerId && nowMs - s.lastTriggerSentMs < 1500)
-            return;
-        if (inside == s.lastTriggerId && s.pendingTransferMap.load() != 0)
-            return; // the server acted on it; a transfer is in flight
-        s.lastTriggerId = inside;
-        s.lastTriggerSentMs = nowMs;
+                nowInside.push_back(t.id);
 
-        WorldPacket* p = new WorldPacket(CMSG_AREATRIGGER, 4);
-        *p << uint32(inside);
-        s.ws->QueuePacket(p);
-        Audit(s, "action", Json::Writer().Add("op", "areatrigger").Add("triggerId", inside).Add("moveId", s.move.moveId).Str());
-        Json::Writer w;
-        w.Add("triggerId", inside).Add("moveId", s.move.moveId);
-        w.Raw("pos", PosJson(x, y, z, s.move.curO));
-        EmitEvent(s, "WB_AREATRIGGER", 0xFF04, w.Str());
+        // Fire once per entry, as a client does: only ids that were not inside
+        // on the previous check. Nothing is re-sent while the mover lingers —
+        // exploration triggers the server does not act on (already credited)
+        // therefore fire exactly once per entry.
+        std::vector<uint32> entered;
+        for (uint32 id : nowInside)
+            if (std::find(s.insideTriggers.begin(), s.insideTriggers.end(), id) == s.insideTriggers.end())
+                entered.push_back(id);
+        s.insideTriggers = std::move(nowInside);
+        if (entered.empty())
+            return;
+
+        // A client never reports a trigger from a position it has not sent:
+        // CMSG_AREATRIGGER always follows a movement packet carrying the entry
+        // position. Heartbeats go out every ~500ms while the position is
+        // tested every tick, so an entry between heartbeats would otherwise
+        // be judged by the server against a position up to ~3.5y behind
+        // (run speed), fail IsInAreaTriggerRadius and, being fired once per
+        // entry, never be retried (smoke-travel 9c44d77a: tram exit 2171 hit
+        // at 9.98y from a r10 centre, no transfer). So send a heartbeat at the
+        // entry position first; both go through the same ordered
+        // WorldSession queue (QueuePacket), so the server applies the
+        // position before it evaluates the trigger.
+        if (s.move.active)
+        {
+            MoveState& m = s.move;
+            SendMovePacket(s, player, MSG_MOVE_HEARTBEAT, MOVEMENTFLAG_FORWARD, x, y, z, m.curO,
+                FindTransportAt(player->GetMap(), x, y, z));
+            m.lastPacketMs = nowMs;
+            Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_HEARTBEAT")
+                .Add("moveId", m.moveId).Add("cause", "areatrigger").Raw("pos", PosJson(x, y, z, m.curO)).Str());
+        }
+
+        for (uint32 id : entered)
+        {
+            WorldPacket* p = new WorldPacket(CMSG_AREATRIGGER, 4);
+            *p << uint32(id);
+            s.ws->QueuePacket(p);
+            Audit(s, "action", Json::Writer().Add("op", "areatrigger").Add("triggerId", id).Add("moveId", s.move.moveId).Str());
+            Json::Writer w;
+            w.Add("triggerId", id).Add("moveId", s.move.moveId);
+            w.Raw("pos", PosJson(x, y, z, s.move.curO));
+            EmitEvent(s, "WB_AREATRIGGER", 0xFF04, w.Str());
+        }
     }
 
     void Manager::TickMovers(int64_t nowMs)
@@ -1943,11 +2309,20 @@ namespace WrathBench
         // every movement opcode until the ack (TickTeleportAcks) and applies the
         // destination itself. `transferred` rather than `interrupted`, so the
         // agent knows a portal took it (FOLLOW-UPS 38 N1); the SDK then waits
-        // for SMSG_NEW_WORLD and resolves on the new map. The 15y desync guard
+        // for SMSG_NEW_WORLD and resolves on the new map. A same-map teleport
+        // (Hearthstone, graveyard port) is `teleported` (FOLLOW-UPS 46): no
+        // map change is coming. The 15y desync guard
         // below must not run here: the far-teleport position jump would race it.
-        if (s.pendingTransferMap.load() != 0 || player->IsBeingTeleported())
+        if (s.pendingTransferMap.load() != 0 || player->IsBeingTeleportedFar())
         {
             FinishMove(s, "transferred");
+            return;
+        }
+        if (player->IsBeingTeleportedNear())
+        {
+            // Same map: no SMSG_NEW_WORLD will follow. The arrival point is
+            // what the server's MSG_MOVE_TELEPORT_ACK (tapped) carries.
+            FinishMove(s, "teleported");
             return;
         }
         if (!player->IsInWorld())
@@ -1995,11 +2370,46 @@ namespace WrathBench
             WbVec const& b = m.points[m.seg + 1];
             float sx = b.x - a.x, sy = b.y - a.y, sz = b.z - a.z;
             float segLen = std::sqrt(sx * sx + sy * sy + sz * sz);
+            // A zero-length segment is consumed, never "walked": a request for
+            // the point the character already stands on resolves to the
+            // two-point path [here, here] (same poly, straight line), and the
+            // old `advance < remain || segLen <= 0.0001f` branch broke out of
+            // this loop without ever advancing `seg` — so the geometric-end
+            // check below never fired, no MSG_MOVE_STOP was sent, and the
+            // move heartbeated in place forever with no WB_MOVE_RESULT
+            // (module-navigation step 5 on the harness-0.4 smoke shape,
+            // 2026-08-23: walk home, off-mesh, too_far, then "walk home" again).
+            if (segLen <= 0.0001f)
+            {
+                ++m.seg;
+                m.segDone = 0.0f;
+                continue;
+            }
+            // Defensive twin of ResolvePathAt's guard: a segment that would
+            // step off a ledge is not walked. Stop at the segment's start (the
+            // edge) and say `drop` rather than interpolate down the cliff.
+            if (m.segDone <= 0.0f)
+            {
+                float dz = 0.0f;
+                if (IsDropSegment(a, b, &dz))
+                {
+                    m.curX = a.x; m.curY = a.y; m.curZ = a.z;
+                    SendMovePacket(s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, m.curX, m.curY, m.curZ, m.curO,
+                        FindTransportAt(player->GetMap(), m.curX, m.curY, m.curZ));
+                    Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_STOP")
+                        .Add("moveId", m.moveId).Add("cause", "drop").Add("dz", (double)dz)
+                        .Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO)).Str());
+                    m.hasDrop = true;
+                    m.dropDz = dz;
+                    FinishMove(s, "drop");
+                    return;
+                }
+            }
             float remain = segLen - m.segDone;
-            if (advance < remain || segLen <= 0.0001f)
+            if (advance < remain)
             {
                 m.segDone += advance;
-                float t = segLen > 0.0001f ? m.segDone / segLen : 1.0f;
+                float t = m.segDone / segLen;
                 m.curX = a.x + sx * t;
                 m.curY = a.y + sy * t;
                 m.curZ = a.z + sz * t;
@@ -2102,6 +2512,79 @@ namespace WrathBench
         }
     }
 
+    // A client that has received a transport's create block animates the car
+    // itself from TransportAnimation.dbc and the clock the block carried
+    // (pathProgress): it always knows where the car is and whether it is
+    // sitting at a platform. The server keeps the same animation
+    // (StaticTransport::RelocateToProgress from the same DBC), so the module
+    // reports, at most once a second per session, the current position of
+    // every transport the session has been sent (knownObjects: the client's
+    // own object cache) on the character's map, plus `docked` — whether the
+    // animation segment the clock is on has no displacement, i.e. the car
+    // is dwelling at an end. Nothing here is beyond what the client computes
+    // locally; it is the riding counterpart of WB_RIDE_PROGRESS for the car
+    // rather than the passenger. World thread only.
+    void Manager::TickTransports(int64_t nowMs)
+    {
+        std::vector<std::shared_ptr<BenchSession>> sessions;
+        {
+            std::lock_guard<std::mutex> lock(_sessMutex);
+            for (auto& [token, s] : _byToken)
+                if (!s->tearingDown.load() && s->phase.load() == BenchSession::P_INWORLD)
+                    sessions.push_back(s);
+        }
+        for (auto& s : sessions)
+        {
+            if (s->lastTransportEmitMs && nowMs - s->lastTransportEmitMs < 1000)
+                continue;
+            if (!s->ws || sWorldSessionMgr->FindSession(s->accountId) != s->ws)
+                continue;
+            Player* player = s->ws->GetPlayer();
+            Map* map = (player && player->IsInWorld()) ? player->GetMap() : nullptr;
+            if (!map)
+                continue;
+            s->lastTransportEmitMs = nowMs;
+            for (Transport* t : map->GetAllTransports())
+            {
+                if (!t || !t->IsInWorld())
+                    continue;
+                {
+                    std::lock_guard<std::mutex> lock(s->objMutex);
+                    if (s->knownObjects.find((uint64_t)t->GetGUID().GetRawValue()) == s->knownObjects.end())
+                        continue; // never sent to this client: not observable
+                }
+                Json::Writer w;
+                w.AddGuid("guid", (uint64_t)t->GetGUID().GetRawValue()).Add("entry", t->GetEntry());
+                w.Raw("pos", PosJson(t->GetPositionX(), t->GetPositionY(), t->GetPositionZ(), t->GetOrientation()));
+                uint32 progress = t->GetPathProgress();
+                w.Add("progressMs", progress);
+                if (TransportAnimation const* anim = t->GetGOValue()->Transport.AnimationInfo)
+                {
+                    w.Add("periodMs", anim->TotalTime);
+                    // Same lookup as TransportAnimation::GetAnimNode (the
+                    // keyframe at or before the clock and the one after it),
+                    // written out so a clock past the last keyframe answers
+                    // nothing instead of tripping that function's ASSERT.
+                    if (anim->TotalTime && !anim->Path.empty())
+                    {
+                        uint32 time = progress % anim->TotalTime;
+                        auto nextIt = anim->Path.upper_bound(time);
+                        if (nextIt != anim->Path.begin() && nextIt != anim->Path.end())
+                        {
+                            TransportAnimationEntry const* next = nextIt->second;
+                            TransportAnimationEntry const* curr = std::prev(nextIt)->second;
+                            float dx = next->X - curr->X, dy = next->Y - curr->Y, dz = next->Z - curr->Z;
+                            w.Add("docked", dx * dx + dy * dy + dz * dz < 0.01f);
+                        }
+                    }
+                }
+                else if (StaticTransport* st = dynamic_cast<StaticTransport*>(t))
+                    w.Add("periodMs", st->GetPeriod());
+                EmitEvent(*s, "WB_TRANSPORT_PROGRESS", 0xFF06, w.Str());
+            }
+        }
+    }
+
     // A real client answers every teleport once its loading screen is done:
     // MSG_MOVE_TELEPORT_ACK for a same-map teleport, MSG_MOVE_WORLDPORT_ACK for
     // a map transfer. Until that ack arrives the core discards all movement
@@ -2138,6 +2621,8 @@ namespace WrathBench
             if (s->teleportAckQueuedMs && nowMs - s->teleportAckQueuedMs < 1000)
                 continue;
             s->teleportAckQueuedMs = nowMs;
+            // A teleport leaves every areatrigger volume: re-entry fires again.
+            s->insideTriggers.clear();
 
             char const* opcodeName;
             if (player->IsBeingTeleportedNear())
@@ -2157,6 +2642,44 @@ namespace WrathBench
                 opcodeName = "MSG_MOVE_WORLDPORT_ACK";
             }
             Audit(*s, "action", Json::Writer().Add("op", "teleport_ack").Add("opcode", opcodeName).Str());
+        }
+    }
+
+    // A real client sends MSG_CORPSE_QUERY once it is a ghost (after the repop
+    // teleport lands), and draws the answer as the corpse marker on its map.
+    // The parked client has no map, so the module issues the same one-shot
+    // query and the tapped MSG_CORPSE_QUERY reply is served as an event
+    // (PROTOCOL.md "Death"; FOLLOW-UPS 53). Client behaviour, not an agent
+    // action: nothing here resurrects or moves anyone, and the handler answers
+    // from the corpse the player already owns. Waiting for the teleport to be
+    // acked matters: the handler compares the corpse map to the player's map,
+    // and the graveyard port must have applied for that to be the right map.
+    void Manager::TickCorpseQuery()
+    {
+        std::vector<std::shared_ptr<BenchSession>> sessions;
+        {
+            std::lock_guard<std::mutex> lock(_sessMutex);
+            for (auto& [token, s] : _byToken)
+                if (!s->tearingDown.load() && s->phase.load() == BenchSession::P_INWORLD)
+                    sessions.push_back(s);
+        }
+        for (auto& s : sessions)
+        {
+            if (!s->ws || sWorldSessionMgr->FindSession(s->accountId) != s->ws)
+                continue;
+            Player* player = s->ws->GetPlayer();
+            if (!player)
+                continue;
+            if (player->IsAlive() || !player->HasPlayerFlag(PLAYER_FLAGS_GHOST))
+            {
+                s->corpseQueried = false;
+                continue;
+            }
+            if (s->corpseQueried || player->IsBeingTeleported())
+                continue;
+            s->corpseQueried = true;
+            s->ws->QueuePacket(new WorldPacket(MSG_CORPSE_QUERY, 0));
+            Audit(*s, "action", Json::Writer().Add("op", "corpse_query").Add("opcode", "MSG_CORPSE_QUERY").Str());
         }
     }
 
@@ -2535,6 +3058,7 @@ namespace WrathBench
          .Add("z", (double)player->GetPositionZ())
          .Add("o", (double)player->GetOrientation())
          .Add("level", (uint32)player->GetLevel());
+        AddAreaFields(w, player);
         EmitEvent(*s, "WB_SESSION_STATE", 0xFF03, w.Str());
     }
 
@@ -2651,7 +3175,9 @@ namespace WrathBench
             uint64 tg = 0; p.readPackGUID(tg);
             o.AddGuid("targetGuid", (uint64_t)tg);
         }
-        if (flags & UPDATEFLAG_TRANSPORT) { uint32 t; p >> t; }
+        // A transport's create block carries its animation clock (ms into the
+        // TransportAnimation.dbc period); the client animates the car from it.
+        if (flags & UPDATEFLAG_TRANSPORT) { uint32 t; p >> t; o.Add("pathProgress", t); }
         if (flags & UPDATEFLAG_VEHICLE)   { uint32 vid; float vo; p >> vid >> vo; }
         if (flags & UPDATEFLAG_ROTATION)  { int64 rot; p >> rot; }
     }
@@ -2688,7 +3214,11 @@ namespace WrathBench
                 case UNIT_FIELD_MAXHEALTH:       f.Add("maxHealth", v); return true;
                 case UNIT_FIELD_LEVEL:           f.Add("level", v); return true;
                 case UNIT_FIELD_FACTIONTEMPLATE: f.Add("faction", v); return true;
-                case UNIT_FIELD_FLAGS:           f.Add("unitFlags", v); return true;
+                case UNIT_FIELD_FLAGS:
+                    // taxiFlight names UNIT_FLAG_TAXI_FLIGHT (0x00100000) off
+                    // the same field: the client's own "on a flight path"
+                    // reading, nothing the server adds (issue #8, ADR-0048).
+                    f.Add("unitFlags", v).Add("taxiFlight", (v & UNIT_FLAG_TAXI_FLIGHT) != 0); return true;
                 case UNIT_FIELD_DISPLAYID:       f.Add("displayId", v); return true;
                 case UNIT_DYNAMIC_FLAGS:         f.Add("dynamicFlags", v); return true;
                 case UNIT_NPC_FLAGS:             f.Add("npcFlags", v); return true;
@@ -2744,6 +3274,20 @@ namespace WrathBench
             if (index == ITEM_FIELD_OWNER + 1)     { f.Add("ownerHi", v); return true; }
             if (index == ITEM_FIELD_CONTAINED)     { f.Add("containedLo", v); return true; }
             if (index == ITEM_FIELD_CONTAINED + 1) { f.Add("containedHi", v); return true; }
+            // Worn-bag contents (FOLLOW-UPS 50): a container's slot guids as
+            // lo/hi u32 halves keyed by bag slot 0-35, plus its slot count.
+            // PUBLIC fields every client in range receives; same idiom as
+            // the player's invSlot<n>. The SDK joins halves into guids.
+            if (typeId == TYPEID_CONTAINER)
+            {
+                if (index == CONTAINER_FIELD_NUM_SLOTS) { f.Add("numSlots", v); return true; }
+                if (index >= CONTAINER_FIELD_SLOT_1 && index < CONTAINER_FIELD_SLOT_1 + 72)
+                {
+                    uint32 rel = index - CONTAINER_FIELD_SLOT_1;
+                    f.Add("bagSlot" + std::to_string(rel / 2) + (rel % 2 ? "Hi" : "Lo"), v);
+                    return true;
+                }
+            }
         }
         else if (typeId == TYPEID_GAMEOBJECT)
         {
@@ -2795,6 +3339,7 @@ namespace WrathBench
         // Creature/name queries a real client would fire on cache miss; issued
         // after the parse so a decode error doesn't send half-baked queries.
         std::vector<std::pair<uint32, uint64_t>> creatureQueries;
+        std::vector<std::pair<uint32, uint64_t>> gameObjectQueries;
         std::vector<uint64_t> nameQueries;
         std::vector<uint32_t> itemQueries;
 
@@ -2849,6 +3394,8 @@ namespace WrathBench
                             s.knownObjects[guid] = typeId;
                             if (typeId == TYPEID_UNIT && entry && s.queriedCreatures.insert(entry).second)
                                 creatureQueries.emplace_back(entry, guid);
+                            if (typeId == TYPEID_GAMEOBJECT && entry && s.queriedGameObjects.insert(entry).second)
+                                gameObjectQueries.emplace_back(entry, guid);
                             if (typeId == TYPEID_PLAYER && s.queriedNames.insert(guid).second)
                                 nameQueries.push_back(guid);
                             if ((typeId == TYPEID_ITEM || typeId == TYPEID_CONTAINER)
@@ -2900,6 +3447,12 @@ namespace WrathBench
             *q << uint32(entry) << uint64(guid);
             ws->QueuePacket(q);
         }
+        for (auto const& [entry, guid] : gameObjectQueries)
+        {
+            WorldPacket* q = new WorldPacket(CMSG_GAMEOBJECT_QUERY, 12);
+            *q << uint32(entry) << uint64(guid);
+            ws->QueuePacket(q);
+        }
         for (uint64_t guid : nameQueries)
         {
             WorldPacket* q = new WorldPacket(CMSG_NAME_QUERY, 8);
@@ -2937,6 +3490,7 @@ namespace WrathBench
             case MSG_MOVE_STOP_SWIM:          return "MSG_MOVE_STOP_SWIM";
             case MSG_MOVE_SET_RUN_MODE:       return "MSG_MOVE_SET_RUN_MODE";
             case MSG_MOVE_SET_WALK_MODE:      return "MSG_MOVE_SET_WALK_MODE";
+            case MSG_MOVE_TELEPORT_ACK:       return "MSG_MOVE_TELEPORT_ACK";
             default:                          return "MSG_MOVE";
         }
     }
@@ -3189,9 +3743,17 @@ namespace WrathBench
                 case MSG_MOVE_STOP_TURN: case MSG_MOVE_SET_FACING: case MSG_MOVE_HEARTBEAT:
                 case MSG_MOVE_FALL_LAND: case MSG_MOVE_START_SWIM: case MSG_MOVE_STOP_SWIM:
                 case MSG_MOVE_SET_RUN_MODE: case MSG_MOVE_SET_WALK_MODE:
+                // The server's side of a same-map teleport (Player::
+                // SendTeleportAckPacket): the bench character's own guid and
+                // the arrival point, which the server relocated to before
+                // building the MovementInfo. One u32 movement-order counter
+                // sits between the packGUID and the MovementInfo; otherwise the
+                // shape is the observed-movement one (FOLLOW-UPS 46).
+                case MSG_MOVE_TELEPORT_ACK:
                 {
                     name = MoveOpcodeName(opcode);
                     uint64 guid = 0; p.readPackGUID(guid);
+                    if (opcode == MSG_MOVE_TELEPORT_ACK) { uint32 counter = 0; p >> counter; }
                     uint32 mflags = 0; uint16 mflags2 = 0; uint32 mtime = 0;
                     p >> mflags >> mflags2 >> mtime;
                     float x, y, z, o;
@@ -3386,6 +3948,21 @@ namespace WrathBench
                         spells += SpellJson(spellId);
                     }
                     spells += "]";
+                    // Upstream quirk (AzerothCore Player::_LoadSpells,
+                    // Player.cpp:2852 at our pinned commit): the cooldown
+                    // count is written as m_spellCooldowns.size() BEFORE the
+                    // loop skips !needSendToClient rows, and unlike the spell
+                    // count above it is never fixed up with a data.put. A
+                    // character holding a category cooldown therefore gets a
+                    // packet declaring more entries than it carries (observed
+                    // live: Hearthstone -> declared 2, carried 1). The loop
+                    // below is correct anyway because it trusts the buffer,
+                    // not the declared count: the `p.rpos() + 16 <= p.size()`
+                    // guard (16 = one full tuple) stops at the actual end of
+                    // the packet, and cooldowns are its final field, so an
+                    // over-declared count yields exactly the rows present —
+                    // no overrun, no partial tuple, no decodeError. Keep that
+                    // guard if this decode is ever tightened.
                     uint16 cdCount = 0;
                     if (p.rpos() + 2 <= p.size()) p >> cdCount;
                     std::string cds = "[";
@@ -3499,6 +4076,58 @@ namespace WrathBench
                     specs += "]";
                     w.Add("pet", false).Add("unspentPoints", unspent).Add("specCount", (uint32)specCount)
                      .Add("activeSpec", (uint32)activeSpec).Raw("specs", specs);
+                    break;
+                }
+                // ----------------------------------- achievements and taxi
+                case SMSG_ACHIEVEMENT_EARNED:
+                {
+                    // AchievementMgr::SendAchievementEarned: packGUID earner,
+                    // u32 id, u32 packed date, u32 0. Broadcast to everyone
+                    // in say range, so `guid` may be another player; the
+                    // client shows those as chat-frame lines too.
+                    name = "SMSG_ACHIEVEMENT_EARNED";
+                    uint64 guid = 0; p.readPackGUID(guid);
+                    uint32 id = 0, date = 0; p >> id >> date;
+                    w.AddGuid("guid", (uint64_t)guid).Add("self", ws && ws->GetPlayer() && ws->GetPlayer()->GetGUID().GetRawValue() == guid)
+                     .Raw("achievement", AchievementJson(id, date));
+                    break;
+                }
+                case SMSG_ALL_ACHIEVEMENT_DATA:
+                {
+                    // AchievementMgr::BuildAllDataPacket, sent to self at
+                    // login: (u32 id, u32 packed date)* then 0xFFFFFFFF, then
+                    // the criteria-progress block to a second 0xFFFFFFFF.
+                    // Only the completed block is served; criteria progress is
+                    // not decoded (ADR-0048).
+                    name = "SMSG_ALL_ACHIEVEMENT_DATA";
+                    std::string list = "[";
+                    bool first = true;
+                    uint32 count = 0;
+                    while (p.rpos() + 4 <= p.size())
+                    {
+                        uint32 id; p >> id;
+                        if (id == 0xFFFFFFFF) break;
+                        uint32 date; p >> date;
+                        if (!first) list += ',';
+                        first = false;
+                        list += AchievementJson(id, date);
+                        ++count;
+                    }
+                    list += "]";
+                    w.Add("count", count).Raw("achievements", list);
+                    break;
+                }
+                case SMSG_ACTIVATETAXIREPLY:
+                {
+                    // WorldSession::SendActivateTaxiReply: u32 ActivateTaxiReply
+                    // (0 ok; 1 server error, 2 no such path, 3 not enough
+                    // money, 4 too far away, 5 no vendor nearby, 6 not
+                    // visited, 7 busy, 8 mounted, 9 shapeshifted, 10 moving,
+                    // 11 same node, 12 not standing). 0 means the flight is
+                    // starting; the ride itself shows as `taxiFlight` on self.
+                    name = "SMSG_ACTIVATETAXIREPLY";
+                    uint32 reply = 0; p >> reply;
+                    w.Add("reply", reply).Add("ok", reply == 0);
                     break;
                 }
                 // -------------------------------------------------- progress
@@ -4042,6 +4671,27 @@ namespace WrathBench
                     }
                     break;
                 }
+                case SMSG_GAMEOBJECT_QUERY_RESPONSE:
+                {
+                    // HandleGameObjectQueryOpcode: entry, type, displayId, name,
+                    // 3 empty names, iconName, castBarCaption, unk1, then the
+                    // 24 raw data u32s, size and quest items (template
+                    // internals a client gets but the agent has no use for).
+                    name = "SMSG_GAMEOBJECT_QUERY_RESPONSE";
+                    uint32 entry = 0; p >> entry;
+                    if (entry & 0x80000000)
+                    {
+                        w.Add("entry", entry & 0x7FFFFFFF).Add("found", false);
+                        break;
+                    }
+                    uint32 gtype, display; p >> gtype >> display;
+                    std::string gname; p >> gname;
+                    std::string n2, n3, n4; p >> n2 >> n3 >> n4; // always empty
+                    std::string iconName, castBarCaption; p >> iconName >> castBarCaption;
+                    w.Add("entry", entry).Add("found", true).Add("name", gname)
+                     .Add("type", gtype).Add("displayId", display).Add("castBarCaption", castBarCaption);
+                    break;
+                }
                 case SMSG_ITEM_QUERY_SINGLE_RESPONSE:
                 {
                     name = "SMSG_ITEM_QUERY_SINGLE_RESPONSE";
@@ -4085,6 +4735,26 @@ namespace WrathBench
                 case SMSG_DURABILITY_DAMAGE_DEATH:
                     name = "SMSG_DURABILITY_DAMAGE_DEATH";
                     break;
+                case MSG_CORPSE_QUERY:
+                {
+                    // The server's answer to the ghost's corpse query
+                    // (HandleCorpseQueryOpcode): found flag, then the point the
+                    // client draws the corpse marker at and the corpse's own
+                    // map. For a corpse in a dungeon the point is the entrance
+                    // on the outer map, which is why the two map ids differ.
+                    // The trailing u32 is unused by the client and dropped.
+                    name = "MSG_CORPSE_QUERY";
+                    uint8 found = 0; p >> found;
+                    w.Add("found", found != 0);
+                    if (found)
+                    {
+                        int32 map, corpseMap; float x, y, z;
+                        p >> map >> x >> y >> z >> corpseMap;
+                        w.Add("map", map).Add("x", (double)x).Add("y", (double)y).Add("z", (double)z)
+                         .Add("corpseMap", corpseMap);
+                    }
+                    break;
+                }
                 // --------------------------------------------------- session
                 case SMSG_CHAR_DELETE:
                 {

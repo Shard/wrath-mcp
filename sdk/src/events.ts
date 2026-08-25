@@ -164,6 +164,19 @@ export class EventStreamClosedError extends Error {
 
 type AnyHandler = (event: StreamEvent) => void;
 
+/** Tag linking a `once` wrapper back to the handler the caller passed, so `off` can find it. */
+const ORIGINAL = Symbol("wrathbench.originalHandler");
+type WrappedHandler = AnyHandler & { [ORIGINAL]?: AnyHandler };
+
+/** How a rejected `off` argument is quoted back (ADR-0016: say what arrived). */
+function describeArg(v: unknown): string {
+  if (typeof v === "function") return "a function";
+  if (typeof v === "string") return JSON.stringify(v);
+  if (v === undefined) return "undefined";
+  if (v === null) return "null";
+  return `${String(v)} (${typeof v})`;
+}
+
 interface Waiter {
   predicate: (event: StreamEvent) => boolean;
   resolve: (event: StreamEvent) => void;
@@ -419,6 +432,9 @@ export class EventStream implements AsyncIterable<StreamEvent> {
   on(opcode: string, handler: (event: StreamEvent) => void): Unsubscribe;
   on(opcode: string, handler: (event: never) => void): Unsubscribe {
     const h = handler as AnyHandler;
+    // "*" has exactly one reading (every event): route it to onAny instead of
+    // registering under a literal opcode that can never fire (ADR-0016 rule 1).
+    if (opcode === "*") return this.onAny(h);
     let set = this.opcodeHandlers.get(opcode);
     if (!set) {
       set = new Set();
@@ -442,11 +458,47 @@ export class EventStream implements AsyncIterable<StreamEvent> {
   once(opcode: string, handler: (event: StreamEvent) => void): Unsubscribe;
   once(opcode: string, handler: (event: never) => void): Unsubscribe {
     const h = handler as unknown as AnyHandler;
-    const off = this.on(opcode, (event: StreamEvent) => {
+    const wrapper: AnyHandler = (event: StreamEvent) => {
       off();
       h(event);
-    });
+    };
+    // So `off(opcode, handler)` can find the wrapper by the handler the caller
+    // actually passed to `once` — otherwise removal would silently miss.
+    (wrapper as WrappedHandler)[ORIGINAL] = h;
+    const off = this.on(opcode, wrapper);
     return off;
+  }
+
+  /**
+   * Remove a handler registered with `on` (or `once`) for one opcode.
+   *
+   * The unsubscribe function `on` returns is still the primary way to detach —
+   * this is the symmetrical spelling models reach for out of EventEmitter habit
+   * (21 uncaught `events.off is not a function` in one 2026-08-22 run), and it
+   * removes exactly the same registration. Returns whether a handler was found:
+   * removing something already gone is a no-op, not an error. Wrong arguments
+   * are an error (ADR-0016): a silently ignored call is the forbidden outcome.
+   */
+  off<K extends keyof EventByOpcode>(opcode: K, handler: (event: EventByOpcode[K]) => void): boolean;
+  off(opcode: string, handler: (event: StreamEvent) => void): boolean;
+  off(opcode: string, handler: (event: never) => void): boolean {
+    if (typeof opcode !== "string" || typeof handler !== "function") {
+      throw new TypeError(
+        `events.off(opcode, handler): received (${describeArg(opcode)}, ${describeArg(handler)}), ` +
+          'expected an opcode string and the handler you passed to on(), e.g. events.off("SMSG_CHAT", h). ' +
+          "For onAny(), call the unsubscribe function it returned.",
+      );
+    }
+    const h = handler as unknown as AnyHandler;
+    if (opcode === "*") return this.anyHandlers.delete(h);
+    const set = this.opcodeHandlers.get(opcode);
+    if (!set) return false;
+    if (set.delete(h)) return true;
+    // A `once` registration is a wrapper around the caller's function.
+    for (const candidate of set) {
+      if ((candidate as WrappedHandler)[ORIGINAL] === h) return set.delete(candidate);
+    }
+    return false;
   }
 
   /**

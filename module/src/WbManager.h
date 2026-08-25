@@ -1,24 +1,26 @@
 /*
  * This file is part of mod-wrathbench, an AzerothCore module.
+ * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * This program is free software: you can redistribute it and/or modify it
- * under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or (at your
- * option) any later version.
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
  *
  * This program is distributed in the hope that it will be useful, but WITHOUT
  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License
- * for more details.
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program. If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU General Public License along
+ * with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
 #ifndef MOD_WRATHBENCH_WBMANAGER_H
 #define MOD_WRATHBENCH_WBMANAGER_H
 
 #include "WbHttpServer.h"
+#include "WbJson.h"
 
 #include <array>
 #include <atomic>
@@ -63,6 +65,24 @@ namespace WrathBench
         float boxLength{0}, boxWidth{0}, boxHeight{0}, boxYaw{0};
     };
 
+    // One AreaTable.dbc record (3.3.5a). Client-side knowledge: the client
+    // names the zone and subzone it draws on screen from this table.
+    struct AreaTableRec
+    {
+        uint32 mapId{0};
+        uint32 parentAreaId{0};     // 0 for a zone; the zone id for a subzone
+        std::string name;           // enUS column
+    };
+
+    // One Achievement.dbc record (3.3.5a). Client-side knowledge: the client
+    // names an earned achievement and its points from this table.
+    struct AchievementRec
+    {
+        std::string name;           // enUS column
+        uint32 points{0};
+        uint32 categoryId{0};       // Achievement_Category.dbc id
+    };
+
     // Per-session synthesized-movement state (ADR-0010). Touched only on the
     // world thread (DoMoveTo/DoStop/DoFace and the Update tick), so unlocked.
     struct MoveState
@@ -81,6 +101,9 @@ namespace WrathBench
         float destX{0}, destY{0}, destZ{0};
         bool hasMeshZ{false};       // the mesh resolved the request to a different z
         float meshZ{0};
+        float reqX{0}, reqY{0}, reqZ{0}; // the point the agent asked for (echoed on `drop`)
+        bool hasDrop{false};        // TickMover found a ledge in the polyline: FinishMove says `drop`
+        float dropDz{0};
     };
 
     // Per-token headless session. See ADR-0009 for the parked-socket design.
@@ -135,16 +158,19 @@ namespace WrathBench
         MoveState move;
         uint64_t moveIdGen{0};
 
-        // Areatrigger edge detection (world thread only): the trigger volume the
-        // mover last reported being inside (0 = none), and when the module last
-        // queued CMSG_AREATRIGGER for it, so a trigger the server did not act on
-        // (heartbeat lag: the server checks its applied position, the module its
-        // interpolated one) is re-sent while the character is still inside.
-        uint32 lastTriggerId{0};
-        int64_t lastTriggerSentMs{0};
+        // Areatrigger edge detection (world thread only): the DBC volumes the
+        // mover is currently inside, and the map they were tested on. A client
+        // sends CMSG_AREATRIGGER once on crossing into a volume and never again
+        // while it lingers (FOLLOW-UPS 56), so an id fires only when it is newly
+        // inside; it is cleared when the mover leaves the volume, changes map,
+        // or is teleported, so a re-entry fires again.
+        std::vector<uint32> insideTriggers;
+        uint32 insideTriggersMap{0xFFFFFFFF};
 
         // WB_RIDE_PROGRESS pacing while aboard a transport (world thread only).
         int64_t lastRideEmitMs{0};
+        // TickTransports: last WB_TRANSPORT_PROGRESS batch for this session.
+        int64_t lastTransportEmitMs{0};
 
         // Map transfer in flight: the destination map from SMSG_TRANSFER_PENDING,
         // cleared by SMSG_NEW_WORLD / SMSG_TRANSFER_ABORTED. Set on tap threads,
@@ -156,6 +182,18 @@ namespace WrathBench
         // TickTeleportAcks.
         int64_t teleportAckQueuedMs{0};
 
+        // Corpse query (world thread only): a client asks MSG_CORPSE_QUERY once
+        // when it becomes a ghost; this latches that ask per death so it is not
+        // re-sent every tick. Reset when the player is alive again. See
+        // TickCorpseQuery.
+        bool corpseQueried{false};
+
+        // Zone/area edge detection (world thread only): the ids last announced
+        // as WB_AREA, sentinel until the first in-world tick so login emits one.
+        // See TickAreas (FOLLOW-UPS 38 N2).
+        uint32 lastZoneId{0xFFFFFFFF};
+        uint32 lastAreaId{0xFFFFFFFF};
+
         // Client-side object cache mirror, fed by the update-object tap. Needed
         // because UPDATETYPE_VALUES blocks carry no object type (a real client
         // resolves them against its own cache). Also tracks which name/creature
@@ -165,6 +203,7 @@ namespace WrathBench
         std::unordered_set<uint32_t> queriedCreatures;           // creature entries
         std::unordered_set<uint64_t> queriedNames;               // player guids
         std::unordered_set<uint32_t> queriedItems;               // item entries
+        std::unordered_set<uint32_t> queriedGameObjects;         // gameobject entries
 
         // loot_all: on the next SMSG_LOOT_RESPONSE the tap replays the client's
         // auto-loot sequence (AUTOSTORE per slot, LOOT_MONEY, LOOT_RELEASE).
@@ -228,7 +267,7 @@ namespace WrathBench
         void DoGameAction(std::string token, std::string action, std::string body,
             std::shared_ptr<std::promise<HttpReply>> ack);
         void DoDeleteSession(std::string token, std::shared_ptr<std::promise<HttpReply>> ack);
-        void DoMoveTo(std::string token, float x, float y, float z, std::shared_ptr<std::promise<HttpReply>> ack);
+        void DoMoveTo(std::string token, float x, float y, float z, std::string guid, std::shared_ptr<std::promise<HttpReply>> ack);
         void DoStop(std::string token, std::shared_ptr<std::promise<HttpReply>> ack);
         void DoFace(std::string token, bool hasO, float o, bool hasXY, float x, float y, std::shared_ptr<std::promise<HttpReply>> ack);
 
@@ -241,10 +280,18 @@ namespace WrathBench
             std::vector<WbVec> points;
             bool hasMeshZ{false};
             float meshZ{0};
-            bool hasReached{false};     // path_incomplete: how far the mesh got
+            bool hasReached{false};     // path_incomplete / drop: how far the mesh got / the ledge edge
             float reachedX{0}, reachedY{0}, reachedZ{0};
+            bool hasDrop{false};        // drop: the vertical step the polyline takes past reachedPos
+            float dropDz{0};
         };
-        PathResolve ResolvePath(Player* player, float x, float y, float z);
+        // One pass of the cause ladder at x,y,z; reqZ is the z the agent asked
+        // for (meshZ is reported relative to it).
+        PathResolve ResolvePathAt(Player* player, float x, float y, float z, float reqZ);
+        // The z-ladder around it: ground height at x,y first for a unit
+        // target, as a fallback after target_off_mesh otherwise.
+        PathResolve ResolvePath(Player* player, float x, float y, float z, bool unitTarget,
+            bool* usedGroundZ = nullptr, float* groundZOut = nullptr);
 
         // AreaTrigger.dbc as the client ships it (FOLLOW-UPS 38 N1): the
         // module reads the DBC from the server data volume so the mover can
@@ -259,16 +306,46 @@ namespace WrathBench
         std::unordered_map<uint32, std::vector<AreaTriggerRec>> _areaTriggers; // by map
         bool _areaTriggersLoaded{false};
 
+        // AreaTable.dbc as the client ships it (FOLLOW-UPS 38 N2): zone and
+        // subzone names. The ids themselves come from Player::GetZoneAndAreaId,
+        // which the server derives from the same terrain data a client reads
+        // locally, so the pair is observation-equivalent (PROTOCOL.md, WB_AREA).
+        bool LoadAreaTableDbc(std::string const& path);
+        std::unordered_map<uint32, AreaTableRec> _areaTable;
+        bool _areaTableLoaded{false};
+
+        // Achievement.dbc as the client ships it (issue #8, ADR-0048): name,
+        // points and category for the ids SMSG_ACHIEVEMENT_EARNED and
+        // SMSG_ALL_ACHIEVEMENT_DATA carry. Ids only when the file is absent.
+        bool LoadAchievementDbc(std::string const& path);
+        std::unordered_map<uint32, AchievementRec> _achievements;
+        bool _achievementsLoaded{false};
+        // One `{ achievementId, date, time, name?, points?, categoryId? }`
+        // object; `date` is the wire's packed bitfield, `time` its reading.
+        std::string AchievementJson(uint32 id, uint32 packedDate) const;
+        // Per tick, every in-world session: emit WB_AREA on login and whenever
+        // zone or area id changes (walking, teleport, transfer). World thread only.
+        void TickAreas();
+        // Append mapId/zoneId/zoneName/areaId/areaName for the player's current
+        // position to a writer (WB_AREA and WB_SESSION_STATE share it).
+        void AddAreaFields(Json::Writer& w, Player* player);
+
         // Mover (world thread only; see ADR-0010).
         void TickMovers(int64_t nowMs);
         void TickMover(BenchSession& s, int64_t nowMs);
         void TickRiders(int64_t nowMs);
+        void TickTransports(int64_t nowMs);
         void FinishMove(BenchSession& s, char const* status);
 
         // Answer pending teleports the way a real client does (world thread
         // only): MSG_MOVE_TELEPORT_ACK / MSG_MOVE_WORLDPORT_ACK through the
         // stock handlers, so the destination is applied and movement resumes.
         void TickTeleportAcks(int64_t nowMs);
+
+        // Ask MSG_CORPSE_QUERY once per death, after the ghost's graveyard
+        // teleport has been acked, the way a client does on becoming a ghost
+        // (world thread only). The answer is tapped as an event.
+        void TickCorpseQuery();
 
         // In-world session guard for action handlers. Returns the player, or
         // nullptr after setting the error reply. World thread only.

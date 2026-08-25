@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * stdio <-> TCP bridge for the claude-subscription driver.
+ * stdio <-> TCP bridge for the claude-code driver.
  *
  * `claude --mcp-config` can only launch a *stdio* MCP server as a child
  * process, but the runner must keep exactly one SandboxHost (one SDK client,

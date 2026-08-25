@@ -209,7 +209,7 @@ export interface CreateSessionRequest {
  */
 export type ActionRequest =
   | { token: string; action: "say"; text: string }
-  | { token: string; action: "move_to"; x: number; y: number; z: number }
+  | { token: string; action: "move_to"; x: number; y: number; z: number; guid?: string }
   | { token: string; action: "stop" }
   | { token: string; action: "face"; orientation: number }
   | { token: string; action: "face"; x: number; y: number }
@@ -415,8 +415,26 @@ export const sessionStateDataSchema = z.looseObject({
   z: z.number(),
   o: z.number(),
   level: z.number(),
+  zoneId: z.number().optional(),
+  zoneName: z.string().optional(),
+  areaId: z.number().optional(),
+  areaName: z.string().optional(),
 });
 export type SessionStateData = z.infer<typeof sessionStateDataSchema>;
+
+/**
+ * Synthetic module event: the zone/subzone the character is in, on login and
+ * on every change. Ids are the pair the server derives from the same terrain
+ * data a client computes its own from; names are the client's AreaTable.dbc.
+ */
+export const areaDataSchema = z.looseObject({
+  mapId: z.number(),
+  zoneId: z.number(),
+  zoneName: z.string(),
+  areaId: z.number(),
+  areaName: z.string(),
+});
+export type AreaData = z.infer<typeof areaDataSchema>;
 
 export const motdDataSchema = z.looseObject({
   lineCount: z.number(),
@@ -487,6 +505,13 @@ export const updateFieldsSchema = z.looseObject({
   level: z.number().optional(),
   faction: z.number().optional(),
   unitFlags: z.number().optional(),
+  /**
+   * `UNIT_FLAG_TAXI_FLIGHT` read off `unitFlags` by the module and named
+   * (PROTOCOL.md, ADR-0048). Served alongside `unitFlags`, never instead of it;
+   * the state cache derives `self.taxiFlight` from the bit itself, so this is
+   * here for the schema to be a full account of what the module sends.
+   */
+  taxiFlight: z.boolean().optional(),
   displayId: z.number().optional(),
   dynamicFlags: z.number().optional(),
   npcFlags: z.number().optional(),
@@ -534,6 +559,8 @@ export const createBlockSchema = z.looseObject({
   runSpeed: z.number().optional(),
   pos: positionSchema.optional(),
   targetGuid: guidSchema.optional(),
+  /** Transports only: ms into the `TransportAnimation.dbc` period when the block was built. */
+  pathProgress: z.number().optional(),
   fields: updateFieldsSchema.optional(),
 });
 
@@ -603,6 +630,21 @@ export const creatureQueryResponseDataSchema = z.looseObject({
 });
 export type CreatureQueryResponseData = z.infer<typeof creatureQueryResponseDataSchema>;
 
+/**
+ * The answer to the `CMSG_GAMEOBJECT_QUERY` the module fires on first sight of
+ * a game object entry, exactly as it does for creatures. `type` is the core's
+ * `GameobjectTypes` value; `found: false` carries the entry and nothing else.
+ */
+export const gameObjectQueryResponseDataSchema = z.looseObject({
+  entry: z.number(),
+  found: z.boolean(),
+  name: z.string().optional(),
+  type: z.number().optional(),
+  displayId: z.number().optional(),
+  castBarCaption: z.string().optional(),
+});
+export type GameObjectQueryResponseData = z.infer<typeof gameObjectQueryResponseDataSchema>;
+
 /** Movement of another nearby unit or player, relayed by the server. */
 export const moveUpdateDataSchema = z.looseObject({
   guid: guidSchema,
@@ -634,6 +676,9 @@ export const MOVE_OPCODES = [
   "MSG_MOVE_STOP_SWIM",
   "MSG_MOVE_SET_RUN_MODE",
   "MSG_MOVE_SET_WALK_MODE",
+  // The one entry about self: the server's side of a same-map teleport
+  // (Hearthstone, graveyard port). `guid` is our own, `pos` the arrival point.
+  "MSG_MOVE_TELEPORT_ACK",
   "MSG_MOVE",
 ] as const;
 export type MoveOpcode = (typeof MOVE_OPCODES)[number];
@@ -649,7 +694,9 @@ export const MOVE_STATUSES = [
   "target_off_mesh",
   "start_off_mesh",
   "path_incomplete",
+  "drop",
   "transferred",
+  "teleported",
   "interrupted",
   "stopped",
   "superseded",
@@ -677,8 +724,12 @@ export const moveResultDataSchema = z.looseObject({
   pos: positionSchema,
   /** `arrived` only: the ground z the mesh walked to when the request's z was off by >1y. */
   meshZ: z.number().optional(),
-  /** `path_incomplete` only: how far the mesh could get toward the request. */
+  /** `path_incomplete`: how far the mesh could get toward the request; `drop`: the ledge edge. */
   reachedPos: z.looseObject({ x: z.number(), y: z.number(), z: z.number() }).optional(),
+  /** `drop` only: the signed vertical step the route would have taken past `reachedPos`. */
+  dz: z.number().optional(),
+  /** `drop` only: the requested point, echoed. */
+  target: z.looseObject({ x: z.number(), y: z.number(), z: z.number() }).optional(),
   /** Present when the character ended the move aboard a transport the server is carrying it on. */
   onTransport: z.looseObject({ guid: guidSchema, entry: z.number() }).optional(),
 });
@@ -695,6 +746,24 @@ export const rideProgressDataSchema = z.looseObject({
   pos: positionSchema,
 });
 export type RideProgressData = z.infer<typeof rideProgressDataSchema>;
+
+/**
+ * Module-synthesized: where a transport the session has been sent (a tram
+ * car, a boat) is right now, at most once a second. A client animates the car
+ * itself from `TransportAnimation.dbc` and the clock its create block carried;
+ * the module reports the same animation's result. `docked` is whether the
+ * keyframe segment the clock is on has no displacement — the car is dwelling
+ * at a platform; absent for transports without an animation path.
+ */
+export const transportProgressDataSchema = z.looseObject({
+  guid: guidSchema,
+  entry: z.number(),
+  pos: positionSchema,
+  progressMs: z.number(),
+  periodMs: z.number().optional(),
+  docked: z.boolean().optional(),
+});
+export type TransportProgressData = z.infer<typeof transportProgressDataSchema>;
 
 // ---------------------------------------------------------- map transfers
 //
@@ -1185,6 +1254,61 @@ export const talentsInfoDataSchema = z.looseObject({
 });
 export type TalentsInfoData = z.infer<typeof talentsInfoDataSchema>;
 
+/**
+ * One achievement as the module serves it (ADR-0048, issue #8): the id and the
+ * wire's packed time, plus `name`/`points`/`categoryId` when the module could
+ * read `Achievement.dbc` — client-cache knowledge, the same class as item and
+ * spell names. Absent DBC means ids only, never a guessed name.
+ */
+export const achievementSchema = z.looseObject({
+  achievementId: z.number(),
+  /** The wire's packed bitfield (`AppendPackedTime`). */
+  date: z.number(),
+  /** The module's reading of `date`, `YYYY-MM-DD HH:MM`. */
+  time: z.string().optional(),
+  name: z.string().optional(),
+  points: z.number().optional(),
+  categoryId: z.number().optional(),
+});
+export type Achievement = z.infer<typeof achievementSchema>;
+
+/**
+ * `SMSG_ACHIEVEMENT_EARNED`. The core broadcasts this in **say range**, so the
+ * event routinely describes another player: `self` is the equality with our own
+ * guid and is the only thing that makes it ours. Never key on the opcode alone.
+ */
+export const achievementEarnedDataSchema = z.looseObject({
+  guid: guidSchema,
+  self: z.boolean(),
+  achievement: achievementSchema,
+});
+export type AchievementEarnedData = z.infer<typeof achievementEarnedDataSchema>;
+
+/**
+ * `SMSG_ALL_ACHIEVEMENT_DATA`: everything already earned, sent to self once
+ * during login. Only the completed block is decoded (the criteria-progress
+ * block is consumed unserved, ADR-0048), so `count` is the completed count.
+ */
+export const allAchievementDataSchema = z.looseObject({
+  count: z.number(),
+  achievements: z.array(achievementSchema),
+});
+export type AllAchievementData = z.infer<typeof allAchievementDataSchema>;
+
+/**
+ * `SMSG_ACTIVATETAXIREPLY`: the server's answer to `CMSG_ACTIVATETAXI` (raw —
+ * there is no flight helper, ADR-0015/0048). `reply` is `ActivateTaxiReply`
+ * (0 ok, 1 server error, 2 no such path, 3 not enough money, 4 too far away,
+ * 5 no vendor nearby, 6 not visited, 7 busy, 8 mounted, 9 shapeshifted,
+ * 10 moving, 11 same node, 12 not standing); `ok` is `reply === 0`. The flight
+ * itself has no event — it is `taxiFlight` on self.
+ */
+export const activateTaxiReplyDataSchema = z.looseObject({
+  reply: z.number(),
+  ok: z.boolean(),
+});
+export type ActivateTaxiReplyData = z.infer<typeof activateTaxiReplyDataSchema>;
+
 /** `result` is an InventoryResult code; the SDK does not name them. */
 export const inventoryChangeFailureDataSchema = z.looseObject({
   result: z.number(),
@@ -1220,6 +1344,23 @@ export type DeathReleaseLocData = z.infer<typeof deathReleaseLocDataSchema>;
 
 export const corpseReclaimDelayDataSchema = z.looseObject({ delayMs: z.number() });
 export type CorpseReclaimDelayData = z.infer<typeof corpseReclaimDelayDataSchema>;
+
+/**
+ * The server's answer to the ghost's `MSG_CORPSE_QUERY` (the module asks once
+ * per death on the client's behalf; PROTOCOL.md "Death"). Position fields only
+ * when `found`; `map`/x/y/z is where a client draws the corpse marker and
+ * `corpseMap` the map the corpse is on — they differ only for a corpse inside
+ * a dungeon, where the marker sits on the entrance.
+ */
+export const corpseQueryDataSchema = z.looseObject({
+  found: z.boolean(),
+  map: z.number().optional(),
+  x: z.number().optional(),
+  y: z.number().optional(),
+  z: z.number().optional(),
+  corpseMap: z.number().optional(),
+});
+export type CorpseQueryData = z.infer<typeof corpseQueryDataSchema>;
 
 export const charDeleteDataSchema = z.looseObject({ result: z.number() });
 export type CharDeleteData = z.infer<typeof charDeleteDataSchema>;
@@ -1261,10 +1402,13 @@ export const eventDataSchemas = {
   SMSG_UPDATE_OBJECT: updateObjectDataSchema,
   SMSG_DESTROY_OBJECT: destroyObjectDataSchema,
   SMSG_CREATURE_QUERY_RESPONSE: creatureQueryResponseDataSchema,
+  SMSG_GAMEOBJECT_QUERY_RESPONSE: gameObjectQueryResponseDataSchema,
   WB_MOVE_PROGRESS: moveProgressDataSchema,
   WB_SESSION_STATE: sessionStateDataSchema,
+  WB_AREA: areaDataSchema,
   WB_MOVE_RESULT: moveResultDataSchema,
   WB_RIDE_PROGRESS: rideProgressDataSchema,
+  WB_TRANSPORT_PROGRESS: transportProgressDataSchema,
   ...moveOpcodeSchemas,
   // map transfers
   SMSG_TRANSFER_PENDING: transferPendingDataSchema,
@@ -1326,10 +1470,15 @@ export const eventDataSchemas = {
   SMSG_COOLDOWN_EVENT: cooldownEventDataSchema,
   SMSG_CLEAR_COOLDOWN: cooldownEventDataSchema,
   SMSG_TALENTS_INFO: talentsInfoDataSchema,
+  // achievements and flight paths (ADR-0048)
+  SMSG_ACHIEVEMENT_EARNED: achievementEarnedDataSchema,
+  SMSG_ALL_ACHIEVEMENT_DATA: allAchievementDataSchema,
+  SMSG_ACTIVATETAXIREPLY: activateTaxiReplyDataSchema,
   // death
   SMSG_DEATH_RELEASE_LOC: deathReleaseLocDataSchema,
   SMSG_CORPSE_RECLAIM_DELAY: corpseReclaimDelayDataSchema,
   SMSG_DURABILITY_DAMAGE_DEATH: emptyDataSchema,
+  MSG_CORPSE_QUERY: corpseQueryDataSchema,
   // session
   SMSG_CHAR_DELETE: charDeleteDataSchema,
   // creature movement

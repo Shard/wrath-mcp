@@ -1,6 +1,6 @@
 # mod-wrathbench
 
-AzerothCore module for WrathBench. Licensed AGPL-3.0 (inherited from AzerothCore); the rest of the WrathBench repository is MIT.
+AzerothCore module for WrathBench. Licensed GPL-2.0-or-later; see `LICENSE`. All other original WrathBench code and documentation are MIT under the root `LICENSE`. AzerothCore remains under its own upstream license; see `../THIRD-PARTY-NOTICES.md`.
 
 ## Status: skeleton
 

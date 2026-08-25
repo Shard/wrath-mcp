@@ -94,10 +94,13 @@ describe("event frames", () => {
       "SMSG_UPDATE_OBJECT",
       "SMSG_DESTROY_OBJECT",
       "SMSG_CREATURE_QUERY_RESPONSE",
+      "SMSG_GAMEOBJECT_QUERY_RESPONSE",
       "WB_MOVE_PROGRESS",
     "WB_SESSION_STATE",
+      "WB_AREA",
       "WB_MOVE_RESULT",
       "WB_RIDE_PROGRESS",
+      "WB_TRANSPORT_PROGRESS",
       ...MOVE_OPCODES,
       // map transfers
       "SMSG_TRANSFER_PENDING",
@@ -154,9 +157,13 @@ describe("event frames", () => {
       "SMSG_COOLDOWN_EVENT",
       "SMSG_CLEAR_COOLDOWN",
       "SMSG_TALENTS_INFO",
+      "SMSG_ACHIEVEMENT_EARNED",
+      "SMSG_ALL_ACHIEVEMENT_DATA",
+      "SMSG_ACTIVATETAXIREPLY",
       "SMSG_DEATH_RELEASE_LOC",
       "SMSG_CORPSE_RECLAIM_DELAY",
       "SMSG_DURABILITY_DAMAGE_DEATH",
+      "MSG_CORPSE_QUERY",
       "SMSG_CHAR_DELETE",
       "SMSG_MONSTER_MOVE",
     ]);
@@ -185,7 +192,10 @@ describe("event frames", () => {
       expect((parsed.event as { schemaError?: string }).schemaError).toBeUndefined();
       expect((parsed.event.data as { guid: string }).guid).toBe("42");
     }
-    expect(isMoveOpcode("MSG_MOVE_TELEPORT_ACK")).toBe(false);
+    // The server's own-guid teleport ack is in the observed set since
+    // FOLLOW-UPS 46; the client's WORLDPORT echo never is.
+    expect(isMoveOpcode("MSG_MOVE_TELEPORT_ACK")).toBe(true);
+    expect(isMoveOpcode("MSG_MOVE_WORLDPORT_ACK")).toBe(false);
   });
 
   test("every fixture frame parses, envelope intact", () => {

@@ -163,7 +163,7 @@ Errors:
 
 Create reclaims a permitted account (2026-08). `POST /session` on an account
 that passed the allowlist **always takes ownership** instead of dead-ending on a
-stale/leaked session — the invariant is one account = one lane = one live
+stale/leaked session — the invariant is one account = one job = one live
 episode (enforced by the fleet's duplicate-account guard and the roster's
 account-busy guard), so any session found holding the account at create time is
 stale, and reclaiming it is correct, not a race:
@@ -240,6 +240,16 @@ Request:
 { "token": "run-abc123", "action": "move_to", "x": -8913.2, "y": -137.6, "z": 80.9 }
 ```
 
+Optional `guid` (decimal string): the unit the point was read from. It is a
+planning hint, never a lookup — the move still goes to `x,y`. A unit's z comes
+from its own movement packets and a patrolling or sloped NPC's can sit outside
+the mesh's poly-search box while the ground under it is walkable, so with
+`guid` the module resolves z to the ground height at `x,y` (terrain, vmap and
+model geometry a client has too) before pathing, and falls back to the given z.
+Without `guid` the ground z is tried only after a `target_off_mesh`. Either way
+a target the mesh rejects at both heights is still `target_off_mesh`, and
+`meshZ` is reported relative to the z asked for.
+
 Success `200` (means "queued and pathing", not "arrived"):
 ```json
 { "ok": true, "action": "move_to", "token": "run-abc123", "moveId": 1 }
@@ -249,8 +259,12 @@ Additional error: `400 {"ok":false,"error":"missing_position","action":"move_to"
 
 The outcome arrives as a `WB_MOVE_RESULT` event carrying the same `moveId`
 (statuses below). A `move_to` issued while a previous one is still running
-supersedes it: the old move ends with status `superseded`, then the new path
-starts from wherever the character is.
+supersedes it: the old move ends with status `superseded` (the module sends the
+`MSG_MOVE_STOP` a redirected client would, so a new request that fails at
+planning never leaves the server believing the character is still running),
+then the new path starts from wherever the character is. A request that fails
+before anything moves (`too_far` and the planning causes below) likewise sends
+a stop if the server still holds the character as moving.
 
 #### stop
 
@@ -321,7 +335,7 @@ them: `{ "ok": true, "action": "<name>", "token": ... }`.
 | `learn_preview_talents` | `talents` = `[[talentId, rank], ...]` | `CMSG_LEARN_PREVIEW_TALENTS` | the preview-mode "learn" button (at most 150 pairs); `400 missing_talents`, `400 invalid_talents` |
 | `raw` | `opcode`, `payload` | the named opcode | the escape hatch (ADR-0025), below |
 | `repop` | — | `CMSG_REPOP_REQUEST` | release spirit while dead |
-| `reclaim_corpse` | `guid?` | `CMSG_RECLAIM_CORPSE` | resurrect at corpse; handler resolves the player's own corpse, guid optional |
+| `reclaim_corpse` | `guid?` | `CMSG_RECLAIM_CORPSE` | resurrect at corpse; handler resolves the player's own corpse, guid optional. Refusals are silent (further than 39y, delay not elapsed, other map, no corpse); the SDK reads them off the corpse-query answer below |
 | `spirit_healer_activate` | `guid` | `CMSG_SPIRIT_HEALER_ACTIVATE` | graveyard resurrection fallback; no dedicated response opcode — the outcome arrives through already-served events (health update fields, res-sickness aura) |
 
 Validation errors (all `400`): `missing_guid`, `missing_option`,
@@ -389,6 +403,9 @@ whose handler does nothing a non-GM client could not do:
   `CMSG_GAMEOBJECT_QUERY`, `CMSG_ITEM_QUERY_SINGLE`, `CMSG_NPC_TEXT_QUERY`,
   `CMSG_PAGE_TEXT_QUERY`, `CMSG_PLAYED_TIME`, `CMSG_QUERY_TIME`,
   `CMSG_SET_WATCHED_FACTION`, `CMSG_SET_ACTION_BUTTON`
+- corpse: `MSG_CORPSE_QUERY` (empty body) — re-ask where the corpse is; the
+  module already asks once per death on the client's behalf (see "Death"), and
+  the answer is whitelisted
 
 Deliberately absent: movement opcodes (the module drives them; a stray one
 desyncs the mover), session lifecycle (login, logout, character create/delete),
@@ -539,6 +556,7 @@ Additional whitelisted opcodes:
 | `SMSG_UPDATE_OBJECT` | 0x0A9 | `{ "blocks": <u32>, "objects": [ ... ] }` (shapes below) |
 | `SMSG_DESTROY_OBJECT` | 0x0AA | `{ "guid": <guid-string>, "onDeath": <bool> }` |
 | `SMSG_CREATURE_QUERY_RESPONSE` | 0x061 | `{ "entry": <u32>, "found": <bool>, "name": <str?>, "subname": <str>, "type": <u32?>, "rank": <u32?> }` — on a found creature `subname` is always present, `""` when the creature has none |
+| `SMSG_GAMEOBJECT_QUERY_RESPONSE` | 0x05F | `{ "entry": <u32>, "found": <bool>, "name": <str?>, "type": <u32?>, "displayId": <u32?>, "castBarCaption": <str?> }` — `type` is the core's `GameobjectTypes` value (11 = transport, 19 = mailbox, 3 = chest, …); the template's raw data, size and quest-item list the packet also carries are not served |
 | `MSG_MOVE_*` (observed) | various | `{ "guid": <guid-string>, "flags": <u32>, "pos": { "x", "y", "z", "o" } }` |
 
 `MSG_MOVE_*` covers movement of *other* nearby units/players relayed by the
@@ -548,11 +566,21 @@ server. The exact `opcode` strings emitted are: `MSG_MOVE_START_FORWARD`,
 `MSG_MOVE_START_TURN_LEFT`, `MSG_MOVE_START_TURN_RIGHT`, `MSG_MOVE_STOP_TURN`,
 `MSG_MOVE_SET_FACING`, `MSG_MOVE_HEARTBEAT`, `MSG_MOVE_FALL_LAND`,
 `MSG_MOVE_START_SWIM`, `MSG_MOVE_STOP_SWIM`, `MSG_MOVE_SET_RUN_MODE`,
-`MSG_MOVE_SET_WALK_MODE`; any other movement opcode in the observed set is
-emitted with the bare fallback name `MSG_MOVE`. The bench character's own
-synthesized movement is not echoed by the server; own position comes from
-`WB_MOVE_PROGRESS` / `WB_MOVE_RESULT` below and from the self
+`MSG_MOVE_SET_WALK_MODE`, `MSG_MOVE_TELEPORT_ACK`; any other movement opcode in
+the observed set is emitted with the bare fallback name `MSG_MOVE`. The bench
+character's own synthesized movement is not echoed by the server; own position
+comes from `WB_MOVE_PROGRESS` / `WB_MOVE_RESULT` below and from the self
 `SMSG_UPDATE_OBJECT` create block.
+
+`MSG_MOVE_TELEPORT_ACK` (0x0C7) is the one entry about *self*: the server's
+side of a same-map teleport (`Player::SendTeleportAckPacket` — Hearthstone,
+graveyard port, any port that does not change map). `guid` is the bench
+character's own and `pos` is the arrival point; the module answers the packet
+itself (module-internal client behaviour, like `MSG_MOVE_WORLDPORT_ACK`) so
+the agent only observes it. No `SMSG_NEW_WORLD`
+follows a same-map teleport; this is how own position follows one. On the wire
+the packet carries a `u32` movement-order counter between the packGUID and the
+MovementInfo; it is consumed, not served.
 
 `SMSG_COMPRESSED_UPDATE_OBJECT` never appears on this stream: the core
 compresses large update packets at socket-write time, below the module's tap,
@@ -575,6 +603,7 @@ one of:
   "runSpeed": 7.0,              // living objects only
   "pos": { "x": -8949.9, "y": -132.5, "z": 83.5, "o": 5.2 },  // conditional, see below
   "targetGuid": "0",            // present when the block carries a target
+  "pathProgress": 12345,        // transports only: ms into the TransportAnimation.dbc period
   "fields": { ... }             // whitelisted update fields, see below; may be {}
 }
 ```
@@ -601,7 +630,8 @@ not need it, docs/CONTRACTS.md):
 
 - all objects: `entry`, `scale`
 - units and players: `health`, `maxHealth`, `power1`..`power7`,
-  `maxPower1`..`maxPower7`, `level`, `faction`, `unitFlags`, `displayId`,
+  `maxPower1`..`maxPower7`, `level`, `faction`, `unitFlags` (with
+  `taxiFlight`, the `UNIT_FLAG_TAXI_FLIGHT` bit named), `displayId`,
   `dynamicFlags`, `npcFlags`, `targetGuid`, `race`, `class`, `gender`,
   `powerType` (the last four unpacked from UNIT_FIELD_BYTES_0)
 - players additionally: `playerFlags`
@@ -614,10 +644,12 @@ delta for an object never seen in a `create` decodes with no named fields
 (the module, like a client, cannot type it); the entry is still emitted, with
 `"fields": {}` present-and-empty rather than absent.
 
-Name resolution: on first sight of a creature (by entry) or player (by guid)
-the module issues the `CMSG_CREATURE_QUERY` / `CMSG_NAME_QUERY` a real client
-would issue on cache miss; the answers arrive as `SMSG_CREATURE_QUERY_RESPONSE`
-/ `SMSG_NAME_QUERY_RESPONSE` events. Joining guid/entry to name is the SDK's job.
+Name resolution: on first sight of a creature or game object (by entry) or
+player (by guid) the module issues the `CMSG_CREATURE_QUERY` /
+`CMSG_GAMEOBJECT_QUERY` / `CMSG_NAME_QUERY` a real client would issue on cache
+miss; the answers arrive as `SMSG_CREATURE_QUERY_RESPONSE` /
+`SMSG_GAMEOBJECT_QUERY_RESPONSE` / `SMSG_NAME_QUERY_RESPONSE` events. Joining
+guid/entry to name is the SDK's job.
 
 #### Module-synthesized events
 
@@ -628,10 +660,12 @@ session's own identity). Their `opcodeId`s are outside the real opcode range.
 | opcode | id | `data` fields |
 |---|---|---|
 | `WB_MOVE_PROGRESS` | 0xFF02 | `{ "moveId": <number>, "pos": { "x","y","z","o" } }` — at most 1/s while moving |
-| `WB_MOVE_RESULT` | 0xFF01 | `{ "moveId": <number>, "status": <str>, "pos": { "x","y","z","o" }, "meshZ": <f?>, "reachedPos": { "x","y","z" }? }` — `meshZ` only on `arrived` when the mesh z differed from the request; `reachedPos` only on `path_incomplete`; `"onTransport": { "guid": <guid-string>, "entry": <u32> }` when the character ended the move aboard a transport |
+| `WB_MOVE_RESULT` | 0xFF01 | `{ "moveId": <number>, "status": <str>, "pos": { "x","y","z","o" }, "meshZ": <f?>, "reachedPos": { "x","y","z" }? }` — `meshZ` only on `arrived` when the mesh z differed from the request; `reachedPos` on `path_incomplete` and `drop`; `"dz": <f>, "target": { "x","y","z" }` only on `drop`; `"onTransport": { "guid": <guid-string>, "entry": <u32> }` when the character ended the move aboard a transport |
 | `WB_RIDE_PROGRESS` | 0xFF05 | `{ "transportGuid": <guid-string>, "transportEntry": <u32>, "pos": { "x","y","z","o" } }` — at most 1/s while the character rides a transport and is not walking; the server-side position the transport carried it to |
+| `WB_TRANSPORT_PROGRESS` | 0xFF06 | `{ "guid": <guid-string>, "entry": <u32>, "pos": { "x","y","z","o" }, "progressMs": <u32>, "periodMs": <u32?>, "docked": <bool?> }` — at most 1/s per session, one per transport on the character's map whose create block the session has received: the car's current position on its `TransportAnimation.dbc` path (what a client animates locally from `pathProgress`), the clock and period, and `docked` when the keyframe segment the clock is on has no displacement (the car is dwelling at a platform; absent for transports without an animation path) |
 | `WB_AREATRIGGER` | 0xFF04 | `{ "triggerId": <u32>, "moveId": <number>, "pos": { "x","y","z","o" } }` — the mover entered an `AreaTrigger.dbc` volume and sent `CMSG_AREATRIGGER` for it (see below) |
-| `WB_SESSION_STATE` | 0xFF03 | `{ "character": <str>, "guid": <guid-string>, "inWorld": true, "map": <n>, "x": <f>, "y": <f>, "z": <f>, "o": <f>, "level": <n> }` — emitted once per WS subscribe to an already-in-world session (reattach semantics in the `/events` section above). Strictly client-visible facts: what `SMSG_LOGIN_VERIFY_WORLD` plus the session's own identity would carry. |
+| `WB_AREA` | 0xFF07 | `{ "mapId": <u32>, "zoneId": <u32>, "zoneName": <str>, "areaId": <u32>, "areaName": <str> }` — the zone and subzone the character is in, named as the client names them; once when the character enters the world and once per change of either id, whatever moved it (walking, a teleport, a map transfer). See "Zone and area" below. |
+| `WB_SESSION_STATE` | 0xFF03 | `{ "character": <str>, "guid": <guid-string>, "inWorld": true, "map": <n>, "x": <f>, "y": <f>, "z": <f>, "o": <f>, "level": <n>, "zoneId", "zoneName", "areaId", "areaName" }` — emitted once per WS subscribe to an already-in-world session (reattach semantics in the `/events` section above). Strictly client-visible facts: what `SMSG_LOGIN_VERIFY_WORLD` plus the session's own identity would carry, plus the same zone/area fields as `WB_AREA` so a reattached client starts where the stream cannot re-emit. |
 
 `moveId` is a plain JSON number: it is a per-session counter that cannot exceed
 2^53, so it falls under the counter exemption to the u64-as-string rule stated
@@ -660,10 +694,25 @@ item 38 N1; the former undifferentiated `no_path` no longer exists):
   destination. The module already tried once to subdivide (path to where the
   mesh got, then onward); `reachedPos` is how far the mesh could get, so the
   agent can route around or approach from another side. Nothing moved.
-- `transferred` — a map transfer or teleport took the character mid-move
-  (an areatrigger portal, a graveyard port); the server applies the
-  destination itself. `pos` is the last old-map position; the new map and
-  arrival point follow on `SMSG_NEW_WORLD`.
+- `drop` — the mesh's route steps off a ledge: some segment of the resolved
+  polyline falls (or climbs) more than 2.0y and steeper than 1.2x its 2D
+  length — a cliff, not a ramp (stairs and ramps pass; a stale z within the
+  `meshZ` band passes). A mesh path that falls is a ledge, not a route, so the
+  walk is not dispatched: `reachedPos` is the last point before the step
+  (the edge, on the character's level), `dz` is the signed vertical step the
+  route would have taken there, and `target` echoes the requested point. Pick
+  a destination on this level, or find the ramp/stairs. The same guard runs
+  per segment while walking; a ledge that slips past planning stops the
+  character at the edge with the same status and `pos` at the edge.
+- `transferred` — a map transfer took the character mid-move (an areatrigger
+  portal, a cross-map port); the server applies the destination itself. `pos`
+  is the last old-map position; the new map and arrival point follow on
+  `SMSG_NEW_WORLD`.
+- `teleported` — a same-map teleport took the character mid-move (Hearthstone,
+  a graveyard port on the same map). No map change is coming and no
+  `SMSG_NEW_WORLD` will follow; `pos` is the pre-teleport position and the
+  arrival point is the `MSG_MOVE_TELEPORT_ACK` observed-movement event (own
+  guid), which the server sends before this result.
 - `interrupted` — the move stopped early (death, root, rejection, or the
   character left the map for a non-teleport reason); `pos` is where the
   character actually is.
@@ -690,6 +739,16 @@ moves the character and the module reports where it is as
 `WB_RIDE_PROGRESS`. No "activate transport" action exists: boarding is
 walking onto the car.
 
+The car itself is observable the way a client sees it (2026-08-23): a
+transport's create block serves `goType` 11 and `pathProgress`, the module
+asks `CMSG_GAMEOBJECT_QUERY` for its name like any other game object, and
+`WB_TRANSPORT_PROGRESS` keeps its position and `docked` state current from
+the same `TransportAnimation.dbc` the client animates from (the server's
+`StaticTransport::RelocateToProgress` runs the same keyframes). The agent
+therefore sees "Subway" standing at the platform or absent, and a `move_to`
+onto an empty rail bed still answers `target_off_mesh` — the SDK's hint
+names the docking car when one is known.
+
 Areatriggers (2026-08, FOLLOW-UPS 38 N1). A real client tests its own position
 against the `AreaTrigger.dbc` volumes it ships and sends `CMSG_AREATRIGGER`
 the moment it enters one — the player never chooses to. The module does the
@@ -697,8 +756,15 @@ same: it reads `AreaTrigger.dbc` from the server data volume (`DataDir/dbc`,
 the same file a client has), tests the mover's interpolated position after
 each heartbeat with the same sphere/oriented-box geometry as
 `Player::IsInAreaTriggerRadius`, and queues `CMSG_AREATRIGGER` once per entry
-(re-sent after 1.5s if still inside and nothing happened, since the server
-checks its applied position and a heartbeat can lag). Each dispatch is
+and never again while the mover lingers inside: the module keeps the set of
+volumes the character is in, fires only for ids newly inside, and forgets an
+id when the character leaves the volume, changes map or is teleported, so a
+re-entry fires again (FOLLOW-UPS 56). Because a client never reports a
+trigger from a position it has not sent, each entry packet is preceded by a
+`MSG_MOVE_HEARTBEAT` at the entry position (audited as a `move_pkt` with
+`cause: "areatrigger"`), so the server's applied position is the tested one
+when it evaluates the trigger rather than one up to a heartbeat interval
+behind. A hit the server still rejects is not retried. Each dispatch is
 audited (`op: "areatrigger"`) and mirrored as `WB_AREATRIGGER`. Consequences
 are whatever the server does for that trigger, as for a client: a map
 transfer (`SMSG_TRANSFER_PENDING` … `transferred`), exploration quest credit
@@ -706,6 +772,30 @@ transfer (`SMSG_TRANSFER_PENDING` … `transferred`), exploration quest credit
 happen without an agent action, because they happen to a client without a
 player action. Triggers fire only while a `move_to` is in progress; the
 server's own radius check rejects any hit the interpolation got wrong.
+
+#### Zone and area (FOLLOW-UPS 38 N2)
+
+No packet carries "Elwynn Forest / Northshire Valley" to a client. The client
+computes its current area id locally — from the area-id grid of the ADT it
+stands on, or from the WMO group it is inside (WMOAreaTable) — walks the
+parent chain in `AreaTable.dbc` for the zone, and draws both names from the
+same table. The server derives the same pair from the same terrain data
+(`Player::GetZoneAndAreaId`, which reads the map-file area grid and the vmap
+WMO area the extractor took from the client's files), so reading the pair
+off the player is observation-equivalent to what the client computes, not a
+server-side extra; the names come from the client's own `AreaTable.dbc` in the
+data volume, loaded at startup next to `AreaTrigger.dbc` (3.3.5a layout: 36
+fields, 144-byte records; `id`, `mapId`, `parentAreaId`, …, enUS `name` at
+field 11 — a file with any other shape is refused with an error, exactly as
+the areatrigger loader refuses a wrong `AreaTrigger.dbc`, and `WB_AREA` then
+carries ids with empty names). Once per world tick, for every in-world
+session, the module compares the pair to the last one announced and emits
+`WB_AREA` when either changed; the first in-world tick counts as a change, so
+login announces the starting zone, and a teleport or map transfer announces
+its arrival the same way a walk across a subzone edge does. The event is
+audited like every other (`kind: "event"`). What the server does with the
+pair (exploration credit, PvP flags, rest state) is unchanged and was never
+gated on this.
 
 ### Quest/combat extension whitelist (2026-08, additive)
 
@@ -803,6 +893,30 @@ knowledge, like item-template fields:
 | `SMSG_CLEAR_COOLDOWN` | 0x1DE | `{ "spellId", "guid" }` |
 | `SMSG_TALENTS_INFO` | 0x4C0 | `{ "pet": false, "unspentPoints", "specCount", "activeSpec", "specs": [{ "talents": [{ "talentId", "rank" }] }] }` — `rank` is 0-based; glyph slots are consumed and not served. The pet form is `{ "pet": true }` only (no pet surface). Sent on login, level-up, after every `CMSG_LEARN_TALENT`, and on spec change |
 
+Achievements and flight paths (2026-08-25, issue #8 first half, ADR-0048):
+
+| opcode | id | `data` fields |
+|---|---|---|
+| `SMSG_ACHIEVEMENT_EARNED` | 0x468 | `{ "guid", "self": <bool>, "achievement": { "achievementId", "date": <u32>, "time": "YYYY-MM-DD HH:MM", "name"?, "points"?, "categoryId"? } }` — the core broadcasts this in say range, so `guid` may be another player's; `self` is the equality with the session's own guid, nothing more |
+| `SMSG_ALL_ACHIEVEMENT_DATA` | 0x47D | `{ "count", "achievements": [ <same achievement object> ] }` — sent to self once during login: every achievement already earned. Only the completed block (to its 0xFFFFFFFF terminator) is decoded; the criteria-progress block that follows is consumed and not served |
+| `SMSG_ACTIVATETAXIREPLY` | 0x1AE | `{ "reply": <u32>, "ok": <bool> }` — the answer to `CMSG_ACTIVATETAXI[EXPRESS]` (raw). `ActivateTaxiReply`: 0 ok, 1 server error, 2 no such path, 3 not enough money, 4 too far away, 5 no vendor nearby, 6 not visited, 7 busy, 8 mounted, 9 shapeshifted, 10 moving, 11 same node, 12 not standing |
+
+`date` is the wire's packed bitfield (`AppendPackedTime`: `(year-2000)<<24 |
+month<<20 | (day-1)<<14 | weekday<<11 | hour<<6 | minute`); `time` is its
+reading, a client-local decode. `name`, `points` and `categoryId` are what a
+client reads from its own `Achievement.dbc` for the id — the module loads that
+file from the data volume beside `AreaTable.dbc` (`dbc/Achievement.dbc`,
+62 fields, record size 248; the loader refuses any other layout) and serves
+ids only when it is absent. Category names (`Achievement_Category.dbc`) are
+not served.
+
+The flight itself has no event: `taxiFlight` on self in `SMSG_UPDATE_OBJECT`
+`fields` (below) is `UNIT_FLAG_TAXI_FLIGHT` read off `unitFlags`, so a
+`reply` of 0 followed by `taxiFlight: true` is the flight starting and the
+flip back to `false` is the landing, exactly as a client sees them. Nothing is
+inferred from the server's taxi state. `SMSG_CRITERIA_UPDATE` (0x46A),
+`SMSG_SHOWTAXINODES` and `SMSG_TAXINODE_STATUS` are not tapped (ADR-0048).
+
 Death:
 
 | opcode | id | `data` fields |
@@ -810,6 +924,18 @@ Death:
 | `SMSG_DEATH_RELEASE_LOC` | 0x378 | `{ "map" (-1 = clear marker), "x", "y", "z" }` |
 | `SMSG_CORPSE_RECLAIM_DELAY` | 0x269 | `{ "delayMs" }` |
 | `SMSG_DURABILITY_DAMAGE_DEATH` | 0x2BD | `{}` |
+| `MSG_CORPSE_QUERY` | 0x216 | `{ "found": <bool>, "map"?, "x"?, "y"?, "z"?, "corpseMap"? }` — the server's answer to the ghost's corpse query (`HandleCorpseQueryOpcode`); position fields only when `found`. `map`/`x`/`y`/`z` is where a client draws the corpse marker, `corpseMap` the map the corpse is actually on; they differ only for a corpse inside a dungeon, where the marker sits on the entrance. The trailing unused u32 is consumed |
+
+A ghost knows where its corpse is (2026-08-23, FOLLOW-UPS 53): a real client
+sends `MSG_CORPSE_QUERY` as soon as it is a ghost and the answer is the corpse
+marker on its map. The parked client has no map, so the module sends the same
+one query per death, once the repop teleport has been acked (the handler
+compares corpse map to player map, so the graveyard port must have applied),
+audited as `op: "corpse_query"`, and the reply is served above. The latch
+resets when the character is alive again. A snippet may re-ask through the raw
+hatch. This is the same class as the time-sync reply and the teleport ack:
+module-internal client behaviour. Nothing resurrects server-side; the
+reclaim radius (`CORPSE_RECLAIM_RADIUS`, 39y) and delay are unchanged.
 
 Session:
 
@@ -840,7 +966,8 @@ Map transfers (navigation, 2026-08, FOLLOW-UPS 38 N1):
 (`SMSG_LOGIN_VERIFY_WORLD` is never re-sent), so it is what self position's
 `map` follows from then on. The module answers the teleport itself
 (`MSG_MOVE_WORLDPORT_ACK`, see the teleport-ack note) and a `move_to` in
-flight when a transfer or teleport begins ends with status `transferred`.
+flight when a transfer begins ends with status `transferred` (a same-map
+teleport: `teleported`, with the arrival on `MSG_MOVE_TELEPORT_ACK`).
 
 #### Update-field whitelist additions (quest/combat extension)
 
@@ -855,6 +982,17 @@ Served in `SMSG_UPDATE_OBJECT` `fields` alongside the existing set:
   item create blocks.
 - items and containers: `stackCount`, `durability`, `maxDurability`,
   `itemFlags`, `ownerLo`/`ownerHi`, `containedLo`/`containedHi`.
+- containers only (worn bags, FOLLOW-UPS 50): `numSlots`
+  (`CONTAINER_FIELD_NUM_SLOTS`) and the bag's contents as
+  `bagSlot<n>Lo`/`bagSlot<n>Hi` u32 guid halves, n 0-35
+  (`CONTAINER_FIELD_SLOT_1`, 36 guid pairs). PUBLIC fields every client in
+  range receives, served exactly as the player's `invSlot<n>` halves are: a
+  values update may carry one half, zero halves in a create block are
+  compressed out, and the SDK joins halves into guids and addresses the
+  slot as `(bag = the bag's equipment slot 19-22, slot = n)`, which is what
+  `CMSG_USE_ITEM` / `CMSG_DESTROYITEM` / `CMSG_AUTOEQUIP_ITEM` resolve
+  through `Player::GetItemByPos`. Nothing new on the action side: swap and
+  split stay off the allowlist.
 
 ## Audit log
 
@@ -871,3 +1009,8 @@ Synthesized movement logs one `action` record per `move_to`/`stop`/`face`
 request plus one per dispatched movement packet (`op: "move_pkt"` with the
 opcode and position), so the packet sequence the "client" sent is fully
 reconstructable from the audit log.
+Each `move_to` that reaches the mesh also logs one `op: "move_path"` record at
+dispatch — `moveId`, `status` (`"ok"` when the walk was dispatched, else the
+`WB_MOVE_RESULT` status), `pointCount`, and `points` (the resolved polyline,
+capped at 64 points with `truncated: true` when the cap bit) — so a route the
+mesh chose is read from the log, not reconstructed from heartbeats.

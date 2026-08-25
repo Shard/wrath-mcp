@@ -54,7 +54,7 @@ class WrathClient {
   health(): Promise<HealthResponse>                                   // GET /health
   createSession(req: Omit<CreateSessionRequest, "token">): Promise<SessionResponse>  // POST /session
   say(text: string): Promise<ActionResponse>                          // POST /action
-  moveToAsync(point: MovePoint): Promise<MoveToResponse>              // POST /action, ack only
+  moveToAsync(target: MoveTarget): Promise<MoveToResponse>            // POST /action, ack only
   stop(): Promise<ActionResponse>                                     // POST /action
   face(orientationOrPoint: number | { x, y }): Promise<FaceResponse>  // POST /action
   deleteSession(): Promise<DeleteSessionResponse>                     // DELETE /session
@@ -70,14 +70,14 @@ class WrathClient {
   questComplete(guid, questId) / questChooseReward(guid, questId, rewardIndex?) / questAbandon(questId)
   loot(guid) / lootAll(guid) / lootItem(slot) / lootMoney() / lootRelease(guid)
   vendorList(guid) / buyItem(guid, itemId, slot, count?) / sellItem(guid, itemGuid, count?) / repairAll(guid)
-  equipItem(bag, slot) / useItem(bag, slot, targetGuid?) / destroyItem(bag, slot, count?)
+  useItem(bag, slot, targetGuid?) / destroyItem(bag, slot, count?)
   trainerListAsync(guid) / trainerBuySpellAsync(guid, spellId)
-  repop() / reclaimCorpse(guid?) / spiritHealerActivate(guid)
+  repop() / reclaimCorpse(guid?, options?) → { status: reclaimed | not_reclaimed | unconfirmed, reason: too_far | delay_not_elapsed | wrong_map | no_corpse | still_ghost … } (waits out SMSG_CORPSE_RECLAIM_DELAY itself; state.self.corpse / graveyard say where to walk) / spiritHealerActivate(guid)
   deleteCharacter(name, o?: DeleteCharacterOptions): Promise<CharacterDeleteResponse>  // POST /character-delete
 
   // composed helpers — each waits for the game's verdict
   waitForChat(match: string | ((e: ChatEntry) => boolean), o?: WaitForChatOptions): Promise<ChatEntry>
-  moveTo(point: MovePoint, o?: MoveToOptions): Promise<MoveResult>
+  moveTo(target: MoveTarget, o?: MoveToOptions): Promise<MoveResult>
   waitForNearby(p: (o: NearbyObject) => boolean, o?: WaitForNearbyOptions): Promise<NearbyObject>
   killTarget(guid, o?: KillTargetOptions): Promise<KillResult>
   lootCorpse(guid, o?: LootOptions): Promise<LootResult>
@@ -87,6 +87,7 @@ class WrathClient {
   waitForQuestObjective(questId, o?: QuestOptions): Promise<QuestLogEntry>
   trainerList(npcGuid, o?: TrainerOptions): Promise<TrainerListResult>
   buySpell(npcGuid, spellId, o?: TrainerOptions): Promise<BuySpellResult>
+  equipItem(bag, slot, o?: EquipOptions): Promise<EquipItemResult>
   get selfKey(): string | undefined
 }
 ```
@@ -202,6 +203,14 @@ const result = await client.moveTo({ x, y, z }, { timeout: 90_000 });
 if (result.ok) console.log("arrived at", result.position);
 else console.log("did not get there:", result.status, "stopped at", result.position);
 ```
+
+`moveTo` takes a point, a unit from `state.units(...)`/`state.closest(...)`, or
+a guid — the unit forms resolve to that unit's position in the state cache at
+call time, and a guid nothing in view answers to comes back as `ok: false,
+status: "unknown_target"` with a hint, the one arm with no move (and so no
+`moveId`/`position`) behind it. `moveToAsync` takes the same targets and is the
+call for a walk longer than your own time budget: dispatch, then watch
+`WB_MOVE_RESULT`.
 
 `moveTo` issues `move_to`, then resolves on the `WB_MOVE_RESULT` carrying the
 same `moveId`. **Game outcomes are returned, not thrown** (`docs/decisions/ADR-0011`):
@@ -434,7 +443,7 @@ when the module's widens.
 ## Running things
 
 ```bash
-bun test sdk                 # 133 tests, no game stack needed
+bun test sdk                 # the whole suite, no game stack needed
 bunx tsc --noEmit -p sdk     # strict typecheck of src, test and examples
 
 # live checks, need the stack up; not part of bun test

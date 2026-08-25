@@ -1,27 +1,40 @@
 import { describe, expect, test } from "bun:test";
 
-import { connect, WrathRequestError, WrathTransportError } from "../src/client";
+import { connect, meshZHint, WrathRequestError, WrathTransportError } from "../src/client";
 import { EventAbortedError, EventTimeoutError } from "../src/events";
 import {
   addKill,
   attackStopped,
+  BACKPACK_SLOT,
   chatEcho,
+  corpseQuery,
+  corpseReclaimDelay,
+  deathReleaseCleared,
+  CREATURE_ENTRY,
   CREATURE_GUID,
   creatureCreate,
   creatureHealth,
+  creatureMove,
   creatureOutOfRange,
   creatureQuery,
   frames,
   gossipWithQuests,
   inventoryChangeFailure,
+  inventorySlot,
+  inventorySlotCleared,
+  inventorySlotMove,
   ITEM_ENTRY,
+  itemCreate,
   itemPushed,
+  itemQuery,
   loginSequence,
   lootRelease,
   lootResponse,
+  moveProgress,
   moveResult,
   newWorld,
   transferAborted,
+  teleportAck,
   transferPending,
   offerReward,
   OTHER_QUEST_ID,
@@ -37,6 +50,7 @@ import {
   questRewarded,
   requestItems,
   SELF_GUID,
+  selfArrived,
   selfCreate,
   selfHealth,
   selfProgress,
@@ -140,7 +154,7 @@ describe("client: operator-bound account (ADR-0016)", () => {
       subscribeEvents: false,
     });
     // The model should never pass an account; if it does, the bound one wins so
-    // it cannot land on someone else's lane by typing the default.
+    // it cannot land on someone else's account by typing the default.
     await client.createSession({ character: "Qwenlocal", account: "RUNNER", race: 1, class: 2 });
     expect(stub.sessions[0]?.account).toBe("RUNNER6");
     client.close();
@@ -260,11 +274,12 @@ describe("client: movement", () => {
     expect(result.ok).toBe(true);
     expect(result.position).toEqual({ x: -1205, y: 981, z: 42, o: 1.2 });
 
-    // A genuinely broken shape is still rejected loudly.
+    // A genuinely broken shape is still rejected loudly, with the message the
+    // shape earns: two numbers are a half-written point, not a guid.
     // @ts-expect-error — deliberately wrong
-    await expect(client.moveTo(-1205, 981)).rejects.toBeInstanceOf(TypeError);
-    // @ts-expect-error — deliberately wrong
-    await expect(client.moveTo("here")).rejects.toBeInstanceOf(TypeError);
+    await expect(client.moveTo(-1205, 981)).rejects.toThrow(/needs a point object \{ x, y, z \}, got number/);
+    // A string is a guid-shaped argument now, so this is rejected as a guid.
+    await expect(client.moveTo("here")).rejects.toThrow(/neither a point nor a decimal guid string/);
 
     client.close();
     await stub.stop();
@@ -283,10 +298,66 @@ describe("client: movement", () => {
       expect(result.ok).toBe(false);
       expect(result.status).toBe(status);
       // Where the character actually ended up — what the next decision needs.
-      expect(result.position.x).toBe(-1205);
+      expect(result.position?.x).toBe(-1205);
       client.close();
       await stub.stop();
     }
+  });
+
+  test("a move that never moved sends the stop the module left unsent", async () => {
+    // fleet-nav-probe-sonnet-20260822-c3: a walking move (heartbeats carrying
+    // MOVEMENTFLAG_FORWARD) was superseded by a sweep of moveTo calls that all
+    // failed `start_off_mesh`. `DoMoveTo` finishes the superseded move without
+    // a MSG_MOVE_STOP and a planning failure sends no packet at all, so the
+    // server's last word stayed "walking forward": ~10 minutes of Hearthstone
+    // use_item answering SMSG_CAST_FAILED result 51 (SPELL_FAILED_MOVING)
+    // while the character stood still, ended by one `stop`. ADR-0016 rule 1:
+    // after a move that did not move, "stop walking" has one reading.
+    for (const status of ["too_far", "no_mesh", "target_off_mesh", "start_off_mesh", "path_incomplete", "drop"] as const) {
+      const stub = startStub({ onConnect: () => frames(loginSequence) });
+      const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+      await client.createSession({ character: "Fenwick" });
+
+      const pending = client.moveTo({ x: 1, y: 2, z: 3 }, { timeout: 2000 });
+      stub.push(JSON.stringify(moveResult(status, 1, 30)));
+      expect((await pending).status).toBe(status);
+      expect(stub.actions.map((a) => a.action)).toEqual(["move_to", "stop"]);
+      client.close();
+      await stub.stop();
+    }
+
+    // The statuses where something did move, or something else is moving now:
+    // the module already sent the stop (arrived, interrupted), a stop is what
+    // ended it (stopped), or a newer move is walking and stopping it would
+    // change game semantics (superseded).
+    for (const status of ["arrived", "interrupted", "stopped", "superseded"] as const) {
+      const stub = startStub({ onConnect: () => frames(loginSequence) });
+      const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+      await client.createSession({ character: "Fenwick" });
+
+      const pending = client.moveTo({ x: 1, y: 2, z: 3 }, { timeout: 2000 });
+      stub.push(JSON.stringify(moveResult(status, 1, 30)));
+      expect((await pending).status).toBe(status);
+      expect(stub.actions.map((a) => a.action)).toEqual(["move_to"]);
+      client.close();
+      await stub.stop();
+    }
+  });
+
+  test("a refused stop after a failed move never masks the move verdict", async () => {
+    const stub = startStub({
+      onConnect: () => frames(loginSequence),
+      failAction: (action) => (action === "stop" ? json({ ok: false, error: "not_in_world" }, 409) : undefined),
+    });
+    const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+    await client.createSession({ character: "Fenwick" });
+    const pending = client.moveTo({ x: 1, y: 2, z: 3 }, { timeout: 2000 });
+    stub.push(JSON.stringify(moveResult("start_off_mesh", 1, 30)));
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("start_off_mesh");
+    client.close();
+    await stub.stop();
   });
 
   test("each typed failure carries its own recovery hint; path_incomplete carries reachedPos", async () => {
@@ -330,6 +401,121 @@ describe("client: movement", () => {
     await stub.stop();
   });
 
+  test("target_off_mesh on a known transport dock names the car and says it is not here", async () => {
+    // The tram platform with no car on it: the rail bed is not mesh, so the
+    // module says target_off_mesh. The generic hint ("pick a floor") would
+    // send the agent away from the one point boarding works at; with the car
+    // observed docking there (WB_TRANSPORT_PROGRESS docked:true) the hint
+    // says whose dock it is and where the car is now.
+    const stub = startStub({ onConnect: () => frames(loginSequence) });
+    const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+    await client.createSession({ character: "Fenwick" });
+    const tram = (seq: number, pos: { x: number; y: number; z: number }, docked: boolean, progressMs: number) =>
+      JSON.stringify({
+        seq,
+        opcode: "WB_TRANSPORT_PROGRESS",
+        opcodeId: 0xff06,
+        ts: 1_700_000_000_000 + seq,
+        data: { guid: "9001", entry: 176081, pos: { ...pos, o: 0 }, progressMs, periodMs: 143_330, docked },
+      });
+    stub.push(
+      JSON.stringify({
+        seq: 20,
+        opcode: "SMSG_UPDATE_OBJECT",
+        opcodeId: 0x0a9,
+        ts: 1_700_000_000_020,
+        data: {
+          blocks: 1,
+          objects: [{ update: "create", guid: "9001", objectType: "gameObject", pos: { x: 4.5, y: 8.4, z: -4.3, o: 0 }, fields: { entry: 176081, goType: 11 } }],
+        },
+      }),
+    );
+    stub.push(
+      JSON.stringify({
+        seq: 21,
+        opcode: "SMSG_GAMEOBJECT_QUERY_RESPONSE",
+        opcodeId: 0x05f,
+        ts: 1_700_000_000_021,
+        data: { entry: 176081, found: true, name: "Subway", type: 11, displayId: 3831, castBarCaption: "" },
+      }),
+    );
+    stub.push(tram(22, { x: 4.5, y: 8.4, z: -4.3 }, true, 5_000));
+    stub.push(tram(23, { x: 4.5, y: 1200.0, z: -4.3 }, false, 40_000));
+    await client.events.waitFor((e) => e.seq === 23, { timeout: 2000 });
+
+    const p1 = client.moveTo({ x: 4.5, y: 8.4, z: -4.3 }, { timeout: 2000 });
+    stub.push(JSON.stringify(moveResult("target_off_mesh", 1, 30)));
+    const r1 = await p1;
+    expect(r1.ok).toBe(false);
+    if (r1.ok) throw new Error("unreachable");
+    expect(r1.status).toBe("target_off_mesh");
+    expect(r1.hint).toContain("where Subway (guid 9001) docks");
+    expect(r1.hint).toContain("it is moving, now at (4.5, 1200.0) 40s into its 143s cycle");
+    expect(r1.hint).toContain("not a z problem");
+    expect(r1.hint).not.toContain("Pick a point on a road");
+
+    // Far from any dock the generic hint stands.
+    const p2 = client.moveTo({ x: 400, y: 8.4, z: -4.3 }, { timeout: 2000 });
+    stub.push(JSON.stringify(moveResult("target_off_mesh", 2, 31)));
+    const r2 = await p2;
+    if (r2.ok) throw new Error("unreachable");
+    expect(r2.hint).toContain("Pick a point on a road");
+
+    // A no-car attempt that the module judged a drop onto the rail bed is a
+    // typed failure, never `arrived` and never aboard.
+    const p3 = client.moveTo({ x: 4.5, y: 8.4, z: -4.3 }, { timeout: 2000 });
+    const ev = moveResult("drop", 3, 32) as { data: Record<string, unknown> };
+    ev.data.reachedPos = { x: 14.0, y: 8.4, z: -4.3 };
+    ev.data.dz = -6.2;
+    stub.push(JSON.stringify(ev));
+    const r3 = await p3;
+    expect(r3.ok).toBe(false);
+    expect(r3.status).toBe("drop");
+    expect((r3 as { onTransport?: unknown }).onTransport).toBeUndefined();
+    client.close();
+    await stub.stop();
+  });
+
+  test("drop carries the edge, the step and the target, with a hint about levels", async () => {
+    // ADR-0027 amendment (nav-probe c4, map 369): a route that falls 7.64y
+    // over 1y of 2D travel is a ledge. The module refuses the walk and says
+    // where the edge is; the hint says to change level by ramp or stairs.
+    const stub = startStub({ onConnect: () => frames(loginSequence) });
+    const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+    await client.createSession({ character: "Fenwick" });
+
+    const p = client.moveTo({ x: 10, y: 20, z: -6.9 }, { timeout: 2000 });
+    const ev = moveResult("drop", 1, 30) as { data: Record<string, unknown> };
+    ev.data.reachedPos = { x: 9.2, y: 19.5, z: 0.7 };
+    ev.data.dz = -7.64;
+    ev.data.target = { x: 10, y: 20, z: -6.9 };
+    stub.push(JSON.stringify(ev));
+    const r = await p;
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error("unreachable");
+    expect(r.status).toBe("drop");
+    expect(r.reachedPos).toEqual({ x: 9.2, y: 19.5, z: 0.7 });
+    expect(r.dz).toBe(-7.64);
+    expect(r.hint).toContain("route to (10.0, 20.0, z -6.9) steps off a ledge of 7.6 yards at (9.2, 19.5)");
+    expect(r.hint).toContain("stopped at the edge");
+    expect(r.hint).toContain("ramp/stairs");
+    // Nothing moved, so the SDK sends the stop the module left unsent.
+    expect(stub.actions.map((a) => a.action)).toEqual(["move_to", "stop"]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("the meshZ hint says 'quote it' within 3y and 'a different level' beyond", async () => {
+    expect(meshZHint({ x: 1, y: 2, z: 80 }, 81.5)).toContain("The mesh owns z; quote 81.5");
+    expect(meshZHint({ x: 1, y: 2, z: 80 }, 77)).toContain("quote 77.0");
+    const far = meshZHint({ x: 1, y: 2, z: 0.7 }, -6.9);
+    expect(far).toContain("z -6.9, not 0.7");
+    expect(far).toContain("ended 7.6 yards below the requested point");
+    expect(far).toContain("not what put it there");
+    expect(far).not.toContain("quote");
+    expect(meshZHint({ x: 1, y: 2, z: 0 }, 5)).toContain("5.0 yards above");
+  });
+
   test("arrived with meshZ says which z the mesh used; a plain arrived carries neither", async () => {
     const stub = startStub({ onConnect: () => frames(loginSequence) });
     const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
@@ -344,8 +530,12 @@ describe("client: movement", () => {
     if (!r1.ok || r1.status !== "arrived") throw new Error("unreachable");
     expect(r1.meshZ).toBe(42);
     expect(r1.hint).toContain("z 42.0, not 80.0");
+    // 38y is a level, not a stale z: the hint must not say "quote it".
+    expect(r1.hint).toContain("38.0 yards below");
+    expect(r1.hint).not.toContain("quote");
 
-    const p2 = client.moveTo({ x: 1, y: 2, z: 3 }, { timeout: 2000 });
+    // A short walk, so the caller's 2s timeout draws no mesh-slack note either.
+    const p2 = client.moveTo({ x: -1200, y: 983, z: 42 }, { timeout: 2000 });
     stub.push(JSON.stringify(moveResult("arrived", 2, 31)));
     const r2 = await p2;
     if (!r2.ok || r2.status !== "arrived") throw new Error("unreachable");
@@ -362,7 +552,7 @@ describe("client: movement", () => {
     expect(r4.onTransport).toEqual({ guid: "12345", entry: 176081 });
 
     // A status the SDK has no recipe for passes through with no hint invented.
-    const p3 = client.moveTo({ x: 1, y: 2, z: 3 }, { timeout: 2000 });
+    const p3 = client.moveTo({ x: -1200, y: 983, z: 42 }, { timeout: 2000 });
     stub.push(JSON.stringify(moveResult("stopped", 4, 34)));
     const r3 = await p3;
     if (r3.ok) throw new Error("unreachable");
@@ -389,10 +579,60 @@ describe("client: movement", () => {
     expect(result.to).toEqual({ map: 369, x: 69.25, y: 10.26, z: -4.3, o: 3.1 });
     expect(result.position.x).toBe(-1205); // old-map position from the result
     expect(result.hint).toContain("map 369");
-    expect(client.state.self.position?.value.map).toBe(369);
+    // The cache holds the *arrival* point, not the old-map pos the result
+    // carried: a `transferred` result is never folded into self position.
+    expect(client.state.self.position?.value).toEqual({ map: 369, x: 69.25, y: 10.26, z: -4.3, o: 3.1 });
     client.close();
     await stub.stop();
   });
+
+  test("teleported (same-map port) resolves on the own-guid MSG_MOVE_TELEPORT_ACK, never waits for NEW_WORLD", async () => {
+    // FOLLOW-UPS 46: a Hearthstone mid-move used to answer `transferred`, and
+    // moveTo then waited 90s for an SMSG_NEW_WORLD that never comes on a
+    // same-map port. The module now says `teleported`, and the arrival point
+    // is the server's own teleport ack, sent before the result.
+    const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate]) });
+    const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+    await client.createSession({ character: "Fenwick" });
+
+    const pending = client.moveTo({ x: -4839, y: -1330, z: 508 }, { timeout: 2000 });
+    await untilAction(stub, "move_to");
+    stub.push(JSON.stringify(teleportAck(30)));
+    stub.push(JSON.stringify(moveResult("teleported", 1, 31)));
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    if (!result.ok || result.status !== "teleported") throw new Error("unreachable");
+    expect(result.to).toEqual({ x: -8833.4, y: 625.9, z: 93.9, o: 0.5 });
+    expect(result.position.x).toBe(-1205); // pre-teleport position from the result
+    expect(result.hint).toContain("same-map teleport");
+    // Self position is the arrival, on the same map; the result's pre-teleport
+    // `pos` (seq 31, later) did not overwrite it.
+    expect(client.state.self.position?.value).toEqual({ map: 0, x: -8833.4, y: 625.9, z: 93.9, o: 0.5 });
+    expect(client.state.self.position?.seq).toBe(30);
+    client.close();
+    await stub.stop();
+  });
+
+  test("teleported with no teleport ack observed is ok:false, status intact, no 90s wait", async () => {
+    // The ack wait is a fixed 5s (it normally hits the buffer), so give the
+    // test room for exactly that.
+    const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate]) });
+    const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+    await client.createSession({ character: "Fenwick" });
+
+    const started = Date.now();
+    const pending = client.moveTo({ x: 1, y: 2, z: 3 }, { timeout: 60_000 });
+    await untilAction(stub, "move_to");
+    stub.push(JSON.stringify(moveResult("teleported", 1, 31)));
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("teleported");
+    if (result.ok) throw new Error("unreachable");
+    expect(result.hint).toContain("MSG_MOVE_TELEPORT_ACK");
+    expect(Date.now() - started).toBeLessThan(20_000);
+    client.close();
+    await stub.stop();
+  }, 15_000);
 
   test("transferred with the transfer still pending at the deadline is ok:false, status intact", async () => {
     const stub = startStub({ onConnect: () => frames(loginSequence) });
@@ -408,6 +648,66 @@ describe("client: movement", () => {
     if (result.ok) throw new Error("unreachable");
     expect(result.hint).toContain("map 369");
     expect(result.hint).toContain("waitForTransfer");
+    client.close();
+    await stub.stop();
+  });
+
+  test("a moveTo timeout says the character is still walking and how far is left", async () => {
+    // fleet-nav-probe-freeplay-sonnet-20260823-c4: 27/27 short-timeout moves
+    // had their verdict arrive *after* the timeout, and the bare "timed out"
+    // message led the model to supersede a move that was about to succeed.
+    const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate]) });
+    const client = await inWorld(stub);
+
+    const walk = client.moveTo({ x: -1000, y: 987.25, z: 42 }, { timeout: 1500 });
+    await untilAction(stub, "move_to");
+    stub.push(JSON.stringify(moveProgress)); // walked ~15y of the way, no verdict
+    const err = (await walk.catch((e: unknown) => e)) as EventTimeoutError;
+    expect(err).toBeInstanceOf(EventTimeoutError);
+    expect(err.message).toContain("~15y covered");
+    expect(err.message).toContain("~220y still to go");
+    expect(err.message).toContain("the character is still walking");
+    expect(err.message).toContain("this move's verdict will arrive later");
+    expect(err.message).toContain("1.5–2× the straight line");
+    expect(err.message).toContain("sdk.moveToAsync(target)");
+
+    client.close();
+    await stub.stop();
+  });
+
+  test("a timeout shorter than the likely walk is called out on the verdict, with no deadline set", async () => {
+    // The pre-flight hint must not depend on a caller budget: the probes that
+    // hit this had no deadline at all.
+    const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate]) });
+    const client = await inWorld(stub);
+
+    const pending = client.moveTo({ x: -1000, y: 987.25, z: 42 }, { timeout: 5000 });
+    await untilAction(stub, "move_to");
+    stub.push(JSON.stringify(moveResult("arrived", 1, 31)));
+    const result = await pending;
+
+    expect(result.status).toBe("arrived");
+    expect(result.hint).toContain("~235y in a straight line");
+    expect(result.hint).toContain("against the 5s timeout it was given");
+    expect(result.hint).toContain("1.5–2× the straight line");
+    expect(result.hint).toContain("sdk.moveToAsync(target)");
+
+    client.close();
+    await stub.stop();
+  });
+
+  test("a generous caller timeout draws no mesh-slack hint", async () => {
+    const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate]) });
+    const client = await inWorld(stub);
+
+    const pending = client.moveTo({ x: -1234.5, y: 990, z: 42 }, { timeout: 10_000 });
+    await untilAction(stub, "move_to");
+    stub.push(JSON.stringify(moveResult("arrived", 1, 31)));
+    const result = await pending;
+
+    expect(result.status).toBe("arrived");
+    expect(result.hint).toBeUndefined();
+
     client.close();
     await stub.stop();
   });
@@ -1579,6 +1879,140 @@ describe("client: trainers", () => {
   });
 });
 
+describe("client: equipItem", () => {
+  // A world where backpack slot 23 holds the fixture item, named and all.
+  const bagWorld = () =>
+    frames([...loginSequence, selfCreate, inventorySlot, itemCreate, itemQuery]);
+
+  test("an item that reaches an equipment slot is equipped, with the slot it landed in", async () => {
+    const stub = startStub({ onConnect: () => bagWorld() });
+    const client = await inWorld(stub);
+    const pending = client.equipItem(255, BACKPACK_SLOT, { timeout: 2000 });
+    await untilAction(stub, "equip_item");
+    // 15 is EQUIPMENT_SLOT_MAINHAND: the item leaves the backpack for it.
+    stub.push(JSON.stringify(inventorySlotMove(70, BACKPACK_SLOT, 15)));
+    const result = await pending;
+    expect(result).toEqual({
+      ok: true,
+      status: "equipped",
+      bag: 255,
+      slot: BACKPACK_SLOT,
+      itemId: ITEM_ENTRY,
+      name: "Gritstone Charm",
+      equippedSlot: 15,
+    });
+    client.close();
+    await stub.stop();
+  });
+
+  test("a refusal is not ok: it carries the server's InventoryResult and a hint", async () => {
+    const stub = startStub({ onConnect: () => bagWorld() });
+    const client = await inWorld(stub);
+    const pending = client.equipItem(255, BACKPACK_SLOT, { timeout: 2000 });
+    await untilAction(stub, "equip_item");
+    // 8 is EQUIP_ERR_NO_REQUIRED_PROFICIENCY — the paladin-with-an-axe refusal
+    // that fleet-nav-probe-sonnet-20260822-c3 saw reported as ok: true.
+    stub.push(JSON.stringify(inventoryChangeFailure(71, 8)));
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.status).toBe("not_equipped");
+    if (result.status !== "not_equipped") throw new Error("unreachable");
+    expect(result.reason).toBe(8);
+    expect(result.hint).toContain("proficiency");
+    expect(result.hint).toContain("Gritstone Charm");
+    expect(result.hint).toContain(`bag 255 slot ${BACKPACK_SLOT}`);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a level refusal reports the level the server named", async () => {
+    const stub = startStub({ onConnect: () => bagWorld() });
+    const client = await inWorld(stub);
+    const pending = client.equipItem(255, BACKPACK_SLOT, { timeout: 2000 });
+    await untilAction(stub, "equip_item");
+    stub.push(JSON.stringify(inventoryChangeFailure(72, 1, { requiredLevel: 6 })));
+    const result = await pending;
+    if (result.ok || result.status !== "not_equipped") throw new Error("unreachable");
+    expect(result.reason).toBe(1);
+    expect(result.requiredLevel).toBe(6);
+    expect(result.hint).toContain("needs level 6");
+    client.close();
+    await stub.stop();
+  });
+
+  test("an unknown code still reports the number", async () => {
+    const stub = startStub({ onConnect: () => bagWorld() });
+    const client = await inWorld(stub);
+    const pending = client.equipItem(255, BACKPACK_SLOT, { timeout: 2000 });
+    await untilAction(stub, "equip_item");
+    stub.push(JSON.stringify(inventoryChangeFailure(73, 99)));
+    const result = await pending;
+    if (result.ok || result.status !== "not_equipped") throw new Error("unreachable");
+    expect(result.reason).toBe(99);
+    expect(result.hint).toContain("InventoryResult 99");
+    client.close();
+    await stub.stop();
+  });
+
+  test("another item's refusal does not settle this equip", async () => {
+    const stub = startStub({ onConnect: () => bagWorld() });
+    const client = await inWorld(stub);
+    const pending = client.equipItem(255, BACKPACK_SLOT, { timeout: 2000 });
+    await untilAction(stub, "equip_item");
+    // A background loot's bag-full names a different item guid: not our answer.
+    stub.push(JSON.stringify(inventoryChangeFailure(74, 50, { itemGuid: "12345" })));
+    stub.push(JSON.stringify(inventorySlotMove(75, BACKPACK_SLOT, 15)));
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(result.equippedSlot).toBe(15);
+    client.close();
+    await stub.stop();
+  });
+
+  test("an item that only leaves the backpack still counts as equipped", async () => {
+    const stub = startStub({ onConnect: () => bagWorld() });
+    const client = await inWorld(stub);
+    const pending = client.equipItem(255, BACKPACK_SLOT, { timeout: 2000 });
+    await untilAction(stub, "equip_item");
+    // The equipment slot's own field was not seen, only the backpack emptying.
+    stub.push(JSON.stringify(inventorySlotCleared(76, BACKPACK_SLOT)));
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(result.equippedSlot).toBeUndefined();
+    client.close();
+    await stub.stop();
+  });
+
+  test("a bag-to-bag shuffle is not an equip", async () => {
+    const stub = startStub({ onConnect: () => bagWorld() });
+    const client = await inWorld(stub);
+    const pending = client.equipItem(255, BACKPACK_SLOT, { timeout: 200 });
+    await untilAction(stub, "equip_item");
+    stub.push(JSON.stringify(inventorySlotMove(77, BACKPACK_SLOT, BACKPACK_SLOT + 1)));
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.status).toBe("unconfirmed");
+    client.close();
+    await stub.stop();
+  });
+
+  test("silence is unconfirmed, not success", async () => {
+    const stub = startStub({ onConnect: () => bagWorld() });
+    const client = await inWorld(stub);
+    const result = await client.equipItem(255, BACKPACK_SLOT, { timeout: 60 });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.status).toBe("unconfirmed");
+    expect(result.hint).toContain("state.bag()");
+    client.close();
+    await stub.stop();
+  });
+});
+
 describe("client: deleteCharacter", () => {
   test("retries past the core's silent window until the delete lands", async () => {
     const stub = startStub({
@@ -2003,6 +2437,406 @@ describe("client: talents and the raw escape hatch (FOLLOW-UPS 39, ADR-0025)", (
     const err = await client.raw("CMSG_EMOTE", [{ u32: 1 }]).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(WrathRequestError);
     expect((err as WrathRequestError).message).toContain("allowlist");
+    await stub.stop();
+  });
+});
+
+describe("client: reclaimCorpse owns the delay and answers with a verdict", () => {
+  /** Login plus our own create block, then whatever health this world needs. */
+  const deadWorld = (health: number, extra: readonly unknown[] = []) =>
+    frames([...loginSequence, selfCreate, selfHealth(health, 90), ...extra]);
+
+  test("a ghost whose delay has already elapsed reclaims, and says so", async () => {
+    // A delay announced 60s ago: nothing left to wait out, so it dispatches now.
+    const stub = startStub({
+      onConnect: () => deadWorld(1, [corpseReclaimDelay(30_000, 91, Date.now() - 60_000)]),
+    });
+    const client = await inWorld(stub);
+    const pending = client.reclaimCorpse(undefined, { timeout: 4000, attemptTimeout: 1500 });
+    await untilAction(stub, "reclaim_corpse");
+    stub.push(JSON.stringify(deathReleaseCleared(92)));
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    expect(result.status).toBe("reclaimed");
+    expect(result.attempts).toBe(1);
+    expect(result.delayMs).toBe(30_000);
+    expect(result.waitedMs).toBeGreaterThanOrEqual(0);
+    client.close();
+    await stub.stop();
+  });
+
+  test("health leaving the ghost's 1 confirms a reclaim on its own", async () => {
+    const stub = startStub({ onConnect: () => deadWorld(1) });
+    const client = await inWorld(stub);
+    const pending = client.reclaimCorpse(undefined, { timeout: 4000, attemptTimeout: 1500 });
+    await untilAction(stub, "reclaim_corpse");
+    stub.push(JSON.stringify(selfHealth(20, 93)));
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    expect(result.status).toBe("reclaimed");
+    client.close();
+    await stub.stop();
+  });
+
+  test("the announced delay is waited out before anything is dispatched", async () => {
+    const stub = startStub({
+      onConnect: () => deadWorld(1, [corpseReclaimDelay(400, 91, Date.now())]),
+    });
+    const client = await inWorld(stub);
+    const started = Date.now();
+    const pending = client.reclaimCorpse(undefined, { timeout: 4000, attemptTimeout: 1500 });
+    await untilAction(stub, "reclaim_corpse");
+    const waited = Date.now() - started;
+    expect(waited).toBeGreaterThanOrEqual(300);
+    stub.push(JSON.stringify(deathReleaseCleared(94)));
+    expect((await pending).ok).toBe(true);
+    client.close();
+    await stub.stop();
+  });
+
+  test("no delay event at all means dispatch now, not a made-up 30s wait", async () => {
+    const stub = startStub({ onConnect: () => deadWorld(1) });
+    const client = await inWorld(stub);
+    const started = Date.now();
+    const pending = client.reclaimCorpse(undefined, { timeout: 4000, attemptTimeout: 1500 });
+    await untilAction(stub, "reclaim_corpse");
+    expect(Date.now() - started).toBeLessThan(1000);
+    stub.push(JSON.stringify(deathReleaseCleared(95)));
+    const result = await pending;
+    expect(result.status).toBe("reclaimed");
+    expect(result.delayMs).toBeUndefined();
+    client.close();
+    await stub.stop();
+  });
+
+  test("a silent refusal with nothing else observed is re-sent, and reported once as still_ghost", async () => {
+    const stub = startStub({ onConnect: () => deadWorld(1) });
+    const client = await inWorld(stub);
+    const result = await client.reclaimCorpse(undefined, { timeout: 700, attemptTimeout: 150 });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.status).toBe("not_reclaimed");
+    expect(result.reason).toBe("still_ghost");
+    expect(result.attempts).toBeGreaterThan(1);
+    expect(result.hint).toContain("39y");
+    expect(result.hint).toContain("spiritHealerActivate");
+    expect(result.hint).not.toMatch(/\d+ reclaims went out/);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a ghost far from its corpse is told too_far with the distance, the radius and the healer's price", async () => {
+    // Died at the create-block position, released 387y away; the corpse query
+    // confirms the corpse at the death spot. Level 3: no sickness at that level.
+    const stub = startStub({
+      onConnect: () =>
+        deadWorld(1, [
+          corpseQuery(91, { map: 0, x: -1234.5, y: 987.25, z: 42.125 }),
+          selfArrived(92, { x: -1234.5 + 387, y: 987.25, z: 42.125 }),
+        ]),
+    });
+    const client = await inWorld(stub);
+    const result = await client.reclaimCorpse(undefined, { timeout: 500, attemptTimeout: 120 });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.reason).toBe("too_far");
+    expect(result.distance).toBe(387);
+    expect(result.radius).toBe(39);
+    expect(result.corpse?.source).toBe("corpse_query");
+    expect(result.hint).toContain("387y");
+    expect(result.hint).toContain("moveTo(state.self.corpse.value)");
+    expect(result.hint).toContain("25% durability");
+    expect(result.hint).toContain("no resurrection sickness at your level");
+    client.close();
+    await stub.stop();
+  });
+
+  test("a corpse on another map is wrong_map, and no corpse at all is no_corpse", async () => {
+    const other = startStub({
+      onConnect: () => deadWorld(1, [corpseQuery(91, { map: 1, x: 10, y: 10, z: 10 })]),
+    });
+    const c1 = await inWorld(other);
+    const r1 = await c1.reclaimCorpse(undefined, { timeout: 400, attemptTimeout: 120 });
+    if (r1.ok) throw new Error("unreachable");
+    expect(r1.reason).toBe("wrong_map");
+    expect(r1.hint).toContain("map 1");
+    c1.close();
+    await other.stop();
+
+    const none = startStub({ onConnect: () => deadWorld(1, [corpseQuery(91)]) });
+    const c2 = await inWorld(none);
+    const r2 = await c2.reclaimCorpse(undefined, { timeout: 400, attemptTimeout: 120 });
+    if (r2.ok) throw new Error("unreachable");
+    expect(r2.reason).toBe("no_corpse");
+    expect(r2.hint).toContain("spiritHealerActivate");
+    c2.close();
+    await none.stop();
+  });
+
+  test("a delay still running after the dispatches is delay_not_elapsed with the seconds left", async () => {
+    // Delay announced 29s ago of 30s: the first pass waits ~1s, but the budget
+    // is shorter, so one attempt goes out at most and the delay is still the cause.
+    const stub = startStub({
+      onConnect: () => deadWorld(1, [corpseReclaimDelay(30_000, 91, Date.now() - 29_700)]),
+    });
+    const client = await inWorld(stub);
+    const result = await client.reclaimCorpse(undefined, { timeout: 200, attemptTimeout: 50 });
+    if (result.ok) throw new Error("unreachable");
+    expect(result.reason).toBe("delay_not_elapsed");
+    expect(result.secondsLeft).toBe(1);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a corpse still unreleased is named, and nothing is sent", async () => {
+    const stub = startStub({ onConnect: () => deadWorld(0) });
+    const client = await inWorld(stub);
+    const result = await client.reclaimCorpse();
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.reason).toBe("not_released");
+    expect(result.hint).toContain("repop()");
+    expect(result.attempts).toBe(0);
+    expect(stub.actions.filter((a) => a.action === "reclaim_corpse")).toHaveLength(0);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a living character is told there is nothing to reclaim", async () => {
+    const stub = startStub({ onConnect: () => deadWorld(40) });
+    const client = await inWorld(stub);
+    const result = await client.reclaimCorpse();
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.reason).toBe("not_dead");
+    expect(stub.actions.filter((a) => a.action === "reclaim_corpse")).toHaveLength(0);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a delay longer than the budget sends nothing and says how much is left", async () => {
+    const stub = startStub({
+      onConnect: () => deadWorld(1, [corpseReclaimDelay(30_000, 91, Date.now())]),
+    });
+    const client = await inWorld(stub);
+    const result = await client.reclaimCorpse(undefined, { timeout: 300, attemptTimeout: 100 });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.reason).toBe("delay_not_elapsed");
+    expect(result.attempts).toBe(0);
+    expect(result.hint).toContain("still to run");
+    expect(stub.actions.filter((a) => a.action === "reclaim_corpse")).toHaveLength(0);
+    client.close();
+    await stub.stop();
+  });
+
+  test("unobserved health with the dispatch out is unconfirmed, not a guess", async () => {
+    const stub = startStub({ onConnect: () => frames([...loginSequence]) });
+    const client = await inWorld(stub);
+    const result = await client.reclaimCorpse(undefined, { timeout: 400, attemptTimeout: 120 });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.status).toBe("unconfirmed");
+    expect(result.reason).toBe("no_observation");
+    expect(result.hint).toContain("state.self.health");
+    client.close();
+    await stub.stop();
+  });
+
+  test("reclaimCorpseAsync is still the bare dispatch", async () => {
+    const stub = startStub({ onConnect: () => deadWorld(1) });
+    const client = await inWorld(stub);
+    const ack = await client.reclaimCorpseAsync();
+    expect(ack.ok).toBe(true);
+    expect(stub.actions.at(-1)?.action).toBe("reclaim_corpse");
+    client.close();
+    await stub.stop();
+  });
+});
+
+/**
+ * `moveTo` taking the thing at the destination, not only the destination
+ * (ADR-0015 earned surface). The trajectory: the 2026-08-23 navigation fan-out,
+ * where 4 of 7 runs threw a raw `TypeError` reading `.x` off a unit lookup that
+ * had returned nothing — the model never learned it was the lookup that failed.
+ */
+describe("client: moveTo target resolution", () => {
+  const movePos = (stub: StubServer): { x: number; y: number; z: number } => {
+    const move = stub.actions.filter((a) => a.action === "move_to").at(-1) as unknown as {
+      x: number;
+      y: number;
+      z: number;
+    };
+    return { x: move.x, y: move.y, z: move.z };
+  };
+
+  test("a unit and its guid both resolve to the position the state cache holds", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const unit = client.state.units({ entry: CREATURE_ENTRY })[0]!;
+
+    const byUnit = client.moveTo(unit, { timeout: 2000 });
+    await untilAction(stub, "move_to");
+    expect(movePos(stub)).toEqual({ x: -1200, y: 980, z: 42 });
+    // A unit target carries its guid as the module's planning hint (ground-z
+    // resolution, PROTOCOL.md move_to); a point (below, in the next test)
+    // sends none.
+    expect(stub.actions.filter((a) => a.action === "move_to").at(-1)?.guid).toBe(CREATURE_GUID);
+    stub.push(JSON.stringify(moveResult("arrived", 1, 30)));
+    expect((await byUnit).ok).toBe(true);
+
+    // The guid form reads the cache at call time, so a unit that has moved
+    // since is walked to where it is now, not where the caller last saw it.
+    stub.push(JSON.stringify(creatureMove));
+    await Bun.sleep(20);
+    const byGuid = client.moveTo(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "move_to", 1);
+    expect(movePos(stub)).toEqual({ x: -1210, y: 985, z: 42 });
+    stub.push(JSON.stringify(moveResult("arrived", 2, 31)));
+    expect((await byGuid).ok).toBe(true);
+
+    client.close();
+    await stub.stop();
+  });
+
+  test("a guid nothing in view answers to is a typed verdict, never a TypeError", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+
+    const result = await client.moveTo("123456789");
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("unknown_target");
+    expect(result.position).toBeUndefined();
+    expect(result.hint).toContain("not in view");
+    expect(result.hint).toContain("state.closest(...)");
+    // Nothing was dispatched: there was nowhere to walk.
+    expect(stub.actions.filter((a) => a.action === "move_to")).toHaveLength(0);
+
+    // The raw tier has no result object to answer in, so it throws — and says
+    // which call does answer.
+    expect(() => client.moveToAsync("123456789")).toThrow(/unknown_target/);
+    // A point is untouched by any of this.
+    const walk = client.moveTo({ x: 1, y: 2, z: 3 }, { timeout: 2000 });
+    await untilAction(stub, "move_to");
+    expect(stub.actions.filter((a) => a.action === "move_to").at(-1)?.guid).toBeUndefined();
+    stub.push(JSON.stringify(moveResult("arrived", 1, 30)));
+    expect((await walk).status).toBe("arrived");
+
+    client.close();
+    await stub.stop();
+  });
+
+  test("a unit that left view walks to the coordinates it carried, and says so", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const unit = client.state.units({ entry: CREATURE_ENTRY })[0]!;
+    stub.push(JSON.stringify(creatureOutOfRange));
+    await Bun.sleep(20);
+    expect(client.state.nearby.has(CREATURE_GUID)).toBe(false);
+
+    const walk = client.moveTo(unit, { timeout: 2000 });
+    await untilAction(stub, "move_to");
+    expect(movePos(stub)).toEqual({ x: -1200, y: 980, z: 42 });
+    stub.push(JSON.stringify(moveResult("arrived", 1, 30)));
+    const result = await walk;
+    expect(result.ok).toBe(true);
+    // Silent wrong behaviour is the one forbidden outcome (ADR-0016).
+    expect(result.hint).toContain("not in view any more");
+
+    client.close();
+    await stub.stop();
+  });
+
+  test("the abandon error names the distance covered, the distance left, and moveToAsync", async () => {
+    // The 2026-08-23 fan-out: 6 of 7 runs hit the 30s snippet abandon with a
+    // moveTo in flight, and one re-issued the identical blocking call 5 times.
+    const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate]) });
+    let current: AbortSignal | undefined;
+    const client = await connect({
+      baseUrl: stub.baseUrl,
+      token: "t",
+      events: { reconnect: false },
+      signal: () => current,
+    });
+    await client.createSession({ character: "Fenwick" });
+    await client.events.waitForOpcode("SMSG_LOGIN_VERIFY_WORLD", { timeout: 2000 });
+
+    const ac = new AbortController();
+    current = ac.signal;
+    const walk = client.moveTo({ x: -1000, y: 987.25, z: 42.125 }, { timeout: 5000 });
+    await untilAction(stub, "move_to");
+    // It got a third of the way before the snippet ran out of time.
+    stub.push(JSON.stringify(moveProgress));
+    await Bun.sleep(20);
+    ac.abort(new Error("snippet abandoned by the harness (timeout)"));
+
+    const err = (await walk.catch((e: unknown) => e)) as Error & { moveAbandon?: string };
+    expect(err).toBeInstanceOf(EventAbortedError);
+    expect(err.message).toContain("~15y covered");
+    expect(err.message).toContain("~220y still to go");
+    expect(err.message).toContain("sdk.moveToAsync(target)");
+    expect(err.moveAbandon).toContain("still walking when this was abandoned");
+
+    client.close();
+    await stub.stop();
+  });
+
+  test("a walk longer than the caller's remaining budget says so in the hint, and still walks", async () => {
+    const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate]) });
+    const client = await connect({
+      baseUrl: stub.baseUrl,
+      token: "t",
+      events: { reconnect: false },
+      // The runner passes the instant the snippet will be abandoned.
+      deadline: () => Date.now() + 5_000,
+    });
+    await client.createSession({ character: "Fenwick" });
+    await client.events.waitForOpcode("SMSG_LOGIN_VERIFY_WORLD", { timeout: 2000 });
+
+    const walk = client.moveTo({ x: -1000, y: 987.25, z: 42.125 }, { timeout: 2000 });
+    await untilAction(stub, "move_to");
+    stub.push(JSON.stringify(moveResult("arrived", 1, 30)));
+    const result = await walk;
+    // No status change and no cap: the move was issued exactly as asked.
+    expect(result.ok).toBe(true);
+    expect(result.status).toBe("arrived");
+    expect(result.hint).toContain("~235y");
+    expect(result.hint).toContain("7yd/s");
+    expect(result.hint).toContain("sdk.moveToAsync(target)");
+
+    // A deadline already past is an unknown budget, not a budget of zero: a
+    // background routine inherits the launching snippet's deadline and keeps
+    // walking legitimately, and telling it to use a background routine would be
+    // the remediation contradicting itself.
+    const routine = await connect({
+      baseUrl: stub.baseUrl,
+      token: "t",
+      events: { reconnect: false },
+      deadline: () => Date.now() - 60_000,
+    });
+    await routine.createSession({ character: "Fenwick" });
+    const leg = routine.moveTo({ x: -1000, y: 987.25, z: 42.125 }, { timeout: 2000 });
+    await untilAction(stub, "move_to", 1);
+    stub.push(JSON.stringify(moveResult("arrived", 2, 31)));
+    // The budget sentence is gone; the caller's own short timeout is still
+    // worth saying, and says nothing about budgets.
+    const legHint = (await leg).hint ?? "";
+    expect(legHint).not.toContain("of its budget left");
+    expect(legHint).toContain("often outlasts a timeout that short");
+    routine.close();
+
+    // With no deadline known, nothing is said either.
+    const quiet = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+    await quiet.createSession({ character: "Fenwick" });
+    const plain = quiet.moveTo({ x: -1000, y: 987.25, z: 42.125 }, { timeout: 2000 });
+    await untilAction(stub, "move_to", 2);
+    stub.push(JSON.stringify(moveResult("arrived", 3, 32)));
+    const plainHint = (await plain).hint ?? "";
+    expect(plainHint).not.toContain("of its budget left");
+    expect(plainHint).toContain("often outlasts a timeout that short");
+
+    quiet.close();
+    client.close();
     await stub.stop();
   });
 });

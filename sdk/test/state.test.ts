@@ -2,13 +2,20 @@ import { describe, expect, test } from "bun:test";
 
 import { parseEventFrame, type GameEvent } from "../src/protocol";
 import { STREAM_GAP, type StreamEvent, type StreamGapEvent } from "../src/events";
-import { pointOf, StateCache, type UnitFilter } from "../src/state";
+import { gameObjectTypeName, pointOf, StateCache, type UnitFilter } from "../src/state";
 import {
   addKill,
   auraRemoved,
   auraUpdate,
   auraUpdateAll,
   BACKPACK_SLOT,
+  BAG_SLOT,
+  BAG_GUID,
+  BAG_NUM_SLOTS,
+  BAGGED_GUID,
+  wornBagSlot,
+  wornBagCreate,
+  wornBagQuery,
   chatEcho,
   inventorySlot,
   ITEM_ENTRY,
@@ -26,6 +33,7 @@ import {
   questComplete,
   questProgress,
   transferAborted,
+  teleportAck,
   transferPending,
   questRewarded,
   questGiverStatus,
@@ -44,6 +52,10 @@ import {
   creatureOutOfRange,
   creatureQuery,
   creatureValues,
+  corpseQuery,
+  corpseReclaimDelay,
+  deathReleaseCleared,
+  deathReleaseLoc,
   fullStream,
   loginSequence,
   moveProgress,
@@ -52,7 +64,9 @@ import {
   PLAYER_GUID,
   playerCreate,
   playerName,
+  SELF_GUID,
   selfCreate,
+  selfHealth,
   worldStream,
 } from "./fixtures";
 
@@ -337,6 +351,54 @@ describe("state cache: self, from the wire", () => {
     expect(cache.self.position?.value.map).toBe(369);
   });
 
+  test("a `transferred` move result never writes old-map coordinates under the new map id", () => {
+    // The module reads the character back before the teleport lands, so
+    // WB_MOVE_RESULT.pos on `transferred` is "the last old-map position"
+    // (PROTOCOL.md). Folding it would pair those x/y/z with the new map id —
+    // a WorldPosition the character was never at. SMSG_NEW_WORLD owns the
+    // arrival point, and it can land on either side of the result.
+    const resultFirst = StateCache.replay(
+      toEvents([...loginSequence, selfCreate, transferPending(369, 40), moveResult("transferred", 1, 41)]),
+      { seed: SEED },
+    );
+    // Nothing adopted: still the old map, at the position login gave.
+    expect(resultFirst.self.position?.value.map).toBe(0);
+    expect(resultFirst.self.position?.value.x).not.toBe(-1205);
+    resultFirst.apply(toEvents([newWorld(369, 42)])[0]!);
+    expect(resultFirst.self.position?.value).toEqual({ map: 369, x: 69.25, y: 10.26, z: -4.3, o: 3.1 });
+
+    const newWorldFirst = StateCache.replay(
+      toEvents([
+        ...loginSequence,
+        selfCreate,
+        transferPending(369, 40),
+        newWorld(369, 41),
+        moveResult("transferred", 1, 42),
+      ]),
+      { seed: SEED },
+    );
+    expect(newWorldFirst.self.position?.value).toEqual({ map: 369, x: 69.25, y: 10.26, z: -4.3, o: 3.1 });
+    expect(newWorldFirst.self.position?.seq).toBe(41);
+    // Every other move result still writes self position, transfer or not.
+    newWorldFirst.apply(toEvents([moveResult("arrived", 2, 43)])[0]!);
+    expect(newWorldFirst.self.position?.value).toEqual({ map: 369, x: -1205, y: 981, z: 42, o: 1.2 });
+  });
+
+  test("an own-guid MSG_MOVE_TELEPORT_ACK moves self, and the `teleported` result after it does not", () => {
+    // FOLLOW-UPS 46: a same-map port sends no SMSG_NEW_WORLD; the server's
+    // teleport ack under our guid is the arrival point. The `teleported` move
+    // result that follows carries the pre-teleport position and must not win.
+    const cache = StateCache.replay(toEvents([...loginSequence, selfCreate, teleportAck(40)]), { seed: SEED });
+    expect(cache.self.position?.value).toEqual({ map: 0, x: -8833.4, y: 625.9, z: 93.9, o: 0.5 });
+    expect(cache.self.position?.seq).toBe(40);
+    expect(cache.nearby.has(SELF_GUID)).toBe(false); // never upserted as a nearby unit
+    cache.apply(toEvents([moveResult("teleported", 1, 41)])[0]!);
+    expect(cache.self.position?.value).toEqual({ map: 0, x: -8833.4, y: 625.9, z: 93.9, o: 0.5 });
+    // Every later own position still folds.
+    cache.apply(toEvents([moveResult("arrived", 2, 42)])[0]!);
+    expect(cache.self.position?.value.x).toBe(-1205);
+  });
+
   test("a pending transfer is visible until NEW_WORLD completes or ABORTED cancels it", () => {
     const pending = StateCache.replay(toEvents([...loginSequence, transferPending(369)]), { seed: SEED });
     expect(pending.self.transfer?.value).toEqual({ toMap: 369 });
@@ -354,6 +416,48 @@ describe("state cache: self, from the wire", () => {
     const cache = StateCache.replay(toEvents([moveProgress]), { seed: SEED });
     expect(cache.self.position).toBeUndefined();
     expect(cache.anomalies[0]?.kind).toBe("self_position_without_map");
+  });
+});
+
+describe("state cache: a ghost knows where its corpse is", () => {
+  const GRAVE = { map: 0, x: -1500, y: 900, z: 50 };
+  const CORPSE = { map: 0, x: -1240.1, y: 990.4, z: 42.5 };
+
+  test("the died transition pins the corpse to the death spot until the query answers", () => {
+    const cache = StateCache.replay(toEvents([...loginSequence, selfCreate, selfHealth(0, 30)]), { seed: SEED });
+    expect(cache.self.corpse?.value).toEqual({ map: 0, x: -1234.5, y: 987.25, z: 42.125, source: "death_spot" });
+    expect(cache.self.graveyard).toBeUndefined();
+  });
+
+  test("the corpse query and the release loc are the server's word, and the resurrect clears both", () => {
+    const events = toEvents([
+      ...loginSequence,
+      selfCreate,
+      selfHealth(0, 30),
+      deathReleaseLoc(31, GRAVE),
+      selfHealth(1, 32),
+      corpseQuery(33, CORPSE),
+    ]);
+    const cache = StateCache.replay(events, { seed: SEED });
+    expect(cache.self.graveyard?.value).toEqual(GRAVE);
+    expect(cache.self.corpse?.value).toEqual({ ...CORPSE, source: "corpse_query" });
+    expect(cache.self.corpse?.seq).toBe(33);
+    cache.apply(toEvents([corpseReclaimDelay(30_000, 34, 1_000)])[0]!);
+    expect(cache.self.reclaimDelay?.value).toEqual({ delayMs: 30_000, readyAt: 31_000 });
+    cache.apply(toEvents([deathReleaseCleared(40)])[0]!);
+    expect(cache.self.corpse).toBeUndefined();
+    expect(cache.self.graveyard).toBeUndefined();
+    expect(cache.self.reclaimDelay).toBeUndefined();
+  });
+
+  test("a corpse query answered not-found leaves no corpse, and a values delta without a death does not invent one", () => {
+    const cache = StateCache.replay(
+      toEvents([...loginSequence, selfCreate, selfHealth(0, 30), corpseQuery(31)]),
+      { seed: SEED },
+    );
+    expect(cache.self.corpse).toBeUndefined();
+    const living = StateCache.replay(toEvents([...loginSequence, selfCreate, selfHealth(50, 30)]), { seed: SEED });
+    expect(living.self.corpse).toBeUndefined();
   });
 });
 
@@ -639,9 +743,34 @@ describe("state cache: self progress, target and inventory", () => {
         itemId: ITEM_ENTRY,
         name: "Gritstone Charm",
         count: 5,
+        quality: 1,
       },
     ]);
     expect(bag.freeSlots).toBe(15);
+    expect(bag.totalSlots).toBe(16);
+    expect(bag.bags).toEqual([]);
+  });
+
+  test("bag() spans a worn bag: container slots joined, addressed by the bag's equip slot", () => {
+    const cache = withWorld([inventorySlot, itemCreate, itemQuery, wornBagSlot, wornBagCreate, wornBagQuery]);
+    const bag = cache.bag();
+    expect(bag.bags).toEqual([{ slot: BAG_SLOT, numSlots: BAG_NUM_SLOTS, name: "Small Brown Pouch" }]);
+    expect(bag.totalSlots).toBe(16 + BAG_NUM_SLOTS);
+    expect(bag.items.map((i) => [i.bag, i.slot, i.guid, i.name, i.count])).toEqual([
+      [255, BACKPACK_SLOT, ITEM_GUID, "Gritstone Charm", 5],
+      [BAG_SLOT, 2, BAGGED_GUID, "Gritstone Charm", 2],
+    ]);
+    expect(bag.freeSlots).toBe(16 + BAG_NUM_SLOTS - 2);
+    // The bag itself is equipment (slot 19), never a carried item.
+    expect(bag.items.some((i) => i.guid === BAG_GUID)).toBe(false);
+    expect(cache.inventory.find((i) => i.slot === BAG_SLOT)?.name).toBe("Small Brown Pouch");
+  });
+
+  test("a worn bag whose create block has not arrived adds no slots", () => {
+    const bag = withWorld([wornBagSlot]).bag();
+    expect(bag.bags).toEqual([{ slot: BAG_SLOT, numSlots: 0, name: undefined }]);
+    expect(bag.totalSlots).toBe(16);
+    expect(bag.freeSlots).toBe(16);
   });
 
   test("bag() reports an unjoined slot as occupied, and equipment stays out", () => {
@@ -653,7 +782,7 @@ describe("state cache: self progress, target and inventory", () => {
     expect(bag.items[0]?.itemId).toBeUndefined();
     expect(bag.freeSlots).toBe(15);
     // No inventory fields at all: nothing occupied has been observed.
-    expect(withWorld([]).bag()).toEqual({ items: [], freeSlots: 16 });
+    expect(withWorld([]).bag()).toEqual({ items: [], freeSlots: 16, totalSlots: 16, bags: [] });
   });
 
   test("a zeroed slot is empty, not an item with guid 0", () => {
@@ -777,6 +906,17 @@ describe("WB_SESSION_STATE (reattach)", () => {
     expect(cache.anomalies.length).toBe(0);
   });
 
+  test("seeds zone and area when the snapshot carries them", () => {
+    const f = frame("7");
+    const cache = StateCache.replay(
+      toEvents([{ ...f, data: { ...f.data, zoneId: 12, zoneName: "Elwynn Forest", areaId: 9, areaName: "Northshire Valley" } }]),
+    );
+    expect(cache.self.zone?.value).toEqual({ id: 12, name: "Elwynn Forest" });
+    expect(cache.self.area?.value).toEqual({ id: 9, name: "Northshire Valley" });
+    // A pre-N2 module's snapshot has neither: nothing is invented.
+    expect(StateCache.replay(toEvents([frame("7")])).self.zone).toBeUndefined();
+  });
+
   test("contradicting guid records an anomaly, never overwrites", () => {
     const cache = StateCache.replay(toEvents([frame("999")]), { seed: SEED });
     expect(cache.self.level?.value).toBeUndefined();
@@ -887,6 +1027,34 @@ function namedEntry(entry: number, name: string, seq: number): unknown {
     opcodeId: 0x061,
     ts: 1_700_000_000_000 + seq,
     data: { entry, found: true, name, subname: "", type: 1, rank: 0 },
+  };
+}
+
+/** The game object template answer the module fires on first sight of a gameObject entry. */
+function namedGameObject(entry: number, name: string, seq: number, type = 5): unknown {
+  return {
+    seq,
+    opcode: "SMSG_GAMEOBJECT_QUERY_RESPONSE",
+    opcodeId: 0x05f,
+    ts: 1_700_000_000_000 + seq,
+    data: { entry, found: true, name, type, displayId: 1, castBarCaption: "" },
+  };
+}
+
+function transportProgress(
+  guid: string,
+  entry: number,
+  seq: number,
+  pos: { x: number; y: number; z: number },
+  docked: boolean | undefined,
+  progressMs = 1000,
+): unknown {
+  return {
+    seq,
+    opcode: "WB_TRANSPORT_PROGRESS",
+    opcodeId: 0xff06,
+    ts: 1_700_000_000_000 + seq,
+    data: { guid, entry, pos: { ...pos, o: 0 }, progressMs, periodMs: 143_330, ...(docked === undefined ? {} : { docked }) },
   };
 }
 
@@ -1012,9 +1180,9 @@ describe("state.units(): the flat scan helper", () => {
   const treeStream: unknown[] = [
     ...worldStream,
     unitAt(STUMP_GUID, 60, { dx: 2, objectType: "gameObject", entry: STUMP_ENTRY }),
-    namedEntry(STUMP_ENTRY, "tree stump", 61),
+    namedGameObject(STUMP_ENTRY, "tree stump", 61),
     unitAt(TREE_GUID, 62, { dx: 20, objectType: "gameObject", entry: TREE_ENTRY }),
-    namedEntry(TREE_ENTRY, "tree", 63),
+    namedGameObject(TREE_ENTRY, "tree", 63),
   ];
   const treeCache = () => StateCache.replay(toEvents(treeStream), { seed: SEED });
 
@@ -1484,5 +1652,294 @@ describe("state cache: spellbook, cooldowns and talents (FOLLOW-UPS 39)", () => 
       ts: 1_700_000_000_061,
     });
     expect(c.snapshot().talents?.unspentPoints).toBe(2);
+  });
+});
+
+describe("xp is read off the state object, not off self", () => {
+  test("state.self.xp and state.self.experience throw and name state.xp", () => {
+    const cache = new StateCache();
+    expect(() => (cache.self as unknown as { xp: unknown }).xp).toThrow(/state\.xp/);
+    expect(() => (cache.self as unknown as { experience: unknown }).experience).toThrow(
+      /state\.nextLevelXp/,
+    );
+  });
+
+  test("the guards are invisible to snapshot, spread and JSON", () => {
+    const cache = new StateCache();
+    expect(() => cache.snapshot()).not.toThrow();
+    expect(() => JSON.stringify(cache.self)).not.toThrow();
+    expect(() => ({ ...cache.self })).not.toThrow();
+    expect(Object.keys(cache.self)).not.toContain("xp");
+  });
+});
+
+describe("game objects: names, goType and transports", () => {
+  const TRAM_GUID = "9001";
+  const TRAM_ENTRY = 176081;
+  const BOX_GUID = "9002";
+  const BOX_ENTRY = 32571;
+
+  test("a game object is named from its own query answer, never from a creature with the same entry", () => {
+    const c = StateCache.replay(
+      toEvents([
+        ...worldStream,
+        unitAt(BOX_GUID, 60, { dx: 3, objectType: "gameObject", entry: BOX_ENTRY }),
+        namedEntry(BOX_ENTRY, "Not A Mailbox", 61),
+      ]),
+      { seed: SEED },
+    );
+    expect(c.units({ type: "gameObject" })[0]!.name).toBeUndefined();
+    c.apply(toEvents([namedGameObject(BOX_ENTRY, "Mailbox", 62, 19)])[0]!);
+    const row = c.units({ type: "gameObject" })[0]!;
+    expect(row.name).toBe("Mailbox");
+    expect(row.goType).toBe("mailbox");
+    expect(c.gameObjects.get(BOX_ENTRY)?.value.type).toBe(19);
+  });
+
+  test("goType comes from the create block's GAMEOBJECT_BYTES_1 when present, named from the core enum", () => {
+    const c = StateCache.replay(
+      toEvents([
+        ...worldStream,
+        {
+          seq: 60,
+          opcode: "SMSG_UPDATE_OBJECT",
+          opcodeId: 0x0a9,
+          ts: 1_700_000_000_060,
+          data: {
+            blocks: 1,
+            objects: [
+              {
+                update: "create",
+                guid: TRAM_GUID,
+                objectType: "gameObject",
+                pos: { x: 4.5, y: 8.4, z: -4.3, o: 0 },
+                pathProgress: 12_000,
+                fields: { entry: TRAM_ENTRY, goState: 1, goType: 11 },
+              },
+            ],
+          },
+        },
+      ]),
+      { seed: SEED },
+    );
+    const row = c.units({ type: "gameObject" }).find((r) => r.guid === TRAM_GUID)!;
+    expect(row.goType).toBe("transport");
+    expect(row.docked).toBeUndefined(); // the clock alone says nothing about dwelling
+    expect(c.nearby.get(TRAM_GUID)?.transport?.value.progressMs).toBe(12_000);
+    // A unit never has a goType, and a value outside the enum is "unknown".
+    expect(c.units({ type: "unit" })[0]!.goType).toBeUndefined();
+    expect(gameObjectTypeName(99)).toBe("unknown");
+  });
+
+  test("WB_TRANSPORT_PROGRESS moves the car, sets docked, and accrues the places it stops", () => {
+    const c = StateCache.replay(
+      toEvents([
+        ...worldStream,
+        unitAt(TRAM_GUID, 60, { dx: 0, objectType: "gameObject", entry: TRAM_ENTRY }),
+        namedGameObject(TRAM_ENTRY, "Subway", 61, 11),
+        transportProgress(TRAM_GUID, TRAM_ENTRY, 62, { x: 4.5, y: 8.4, z: -4.3 }, true, 1000),
+        transportProgress(TRAM_GUID, TRAM_ENTRY, 63, { x: 4.5, y: 9.0, z: -4.3 }, true, 2000),
+        transportProgress(TRAM_GUID, TRAM_ENTRY, 64, { x: 4.5, y: 900.0, z: -4.3 }, false, 40_000),
+      ]),
+      { seed: SEED },
+    );
+    const row = c.units({ type: "gameObject" }).find((r) => r.guid === TRAM_GUID)!;
+    expect(row.name).toBe("Subway");
+    expect(row.goType).toBe("transport");
+    expect(row.docked).toBe(false);
+    expect(row.y).toBe(900);
+    const t = c.nearby.get(TRAM_GUID)!.transport!.value;
+    expect(t.progressMs).toBe(40_000);
+    expect(t.periodMs).toBe(143_330);
+    expect(t.docks).toEqual([{ x: 4.5, y: 8.4, z: -4.3 }]); // 0.6y apart: one dock, not two
+    c.apply(toEvents([transportProgress(TRAM_GUID, TRAM_ENTRY, 65, { x: 4.5, y: 2480.0, z: -4.3 }, true, 70_000)])[0]!);
+    expect(c.nearby.get(TRAM_GUID)!.transport!.value.docks).toHaveLength(2);
+    expect(c.units({ type: "gameObject" }).find((r) => r.guid === TRAM_GUID)!.docked).toBe(true);
+  });
+
+  test("a report for a car the update stream never created still puts it in view, typed by its report", () => {
+    const c = StateCache.replay(
+      toEvents([...worldStream, transportProgress(TRAM_GUID, TRAM_ENTRY, 62, { x: 4.5, y: 8.4, z: -4.3 }, true)]),
+      { seed: SEED },
+    );
+    const obj = c.nearby.get(TRAM_GUID)!;
+    expect(obj.entry?.value).toBe(TRAM_ENTRY);
+    expect(obj.transport?.value.docked).toBe(true);
+    // No create block: objectType is unobserved, so it is not a gameObject row and has no goType.
+    expect(c.units().find((r) => r.guid === TRAM_GUID)!.goType).toBeUndefined();
+  });
+});
+
+describe("WB_AREA (zone/subzone as the client names them)", () => {
+  const area = (seq: number, d: Record<string, unknown>) => ({
+    seq,
+    opcode: "WB_AREA",
+    opcodeId: 0xff07,
+    ts: 1000 + seq,
+    data: { mapId: 0, zoneId: 12, zoneName: "Elwynn Forest", areaId: 9, areaName: "Northshire Valley", ...d },
+  });
+
+  test("folds into self.zone / self.area as Observed { id, name }", () => {
+    const cache = StateCache.replay(toEvents([area(1, {})]), { seed: SEED });
+    expect(cache.self.zone).toEqual({ value: { id: 12, name: "Elwynn Forest" }, seq: 1, ts: 1001 });
+    expect(cache.self.area).toEqual({ value: { id: 9, name: "Northshire Valley" }, seq: 1, ts: 1001 });
+  });
+
+  test("a later event replaces both; the zone survives a subzone-only change", () => {
+    const cache = StateCache.replay(
+      toEvents([area(1, {}), area(2, { areaId: 24, areaName: "Northshire Abbey" })]),
+      { seed: SEED },
+    );
+    expect(cache.self.zone?.value).toEqual({ id: 12, name: "Elwynn Forest" });
+    expect(cache.self.area?.value).toEqual({ id: 24, name: "Northshire Abbey" });
+    expect(cache.self.area?.seq).toBe(2);
+  });
+});
+
+describe("units(): NPC roles from UNIT_NPC_FLAGS", () => {
+  const cache = () =>
+    StateCache.replay(
+      toEvents([
+        // questgiver + gossip
+        unitAt("901", 1, { dx: 3, entry: 823, health: 100, maxHealth: 100, npcFlags: 0x3 }),
+        // vendor (general + food) + repair
+        unitAt("902", 2, { dx: 5, entry: 824, health: 100, maxHealth: 100, npcFlags: 0x80 | 0x200 | 0x1000 }),
+        // flight master
+        unitAt("903", 3, { dx: 7, entry: 825, health: 100, maxHealth: 100, npcFlags: 0x2000 }),
+        // flags never observed
+        unitAt("904", 4, { dx: 9, entry: 826, health: 100, maxHealth: 100 }),
+      ]),
+      { seed: SEED },
+    );
+
+  test("rows carry role words in bit order; no flags means an empty array", () => {
+    const c = cache();
+    const by = (g: string) => c.units().find((u) => u.guid === g)!.roles;
+    expect(by("901")).toEqual(["gossip", "questGiver"]);
+    expect(by("902")).toEqual(["vendor", "foodVendor", "repair"]);
+    expect(by("903")).toEqual(["flightMaster"]);
+    expect(by("904")).toEqual([]);
+  });
+
+  test("role filter matches one word or any of a list, nearest first", () => {
+    const c = cache();
+    expect(c.units({ role: "questGiver" }).map((u) => u.guid)).toEqual(["901"]);
+    expect(c.units({ role: ["repair", "flightMaster"] }).map((u) => u.guid)).toEqual(["902", "903"]);
+    expect(c.units({ role: "innkeeper" })).toEqual([]);
+  });
+
+  test("an unknown role word is rejected with the list", () => {
+    expect(() => cache().units({ role: "flight master" as never })).toThrow(/role received "flight master", expected one of/);
+  });
+});
+
+describe("achievements and flight paths (ADR-0048)", () => {
+  const earned = (seq: number, id: number, self: boolean, extra: Record<string, unknown> = {}) => ({
+    seq,
+    opcode: "SMSG_ACHIEVEMENT_EARNED",
+    opcodeId: 0x468,
+    ts: 2000 + seq,
+    data: {
+      guid: self ? SEED.guid : "999",
+      self,
+      achievement: { achievementId: id, date: 123, time: "2026-08-25 10:00", ...extra },
+    },
+  });
+  const backlog = (seq: number, ids: number[]) => ({
+    seq,
+    opcode: "SMSG_ALL_ACHIEVEMENT_DATA",
+    opcodeId: 0x47d,
+    ts: 2000 + seq,
+    data: {
+      count: ids.length,
+      achievements: ids.map((id) => ({ achievementId: id, date: 1, points: 10 })),
+    },
+  });
+  const taxiReply = (seq: number, reply: number) => ({
+    seq,
+    opcode: "SMSG_ACTIVATETAXIREPLY",
+    opcodeId: 0x1ae,
+    ts: 2000 + seq,
+    data: { reply, ok: reply === 0 },
+  });
+  /** A self values block carrying `unitFlags` (and the module's named bit). */
+  const unitFlags = (seq: number, flags: number) => ({
+    seq,
+    opcode: "SMSG_UPDATE_OBJECT",
+    opcodeId: 0x0a9,
+    ts: 2000 + seq,
+    data: {
+      blocks: 1,
+      objects: [
+        {
+          update: "values",
+          guid: SEED.guid,
+          fields: { unitFlags: flags, taxiFlight: (flags & 0x0010_0000) !== 0 },
+        },
+      ],
+    },
+  });
+
+  test("the login backlog and our own earns land in self.achievements, with the points total", () => {
+    const cache = StateCache.replay(
+      toEvents([backlog(1, [6, 7]), earned(2, 12, true, { name: "Explore Elwynn Forest", points: 10, categoryId: 97 })]),
+      { seed: SEED },
+    );
+    const a = cache.self.achievements!;
+    expect(a.loginSeen).toBe(true);
+    expect(a.entries.map((e) => [e.achievementId, e.source])).toEqual([
+      [6, "login"],
+      [7, "login"],
+      [12, "earned"],
+    ]);
+    expect(a.points).toBe(30);
+    expect(a.entries[2]!.name).toBe("Explore Elwynn Forest");
+    expect(a.entries[2]!.categoryId).toBe(97);
+  });
+
+  test("a say-range broadcast for another player is not ours and is dropped", () => {
+    // SMSG_ACHIEVEMENT_EARNED reaches every client in say range; `self` is the
+    // only thing that makes it this character's.
+    const cache = StateCache.replay(toEvents([earned(1, 99, false, { points: 50 })]), { seed: SEED });
+    expect(cache.self.achievements).toBeUndefined();
+  });
+
+  test("an empty backlog is observed, which is not the same as no backlog", () => {
+    const cache = StateCache.replay(toEvents([backlog(1, [])]), { seed: SEED });
+    expect(cache.self.achievements).toEqual({ entries: [], points: 0, loginSeen: true });
+    expect(StateCache.replay(toEvents([]), { seed: SEED }).self.achievements).toBeUndefined();
+  });
+
+  test("an id already in the backlog is not double-counted by a later earn", () => {
+    const cache = StateCache.replay(toEvents([backlog(1, [6]), earned(2, 6, true, { points: 10 })]), {
+      seed: SEED,
+    });
+    expect(cache.self.achievements!.entries).toHaveLength(1);
+    expect(cache.self.achievements!.points).toBe(10);
+    expect(cache.self.achievements!.entries[0]!.source).toBe("login");
+  });
+
+  test("taxiFlight is the UNIT_FLAG_TAXI_FLIGHT bit on self, with the reply beside it", () => {
+    const cache = StateCache.replay(
+      toEvents([unitFlags(1, 0x8), taxiReply(2, 0), unitFlags(3, 0x0010_0008), unitFlags(4, 0x8)]),
+      { seed: SEED },
+    );
+    expect(cache.self.taxiReply?.value).toEqual({ reply: 0, ok: true });
+    // The last word is the landing; the flip itself is the runner's to read.
+    expect(cache.self.taxiFlight).toEqual({ value: false, seq: 4, ts: 2004 });
+  });
+
+  test("a refused flight is an ok:false reply and no flag", () => {
+    const cache = StateCache.replay(toEvents([taxiReply(1, 3)]), { seed: SEED });
+    expect(cache.self.taxiReply?.value).toEqual({ reply: 3, ok: false });
+    expect(cache.self.taxiFlight).toBeUndefined();
+  });
+
+  test("a block with no unitFlags leaves taxiFlight alone rather than reading it as false", () => {
+    const cache = StateCache.replay(
+      toEvents([unitFlags(1, 0x0010_0000), selfProgress]),
+      { seed: SEED },
+    );
+    expect(cache.self.taxiFlight).toEqual({ value: true, seq: 1, ts: 2001 });
   });
 });

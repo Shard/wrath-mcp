@@ -39,6 +39,7 @@ import {
   type AuraData,
   type AuraUpdateData,
   type CreateBlock,
+  type GameObjectQueryResponseData,
   type GuidKey,
   type CooldownEventData,
   type InitialSpellsData,
@@ -49,6 +50,10 @@ import {
   type SpellCooldownData,
   type SupersededSpellData,
   type TalentsInfoData,
+  type AchievementEarnedData,
+  type AllAchievementData,
+  type ActivateTaxiReplyData,
+  type TransportProgressData,
   type QuestGiverStatusData,
   type QuestGiverStatusMultipleData,
   type QuestQueryResponseData,
@@ -58,6 +63,9 @@ import {
   type UpdateFields,
 } from "./protocol";
 import { STREAM_GAP, type StreamEvent } from "./events";
+
+/** `UNIT_FLAG_TAXI_FLIGHT` — the bit a client reads to know it is being flown. */
+const UNIT_FLAG_TAXI_FLIGHT = 0x0010_0000;
 
 /** A value together with the event that carried it. */
 export interface Observed<T> {
@@ -163,10 +171,101 @@ export interface UnitFieldsState {
   fields: Map<string, Observed<number>>;
 }
 
+/**
+ * Where the corpse is, while dead. `source` says which packet it came from:
+ * `corpse_query` is the server's own answer to the ghost's `MSG_CORPSE_QUERY`
+ * (the one a client draws its corpse marker from); `death_spot` is the own
+ * position at the moment health reached 0, held until that answer lands. Both
+ * are things a client shows a player.
+ */
+export interface CorpseLocation extends Point3 {
+  readonly map: number;
+  readonly source: "corpse_query" | "death_spot";
+}
+
+/**
+ * A zone or subzone as the client names it: the id the client computes from
+ * its own map files and the `AreaTable.dbc` name it draws on screen. `name` is
+ * `""` only for an id the DBC has no row for.
+ */
+export interface AreaRef {
+  readonly id: number;
+  readonly name: string;
+}
+
+/**
+ * One achievement the character holds, as the packets said it (ADR-0048).
+ *
+ * `source` is which packet carried it: `login` is the `SMSG_ALL_ACHIEVEMENT_DATA`
+ * backlog a client receives once during login, `earned` is an
+ * `SMSG_ACHIEVEMENT_EARNED` for our own guid. The distinction is the whole
+ * point — a backlog entry is history, an earn is a thing that just happened —
+ * and it is what keeps the runner from re-reporting a resumed run's past as
+ * fresh milestones.
+ *
+ * `name`, `points` and `categoryId` are present only when the module could read
+ * `Achievement.dbc`; nothing is invented for an id it could not name.
+ */
+export interface AchievementEntry {
+  readonly achievementId: number;
+  readonly name: string | undefined;
+  readonly points: number | undefined;
+  readonly categoryId: number | undefined;
+  /** The wire's packed time bitfield, and the module's reading of it. */
+  readonly date: number | undefined;
+  readonly time: string | undefined;
+  readonly source: "login" | "earned";
+  readonly seq: number;
+  readonly ts: number;
+}
+
+/**
+ * Every achievement observed for our own character, in observation order:
+ * the login backlog first, then each earn as it landed.
+ *
+ * `points` is the sum of the entries whose points the module could name — a
+ * lower bound when `Achievement.dbc` is absent, never a guess. `loginSeen` is
+ * whether `SMSG_ALL_ACHIEVEMENT_DATA` was observed at all, which is a different
+ * fact from the list being empty: a fresh character's backlog is genuinely
+ * empty, and a session the cache joined late has no backlog to show.
+ */
+export interface AchievementsState {
+  readonly entries: readonly AchievementEntry[];
+  readonly points: number;
+  readonly loginSeen: boolean;
+}
+
 export interface SelfState extends UnitFieldsState {
   guid: GuidKey | undefined;
   name: string | undefined;
   position: Observed<WorldPosition> | undefined;
+  /**
+   * The zone the character stands in (`WB_AREA`, seeded by the login
+   * snapshot): the top-level area, e.g. "Elwynn Forest". Changes whether the
+   * character walked, was teleported or transferred.
+   */
+  zone: Observed<AreaRef> | undefined;
+  /** The subzone (`WB_AREA`), e.g. "Northshire Valley"; equals `zone` when there is none. */
+  area: Observed<AreaRef> | undefined;
+  /**
+   * The corpse, from death until the resurrect (`SMSG_DEATH_RELEASE_LOC` with
+   * `map: -1`). `undefined` while alive, before the first death, or when the
+   * server answered the corpse query with "no corpse" (a spirit-healer
+   * resurrection or a corpse that expired). A ghost walks here to reclaim.
+   */
+  corpse: Observed<CorpseLocation> | undefined;
+  /**
+   * The graveyard the spirit was released to, from `SMSG_DEATH_RELEASE_LOC`
+   * (the packet a client draws the spirit-healer marker from). Cleared by the
+   * same packet with `map: -1`, which is what a resurrect sends first.
+   */
+  graveyard: Observed<Point3 & { readonly map: number }> | undefined;
+  /**
+   * The server's reclaim delay for this death (`SMSG_CORPSE_RECLAIM_DELAY`):
+   * `readyAt` is the event's wall-clock `ts` plus `delayMs`, when a reclaim
+   * becomes legal. Cleared by the resurrect.
+   */
+  reclaimDelay: Observed<{ readonly delayMs: number; readonly readyAt: number }> | undefined;
   /**
    * A map transfer the server announced (`SMSG_TRANSFER_PENDING`) and has not
    * yet completed (`SMSG_NEW_WORLD`) or abandoned (`SMSG_TRANSFER_ABORTED`).
@@ -175,6 +274,24 @@ export interface SelfState extends UnitFieldsState {
   transfer: Observed<{ readonly toMap: number }> | undefined;
   /** `UNIT_FIELD_TARGET` on our own block: what the client shows as selected. */
   targetGuid: Observed<GuidKey> | undefined;
+  /**
+   * Achievements held, from the login backlog and our own earns (ADR-0048).
+   * `undefined` until an achievement packet has been observed at all.
+   */
+  achievements: AchievementsState | undefined;
+  /**
+   * `UNIT_FLAG_TAXI_FLIGHT` on our own `unitFlags`: true while the character is
+   * being flown. There is no flight event — a `taxiReply` of `ok` followed by
+   * this turning true is the flight starting, and the flip back is the landing,
+   * exactly as a client reads it.
+   */
+  taxiFlight: Observed<boolean> | undefined;
+  /**
+   * The last `SMSG_ACTIVATETAXIREPLY` (the answer to a raw `CMSG_ACTIVATETAXI`).
+   * Kept because it is the only thing that says a flight was *accepted*; the
+   * ride itself shows on `taxiFlight`.
+   */
+  taxiReply: Observed<{ readonly reply: number; readonly ok: boolean }> | undefined;
 }
 
 /**
@@ -290,9 +407,12 @@ export interface InventoryItem {
 }
 
 /**
- * One occupied backpack slot, addressed the way the item actions want it:
- * `bag`/`slot` feed `equipItem`, `useItem` and `destroyItem` unchanged
- * (`bag` 255 is the backpack, `slot` 23-38).
+ * One occupied carried slot, addressed the way the item actions want it:
+ * `bag`/`slot` feed `equipItem`, `useItem` and `destroyItem` unchanged. For
+ * the backpack `bag` is 255 and `slot` 23-38; for a worn bag `bag` is the
+ * bag's own equipment slot (19-22) and `slot` 0..numSlots-1 — exactly what
+ * `Player::GetItemByPos(bag, slot)` resolves behind `CMSG_USE_ITEM` and
+ * `CMSG_DESTROYITEM`.
  */
 export interface BagSlotItem {
   readonly bag: number;
@@ -301,12 +421,26 @@ export interface BagSlotItem {
   readonly itemId: number | undefined;
   readonly name: string | undefined;
   readonly count: number | undefined;
+  /** Item quality (0 poor .. 5 legendary) from the item query, when answered. */
+  readonly quality?: number | undefined;
 }
 
-/** The backpack as `bag()` reports it. */
+/** One worn bag, by the equipment slot the item actions address it as. */
+export interface WornBag {
+  readonly slot: number;
+  readonly numSlots: number;
+  readonly name: string | undefined;
+}
+
+/** The whole carried inventory — backpack plus worn bags — as `bag()` reports it. */
 export interface BagContents {
   readonly items: readonly BagSlotItem[];
+  /** Empty slots across the backpack and every worn bag whose size is known. */
   readonly freeSlots: number;
+  /** 16 for the backpack plus each worn bag's `numSlots`. */
+  readonly totalSlots: number;
+  /** Worn bags (equipment slots 19-22), in slot order. */
+  readonly bags: readonly WornBag[];
 }
 
 /** What an item query answered about one item entry. */
@@ -395,6 +529,82 @@ export interface CreatureInfo {
   readonly rank: number | undefined;
 }
 
+/** A game object template as `SMSG_GAMEOBJECT_QUERY_RESPONSE` describes it. */
+export interface GameObjectInfo {
+  readonly entry: number;
+  readonly name: string;
+  /** The core's `GameobjectTypes` value; `gameObjectTypeName` names it. */
+  readonly type: number | undefined;
+  readonly displayId: number | undefined;
+  readonly castBarCaption: string | undefined;
+}
+
+/**
+ * The core's `GameobjectTypes` enum (SharedDefines.h, 3.3.5a), by value. A
+ * value outside the enum reads as `unknown`.
+ */
+export const GAME_OBJECT_TYPE_NAMES = [
+  "door",
+  "button",
+  "questgiver",
+  "chest",
+  "binder",
+  "generic",
+  "trap",
+  "chair",
+  "spell_focus",
+  "text",
+  "goober",
+  "transport",
+  "areadamage",
+  "camera",
+  "map_object",
+  "mo_transport",
+  "duel_arbiter",
+  "fishingnode",
+  "summoning_ritual",
+  "mailbox",
+  "do_not_use",
+  "guardpost",
+  "spellcaster",
+  "meetingstone",
+  "flagstand",
+  "fishinghole",
+  "flagdrop",
+  "mini_game",
+  "do_not_use_2",
+  "capture_point",
+  "aura_generator",
+  "dungeon_difficulty",
+  "barber_chair",
+  "destructible_building",
+  "guild_bank",
+  "trapdoor",
+] as const;
+export type GameObjectTypeName = (typeof GAME_OBJECT_TYPE_NAMES)[number] | "unknown";
+
+export function gameObjectTypeName(type: number): GameObjectTypeName {
+  return GAME_OBJECT_TYPE_NAMES[type] ?? "unknown";
+}
+
+/**
+ * What a client animates for a transport it has been sent: the car's clock
+ * on its `TransportAnimation.dbc` period and whether the segment under that
+ * clock has no displacement (the car is dwelling at a platform). Folded from
+ * `WB_TRANSPORT_PROGRESS`; the position itself goes on `position`.
+ */
+export interface TransportState {
+  readonly progressMs: number;
+  readonly periodMs: number | undefined;
+  readonly docked: boolean | undefined;
+  /**
+   * Every point this car has been observed dwelling at (`docked: true`),
+   * deduplicated within 5y: where it stops, as far as this session has seen.
+   * A tram car accrues its two platforms over one round trip.
+   */
+  readonly docks: readonly Point3[];
+}
+
 /** One selectable row of an open gossip menu, as `gossipSelect` resolves against. */
 export interface GossipMenuOption {
   readonly optionId: number;
@@ -432,6 +642,12 @@ export interface NearbyObject extends UnitFieldsState {
   /** From `SMSG_MONSTER_MOVE`: creatures move by spline, not by `MSG_MOVE_*`. */
   motion: Observed<Motion> | undefined;
   targetGuid: Observed<GuidKey> | undefined;
+  /**
+   * Transports only: the animation clock and `docked`, from the create block's
+   * `pathProgress` and then every `WB_TRANSPORT_PROGRESS`. Undefined for
+   * everything else and for a transport the module has not yet reported on.
+   */
+  transport: Observed<TransportState> | undefined;
   /**
    * The questgiver marker the client draws over this object (`!`/`?`/grey),
    * from `SMSG_QUESTGIVER_STATUS` / `_MULTIPLE`. The wire `DIALOG_STATUS_*`
@@ -484,6 +700,98 @@ export interface UnitView {
   readonly questGiver: QuestGiverStatusName | undefined;
   /** The raw `DIALOG_STATUS_*` byte behind `questGiver`. */
   readonly questGiverStatus: number | undefined;
+  /**
+   * What this NPC is for, decoded from its `UNIT_NPC_FLAGS` (the bits a client
+   * uses to pick the cursor and the interaction window): `questGiver`,
+   * `vendor`, `trainer`, `flightMaster`, `innkeeper`, … Role words only, no
+   * recommendation. Empty for players, game objects and creatures with no
+   * flags; empty (not undefined) when the flags were never observed.
+   */
+  readonly roles: readonly NpcRole[];
+  /**
+   * Game objects only: what kind of object this is, named from the core's
+   * `GameobjectTypes` (`door`, `chest`, `mailbox`, `transport`, …). From the
+   * object's own `GAMEOBJECT_BYTES_1` or its template answer; undefined for
+   * units and players, and for a game object neither has described yet.
+   */
+  readonly goType: GameObjectTypeName | undefined;
+  /**
+   * Transports only: `true` while the car is dwelling at a platform, `false`
+   * while it is between ends — from the same `TransportAnimation.dbc` clock a
+   * client animates the car with (`WB_TRANSPORT_PROGRESS`). Undefined for
+   * everything that is not a transport, and until the first report.
+   */
+  readonly docked: boolean | undefined;
+}
+
+/**
+ * `UNIT_NPC_FLAGS` bits, 3.3.5a (`UnitDefines.h` NPCFlags), as role words.
+ * Sub-kinds (`classTrainer`, `foodVendor`) come alongside their parent
+ * (`trainer`, `vendor`) when the server sets both bits, which it does.
+ */
+export const NPC_ROLES = [
+  "gossip",
+  "questGiver",
+  "trainer",
+  "classTrainer",
+  "professionTrainer",
+  "vendor",
+  "ammoVendor",
+  "foodVendor",
+  "poisonVendor",
+  "reagentVendor",
+  "repair",
+  "flightMaster",
+  "spiritHealer",
+  "spiritGuide",
+  "innkeeper",
+  "banker",
+  "petitioner",
+  "tabardDesigner",
+  "battlemaster",
+  "auctioneer",
+  "stableMaster",
+  "guildBanker",
+  "spellClick",
+  "playerVehicle",
+  "mailbox",
+] as const;
+export type NpcRole = (typeof NPC_ROLES)[number];
+
+const NPC_ROLE_BITS: readonly (readonly [number, NpcRole])[] = [
+  [0x00000001, "gossip"],
+  [0x00000002, "questGiver"],
+  [0x00000010, "trainer"],
+  [0x00000020, "classTrainer"],
+  [0x00000040, "professionTrainer"],
+  [0x00000080, "vendor"],
+  [0x00000100, "ammoVendor"],
+  [0x00000200, "foodVendor"],
+  [0x00000400, "poisonVendor"],
+  [0x00000800, "reagentVendor"],
+  [0x00001000, "repair"],
+  [0x00002000, "flightMaster"],
+  [0x00004000, "spiritHealer"],
+  [0x00008000, "spiritGuide"],
+  [0x00010000, "innkeeper"],
+  [0x00020000, "banker"],
+  [0x00040000, "petitioner"],
+  [0x00080000, "tabardDesigner"],
+  [0x00100000, "battlemaster"],
+  [0x00200000, "auctioneer"],
+  [0x00400000, "stableMaster"],
+  [0x00800000, "guildBanker"],
+  [0x01000000, "spellClick"],
+  [0x02000000, "playerVehicle"],
+  [0x04000000, "mailbox"],
+];
+
+/** Decode a `UNIT_NPC_FLAGS` value into role words, in bit order. */
+export function npcRolesOf(npcFlags: number | undefined): NpcRole[] {
+  if (npcFlags === undefined || npcFlags === 0) return [];
+  const out: NpcRole[] = [];
+  for (const [bit, role] of NPC_ROLE_BITS) if ((npcFlags & bit) !== 0) out.push(role);
+  return out;
 }
 
 /** The `DIALOG_STATUS_*` names, 3.3.5a. `unknown` covers any byte outside 0-10. */
@@ -547,12 +855,21 @@ export interface UnitFilter {
   /** `npcFlags > 0` — a gossip/vendor/questgiver NPC, as observed. */
   npc?: boolean;
   /**
+   * Keep only NPCs whose observed `roles` include this word (or any of a
+   * list), e.g. `{ role: "flightMaster" }`, `{ role: ["vendor", "repair"] }`.
+   */
+  role?: NpcRole | NpcRole[];
+  /**
    * The observed questgiver marker, by name or a list of names — e.g.
    * `{ questGiver: "reward" }` for every NPC ready to take a turn-in, or
    * `{ questGiver: ["available", "available_rep"] }`. Objects with no observed
    * status never match.
+   *
+   * `true` is shorthand for "has any marker at all": every observed status
+   * except `"none"`, which is the server saying this NPC has nothing for you.
+   * `false` is rejected — "no marker" and "never observed" are two readings.
    */
-  questGiver?: QuestGiverStatusName | QuestGiverStatusName[];
+  questGiver?: QuestGiverStatusName | QuestGiverStatusName[] | true;
 }
 
 /**
@@ -625,8 +942,16 @@ export class StateCache {
     name: undefined,
     level: undefined,
     position: undefined,
+    zone: undefined,
+    area: undefined,
+    corpse: undefined,
+    graveyard: undefined,
+    reclaimDelay: undefined,
     transfer: undefined,
     targetGuid: undefined,
+    achievements: undefined,
+    taxiFlight: undefined,
+    taxiReply: undefined,
     health: undefined,
     power: undefined,
     fields: new Map<string, Observed<number>>(),
@@ -647,6 +972,13 @@ export class StateCache {
    * re-approached creature permanently nameless. Same reasoning for `names`.
    */
   readonly creatures = new Map<number, Observed<CreatureInfo>>();
+
+  /**
+   * entry -> game object template info, from `SMSG_GAMEOBJECT_QUERY_RESPONSE`.
+   * Never pruned, for the same reason as `creatures`: the module issues the
+   * query once per entry per session.
+   */
+  readonly gameObjects = new Map<number, Observed<GameObjectInfo>>();
 
   /**
    * itemId -> item template info, from `SMSG_ITEM_QUERY_SINGLE_RESPONSE`.
@@ -695,6 +1027,18 @@ export class StateCache {
 
   private talentState: TalentState | undefined;
 
+  /**
+   * achievementId -> the entry, in observation order (Map preserves it).
+   *
+   * First writer wins: a login backlog entry is not overwritten by a later
+   * earn of the same id, because the backlog is what made it history. The
+   * derived `self.achievements` is rebuilt from this map on every change.
+   */
+  private readonly achievementMap = new Map<number, AchievementEntry>();
+
+  /** Whether `SMSG_ALL_ACHIEVEMENT_DATA` has been observed at all. */
+  private achievementsLoginSeen = false;
+
   /** The one input that did not come from an event. */
   readonly seed: StateSeed;
 
@@ -730,6 +1074,7 @@ export class StateCache {
     this.seed = { ...options.seed };
     if (this.seed.guid !== undefined) this.self.guid = this.seed.guid;
     if (this.seed.name !== undefined) this.self.name = this.seed.name;
+    guardSelfMisreads(this.self);
   }
 
   /** Rebuild a cache by replaying events from seq 0. */
@@ -922,33 +1267,67 @@ export class StateCache {
   }
 
   /**
-   * The backpack, shaped for acting on it: `bag`/`slot` are exactly what
-   * `equipItem(bag, slot)`, `useItem` and `destroyItem` take (bag 255, slots
-   * 23-38), and `freeSlots` is how many of the 16 backpack slots hold nothing.
+   * The carried inventory, shaped for acting on it: `bag`/`slot` are exactly
+   * what `equipItem(bag, slot)`, `useItem` and `destroyItem` take — the
+   * backpack is bag 255, slots 23-38; a worn bag is addressed by its own
+   * equipment slot (19-22) with slots 0..numSlots-1 — and `freeSlots` counts
+   * empty slots across all of them, out of `totalSlots`. Equipment (slots
+   * 0-18) is the `inventory` rows with `slot < 19`, not part of this list.
    *
-   * A view over `inventory` — same fields, same three-way join, no new
-   * observation. Earned surface (ADR-0015): morning-opus-1 rebuilt this from
-   * ITEM_PUSH_RESULT listeners, invSlot regexes over raw updates, and a full
-   * relog to force a resend, when everything needed was already in the cache.
+   * A view over `inventory` and the worn bags' own create blocks — same
+   * three-way join, no new observation. Earned surface (ADR-0015):
+   * morning-opus-1 rebuilt the backpack view from ITEM_PUSH_RESULT listeners,
+   * invSlot regexes over raw updates, and a full relog to force a resend; the
+   * worn-bag span came from `inventory_full` turn-ins (quests 33, 183) and a
+   * model hand-rolling destroyItem loops against a 16-slot ceiling while a
+   * worn bag had room (FOLLOW-UPS 50).
    *
-   * Two honest caveats. Empty slots are zero-valued update fields and the wire
+   * One honest caveat. Empty slots are zero-valued update fields and the wire
    * compresses zeros out of create blocks, so "no field observed" reads as
-   * free — before our own create block has arrived this says 16. And the
-   * contents of *equipped* bags (slots 19-22) are container fields no
-   * whitelisted opcode serves, so only the backpack is reported.
+   * free — before our own create block has arrived this says 16 free.
    */
   bag(): BagContents {
-    const items = this.inventory
-      .filter((i) => i.slot >= BACKPACK_FIRST_SLOT)
-      .map((i) => ({
-        bag: BACKPACK_BAG,
-        slot: i.slot,
-        guid: i.guid,
-        itemId: i.itemId,
-        name: i.name,
-        count: i.stackCount,
-      }));
-    return { items, freeSlots: BACKPACK_SIZE - items.length };
+    const items: BagSlotItem[] = [];
+    const bags: WornBag[] = [];
+    const rowOf = (bag: number, slot: number, guid: GuidKey): BagSlotItem => {
+      const item = this.nearby.get(guid);
+      const itemId = item?.entry?.value;
+      const info = itemId === undefined ? undefined : this.items.get(itemId)?.value;
+      return {
+        bag,
+        slot,
+        guid,
+        itemId,
+        name: info?.name,
+        count: item?.fields.get("stackCount")?.value,
+        quality: info?.quality,
+      };
+    };
+    let totalSlots = BACKPACK_SIZE;
+    const inventory = this.inventory;
+    // Backpack first, then each worn bag in slot order.
+    for (const i of inventory) {
+      if (i.slot >= BACKPACK_FIRST_SLOT) items.push(rowOf(BACKPACK_BAG, i.slot, i.guid));
+    }
+    for (const i of inventory) {
+      if (i.slot < BAG_FIRST_SLOT || i.slot > BAG_LAST_SLOT) continue;
+      // A worn bag: its contents are the container's own `bagSlot<n>Lo/Hi`
+      // fields, addressed by the equipment slot the bag sits in.
+      const container = this.nearby.get(i.guid);
+      const numSlots = container?.fields.get("numSlots")?.value ?? 0;
+      bags.push({ slot: i.slot, numSlots, name: i.name });
+      totalSlots += numSlots;
+      if (!container) continue;
+      for (let n = 0; n < numSlots; n++) {
+        const lo = container.fields.get(`bagSlot${n}Lo`);
+        const hi = container.fields.get(`bagSlot${n}Hi`);
+        if (!lo && !hi) continue;
+        const guid = formatGuid((BigInt(hi?.value ?? 0) << 32n) | BigInt((lo?.value ?? 0) >>> 0));
+        if (guid === "0") continue;
+        items.push(rowOf(i.slot, n, guid));
+      }
+    }
+    return { items, freeSlots: totalSlots - items.length, totalSlots, bags };
   }
 
   /** The object our own `targetGuid` points at, when it is also in view. */
@@ -1094,6 +1473,7 @@ export class StateCache {
         const d = event.data as {
           character: string; guid: GuidKey; map: number; x: number; y: number;
           z: number; o: number; level: number;
+          zoneId?: number; zoneName?: string; areaId?: number; areaName?: string;
         };
         if (this.seed.guid !== undefined && this.seed.guid !== d.guid) {
           this.anomalyBuf.push({
@@ -1113,6 +1493,20 @@ export class StateCache {
           ts: event.ts,
         };
         this.self.level = { value: d.level, seq: event.seq, ts: event.ts };
+        if (d.zoneId !== undefined && d.areaId !== undefined) {
+          this.self.zone = { value: { id: d.zoneId, name: d.zoneName ?? "" }, seq: event.seq, ts: event.ts };
+          this.self.area = { value: { id: d.areaId, name: d.areaName ?? "" }, seq: event.seq, ts: event.ts };
+        }
+        return;
+      }
+      case "WB_AREA": {
+        // The module reads the server's zone/area pair for this character —
+        // the same pair a client computes from its own map files — and names
+        // it from the client's AreaTable.dbc (PROTOCOL.md). One event per
+        // change, the first at login.
+        const d = event.data as { mapId: number; zoneId: number; zoneName: string; areaId: number; areaName: string };
+        this.self.zone = { value: { id: d.zoneId, name: d.zoneName }, seq: event.seq, ts: event.ts };
+        this.self.area = { value: { id: d.areaId, name: d.areaName }, seq: event.seq, ts: event.ts };
         return;
       }
       case "SMSG_LOGIN_VERIFY_WORLD":
@@ -1138,6 +1532,47 @@ export class StateCache {
       }
       case "SMSG_TRANSFER_ABORTED": {
         this.self.transfer = undefined;
+        return;
+      }
+      case "SMSG_DEATH_RELEASE_LOC": {
+        // `map: -1` is the clear marker — the first thing `ResurrectPlayer`
+        // sends — so it ends both the corpse and the graveyard. Otherwise it
+        // is the graveyard the spirit was released to.
+        const d = event.data as { map: number; x: number; y: number; z: number };
+        if (d.map < 0) {
+          this.self.corpse = undefined;
+          this.self.graveyard = undefined;
+          this.self.reclaimDelay = undefined;
+          return;
+        }
+        this.self.graveyard = { value: { map: d.map, x: d.x, y: d.y, z: d.z }, seq: event.seq, ts: event.ts };
+        return;
+      }
+      case "SMSG_CORPSE_RECLAIM_DELAY": {
+        const d = event.data as { delayMs: number };
+        this.self.reclaimDelay = {
+          value: { delayMs: d.delayMs, readyAt: event.ts + d.delayMs },
+          seq: event.seq,
+          ts: event.ts,
+        };
+        return;
+      }
+      case "MSG_CORPSE_QUERY": {
+        // The server's own word on where the corpse is, replacing the
+        // death-spot fallback. "Not found" is an answer too: there is no
+        // corpse to reclaim (healer resurrection, expiry), so nothing is kept.
+        const d = event.data as {
+          found: boolean; map?: number; x?: number; y?: number; z?: number;
+        };
+        if (!d.found || d.map === undefined || d.x === undefined || d.y === undefined || d.z === undefined) {
+          this.self.corpse = undefined;
+          return;
+        }
+        this.self.corpse = {
+          value: { map: d.map, x: d.x, y: d.y, z: d.z, source: "corpse_query" },
+          seq: event.seq,
+          ts: event.ts,
+        };
         return;
       }
       case "SMSG_QUESTGIVER_QUEST_COMPLETE": {
@@ -1260,6 +1695,30 @@ export class StateCache {
         };
         return;
       }
+      /*
+       * Achievements and flight paths (ADR-0048, issue #8). The earn is a
+       * say-range broadcast, so `self` — not the opcode — is what makes it
+       * ours; another player's achievement is not an observation about this
+       * character and is dropped here rather than filtered downstream.
+       */
+      case "SMSG_ACHIEVEMENT_EARNED": {
+        const d = event.data as AchievementEarnedData;
+        if (d.self !== true) return;
+        this.addAchievement(d.achievement, "earned", event.seq, event.ts);
+        return;
+      }
+      case "SMSG_ALL_ACHIEVEMENT_DATA": {
+        const d = event.data as AllAchievementData;
+        this.achievementsLoginSeen = true;
+        for (const a of d.achievements) this.addAchievement(a, "login", event.seq, event.ts);
+        this.rebuildAchievements();
+        return;
+      }
+      case "SMSG_ACTIVATETAXIREPLY": {
+        const d = event.data as ActivateTaxiReplyData;
+        this.self.taxiReply = { value: { reply: d.reply, ok: d.ok }, seq: event.seq, ts: event.ts };
+        return;
+      }
       case "SMSG_NAME_QUERY_RESPONSE": {
         const d = event.data as { guid: GuidKey; found: boolean; name?: string };
         if (d.found && d.name !== undefined) {
@@ -1295,6 +1754,48 @@ export class StateCache {
         for (const obj of this.nearby.values()) {
           if (obj.entry?.value === d.entry) this.joinName(obj);
         }
+        return;
+      }
+      case "SMSG_GAMEOBJECT_QUERY_RESPONSE": {
+        const d = event.data as GameObjectQueryResponseData;
+        if (!d.found || d.name === undefined) return;
+        this.gameObjects.set(d.entry, {
+          value: {
+            entry: d.entry,
+            name: d.name,
+            type: d.type,
+            displayId: d.displayId,
+            castBarCaption: d.castBarCaption === undefined || d.castBarCaption === "" ? undefined : d.castBarCaption,
+          },
+          seq: event.seq,
+          ts: event.ts,
+        });
+        for (const obj of this.nearby.values()) {
+          if (obj.objectType?.value === "gameObject" && obj.entry?.value === d.entry) this.joinName(obj);
+        }
+        return;
+      }
+      case "WB_TRANSPORT_PROGRESS": {
+        // The car moved (or did not): a client animating the transport from
+        // its own DBC knows exactly this. The object stays in `nearby` only
+        // if the update stream put it there; a report for a guid never
+        // created still means the server sent the car, so it is upserted the
+        // way a `values` delta for an unseen guid is.
+        const d = event.data as TransportProgressData;
+        this.upsertNearby(d.guid, event.seq, (obj) => {
+          if (obj.entry === undefined) obj.entry = { value: d.entry, seq: event.seq, ts: event.ts };
+          obj.position = { value: toUnitPosition(d.pos), seq: event.seq, ts: event.ts };
+          const docks = [...(obj.transport?.value.docks ?? [])];
+          if (d.docked === true && !docks.some((k) => Math.hypot(k.x - d.pos.x, k.y - d.pos.y) < 5)) {
+            docks.push({ x: d.pos.x, y: d.pos.y, z: d.pos.z });
+          }
+          obj.transport = {
+            value: { progressMs: d.progressMs, periodMs: d.periodMs, docked: d.docked, docks },
+            seq: event.seq,
+            ts: event.ts,
+          };
+          this.joinName(obj);
+        });
         return;
       }
       case "SMSG_ITEM_QUERY_SINGLE_RESPONSE": {
@@ -1387,7 +1888,22 @@ export class StateCache {
         // Our own position while moving: the module's movement engine knows it
         // locally, exactly as a running client does. `WB_MOVE_RESULT.pos` is
         // read back from the live character, so it is the server's word.
-        const d = event.data as { pos: PositionData };
+        //
+        // Except on `transferred`: the module reads the character back *before*
+        // the teleport lands, so that `pos` is "the last old-map position"
+        // (PROTOCOL.md). `SMSG_NEW_WORLD` carries the arrival point and can
+        // land either side of the result (client.ts moveTo says so and passes
+        // its own `sinceSeq` for exactly that reason), so folding it would pair
+        // old-map x/y/z with the new map id — a WorldPosition the character was
+        // never at, which is the invention `self_position_without_map` exists
+        // to refuse. The arrival comes from `SMSG_NEW_WORLD` alone.
+        //
+        // Likewise on `teleported` (a same-map port): `pos` is the pre-teleport
+        // position, and the arrival point came on the `MSG_MOVE_TELEPORT_ACK`
+        // the server sent *before* this result — folding `pos` here would
+        // overwrite the arrival with where the character left from.
+        const d = event.data as { pos: PositionData; status?: string };
+        if (event.opcode === "WB_MOVE_RESULT" && (d.status === "transferred" || d.status === "teleported")) return;
         this.applySelfPosition(d.pos, event.seq, event.ts);
         return;
       }
@@ -1451,9 +1967,12 @@ export class StateCache {
         if (isMoveOpcode(event.opcode)) {
           const d = event.data as MoveUpdateData;
           if (this.self.guid !== undefined && d.guid === this.self.guid) {
-            // PROTOCOL.md says our own synthesized movement is never echoed, so
-            // this should not happen — but if the server ever does relay it,
-            // it is still our position and belongs on `self`.
+            // Our own guid: `MSG_MOVE_TELEPORT_ACK`, the server's side of a
+            // same-map teleport, carrying the arrival point (PROTOCOL.md; no
+            // SMSG_NEW_WORLD follows a same-map port, so this is how self
+            // position follows a Hearthstone). Our own synthesized movement
+            // is never echoed, but if the server ever relays any other
+            // MSG_MOVE_* under our guid it is still our position.
             this.applySelfPosition(d.pos, event.seq, event.ts);
             return;
           }
@@ -1504,6 +2023,10 @@ export class StateCache {
    * Positions come from `pointOf`, the same resolution `closest()` uses, so a
    * creature mid-spline reports where it is heading. `distance` is `undefined`
    * when either side has no known position.
+   *
+   * No match returns `[]`, never `undefined` and never an error: nothing in
+   * view matching is an answer. (`closest()` answers the same question with
+   * `undefined`.)
    */
   units(filter?: UnitFilter): UnitView[] {
     const f = normalizeUnitFilter(filter);
@@ -1566,6 +2089,11 @@ export class StateCache {
    *
    * Distances mix the freshness of two observations (ours and theirs); both
    * carry their own `seq`, so a caller that cares can check.
+   *
+   * Returns `undefined` on no match, and also when our own position has not
+   * been observed yet — so read a field off it only after checking, or the
+   * miss arrives as a bare `TypeError` from your own code rather than as an
+   * answer. (`units()` answers the same question with `[]`.)
    */
   closest(filter?: UnitFilter | ((obj: NearbyObject) => boolean)): NearbyObject | undefined {
     const from = this.self.position?.value;
@@ -1685,6 +2213,13 @@ export class StateCache {
       if (block.moveFlags !== undefined) obj.fields.set("moveFlags", { value: block.moveFlags, seq, ts });
       if (block.runSpeed !== undefined) obj.fields.set("runSpeed", { value: block.runSpeed, seq, ts });
       if (block.targetGuid !== undefined) obj.targetGuid = { value: block.targetGuid, seq, ts };
+      if (block.pathProgress !== undefined) {
+        obj.transport = {
+          value: { progressMs: block.pathProgress, periodMs: undefined, docked: undefined, docks: [] },
+          seq,
+          ts,
+        };
+      }
       this.mergeFields(obj, block.fields, seq, ts);
       this.joinName(obj);
     });
@@ -1756,6 +2291,39 @@ export class StateCache {
   }
 
   /**
+   * Record one achievement, first writer wins. `rebuildAchievements` is the
+   * caller's job for the login batch so a backlog of hundreds rebuilds once.
+   */
+  private addAchievement(
+    a: { achievementId: number; date?: number; time?: string; name?: string; points?: number; categoryId?: number },
+    source: "login" | "earned",
+    seq: number,
+    ts: number,
+  ): void {
+    if (this.achievementMap.has(a.achievementId)) return;
+    this.achievementMap.set(a.achievementId, {
+      achievementId: a.achievementId,
+      name: a.name,
+      points: a.points,
+      categoryId: a.categoryId,
+      date: a.date,
+      time: a.time,
+      source,
+      seq,
+      ts,
+    });
+    if (source === "earned") this.rebuildAchievements();
+  }
+
+  /** Replace `self.achievements` wholesale; the snapshot's shallow copy relies on it. */
+  private rebuildAchievements(): void {
+    const entries = [...this.achievementMap.values()];
+    let points = 0;
+    for (const e of entries) points += e.points ?? 0;
+    this.self.achievements = { entries, points, loginSeen: this.achievementsLoginSeen };
+  }
+
+  /**
    * Merge one block's named fields, per field, with that block's provenance.
    * `targetGuid` is a guid rather than a number, so it gets its own group.
    */
@@ -1769,6 +2337,7 @@ export class StateCache {
     ts: number,
   ): void {
     if (!fields) return;
+    const healthBefore = target === this.self ? target.fields.get("health")?.value : undefined;
     for (const [key, raw] of Object.entries(fields)) {
       if (key === "targetGuid") {
         if (typeof raw === "string" && "targetGuid" in target) {
@@ -1786,6 +2355,24 @@ export class StateCache {
     const entry = target.fields.get("entry");
     if (entry && "entry" in target) target.entry = entry;
     this.deriveGauges(target);
+    if (target === this.self) {
+      // `taxiFlight` rides `unitFlags` in every block that carries it
+      // (PROTOCOL.md), and the module names the bit; the bit is read here
+      // rather than the named boolean because `fields` holds numbers only.
+      // Derived only from a block that *carried* unitFlags, so the observation
+      // keeps the provenance of the packet that made it.
+      if (typeof fields.unitFlags === "number") {
+        this.self.taxiFlight = { value: (fields.unitFlags & UNIT_FLAG_TAXI_FLIGHT) !== 0, seq, ts };
+      }
+      const healthAfter = target.fields.get("health")?.value;
+      const pos = this.self.position?.value;
+      // The died transition: own health reaching 0 from a living value. Until
+      // the corpse query answers, the corpse is where the character stood —
+      // what a client knows from having been there.
+      if (healthAfter === 0 && healthBefore !== undefined && healthBefore > 0 && pos !== undefined) {
+        this.self.corpse = { value: { map: pos.map, x: pos.x, y: pos.y, z: pos.z, source: "death_spot" }, seq, ts };
+      }
+    }
   }
 
   /**
@@ -1832,6 +2419,20 @@ export class StateCache {
     if ((type === "item" || type === "container") && entry !== undefined) {
       const info = this.items.get(entry);
       if (info) obj.name = { value: info.value.name, seq: info.seq, ts: info.ts };
+      return;
+    }
+    if (type === "gameObject" && entry !== undefined) {
+      // Game object and creature entries are separate id spaces: a chest's
+      // entry can equal some creature's, so only the game object answer names it.
+      const info = this.gameObjects.get(entry);
+      if (info) {
+        obj.name = { value: info.value.name, seq: info.seq, ts: info.ts };
+        // The template's type stands in when the create block's
+        // GAMEOBJECT_BYTES_1 was not in the mask; both are client-cache facts.
+        if (!obj.fields.has("goType") && info.value.type !== undefined) {
+          obj.fields.set("goType", { value: info.value.type, seq: info.seq, ts: info.ts });
+        }
+      }
       return;
     }
     if (type !== "player" && entry !== undefined) {
@@ -1881,6 +2482,7 @@ export class StateCache {
         health: undefined,
         power: undefined,
         targetGuid: undefined,
+        transport: undefined,
         questGiver: undefined,
         fields: new Map<string, Observed<number>>(),
         firstSeq: seq,
@@ -1925,7 +2527,21 @@ function toUnitView(obj: NearbyObject, from: UnitPosition | undefined): UnitView
     targetGuid: target === undefined || target === "0" ? undefined : target,
     questGiver: obj.questGiver === undefined ? undefined : questGiverStatusName(obj.questGiver.value),
     questGiverStatus: obj.questGiver?.value,
+    roles: npcRolesOf(obj.fields.get("npcFlags")?.value),
+    goType: goTypeOf(obj),
+    docked: obj.transport?.value.docked,
   };
+}
+
+/**
+ * A game object's type name from its `goType` field (the create block's
+ * `GAMEOBJECT_BYTES_1`, or the template answer joined in by `joinName`).
+ * Units and players have no type here.
+ */
+function goTypeOf(obj: NearbyObject): GameObjectTypeName | undefined {
+  if (obj.objectType?.value !== "gameObject") return undefined;
+  const own = obj.fields.get("goType")?.value;
+  return own === undefined ? undefined : gameObjectTypeName(own);
 }
 
 /**
@@ -1959,8 +2575,14 @@ function passesUnitFilter(view: UnitView, obj: NearbyObject, f: NormalizedUnitFi
     const isNpc = (obj.fields.get("npcFlags")?.value ?? 0) > 0;
     if (isNpc !== f.npc) return false;
   }
-  if (f.questGiver !== undefined && (view.questGiver === undefined || !f.questGiver.has(view.questGiver))) {
-    return false;
+  if (f.role !== undefined && !view.roles.some((r) => f.role!.has(r))) return false;
+  if (f.questGiver !== undefined) {
+    if (view.questGiver === undefined) return false;
+    if (f.questGiver === ANY_QUEST_GIVER) {
+      if (view.questGiver === "none") return false;
+    } else if (!f.questGiver.has(view.questGiver)) {
+      return false;
+    }
   }
   return true;
 }
@@ -1973,7 +2595,28 @@ function passesUnitFilter(view: UnitView, obj: NearbyObject, f: NormalizedUnitFi
 // the forbidden outcome — it returns a wrong-but-plausible answer, which is the
 // very failure this helper exists to remove.
 
-const UNIT_FILTER_KEYS = ["entry", "name", "type", "alive", "maxDistance", "npc", "questGiver"] as const;
+const UNIT_FILTER_KEYS = ["entry", "name", "type", "alive", "maxDistance", "npc", "role", "questGiver"] as const;
+
+/** `questGiver: true` — any marker except `"none"`. Not a status name, so it cannot collide with one. */
+const ANY_QUEST_GIVER = "any" as const;
+
+/**
+ * Keys models actually passed that are not filter keys, and where the thing
+ * they wanted really lives (2026-08-23 run audit: `dead`, `guid`). Naming the
+ * replacement is explanation, not repair — inverting `dead` into `alive` would
+ * be a guess, and ADR-0016 rule 1 forbids guessing.
+ */
+const UNIT_FILTER_KEY_HINTS: Readonly<Record<string, string>> = {
+  dead: 'use alive instead — { alive: false } is the known-dead, { alive: true } drops them',
+  guid: "guid is not a criterion — each returned row carries .guid, and state.nearby is keyed by it",
+  questgiver: "questGiver is spelled with a capital G",
+  distance: "use maxDistance (yards)",
+  maxDist: "use maxDistance (yards)",
+  id: "use entry (the creature/gameobject template id)",
+  entryId: "use entry",
+  level: "level is not a criterion — each returned row carries .level; filter the array yourself",
+  hostile: "hostility is not observed as a filter criterion; read each row's fields instead",
+};
 const UNIT_FILTER_TYPES = ["unit", "player", "gameObject"] as const;
 
 /**
@@ -1990,7 +2633,8 @@ interface NormalizedUnitFilter {
   alive: boolean | undefined;
   maxDistance: number | undefined;
   npc: boolean | undefined;
-  questGiver: Set<QuestGiverStatusName> | undefined;
+  role: Set<NpcRole> | undefined;
+  questGiver: Set<QuestGiverStatusName> | typeof ANY_QUEST_GIVER | undefined;
 }
 
 const EMPTY_UNIT_FILTER: NormalizedUnitFilter = {
@@ -2000,6 +2644,7 @@ const EMPTY_UNIT_FILTER: NormalizedUnitFilter = {
   alive: undefined,
   maxDistance: undefined,
   npc: undefined,
+  role: undefined,
   questGiver: undefined,
 };
 
@@ -2136,9 +2781,13 @@ function normalizeUnitFilter(filter: UnitFilter | undefined): NormalizedUnitFilt
     (k) => !(UNIT_FILTER_KEYS as readonly string[]).includes(k),
   );
   if (unknown.length > 0) {
+    const hints = unknown
+      .map((k) => (UNIT_FILTER_KEY_HINTS[k] !== undefined ? `${k}: ${UNIT_FILTER_KEY_HINTS[k]}` : undefined))
+      .filter((h): h is string => h !== undefined);
     throw filterError(
       `unknown ${unknown.length === 1 ? "key" : "keys"} ${unknown.map(showValue).join(", ")}. ` +
-        `Valid keys are ${UNIT_FILTER_KEYS.join(", ")}. Drop the key or use one of those.`,
+        `Valid keys are ${UNIT_FILTER_KEYS.join(", ")}. Drop the key or use one of those.` +
+        (hints.length > 0 ? ` (${hints.join("; ")}.)` : ""),
     );
   }
 
@@ -2179,25 +2828,56 @@ function normalizeUnitFilter(filter: UnitFilter | undefined): NormalizedUnitFilt
   if (filter.alive !== undefined) out.alive = coerceBoolean(filter.alive, "alive");
   if (filter.npc !== undefined) out.npc = coerceBoolean(filter.npc, "npc");
 
+  if (filter.role !== undefined) {
+    const raw = Array.isArray(filter.role) ? filter.role : [filter.role];
+    if (raw.length === 0) throw filterError('role received an empty array; pass a role word such as "vendor", or omit role.');
+    const roles = new Set<NpcRole>();
+    for (const item of raw) {
+      if (typeof item !== "string" || !(NPC_ROLES as readonly string[]).includes(item)) {
+        throw filterError(
+          `role received ${showValue(item)}, expected one of ${NPC_ROLES.map(showValue).join(", ")} ` +
+            "(exact, case-sensitive) or an array of them.",
+        );
+      }
+      roles.add(item as NpcRole);
+    }
+    out.role = roles;
+  }
+
   if (filter.questGiver !== undefined) {
     // Exact names only: "?"/"!" or "turnin" have more than one reading
     // (reward vs reward_rep vs incomplete), so ADR-0016 says reject and list.
-    const raw = Array.isArray(filter.questGiver) ? filter.questGiver : [filter.questGiver];
-    if (raw.length === 0) {
-      throw filterError('questGiver received an empty array; pass a status name such as "reward", or omit questGiver.');
-    }
-    const names = new Set<QuestGiverStatusName>();
-    for (const item of raw) {
-      if (typeof item !== "string" || !(QUEST_GIVER_STATUS_NAMES as readonly string[]).includes(item)) {
+    // `true` is the exception: "does this NPC have anything for me" has one
+    // reading (any marker but "none"), so it is honored. `false` has two
+    // ("marker observed as none" vs "no marker observed"), so it is rejected.
+    if (filter.questGiver === true) {
+      out.questGiver = ANY_QUEST_GIVER;
+    } else if (typeof filter.questGiver === "boolean") {
+      throw filterError(
+        'questGiver received false, which has no single meaning here. Use { questGiver: true } for "has any ' +
+          'marker at all", or name the statuses you want, e.g. { questGiver: ["available", "reward"] }.',
+      );
+    } else {
+      const raw = Array.isArray(filter.questGiver) ? filter.questGiver : [filter.questGiver];
+      if (raw.length === 0) {
         throw filterError(
-          `questGiver received ${showValue(item)}, expected one of ${QUEST_GIVER_STATUS_NAMES.map(showValue).join(", ")} ` +
-            '(exact, case-sensitive) or an array of them. "reward" is a turn-in ready now, "available" a quest on offer, ' +
-            '"incomplete" an ender whose quest is not done yet.',
+          'questGiver received an empty array; pass a status name such as "reward", { questGiver: true } for any ' +
+            "marker at all, or omit questGiver.",
         );
       }
-      names.add(item as QuestGiverStatusName);
+      const names = new Set<QuestGiverStatusName>();
+      for (const item of raw) {
+        if (typeof item !== "string" || !(QUEST_GIVER_STATUS_NAMES as readonly string[]).includes(item)) {
+          throw filterError(
+            `questGiver received ${showValue(item)}, expected one of ${QUEST_GIVER_STATUS_NAMES.map(showValue).join(", ")} ` +
+              '(exact, case-sensitive), an array of them, or true for any marker at all. "reward" is a turn-in ready ' +
+              'now, "available" a quest on offer, "incomplete" an ender whose quest is not done yet.',
+          );
+        }
+        names.add(item as QuestGiverStatusName);
+      }
+      out.questGiver = names;
     }
-    out.questGiver = names;
   }
 
   if (filter.maxDistance !== undefined) {
@@ -2225,6 +2905,9 @@ const BACKPACK_FIRST_SLOT = 23;
 const BACKPACK_SIZE = 16;
 /** `INVENTORY_SLOT_BAG_0` on the wire: the bag id the item actions take for the backpack. */
 const BACKPACK_BAG = 255;
+/** Worn-bag equipment slots (`INVENTORY_SLOT_BAG_START..END`): the bag ids the item actions take for them. */
+const BAG_FIRST_SLOT = 19;
+const BAG_LAST_SLOT = 22;
 
 /**
  * Where an object is, from the freshest thing that said so.
@@ -2246,4 +2929,40 @@ export function pointOf(obj: NearbyObject): Observed<Point3> | undefined {
   }
   if (!pos) return undefined;
   return { value: { x: pos.value.x, y: pos.value.y, z: pos.value.z }, seq: pos.seq, ts: pos.ts };
+}
+
+
+/**
+ * Wrong reads of the XP bar, made loud.
+ *
+ * XP lives on the state object (`state.xp`, `state.nextLevelXp`), not on
+ * `state.self`, because it is derived from `self.fields` the same way `money`
+ * is. Models do not know that: two model families in the 2026-08-23 window
+ * printed `XP: undefined /900` for a whole run reading `state.self.xp` or
+ * `state.self.experience`, which are simply absent and so answer `undefined`
+ * forever without ever being wrong out loud. ADR-0016 rule 2 forbids exactly
+ * that: an unusable read must say what it should have been.
+ *
+ * The getters are non-enumerable on purpose — `snapshot()` spreads `self`, and
+ * an enumerable throwing getter would blow up every snapshot, every
+ * `JSON.stringify`, and every `Bun.inspect` of the character.
+ */
+function guardSelfMisreads(self: SelfState): void {
+  const wrong: Record<string, string> = {
+    xp: "state.self.xp",
+    experience: "state.self.experience",
+  };
+  for (const [key, spelling] of Object.entries(wrong)) {
+    Object.defineProperty(self, key, {
+      enumerable: false,
+      configurable: true,
+      get(): never {
+        throw new TypeError(
+          `${spelling} does not exist. Current XP is state.xp (wrapped: state.xp.value), and the ` +
+            `bar's target is state.nextLevelXp (state.nextLevelXp.value). Both are undefined until ` +
+            `an event has carried them.`,
+        );
+      },
+    });
+  }
 }

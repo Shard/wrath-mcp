@@ -260,6 +260,21 @@ export function moveResult(status: string, moveId = 1, seq = 19): unknown {
   };
 }
 
+/**
+ * The server's side of a same-map teleport (Player::SendTeleportAckPacket),
+ * tapped under our own guid with the arrival point. Sent before the
+ * `teleported` move result; no SMSG_NEW_WORLD follows.
+ */
+export function teleportAck(seq = 40, pos = { x: -8833.4, y: 625.9, z: 93.9, o: 0.5 }): unknown {
+  return {
+    seq,
+    opcode: "MSG_MOVE_TELEPORT_ACK",
+    opcodeId: 0x0c7,
+    ts: 1_700_000_000_400,
+    data: { guid: SELF_GUID, flags: 0, pos },
+  };
+}
+
 export function transferPending(toMap: number, seq = 40): unknown {
   return { seq, opcode: "SMSG_TRANSFER_PENDING", opcodeId: 0x03f, ts: 1_700_000_000_400, data: { map: toMap } };
 }
@@ -407,6 +422,63 @@ export const itemCreate = {
       },
     ],
   },
+};
+
+/**
+ * A worn bag in equipment slot 19 (FOLLOW-UPS 50): the player's `invSlot19`
+ * halves name the container, the container's own create block carries
+ * `numSlots` and its `bagSlot<n>Lo/Hi` halves, and one of those names a second
+ * copy of the charm. Guid high halves are non-zero to prove reassembly.
+ */
+export const BAG_SLOT = 19;
+export const BAG_GUID_LO = 777;
+export const BAG_GUID_HI = 0x4000_0000;
+export const BAG_GUID = ((BigInt(BAG_GUID_HI) << 32n) | BigInt(BAG_GUID_LO)).toString();
+export const BAG_ENTRY = 4496;
+export const BAG_NUM_SLOTS = 6;
+export const BAGGED_GUID_LO = 9999;
+export const BAGGED_GUID_HI = 0x4000_0000;
+export const BAGGED_GUID = ((BigInt(BAGGED_GUID_HI) << 32n) | BigInt(BAGGED_GUID_LO)).toString();
+export const wornBagSlot = selfFields(36, {
+  [`invSlot${BAG_SLOT}Lo`]: BAG_GUID_LO,
+  [`invSlot${BAG_SLOT}Hi`]: BAG_GUID_HI,
+});
+export const wornBagCreate = {
+  seq: 37,
+  opcode: "SMSG_UPDATE_OBJECT",
+  opcodeId: 0x0a9,
+  ts: 1_700_000_000_371,
+  data: {
+    blocks: 2,
+    objects: [
+      {
+        update: "create",
+        guid: BAG_GUID,
+        objectType: "container",
+        fields: {
+          entry: BAG_ENTRY,
+          numSlots: BAG_NUM_SLOTS,
+          bagSlot0Lo: 0,
+          bagSlot0Hi: 0,
+          bagSlot2Lo: BAGGED_GUID_LO,
+          bagSlot2Hi: BAGGED_GUID_HI,
+        },
+      },
+      {
+        update: "create",
+        guid: BAGGED_GUID,
+        objectType: "item",
+        fields: { entry: ITEM_ENTRY, stackCount: 2 },
+      },
+    ],
+  },
+};
+export const wornBagQuery = {
+  seq: 38,
+  opcode: "SMSG_ITEM_QUERY_SINGLE_RESPONSE",
+  opcodeId: 0x058,
+  ts: 1_700_000_000_381,
+  data: { itemId: BAG_ENTRY, found: true, name: "Small Brown Pouch", quality: 1 },
 };
 
 /** The item query the module fired on first sight of that entry. */
@@ -568,14 +640,37 @@ export function questRewarded(questId: number, seq = 49): unknown {
 }
 
 /** `result` 48 is EQUIP_ERR_INVENTORY_FULL, the bag-full refusal. */
-export function inventoryChangeFailure(seq: number, result = 48): unknown {
+export function inventoryChangeFailure(
+  seq: number,
+  result = 48,
+  extra: { itemGuid?: string; requiredLevel?: number } = {},
+): unknown {
   return {
     seq,
     opcode: "SMSG_INVENTORY_CHANGE_FAILURE",
     opcodeId: 0x112,
     ts: 1_700_000_000_495,
-    data: { result },
+    data: { result, ...extra },
   };
+}
+
+/** The source slot zeroed with no arrival seen: the item left the backpack. */
+export function inventorySlotCleared(seq: number, slot: number): unknown {
+  return selfFields(seq, { [`invSlot${slot}Lo`]: 0, [`invSlot${slot}Hi`]: 0 });
+}
+
+/**
+ * The character's own inventory fields after the server moved `ITEM_GUID` from
+ * one slot to another — what an accepted equip looks like on the wire (the old
+ * slot zeroed, the equipment slot carrying the guid halves).
+ */
+export function inventorySlotMove(seq: number, from: number, to: number): unknown {
+  return selfFields(seq, {
+    [`invSlot${from}Lo`]: 0,
+    [`invSlot${from}Hi`]: 0,
+    [`invSlot${to}Lo`]: ITEM_GUID_LO,
+    [`invSlot${to}Hi`]: ITEM_GUID_HI,
+  });
 }
 
 /** `slotType` defaults to 4 (LOOT_SLOT_TYPE_OWNER): what every solo loot carries. */
@@ -847,5 +942,60 @@ export function questQueryResponse(questId = QUEST_ID, seq = 60): unknown {
         { itemId: 0, count: 0 },
       ],
     },
+  };
+}
+
+// ------------------------------------------------------------------ death
+//
+// Hand-written from PROTOCOL.md's death table. `SMSG_CORPSE_RECLAIM_DELAY`
+// starts the clock the server enforces before a reclaim is legal;
+// `SMSG_DEATH_RELEASE_LOC` with map -1 is what `Player::ResurrectPlayer` sends
+// first, and is the observable a reclaim actually worked.
+
+export function corpseReclaimDelay(delayMs: number, seq: number, ts = Date.now()): unknown {
+  return { seq, opcode: "SMSG_CORPSE_RECLAIM_DELAY", opcodeId: 0x269, ts, data: { delayMs } };
+}
+
+/** `map: -1` clears the client's spirit-healer marker: you are alive again. */
+export function deathReleaseCleared(seq: number): unknown {
+  return {
+    seq,
+    opcode: "SMSG_DEATH_RELEASE_LOC",
+    opcodeId: 0x378,
+    ts: 1_700_000_000_000 + seq,
+    data: { map: -1, x: 0, y: 0, z: 0 },
+  };
+}
+
+/** The graveyard the spirit was released to (`SMSG_DEATH_RELEASE_LOC` with a real map). */
+export function deathReleaseLoc(seq: number, at: { map: number; x: number; y: number; z: number }): unknown {
+  return { seq, opcode: "SMSG_DEATH_RELEASE_LOC", opcodeId: 0x378, ts: 1_700_000_000_000 + seq, data: at };
+}
+
+/**
+ * The server's answer to the ghost's `MSG_CORPSE_QUERY` (the module asks once
+ * per death on the client's behalf). `found: false` carries no position.
+ */
+export function corpseQuery(
+  seq: number,
+  at?: { map: number; x: number; y: number; z: number; corpseMap?: number },
+): unknown {
+  return {
+    seq,
+    opcode: "MSG_CORPSE_QUERY",
+    opcodeId: 0x216,
+    ts: 1_700_000_000_000 + seq,
+    data: at === undefined ? { found: false } : { found: true, corpseMap: at.map, ...at },
+  };
+}
+
+/** Our own position moving (a ghost walking), as the module's WB_MOVE_RESULT reports it. */
+export function selfArrived(seq: number, pos: { x: number; y: number; z: number }): unknown {
+  return {
+    seq,
+    opcode: "WB_MOVE_RESULT",
+    opcodeId: 0xff01,
+    ts: 1_700_000_000_000 + seq,
+    data: { moveId: seq, status: "arrived", pos: { ...pos, o: 0 } },
   };
 }

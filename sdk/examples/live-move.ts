@@ -153,6 +153,9 @@ async function main(): Promise<void> {
           `${travel.toFixed(1)}y toward ${obj.name?.value}`,
       );
       const result = await client.moveTo(dest, { timeout: 90_000 });
+      // `unknown_target` is the one verdict with no move behind it, so no
+      // server-confirmed position either; a point target cannot produce it.
+      if (result.position === undefined) fail(`move refused before dispatch: ${result.hint}`);
       log(
         `WB_MOVE_RESULT moveId=${result.moveId} status=${result.status} ` +
           `server-confirmed pos=(${result.position.x.toFixed(1)}, ${result.position.y.toFixed(1)}, ` +

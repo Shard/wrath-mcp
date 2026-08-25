@@ -154,6 +154,26 @@ describe("error-code hints", () => {
     expect(err.message).toContain("that name is already in use");
   });
 
+  test("a taken name tells the model to choose another, in the game's own naming rules (ADR-0050)", () => {
+    // The model names its own character, so code 50 is a retry and not a dead
+    // end: `fleet-sonnet-e90-...-a12` looped it for eight minutes on 2026-08-25
+    // because the message named no way forward.
+    const err = new WrathRequestError(400, { ok: false, error: "char_create_failed_code_50" });
+    expect(err.message).toContain("choose a different character name");
+    expect(err.message).toContain("createSession again");
+    expect(err.message).toContain("2-12 letters");
+  });
+
+  test("every naming refusal names a way out, not just the objection (ADR-0050)", () => {
+    // 0x5a-0x5f were unreachable while the harness assigned the name and are
+    // model-reachable now: `createSession` validates race and class before the
+    // wire, never the name.
+    for (const code of [0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e, 0x5f]) {
+      const err = new WrathRequestError(400, { ok: false, error: `char_create_failed_code_${code}` });
+      expect(err.message).toMatch(/choose (a |another)/);
+    }
+  });
+
   test("every KnownErrorCode renders a hint — the table cannot drift from the list", () => {
     // The module grew codes (account_not_permitted) the hint table never
     // learned, and unknown_account's hint described the wrong condition. Any

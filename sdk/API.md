@@ -51,7 +51,7 @@ own client — not for snippets, where `sdk` already exists.) Then, on the clien
 
 | Method | Signature | Purpose |
 | --- | --- | --- |
-| `moveTo` | `moveTo(point, options?): Promise<MoveResult>` | Walk to a world position and wait for the server's arrive/target_off_mesh/… verdict. |
+| `moveTo` | `moveTo(target, options?): Promise<MoveResult>` | Walk to a point { x, y, z }, a unit, or a guid (its cached position; the guid rides along so the module resolves z to the ground under the unit) and wait for the server's arrive/target_off_mesh/transferred/teleported/… verdict; a target nothing in view answers to comes back as status "unknown_target". An arrival aboard a tram car or boat carries onTransport { guid, entry }, and state.self.position then follows the ride (WB_RIDE_PROGRESS). |
 | `killTarget` | `killTarget(target: GuidOrUnit, options?): Promise<KillResult>` | Approach and auto-attack until the target or we drop; returns how the fight ended. |
 | `lootCorpse` | `lootCorpse(target: GuidOrUnit, options?): Promise<LootResult>` | Empty a corpse and report what actually entered the bags (confirmed pushes, not the window). |
 | `acceptQuestFrom` | `acceptQuestFrom(npcGuid: GuidOrUnit, questId, options?): Promise<QuestAcceptResult>` | Take a quest from an NPC and confirm it landed in the quest log. |
@@ -59,6 +59,7 @@ own client — not for snippets, where `sdk` already exists.) Then, on the clien
 | `questsAvailableFrom` | `questsAvailableFrom(npcGuid: GuidOrUnit, options?): Promise<{ ok, quests }>` | What an NPC is offering right now; an empty list is an answer, not an error. |
 | `trainerList` | `trainerList(npcGuid: GuidOrUnit, options?): Promise<TrainerListResult>` | What a trainer teaches, each row with derived learnable/affordable. |
 | `buySpell` | `buySpell(npcGuid: GuidOrUnit, spellId, options?): Promise<BuySpellResult>` | Learn one spell from a trainer for money; returns learned or buy_failed. |
+| `equipItem` | `equipItem(bag, slot, options?): Promise<EquipItemResult>` | Equip a carried item (bag/slot as `state.bag()` lists them: 255/23-38 for the backpack, a worn bag's equip slot 19-22 with slots 0..numSlots-1) and wait for the server's verdict; returns equipped, or not_equipped with the InventoryResult reason (proficiency, level, a two-hander blocking a shield, …). |
 | `learnTalent` | `learnTalent(talentId, rank, options?): Promise<LearnTalentResult>` | Spend a talent point (rank is 0-based) and read the verdict off the SMSG_TALENTS_INFO answer; returns learned or not_learned with the new state.talents(). |
 | `waitForChat` | `waitForChat(match: string | (entry) => boolean, options?): Promise<ChatEntry>` | Wait for a chat line matching a string or predicate. |
 | `waitForNearby` | `waitForNearby(predicate: (obj) => boolean, options?): Promise<NearbyObject>` | Wait until an object in view satisfies the predicate. |
@@ -70,7 +71,7 @@ own client — not for snippets, where `sdk` already exists.) Then, on the clien
 | Method | Signature | Purpose |
 | --- | --- | --- |
 | `say` | `say(text): Promise<ActionResponse>` | Say something in local chat. |
-| `moveToAsync` | `moveToAsync(point): Promise<MoveToResponse>` | Queue a move without waiting; prefer moveTo, which waits for the verdict. |
+| `moveToAsync` | `moveToAsync(target): Promise<MoveToResponse>` | Queue a move without waiting — the call for a walk longer than your own time budget; same targets as moveTo. |
 | `stop` | `stop(): Promise<ActionResponse>` | Queue a movement stop; the in-flight moveTo resolves with status 'stopped'. |
 | `face` | `face(orientationOrPoint: number | { x, y }): Promise<FaceResponse>` | Turn in place toward an orientation (radians) or a point. |
 | `setTarget` | `setTarget(guid: GuidArg): Promise<ActionResponse>` | Set the current target (guid string only). |
@@ -99,11 +100,11 @@ own client — not for snippets, where `sdk` already exists.) Then, on the clien
 | `buyItem` | `buyItem(guid: GuidArg, itemId, slot, count?): Promise<ActionResponse>` | Buy an item from a vendor (slot is the 1-based vendor slot). |
 | `sellItem` | `sellItem(guid: GuidArg, itemGuid: GuidArg, count?): Promise<ActionResponse>` | Sell an item to a vendor; omit count to sell the whole stack. |
 | `repairAll` | `repairAll(guid: GuidArg): Promise<ActionResponse>` | Repair everything at a repair vendor. |
-| `equipItem` | `equipItem(bag, slot): Promise<ActionResponse>` | Equip an item; bag 255 is the backpack, slots 23-38. |
 | `useItem` | `useItem(bag, slot, targetGuid?: GuidArg): Promise<ActionResponse>` | Use a bag item's on-use effect. |
 | `destroyItem` | `destroyItem(bag, slot, count?): Promise<ActionResponse>` | Destroy a bag item; omit count to destroy the whole stack. |
 | `repop` | `repop(): Promise<ActionResponse>` | Release the spirit while dead. |
-| `reclaimCorpse` | `reclaimCorpse(guid?: GuidArg): Promise<ActionResponse>` | Resurrect at the corpse (accepted only near it, after the delay). |
+| `reclaimCorpse` | `reclaimCorpse(guid?: GuidArg, options?: ReclaimCorpseOptions): Promise<ReclaimCorpseResult>` | Wait out the server's corpse reclaim delay, reclaim, and report the verdict: reclaimed / not_reclaimed / unconfirmed. |
+| `reclaimCorpseAsync` | `reclaimCorpseAsync(guid?: GuidArg): Promise<ActionResponse>` | CMSG_RECLAIM_CORPSE, dispatch only. Prefer reclaimCorpse. |
 | `spiritHealerActivate` | `spiritHealerActivate(guid: GuidArg): Promise<ActionResponse>` | Resurrect at a graveyard spirit healer (durability cost, resurrection sickness). |
 | `trainerListAsync` | `trainerListAsync(guid: GuidArg): Promise<ActionResponse>` | Ask a trainer for its list without waiting (prefer trainerList). |
 | `trainerBuySpellAsync` | `trainerBuySpellAsync(guid: GuidArg, spellId): Promise<ActionResponse>` | Buy a spell without waiting (prefer buySpell). |
@@ -113,7 +114,9 @@ own client — not for snippets, where `sdk` already exists.) Then, on the clien
 ## State reads (`state.*`)
 
 `state` (alias for `sdk.state`) is a cache folded from events. `state.self`
-(guid, name, level, position, health, targetGuid) and `state.nearby` (a Map
+(guid, name, level, position, zone and area — `{ id, name }`, the game's own
+zone/subzone as the client names them on screen, e.g. "Elwynn Forest" /
+"Northshire Valley" — health, targetGuid) and `state.nearby` (a Map
 keyed by guid) are plain properties; the members below are getters and methods.
 Observed fields are wrapped as `{ value, seq, ts }` — read `.value`. Every field
 is `undefined` until an event carried it; `undefined` means unobserved, never
@@ -121,11 +124,11 @@ zero.
 
 | Method | Signature | Purpose |
 | --- | --- | --- |
-| `units` | `state.units(filter?: UnitFilter): UnitView[]` | Scan nearby objects, nearest first; filter by entry, name (string | RegExp), type, alive, maxDistance, npc, questGiver (the observed marker name: "available" offers a quest, "reward" takes a turn-in now, "incomplete" ends a quest not yet done). Rows carry questGiver / questGiverStatus. |
-| `closest` | `state.closest(filter?): NearbyObject | undefined` | The nearest object by distance. `filter` is a units() criteria object ({ entry, name, type, alive, maxDistance, npc, questGiver }) or a predicate over the raw object. |
+| `units` | `state.units(filter?: UnitFilter): UnitView[]` | Scan nearby objects, nearest first; filter by entry, name (string | RegExp), type, alive, maxDistance, npc, role (an NPC role word or a list: "questGiver", "vendor", "repair", "trainer", "flightMaster", "innkeeper", "spiritHealer", "banker", "auctioneer", …), questGiver (the observed marker name: "available" offers a quest, "reward" takes a turn-in now, "incomplete" ends a quest not yet done; true means any marker but "none"). Rows carry roles (the NPC's role words from its npc flags — what it is for, never what to do; empty for non-NPCs) and questGiver / questGiverStatus; game objects are named ("Mailbox", "Subway") and carry goType (door, chest, mailbox, transport, …), and a transport carries docked (true while the car sits at a platform). |
+| `closest` | `state.closest(filter?): NearbyObject | undefined` | The nearest object by distance. `filter` is a units() criteria object ({ entry, name, type, alive, maxDistance, npc, role, questGiver }) or a predicate over the raw object. |
 | `nearbyUnits` | `state.nearbyUnits(): NearbyObject[]` | The raw nearby objects (state.units gives flat plain objects instead). |
 | `creaturesByEntry` | `state.creaturesByEntry(entry): NearbyObject[]` | Nearby creatures with a given template entry id. |
-| `bag` | `state.bag(): BagContents` | The backpack as { items: [{ bag, slot, itemId, name, count }], freeSlots }. |
+| `bag` | `state.bag(): BagContents` | The whole carried inventory — backpack plus worn bags — as { items: [{ bag, slot, guid, itemId, name, count, quality? }], freeSlots, totalSlots, bags: [{ slot, numSlots, name }] }; each item's bag/slot is what the item actions take. |
 | `quest` | `state.quest(questId): QuestLogEntry | undefined` | One quest-log entry by id: questId, title, complete bit, counts, and objectives: [{ kind: "kill"|"interact"|"collect"|"event", entry, text, required, have, done }] (objectives/title are undefined until the quest template answer has arrived, usually within a second of accepting). |
 | `questLog` | `get state.questLog: QuestLogEntry[]` | All quest-log entries. |
 | `lastGossip` | `state.lastGossip(guid): GossipMenu | undefined` | The gossip menu last observed open for a guid (what gossipSelect-by-text resolves against). |
@@ -140,7 +143,7 @@ zero.
 | `xp` | `get state.xp: Observed<number> | undefined` | Current experience (read .value). |
 | `nextLevelXp` | `get state.nextLevelXp: Observed<number> | undefined` | Experience needed for the next level (read .value). |
 | `money` | `get state.money: Observed<number> | undefined` | Money in copper (read .value). |
-| `inventory` | `get state.inventory: InventoryItem[]` | All observed inventory items (bag() is the backpack view). |
+| `inventory` | `get state.inventory: InventoryItem[]` | All observed inventory slots by raw slot id; equipment is `slot < 19` (worn bags 19-22), bag() is the carried view. |
 | `chat` | `get state.chat: readonly ChatEntry[]` | The retained chat tail. |
 | `notifications` | `get state.notifications: readonly NotificationEntry[]` | The retained notification tail. |
 | `gaps` | `get state.gaps: readonly GapRecord[]` | Observed gaps in the event stream. |
@@ -150,11 +153,20 @@ zero.
 
 ## Events (`sdk.events`)
 
-Events are the server's `SMSG_*` packets as JSON.
+Events are the server's `SMSG_*` packets as JSON, plus a few `WB_*` events for
+what a client knows locally: `WB_MOVE_RESULT` / `WB_MOVE_PROGRESS` (own moves),
+`WB_AREA` (`{ mapId, zoneId, zoneName, areaId, areaName }` on login and whenever
+the zone or subzone changes, by foot, teleport or transfer — what `state.self.zone`
+/ `state.self.area` are folded from),
+`WB_RIDE_PROGRESS` (own position while a transport carries you, ≤1/s) and
+`WB_TRANSPORT_PROGRESS` (`{ guid, entry, pos, docked, progressMs, periodMs }`
+per transport in view, ≤1/s — the same facts as the `docked` column of
+`state.units()`).
 
 | Method | Signature | Purpose |
 | --- | --- | --- |
 | `on` | `events.on(opcode, fn): Unsubscribe` | Subscribe to an SMSG_* opcode; returns a function that unsubscribes. |
+| `off` | `events.off(opcode, fn): boolean` | Remove a handler added with on() (or once()) for that opcode; returns whether one was found. Removing something already gone is a no-op. For onAny(), call the unsubscribe it returned. |
 | `onAny` | `events.onAny(fn): Unsubscribe` | Subscribe to every event. |
 | `once` | `events.once(opcode, fn): Unsubscribe` | Subscribe to the next single event of an opcode. |
 | `waitFor` | `events.waitFor(predicate, options?): Promise<StreamEvent>` | Wait for the next event satisfying a predicate; throws EventTimeoutError on timeout, EventAbortedError if options.signal (or the client default) fires. |

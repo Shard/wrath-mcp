@@ -64,7 +64,7 @@ const CLIENT_ENDPOINTS: readonly Row[] = [
 
 /** Helpers: they wait for the game's verdict and return it as a value (ADR-0011). */
 const CLIENT_HELPERS: readonly Row[] = [
-  { name: "moveTo", sig: "moveTo(point, options?): Promise<MoveResult>", purpose: "Walk to a world position and wait for the server's arrive/target_off_mesh/… verdict." },
+  { name: "moveTo", sig: "moveTo(target, options?): Promise<MoveResult>", purpose: "Walk to a point { x, y, z }, a unit, or a guid (its cached position; the guid rides along so the module resolves z to the ground under the unit) and wait for the server's arrive/target_off_mesh/transferred/teleported/… verdict; a target nothing in view answers to comes back as status \"unknown_target\". An arrival aboard a tram car or boat carries onTransport { guid, entry }, and state.self.position then follows the ride (WB_RIDE_PROGRESS)." },
   { name: "killTarget", sig: "killTarget(target: GuidOrUnit, options?): Promise<KillResult>", purpose: "Approach and auto-attack until the target or we drop; returns how the fight ended." },
   { name: "lootCorpse", sig: "lootCorpse(target: GuidOrUnit, options?): Promise<LootResult>", purpose: "Empty a corpse and report what actually entered the bags (confirmed pushes, not the window)." },
   { name: "acceptQuestFrom", sig: "acceptQuestFrom(npcGuid: GuidOrUnit, questId, options?): Promise<QuestAcceptResult>", purpose: "Take a quest from an NPC and confirm it landed in the quest log." },
@@ -72,6 +72,7 @@ const CLIENT_HELPERS: readonly Row[] = [
   { name: "questsAvailableFrom", sig: "questsAvailableFrom(npcGuid: GuidOrUnit, options?): Promise<{ ok, quests }>", purpose: "What an NPC is offering right now; an empty list is an answer, not an error." },
   { name: "trainerList", sig: "trainerList(npcGuid: GuidOrUnit, options?): Promise<TrainerListResult>", purpose: "What a trainer teaches, each row with derived learnable/affordable." },
   { name: "buySpell", sig: "buySpell(npcGuid: GuidOrUnit, spellId, options?): Promise<BuySpellResult>", purpose: "Learn one spell from a trainer for money; returns learned or buy_failed." },
+  { name: "equipItem", sig: "equipItem(bag, slot, options?): Promise<EquipItemResult>", purpose: "Equip a carried item (bag/slot as `state.bag()` lists them: 255/23-38 for the backpack, a worn bag's equip slot 19-22 with slots 0..numSlots-1) and wait for the server's verdict; returns equipped, or not_equipped with the InventoryResult reason (proficiency, level, a two-hander blocking a shield, …)." },
   { name: "learnTalent", sig: "learnTalent(talentId, rank, options?): Promise<LearnTalentResult>", purpose: "Spend a talent point (rank is 0-based) and read the verdict off the SMSG_TALENTS_INFO answer; returns learned or not_learned with the new state.talents()." },
   { name: "waitForChat", sig: "waitForChat(match: string | (entry) => boolean, options?): Promise<ChatEntry>", purpose: "Wait for a chat line matching a string or predicate." },
   { name: "waitForNearby", sig: "waitForNearby(predicate: (obj) => boolean, options?): Promise<NearbyObject>", purpose: "Wait until an object in view satisfies the predicate." },
@@ -88,7 +89,7 @@ const CLIENT_HELPERS: readonly Row[] = [
  */
 const CLIENT_RAW: readonly Row[] = [
   { name: "say", sig: "say(text): Promise<ActionResponse>", purpose: "Say something in local chat." },
-  { name: "moveToAsync", sig: "moveToAsync(point): Promise<MoveToResponse>", purpose: "Queue a move without waiting; prefer moveTo, which waits for the verdict." },
+  { name: "moveToAsync", sig: "moveToAsync(target): Promise<MoveToResponse>", purpose: "Queue a move without waiting — the call for a walk longer than your own time budget; same targets as moveTo." },
   { name: "stop", sig: "stop(): Promise<ActionResponse>", purpose: "Queue a movement stop; the in-flight moveTo resolves with status 'stopped'." },
   { name: "face", sig: "face(orientationOrPoint: number | { x, y }): Promise<FaceResponse>", purpose: "Turn in place toward an orientation (radians) or a point." },
   { name: "setTarget", sig: "setTarget(guid: GuidArg): Promise<ActionResponse>", purpose: "Set the current target (guid string only)." },
@@ -117,11 +118,11 @@ const CLIENT_RAW: readonly Row[] = [
   { name: "buyItem", sig: "buyItem(guid: GuidArg, itemId, slot, count?): Promise<ActionResponse>", purpose: "Buy an item from a vendor (slot is the 1-based vendor slot)." },
   { name: "sellItem", sig: "sellItem(guid: GuidArg, itemGuid: GuidArg, count?): Promise<ActionResponse>", purpose: "Sell an item to a vendor; omit count to sell the whole stack." },
   { name: "repairAll", sig: "repairAll(guid: GuidArg): Promise<ActionResponse>", purpose: "Repair everything at a repair vendor." },
-  { name: "equipItem", sig: "equipItem(bag, slot): Promise<ActionResponse>", purpose: "Equip an item; bag 255 is the backpack, slots 23-38." },
   { name: "useItem", sig: "useItem(bag, slot, targetGuid?: GuidArg): Promise<ActionResponse>", purpose: "Use a bag item's on-use effect." },
   { name: "destroyItem", sig: "destroyItem(bag, slot, count?): Promise<ActionResponse>", purpose: "Destroy a bag item; omit count to destroy the whole stack." },
   { name: "repop", sig: "repop(): Promise<ActionResponse>", purpose: "Release the spirit while dead." },
-  { name: "reclaimCorpse", sig: "reclaimCorpse(guid?: GuidArg): Promise<ActionResponse>", purpose: "Resurrect at the corpse (accepted only near it, after the delay)." },
+  { name: "reclaimCorpse", sig: "reclaimCorpse(guid?: GuidArg, options?: ReclaimCorpseOptions): Promise<ReclaimCorpseResult>", purpose: "Wait out the server's corpse reclaim delay, reclaim, and report the verdict: reclaimed / not_reclaimed / unconfirmed." },
+  { name: "reclaimCorpseAsync", sig: "reclaimCorpseAsync(guid?: GuidArg): Promise<ActionResponse>", purpose: "CMSG_RECLAIM_CORPSE, dispatch only. Prefer reclaimCorpse." },
   { name: "spiritHealerActivate", sig: "spiritHealerActivate(guid: GuidArg): Promise<ActionResponse>", purpose: "Resurrect at a graveyard spirit healer (durability cost, resurrection sickness)." },
   { name: "trainerListAsync", sig: "trainerListAsync(guid: GuidArg): Promise<ActionResponse>", purpose: "Ask a trainer for its list without waiting (prefer trainerList)." },
   { name: "trainerBuySpellAsync", sig: "trainerBuySpellAsync(guid: GuidArg, spellId): Promise<ActionResponse>", purpose: "Buy a spell without waiting (prefer buySpell)." },
@@ -133,13 +134,19 @@ const CLIENT_RAW: readonly Row[] = [
 const CLIENT_INTERNAL = new Set([
   "action",
   "request",
+  "postMoveTo",
+  "waitOwnTeleportAck",
+  "reclaimRefusal",
+  "latestReclaimDelay",
   "resolveGossipOption",
   "questOffer",
   "faceQuietly",
   "waitForState",
   "waitEvent",
   "currentSignal",
+  "remainingBudgetMs",
   "throwIfAborted",
+  "sleepAborting",
   "clientParityQueries",
   "fireAndForget",
   "flushStatusQueries",
@@ -156,16 +163,16 @@ const CLIENT_INTERNAL = new Set([
  * unobserved, never zero.
  */
 const STATE_ROWS: readonly Row[] = [
-  { name: "units", sig: "state.units(filter?: UnitFilter): UnitView[]", purpose: "Scan nearby objects, nearest first; filter by entry, name (string | RegExp), type, alive, maxDistance, npc, questGiver (the observed marker name: \"available\" offers a quest, \"reward\" takes a turn-in now, \"incomplete\" ends a quest not yet done). Rows carry questGiver / questGiverStatus." },
+  { name: "units", sig: "state.units(filter?: UnitFilter): UnitView[]", purpose: "Scan nearby objects, nearest first; filter by entry, name (string | RegExp), type, alive, maxDistance, npc, role (an NPC role word or a list: \"questGiver\", \"vendor\", \"repair\", \"trainer\", \"flightMaster\", \"innkeeper\", \"spiritHealer\", \"banker\", \"auctioneer\", …), questGiver (the observed marker name: \"available\" offers a quest, \"reward\" takes a turn-in now, \"incomplete\" ends a quest not yet done; true means any marker but \"none\"). Rows carry roles (the NPC's role words from its npc flags — what it is for, never what to do; empty for non-NPCs) and questGiver / questGiverStatus; game objects are named (\"Mailbox\", \"Subway\") and carry goType (door, chest, mailbox, transport, …), and a transport carries docked (true while the car sits at a platform)." },
   {
     name: "closest",
     sig: "state.closest(filter?): NearbyObject | undefined",
     purpose:
-      "The nearest object by distance. `filter` is a units() criteria object ({ entry, name, type, alive, maxDistance, npc, questGiver }) or a predicate over the raw object.",
+      "The nearest object by distance. `filter` is a units() criteria object ({ entry, name, type, alive, maxDistance, npc, role, questGiver }) or a predicate over the raw object.",
   },
   { name: "nearbyUnits", sig: "state.nearbyUnits(): NearbyObject[]", purpose: "The raw nearby objects (state.units gives flat plain objects instead)." },
   { name: "creaturesByEntry", sig: "state.creaturesByEntry(entry): NearbyObject[]", purpose: "Nearby creatures with a given template entry id." },
-  { name: "bag", sig: "state.bag(): BagContents", purpose: "The backpack as { items: [{ bag, slot, itemId, name, count }], freeSlots }." },
+  { name: "bag", sig: "state.bag(): BagContents", purpose: "The whole carried inventory — backpack plus worn bags — as { items: [{ bag, slot, guid, itemId, name, count, quality? }], freeSlots, totalSlots, bags: [{ slot, numSlots, name }] }; each item's bag/slot is what the item actions take." },
   { name: "quest", sig: "state.quest(questId): QuestLogEntry | undefined", purpose: "One quest-log entry by id: questId, title, complete bit, counts, and objectives: [{ kind: \"kill\"|\"interact\"|\"collect\"|\"event\", entry, text, required, have, done }] (objectives/title are undefined until the quest template answer has arrived, usually within a second of accepting)." },
   { name: "questLog", sig: "get state.questLog: QuestLogEntry[]", purpose: "All quest-log entries." },
   { name: "lastGossip", sig: "state.lastGossip(guid): GossipMenu | undefined", purpose: "The gossip menu last observed open for a guid (what gossipSelect-by-text resolves against)." },
@@ -180,7 +187,7 @@ const STATE_ROWS: readonly Row[] = [
   { name: "xp", sig: "get state.xp: Observed<number> | undefined", purpose: "Current experience (read .value)." },
   { name: "nextLevelXp", sig: "get state.nextLevelXp: Observed<number> | undefined", purpose: "Experience needed for the next level (read .value)." },
   { name: "money", sig: "get state.money: Observed<number> | undefined", purpose: "Money in copper (read .value)." },
-  { name: "inventory", sig: "get state.inventory: InventoryItem[]", purpose: "All observed inventory items (bag() is the backpack view)." },
+  { name: "inventory", sig: "get state.inventory: InventoryItem[]", purpose: "All observed inventory slots by raw slot id; equipment is `slot < 19` (worn bags 19-22), bag() is the carried view." },
   { name: "chat", sig: "get state.chat: readonly ChatEntry[]", purpose: "The retained chat tail." },
   { name: "notifications", sig: "get state.notifications: readonly NotificationEntry[]", purpose: "The retained notification tail." },
   { name: "gaps", sig: "get state.gaps: readonly GapRecord[]", purpose: "Observed gaps in the event stream." },
@@ -195,6 +202,7 @@ const STATE_ROWS: readonly Row[] = [
  * the prototype, so they are described in prose in the state section, not here.
  */
 const STATE_INTERNAL = new Set([
+  "addAchievement",
   "apply",
   "applyQuestGiverStatus",
   "questObjectives",
@@ -209,6 +217,7 @@ const STATE_INTERNAL = new Set([
   "isSelfGuid",
   "joinName",
   "mergeFields",
+  "rebuildAchievements",
   "upsertNearby",
 ]);
 
@@ -217,6 +226,7 @@ const STATE_INTERNAL = new Set([
 /** The event stream, accessed as `sdk.events` (aliased as `events` in a snippet). */
 const EVENT_ROWS: readonly Row[] = [
   { name: "on", sig: "events.on(opcode, fn): Unsubscribe", purpose: "Subscribe to an SMSG_* opcode; returns a function that unsubscribes." },
+  { name: "off", sig: "events.off(opcode, fn): boolean", purpose: "Remove a handler added with on() (or once()) for that opcode; returns whether one was found. Removing something already gone is a no-op. For onAny(), call the unsubscribe it returned." },
   { name: "onAny", sig: "events.onAny(fn): Unsubscribe", purpose: "Subscribe to every event." },
   { name: "once", sig: "events.once(opcode, fn): Unsubscribe", purpose: "Subscribe to the next single event of an opcode." },
   { name: "waitFor", sig: "events.waitFor(predicate, options?): Promise<StreamEvent>", purpose: "Wait for the next event satisfying a predicate; throws EventTimeoutError on timeout, EventAbortedError if options.signal (or the client default) fires." },
@@ -339,7 +349,9 @@ ${table(CLIENT_RAW)}
 ## State reads (\`state.*\`)
 
 \`state\` (alias for \`sdk.state\`) is a cache folded from events. \`state.self\`
-(guid, name, level, position, health, targetGuid) and \`state.nearby\` (a Map
+(guid, name, level, position, zone and area — \`{ id, name }\`, the game's own
+zone/subzone as the client names them on screen, e.g. "Elwynn Forest" /
+"Northshire Valley" — health, targetGuid) and \`state.nearby\` (a Map
 keyed by guid) are plain properties; the members below are getters and methods.
 Observed fields are wrapped as \`{ value, seq, ts }\` — read \`.value\`. Every field
 is \`undefined\` until an event carried it; \`undefined\` means unobserved, never
@@ -349,7 +361,15 @@ ${table(STATE_ROWS)}
 
 ## Events (\`sdk.events\`)
 
-Events are the server's \`SMSG_*\` packets as JSON.
+Events are the server's \`SMSG_*\` packets as JSON, plus a few \`WB_*\` events for
+what a client knows locally: \`WB_MOVE_RESULT\` / \`WB_MOVE_PROGRESS\` (own moves),
+\`WB_AREA\` (\`{ mapId, zoneId, zoneName, areaId, areaName }\` on login and whenever
+the zone or subzone changes, by foot, teleport or transfer — what \`state.self.zone\`
+/ \`state.self.area\` are folded from),
+\`WB_RIDE_PROGRESS\` (own position while a transport carries you, ≤1/s) and
+\`WB_TRANSPORT_PROGRESS\` (\`{ guid, entry, pos, docked, progressMs, periodMs }\`
+per transport in view, ≤1/s — the same facts as the \`docked\` column of
+\`state.units()\`).
 
 ${table(EVENT_ROWS)}
 
