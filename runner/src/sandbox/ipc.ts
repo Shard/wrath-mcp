@@ -36,8 +36,8 @@ export interface EvalResultMsg {
   error?: string;
   /**
    * A note about the completion value itself, rendered under it. Today the one
-   * case is a snippet whose value is a function it never called (ADR-0016 rule
-   * 2: the harness explains, it does not act).
+   * case is a snippet whose value is a function it never called (the harness
+   * explains, it does not act).
    */
   hint?: string;
   /** console output drained since the previous result (includes background logs). */

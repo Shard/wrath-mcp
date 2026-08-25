@@ -104,7 +104,7 @@ export interface Point3 {
 }
 
 /**
- * A creature's movement as a player perceives it (ADR-0013): where the spline
+ * A creature's movement as a player perceives it: where the spline
  * started, where it is heading, how long it takes. No path points: the module
  * consumes them.
  */
@@ -194,7 +194,7 @@ export interface AreaRef {
 }
 
 /**
- * One achievement the character holds, as the packets said it (ADR-0048).
+ * One achievement the character holds, as the packets said it.
  *
  * `source` is which packet carried it: `login` is the `SMSG_ALL_ACHIEVEMENT_DATA`
  * backlog a client receives once during login, `earned` is an
@@ -275,7 +275,7 @@ export interface SelfState extends UnitFieldsState {
   /** `UNIT_FIELD_TARGET` on our own block: what the client shows as selected. */
   targetGuid: Observed<GuidKey> | undefined;
   /**
-   * Achievements held, from the login backlog and our own earns (ADR-0048).
+   * Achievements held, from the login backlog and our own earns.
    * `undefined` until an achievement packet has been observed at all.
    */
   achievements: AchievementsState | undefined;
@@ -296,7 +296,7 @@ export interface SelfState extends UnitFieldsState {
 
 /**
  * One occupied quest-log slot, folded out of the raw `quest<slot><Off>` update
- * fields (PROTOCOL.md; ADR-0013 keeps the wire shape and leaves the join here).
+ * fields (PROTOCOL.md; the module keeps the wire shape and leaves the join here).
  *
  * `complete` is the quest log's own completion bit, and it is the *only*
  * reliable completion signal for a kill objective at the pinned commit: the
@@ -669,7 +669,7 @@ export interface NearbyObject extends UnitFieldsState {
  * 1). `undefined` means unobserved, never zero and never a guess.
  */
 export interface UnitView {
-  /** Opaque decimal-string guid (ADR-0017). */
+  /** Opaque decimal-string guid. */
   readonly guid: GuidKey;
   /** Creature/gameobject template id, from `OBJECT_FIELD_ENTRY`. */
   readonly entry: number | undefined;
@@ -830,7 +830,7 @@ export function questGiverStatusName(status: number): QuestGiverStatusName {
 
 /**
  * Criteria for `units()`. All present criteria are AND-ed; an absent one does
- * not filter. Anything else is rejected loudly (ADR-0016).
+ * not filter. Anything else is rejected loudly.
  */
 export interface UnitFilter {
   /** One template id or a list of them. */
@@ -1275,7 +1275,7 @@ export class StateCache {
    * 0-18) is the `inventory` rows with `slot < 19`, not part of this list.
    *
    * A view over `inventory` and the worn bags' own create blocks — same
-   * three-way join, no new observation. Earned surface (ADR-0015):
+   * three-way join, no new observation. Earned surface:
    * morning-opus-1 rebuilt the backpack view from ITEM_PUSH_RESULT listeners,
    * invSlot regexes over raw updates, and a full relog to force a resend; the
    * worn-bag span came from `inventory_full` turn-ins (quests 33, 183) and a
@@ -1696,7 +1696,7 @@ export class StateCache {
         return;
       }
       /*
-       * Achievements and flight paths (ADR-0048, issue #8). The earn is a
+       * Achievements and flight paths (issue #8). The earn is a
        * say-range broadcast, so `self` — not the opcode — is what makes it
        * ours; another player's achievement is not an observation about this
        * character and is dropped here rather than filtered downstream.
@@ -2005,7 +2005,7 @@ export class StateCache {
   /**
    * Everything in view, flattened, sorted by distance — the scan helper.
    *
-   * Earned surface (ADR-0015). Models kept hand-rolling this over `nearby` and
+   * Earned surface. Models kept hand-rolling this over `nearby` and
    * tripping on the two shapes underneath it: roster-opus-low-20260822 turn 15
    * filtered `nearbyUnits()` on `u.fields.entry?.value`, and because `fields`
    * is a `Map` every filter returned `[]` while units stood in view — the model
@@ -2080,8 +2080,8 @@ export class StateCache {
    * object. Four of five models in the 2026-08-22 roster reached for the
    * criteria object by analogy with `units(filter)` and got a bare V8
    * `TypeError: filter is not a function`, which cost one of them a 15-turn
-   * detour; the analogy was right, so the surface now matches it (ADR-0015:
-   * earned by observed need).
+   * detour; the analogy was right, so the surface now matches it (earned by
+   * observed need).
    *
    * Ordering is by distance in both forms. `units({ name: "tree" })` ranks its
    * name matches by tier first; `closest` does not, because "nearest" is the
@@ -2589,7 +2589,7 @@ function passesUnitFilter(view: UnitView, obj: NearbyObject, f: NormalizedUnitFi
 
 // ------------------------------------------------------ units() filter input
 //
-// ADR-0016: repair only what has exactly one valid reading (a numeric string
+// Softening policy: repair only what has exactly one valid reading (a numeric string
 // where a number is expected), reject everything else with a message that says
 // what arrived, what was expected, and what to do. A silently ignored key is
 // the forbidden outcome — it returns a wrong-but-plausible answer, which is the
@@ -2604,7 +2604,7 @@ const ANY_QUEST_GIVER = "any" as const;
  * Keys models actually passed that are not filter keys, and where the thing
  * they wanted really lives (2026-08-23 run audit: `dead`, `guid`). Naming the
  * replacement is explanation, not repair — inverting `dead` into `alive` would
- * be a guess, and ADR-0016 rule 1 forbids guessing.
+ * be a guess, and repairs must be deterministic — guessing is forbidden.
  */
 const UNIT_FILTER_KEY_HINTS: Readonly<Record<string, string>> = {
   dead: 'use alive instead — { alive: false } is the known-dead, { alive: true } drops them',
@@ -2695,7 +2695,7 @@ const REGEX_LITERAL = /^\/(.*)\/([dgimsuy]*)$/s;
  * `/` but is not a valid `/pat/flags` (a bad flag, a dangling slash) is a
  * literal name, not an error — but a well-formed literal whose pattern does not
  * compile (`"/tree(/"`) is rejected, because it has exactly one reading and
- * that reading is broken (ADR-0016).
+ * that reading is broken.
  */
 function compileNameMatcher(value: unknown): NameMatcher {
   if (value instanceof RegExp) return { kind: "regex", re: value };
@@ -2815,7 +2815,7 @@ function normalizeUnitFilter(filter: UnitFilter | undefined): NormalizedUnitFilt
 
   if (filter.type !== undefined) {
     // An enum near-miss ("gameobject", "npc") has more than one plausible
-    // reading, so ADR-0016 says reject rather than pick. No case folding here.
+    // reading, so reject rather than pick. No case folding here.
     if (!(UNIT_FILTER_TYPES as readonly string[]).includes(filter.type as string)) {
       throw filterError(
         `type received ${showValue(filter.type)}, expected one of ${UNIT_FILTER_TYPES.map(showValue).join(", ")} ` +
@@ -2846,7 +2846,7 @@ function normalizeUnitFilter(filter: UnitFilter | undefined): NormalizedUnitFilt
 
   if (filter.questGiver !== undefined) {
     // Exact names only: "?"/"!" or "turnin" have more than one reading
-    // (reward vs reward_rep vs incomplete), so ADR-0016 says reject and list.
+    // (reward vs reward_rep vs incomplete), so reject and list the options.
     // `true` is the exception: "does this NPC have anything for me" has one
     // reading (any marker but "none"), so it is honored. `false` has two
     // ("marker observed as none" vs "no marker observed"), so it is rejected.
@@ -2940,7 +2940,7 @@ export function pointOf(obj: NearbyObject): Observed<Point3> | undefined {
  * is. Models do not know that: two model families in the 2026-08-23 window
  * printed `XP: undefined /900` for a whole run reading `state.self.xp` or
  * `state.self.experience`, which are simply absent and so answer `undefined`
- * forever without ever being wrong out loud. ADR-0016 rule 2 forbids exactly
+ * forever without ever being wrong out loud. The softening policy forbids exactly
  * that: an unusable read must say what it should have been.
  *
  * The getters are non-enumerable on purpose — `snapshot()` spreads `self`, and

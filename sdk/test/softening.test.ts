@@ -1,5 +1,5 @@
 /**
- * Softening repairs from the 2026-08-23 run audit (ADR-0016), kept together so
+ * Softening repairs from the 2026-08-23 run audit, kept together so
  * the evidence that earned each one stays next to the behaviour it bought:
  *
  *   - `state.units({ questGiver: true })`: 17 filter-misuse calls, six of them

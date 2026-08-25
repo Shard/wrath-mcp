@@ -18,7 +18,7 @@
 
 // Tiny self-contained JSON. The module's wire shapes are small and flat, so a
 // hand-rolled builder plus a minimal parser is less total risk than wiring a
-// Boost.JSON link mode into AzerothCore's module build (see ADR-0009). Not a
+// Boost.JSON link mode into AzerothCore's module build. Not a
 // general JSON library: enough for module/PROTOCOL.md and nothing more.
 
 #ifndef MOD_WRATHBENCH_WBJSON_H

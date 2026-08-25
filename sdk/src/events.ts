@@ -168,7 +168,7 @@ type AnyHandler = (event: StreamEvent) => void;
 const ORIGINAL = Symbol("wrathbench.originalHandler");
 type WrappedHandler = AnyHandler & { [ORIGINAL]?: AnyHandler };
 
-/** How a rejected `off` argument is quoted back (ADR-0016: say what arrived). */
+/** How a rejected `off` argument is quoted back (rejections say what arrived). */
 function describeArg(v: unknown): string {
   if (typeof v === "function") return "a function";
   if (typeof v === "string") return JSON.stringify(v);
@@ -433,7 +433,7 @@ export class EventStream implements AsyncIterable<StreamEvent> {
   on(opcode: string, handler: (event: never) => void): Unsubscribe {
     const h = handler as AnyHandler;
     // "*" has exactly one reading (every event): route it to onAny instead of
-    // registering under a literal opcode that can never fire (ADR-0016 rule 1).
+    // registering under a literal opcode that can never fire.
     if (opcode === "*") return this.onAny(h);
     let set = this.opcodeHandlers.get(opcode);
     if (!set) {
@@ -477,7 +477,7 @@ export class EventStream implements AsyncIterable<StreamEvent> {
    * (21 uncaught `events.off is not a function` in one 2026-08-22 run), and it
    * removes exactly the same registration. Returns whether a handler was found:
    * removing something already gone is a no-op, not an error. Wrong arguments
-   * are an error (ADR-0016): a silently ignored call is the forbidden outcome.
+   * are an error: a silently ignored call is the forbidden outcome.
    */
   off<K extends keyof EventByOpcode>(opcode: K, handler: (event: EventByOpcode[K]) => void): boolean;
   off(opcode: string, handler: (event: StreamEvent) => void): boolean;

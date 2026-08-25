@@ -171,7 +171,7 @@ stale, and reclaiming it is correct, not a race:
   success idempotently (the caller re-syncs state from the event stream); it does
   not tear down and rebuild. A same-token session mid-login is `token_in_use`; a
   same-token session in world for a **different** character/account is torn down
-  and rebuilt (never a silent wrong-character success, ADR-0016).
+  and rebuilt (never a silent wrong-character success).
 - A different token (or a core-side session with no live bench token) holding the
   account is torn down via the normal teardown path, and the create waits for the
   core to fully release the account before entering world. If the release does not
@@ -333,7 +333,7 @@ them: `{ "ok": true, "action": "<name>", "token": ... }`.
 | `trainer_buy_spell` | `guid`, `spellId` | `CMSG_TRAINER_BUY_SPELL` | costs the character's own money server-side; answered by `SMSG_TRAINER_BUY_SUCCEEDED` or `SMSG_TRAINER_BUY_FAILED` |
 | `learn_talent` | `talentId`, `rank` | `CMSG_LEARN_TALENT` | `talentId` from Talent.dbc, `rank` 0-based; the handler always answers `SMSG_TALENTS_INFO`, and a granted spell arrives as `SMSG_LEARNED_SPELL`; `400 missing_talent` |
 | `learn_preview_talents` | `talents` = `[[talentId, rank], ...]` | `CMSG_LEARN_PREVIEW_TALENTS` | the preview-mode "learn" button (at most 150 pairs); `400 missing_talents`, `400 invalid_talents` |
-| `raw` | `opcode`, `payload` | the named opcode | the escape hatch (ADR-0025), below |
+| `raw` | `opcode`, `payload` | the named opcode | the escape hatch, below |
 | `repop` | — | `CMSG_REPOP_REQUEST` | release spirit while dead |
 | `reclaim_corpse` | `guid?` | `CMSG_RECLAIM_CORPSE` | resurrect at corpse; handler resolves the player's own corpse, guid optional. Refusals are silent (further than 39y, delay not elapsed, other map, no corpse); the SDK reads them off the corpse-query answer below |
 | `spirit_healer_activate` | `guid` | `CMSG_SPIRIT_HEALER_ACTIVATE` | graveyard resurrection fallback; no dedicated response opcode — the outcome arrives through already-served events (health update fields, res-sickness aura) |
@@ -350,11 +350,11 @@ A guid-shaped field (`guid`, `targetGuid`, `itemGuid`) that is present but not
 a decimal u64 string is `400 invalid_guid`, echoing `action`, `param` and the
 received value (truncated to 64 chars) — never silently coerced to guid 0.
 
-#### raw (escape hatch, 2026-08, ADR-0025)
+#### raw (escape hatch, 2026-08)
 
 Send one allowlisted client opcode with a caller-built body. Exists so a
 trajectory can demonstrate the need for a surface before the module and SDK
-grow a dedicated action for it (ADR-0015); it is not a second way to do what an
+grow a dedicated action for it; it is not a second way to do what an
 action already does.
 
 Request:
@@ -423,7 +423,7 @@ A parked utility session (never enters world) answers with the decoded `SMSG_CHA
 
 Delete a character by name through the real `CMSG_CHAR_DELETE` path (added in
 the quest/combat extension, 2026-08). Needed because per-episode fresh
-characters (ADR-0006) accumulate against the realm's 10-characters-per-account
+characters accumulate against the realm's 10-characters-per-account
 cap. The module stands up a short-lived parked session, authenticates, walks
 the character list, sends `CMSG_CHAR_DELETE` for the matching name, and tears
 the session down. Cannot run while another session is live on the same account
@@ -847,7 +847,7 @@ Quests and gossip (quest/gossip text served as the client would show it):
 | `SMSG_QUESTGIVER_QUEST_FAILED` | 0x192 | `{ "questId", "reason" }` |
 | `SMSG_QUESTUPDATE_ADD_KILL` | 0x199 | `{ "questId", "entry", "current", "required", "guid" }` (gameobject credit arrives with `entry | 0x80000000`) |
 | `SMSG_QUESTUPDATE_ADD_ITEM` | 0x19A | `{}` — the core sends it empty; item progress is in the quest-log update fields |
-| `SMSG_QUESTUPDATE_COMPLETE` | 0x198 | `{ "questId" }` — NOT sent for kill/item objectives at the pinned commit (exploration/event quests only); read completion from the quest-log `State` complete bit or the final `ADD_KILL` with `current == required` (ADR-0013) |
+| `SMSG_QUESTUPDATE_COMPLETE` | 0x198 | `{ "questId" }` — NOT sent for kill/item objectives at the pinned commit (exploration/event quests only); read completion from the quest-log `State` complete bit or the final `ADD_KILL` with `current == required` |
 | `SMSG_QUESTUPDATE_FAILED` | 0x196 | `{ "questId" }` |
 | `SMSG_GOSSIP_MESSAGE` | 0x17D | `{ "guid", "menuId", "textId", "options": [{ "optionId", "icon", "text" }], "quests": [{ "questId", "icon", "level", "title" }] }` |
 | `SMSG_GOSSIP_COMPLETE` | 0x17E | `{}` |
@@ -893,7 +893,7 @@ knowledge, like item-template fields:
 | `SMSG_CLEAR_COOLDOWN` | 0x1DE | `{ "spellId", "guid" }` |
 | `SMSG_TALENTS_INFO` | 0x4C0 | `{ "pet": false, "unspentPoints", "specCount", "activeSpec", "specs": [{ "talents": [{ "talentId", "rank" }] }] }` — `rank` is 0-based; glyph slots are consumed and not served. The pet form is `{ "pet": true }` only (no pet surface). Sent on login, level-up, after every `CMSG_LEARN_TALENT`, and on spec change |
 
-Achievements and flight paths (2026-08-25, issue #8 first half, ADR-0048):
+Achievements and flight paths (2026-08-25, issue #8 first half):
 
 | opcode | id | `data` fields |
 |---|---|---|
@@ -915,7 +915,8 @@ The flight itself has no event: `taxiFlight` on self in `SMSG_UPDATE_OBJECT`
 `reply` of 0 followed by `taxiFlight: true` is the flight starting and the
 flip back to `false` is the landing, exactly as a client sees them. Nothing is
 inferred from the server's taxi state. `SMSG_CRITERIA_UPDATE` (0x46A),
-`SMSG_SHOWTAXINODES` and `SMSG_TAXINODE_STATUS` are not tapped (ADR-0048).
+`SMSG_SHOWTAXINODES` and `SMSG_TAXINODE_STATUS` are not tapped: the agent finds
+flight masters the way it finds anything, and learns a node by visiting it.
 
 Death:
 
@@ -951,8 +952,8 @@ Creature movement:
 
 `SMSG_MONSTER_MOVE` is deliberately reduced to destination + duration: the
 spline path points the client receives are consumed and dropped, because
-serving them would hand the agent the server's route in machine-readable form
-(ADR-0010). A client player only sees the animation.
+serving them would hand the agent the server's route in machine-readable form.
+A client player only sees the animation.
 
 Map transfers (navigation, 2026-08, FOLLOW-UPS 38 N1):
 

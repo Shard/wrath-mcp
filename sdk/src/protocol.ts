@@ -31,7 +31,7 @@ export const PROTOCOL_REVISION = "phase0-stage2+movement+quest-combat+trainer+sp
  * a high part (0xF130…) far above `Number.MAX_SAFE_INTEGER`, so a bare JSON
  * number would already be corrupted by `JSON.parse` before this schema ran.
  *
- * The schema emits the guid as an **opaque decimal string** (ADR-0017): that is
+ * The schema emits the guid as an **opaque decimal string**: that is
  * the only representation the model surface ever carries, so `===`, Map keys,
  * template literals and `JSON.stringify` all behave as a model expects. The
  * round-trip through `parseGuid`/`formatGuid` canonicalises ("007" -> "7") and
@@ -55,7 +55,7 @@ export type GuidKey = string;
 
 // The one auditable seam between the string surface and the SDK's internal
 // bigint use (bit packing/unpacking). A bigint never escapes past this pair to
-// anything model-visible (ADR-0017).
+// anything model-visible.
 
 /** SDK-internal: a guid string as a u64 for bit arithmetic. Throws on non-decimal input. */
 export function parseGuid(guid: string): bigint {
@@ -253,13 +253,13 @@ export type ActionRequest =
   // spellbook/talent extension
   | { token: string; action: "learn_talent"; talentId: number; rank: number }
   | { token: string; action: "learn_preview_talents"; talents: readonly (readonly [number, number])[] }
-  /** The escape hatch (ADR-0025): an allowlisted client opcode by name and its body as hex. */
+  /** The escape hatch: an allowlisted client opcode by name and its body as hex. */
   | { token: string; action: "raw"; opcode: string; payload: string };
 
 // ------------------------------------------------------------ raw payloads
 
 /**
- * One field of a raw-action payload (ADR-0025). Integers are little-endian,
+ * One field of a raw-action payload (module/PROTOCOL.md "raw"). Integers are little-endian,
  * as on the 3.3.5a wire; `guid` is a plain u64 (given as the decimal string
  * every guid already is), `packedGuid` the client's compressed form, `cstring`
  * a NUL-terminated UTF-8 string, `bytes` pre-built hex.
@@ -342,7 +342,7 @@ export function encodeRawPayload(payload: z.output<typeof rawPayloadSchema>): st
 
 /**
  * POST /character-delete body. Not session-scoped: the module stands up its own
- * parked session for the delete (ADR-0013), so `token` is a throwaway for this
+ * parked session for the delete (module/PROTOCOL.md), so `token` is a throwaway for this
  * one operation's audit log, never the live session's token.
  */
 export interface CharacterDeleteRequest {
@@ -507,7 +507,7 @@ export const updateFieldsSchema = z.looseObject({
   unitFlags: z.number().optional(),
   /**
    * `UNIT_FLAG_TAXI_FLIGHT` read off `unitFlags` by the module and named
-   * (PROTOCOL.md, ADR-0048). Served alongside `unitFlags`, never instead of it;
+   * (PROTOCOL.md). Served alongside `unitFlags`, never instead of it;
    * the state cache derives `self.taxiFlight` from the bit itself, so this is
    * here for the schema to be a full account of what the module sends.
    */
@@ -1255,7 +1255,7 @@ export const talentsInfoDataSchema = z.looseObject({
 export type TalentsInfoData = z.infer<typeof talentsInfoDataSchema>;
 
 /**
- * One achievement as the module serves it (ADR-0048, issue #8): the id and the
+ * One achievement as the module serves it (issue #8): the id and the
  * wire's packed time, plus `name`/`points`/`categoryId` when the module could
  * read `Achievement.dbc` — client-cache knowledge, the same class as item and
  * spell names. Absent DBC means ids only, never a guessed name.
@@ -1287,7 +1287,7 @@ export type AchievementEarnedData = z.infer<typeof achievementEarnedDataSchema>;
 /**
  * `SMSG_ALL_ACHIEVEMENT_DATA`: everything already earned, sent to self once
  * during login. Only the completed block is decoded (the criteria-progress
- * block is consumed unserved, ADR-0048), so `count` is the completed count.
+ * block is consumed unserved), so `count` is the completed count.
  */
 export const allAchievementDataSchema = z.looseObject({
   count: z.number(),
@@ -1297,7 +1297,7 @@ export type AllAchievementData = z.infer<typeof allAchievementDataSchema>;
 
 /**
  * `SMSG_ACTIVATETAXIREPLY`: the server's answer to `CMSG_ACTIVATETAXI` (raw —
- * there is no flight helper, ADR-0015/0048). `reply` is `ActivateTaxiReply`
+ * there is no flight helper). `reply` is `ActivateTaxiReply`
  * (0 ok, 1 server error, 2 no such path, 3 not enough money, 4 too far away,
  * 5 no vendor nearby, 6 not visited, 7 busy, 8 mounted, 9 shapeshifted,
  * 10 moving, 11 same node, 12 not standing); `ok` is `reply === 0`. The flight
@@ -1368,7 +1368,7 @@ export type CharDeleteData = z.infer<typeof charDeleteDataSchema>;
 /**
  * A creature's movement, reduced to what a player perceives: where it is, where
  * it is heading, and how long it will take. The spline points are consumed by
- * the module and never served (ADR-0010/0013). A stopped creature sends
+ * the module and never served (module/PROTOCOL.md). A stopped creature sends
  * `stopped: true` and no destination.
  */
 export const monsterMoveDataSchema = z.looseObject({
@@ -1470,7 +1470,7 @@ export const eventDataSchemas = {
   SMSG_COOLDOWN_EVENT: cooldownEventDataSchema,
   SMSG_CLEAR_COOLDOWN: cooldownEventDataSchema,
   SMSG_TALENTS_INFO: talentsInfoDataSchema,
-  // achievements and flight paths (ADR-0048)
+  // achievements and flight paths
   SMSG_ACHIEVEMENT_EARNED: achievementEarnedDataSchema,
   SMSG_ALL_ACHIEVEMENT_DATA: allAchievementDataSchema,
   SMSG_ACTIVATETAXIREPLY: activateTaxiReplyDataSchema,

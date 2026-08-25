@@ -14,7 +14,7 @@ go through `interact`, `gossipHello`, `gossipSelect`, `useItem`, and
 and in template literals, and `JSON.stringify` them freely; get them from
 `state.units(...)`, `state.closest(...)`, or event data. Never a number.
 
-**Throw vs value (ADR-0011).** A transport or request error always throws
+**Throw vs value.** A transport or request error always throws
 (`WrathTransportError`, `WrathRequestError`), and so does the *absence* of an
 outcome (`EventTimeoutError` — no result arrived within the timeout;
 `EventAbortedError` — the wait was cancelled by its abort signal). Anything
@@ -109,7 +109,7 @@ own client — not for snippets, where `sdk` already exists.) Then, on the clien
 | `trainerListAsync` | `trainerListAsync(guid: GuidArg): Promise<ActionResponse>` | Ask a trainer for its list without waiting (prefer trainerList). |
 | `trainerBuySpellAsync` | `trainerBuySpellAsync(guid: GuidArg, spellId): Promise<ActionResponse>` | Buy a spell without waiting (prefer buySpell). |
 | `learnTalentAsync` | `learnTalentAsync(talentId, rank): Promise<ActionResponse>` | Spend a talent point without waiting (prefer learnTalent). |
-| `raw` | `raw(opcode: string, payload?: hex | Uint8Array | RawField[]): Promise<RawActionResponse>` | Escape hatch (ADR-0025): send one allowlisted CMSG_* opcode with a body you build — a field list like [{ u32: 5 }, { guid: unit.guid }, { cstring: "x" }] is packed little-endian for you. Allowlist and field types: module/PROTOCOL.md "raw". The answer arrives on sdk.events only if its opcode is whitelisted there. |
+| `raw` | `raw(opcode: string, payload?: hex | Uint8Array | RawField[]): Promise<RawActionResponse>` | Escape hatch: send one allowlisted CMSG_* opcode with a body you build — a field list like [{ u32: 5 }, { guid: unit.guid }, { cstring: "x" }] is packed little-endian for you. Allowlist and field types: module/PROTOCOL.md "raw". The answer arrives on sdk.events only if its opcode is whitelisted there. |
 
 ## State reads (`state.*`)
 

@@ -67,12 +67,12 @@ describe("guid argument validation", () => {
     expect(() => client.interact(true as unknown as string)).toThrow(/a boolean.*unit\.guid/s);
   });
 
-  test("a decimal string passes; a model-conjured bigint is repaired, not rejected (ADR-0017)", () => {
+  test("a decimal string passes; a model-conjured bigint is repaired, not rejected", () => {
     const client = makeClient();
     // These reach fetch against an unreachable host: the returned promise
     // rejects with a transport error, but nothing throws synchronously. A
     // bigint names exactly one guid, so it is silently converted to the
-    // string form (ADR-0016 deterministic repair) rather than thrown on.
+    // string form (deterministic repair) rather than thrown on.
     expect(() => void client.setTarget("12970366926827028480").catch(() => {})).not.toThrow();
     expect(() => void client.setTarget(7n as unknown as string).catch(() => {})).not.toThrow();
   });
@@ -154,7 +154,7 @@ describe("error-code hints", () => {
     expect(err.message).toContain("that name is already in use");
   });
 
-  test("a taken name tells the model to choose another, in the game's own naming rules (ADR-0050)", () => {
+  test("a taken name tells the model to choose another, in the game's own naming rules", () => {
     // The model names its own character, so code 50 is a retry and not a dead
     // end: `fleet-sonnet-e90-...-a12` looped it for eight minutes on 2026-08-25
     // because the message named no way forward.
@@ -164,7 +164,7 @@ describe("error-code hints", () => {
     expect(err.message).toContain("2-12 letters");
   });
 
-  test("every naming refusal names a way out, not just the objection (ADR-0050)", () => {
+  test("every naming refusal names a way out, not just the objection", () => {
     // 0x5a-0x5f were unreachable while the harness assigned the name and are
     // model-reachable now: `createSession` validates race and class before the
     // wire, never the name.

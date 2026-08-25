@@ -3,8 +3,8 @@
  * Emit `sdk/API.md` from the public `WrathClient` + `StateCache` surface.
  *
  * The doc is the model's reference for exact signatures, so it must never drift
- * from the code and must never advertise a method that does not exist (ADR-0015
- * recorded models burning turns inventing `mineRock`-shaped helpers). This
+ * from the code and must never advertise a method that does not exist (runs
+ * have recorded models burning turns inventing `mineRock`-shaped helpers). This
  * generator is therefore self-checking against the *live* prototypes:
  *
  *   - every documented member must exist on the prototype (no invented rows),
@@ -62,7 +62,7 @@ const CLIENT_ENDPOINTS: readonly Row[] = [
   { name: "selfKey", sig: "get selfKey: string | undefined", purpose: "Our own guid once the session response has seeded it." },
 ];
 
-/** Helpers: they wait for the game's verdict and return it as a value (ADR-0011). */
+/** Helpers: they wait for the game's verdict and return it as a value. */
 const CLIENT_HELPERS: readonly Row[] = [
   { name: "moveTo", sig: "moveTo(target, options?): Promise<MoveResult>", purpose: "Walk to a point { x, y, z }, a unit, or a guid (its cached position; the guid rides along so the module resolves z to the ground under the unit) and wait for the server's arrive/target_off_mesh/transferred/teleported/… verdict; a target nothing in view answers to comes back as status \"unknown_target\". An arrival aboard a tram car or boat carries onTransport { guid, entry }, and state.self.position then follows the ride (WB_RIDE_PROGRESS)." },
   { name: "killTarget", sig: "killTarget(target: GuidOrUnit, options?): Promise<KillResult>", purpose: "Approach and auto-attack until the target or we drop; returns how the fight ended." },
@@ -127,7 +127,7 @@ const CLIENT_RAW: readonly Row[] = [
   { name: "trainerListAsync", sig: "trainerListAsync(guid: GuidArg): Promise<ActionResponse>", purpose: "Ask a trainer for its list without waiting (prefer trainerList)." },
   { name: "trainerBuySpellAsync", sig: "trainerBuySpellAsync(guid: GuidArg, spellId): Promise<ActionResponse>", purpose: "Buy a spell without waiting (prefer buySpell)." },
   { name: "learnTalentAsync", sig: "learnTalentAsync(talentId, rank): Promise<ActionResponse>", purpose: "Spend a talent point without waiting (prefer learnTalent)." },
-  { name: "raw", sig: "raw(opcode: string, payload?: hex | Uint8Array | RawField[]): Promise<RawActionResponse>", purpose: "Escape hatch (ADR-0025): send one allowlisted CMSG_* opcode with a body you build — a field list like [{ u32: 5 }, { guid: unit.guid }, { cstring: \"x\" }] is packed little-endian for you. Allowlist and field types: module/PROTOCOL.md \"raw\". The answer arrives on sdk.events only if its opcode is whitelisted there." },
+  { name: "raw", sig: "raw(opcode: string, payload?: hex | Uint8Array | RawField[]): Promise<RawActionResponse>", purpose: "Escape hatch: send one allowlisted CMSG_* opcode with a body you build — a field list like [{ u32: 5 }, { guid: unit.guid }, { cstring: \"x\" }] is packed little-endian for you. Allowlist and field types: module/PROTOCOL.md \"raw\". The answer arrives on sdk.events only if its opcode is whitelisted there." },
 ];
 
 /** WrathClient prototype members that are internal plumbing, deliberately undocumented. */
@@ -313,7 +313,7 @@ go through \`interact\`, \`gossipHello\`, \`gossipSelect\`, \`useItem\`, and
 and in template literals, and \`JSON.stringify\` them freely; get them from
 \`state.units(...)\`, \`state.closest(...)\`, or event data. Never a number.
 
-**Throw vs value (ADR-0011).** A transport or request error always throws
+**Throw vs value.** A transport or request error always throws
 (\`WrathTransportError\`, \`WrathRequestError\`), and so does the *absence* of an
 outcome (\`EventTimeoutError\` — no result arrived within the timeout;
 \`EventAbortedError\` — the wait was cancelled by its abort signal). Anything

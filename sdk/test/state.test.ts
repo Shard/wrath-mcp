@@ -925,7 +925,7 @@ describe("WB_SESSION_STATE (reattach)", () => {
   });
 });
 
-describe("ADR-0017: guids are opaque decimal strings at the model surface", () => {
+describe("guids are opaque decimal strings at the model surface", () => {
   test("nearbyUnits guids and targetGuid are plain strings", () => {
     const cache = StateCache.replay(toEvents(worldStream), { seed: SEED });
     const units = cache.nearbyUnits();
@@ -963,7 +963,7 @@ describe("ADR-0017: guids are opaque decimal strings at the model surface", () =
 
 // ---------------------------------------------------------------- state.units
 //
-// The scan helper (ADR-0015, earned by roster-opus-low-20260822 turn 15, where
+// The scan helper (earned by roster-opus-low-20260822 turn 15, where
 // `u.fields.entry?.value` on the raw Map made a populated world look empty).
 // Fixtures here are local because they exist to make one query answer
 // interesting: several objects at known distances, in known conditions.
@@ -1155,7 +1155,7 @@ describe("state.units(): the flat scan helper", () => {
       VENDOR_GUID,
       CREATURE_GUID,
     ]);
-    // ADR-0016 deterministic repair: "90210" has exactly one valid reading.
+    // Deterministic repair: "90210" has exactly one valid reading.
     expect(c.units({ entry: String(CREATURE_ENTRY) as unknown as number })).toEqual(
       c.units({ entry: CREATURE_ENTRY }),
     );
@@ -1212,7 +1212,7 @@ describe("state.units(): the flat scan helper", () => {
     expect(() => cache().units({ name: "/tree(/" })).toThrow(/did not compile/);
   });
 
-  test("a non-string, non-RegExp name is rejected with the ADR-0016 help", () => {
+  test("a non-string, non-RegExp name is rejected with actionable help", () => {
     expect(() => cache().units({ name: 5 as unknown as string })).toThrow(/expected a string.*or a RegExp/s);
   });
 
@@ -1280,7 +1280,7 @@ describe("state.units(): the flat scan helper", () => {
     expect(targeting.units().find((r) => r.guid === CREATURE_GUID)!.targetGuid).toBe("7");
   });
 
-  test("bad filter values are rejected with an actionable TypeError (ADR-0016)", () => {
+  test("bad filter values are rejected with an actionable TypeError", () => {
     const c = cache();
     expect(() => c.units({ entry: "boar" as unknown as number })).toThrow(TypeError);
     expect(() => c.units({ entry: "boar" as unknown as number })).toThrow(/received "boar" \(string\)/);
@@ -1833,7 +1833,7 @@ describe("units(): NPC roles from UNIT_NPC_FLAGS", () => {
   });
 });
 
-describe("achievements and flight paths (ADR-0048)", () => {
+describe("achievements and flight paths", () => {
   const earned = (seq: number, id: number, self: boolean, extra: Record<string, unknown> = {}) => ({
     seq,
     opcode: "SMSG_ACHIEVEMENT_EARNED",

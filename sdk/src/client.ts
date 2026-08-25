@@ -100,7 +100,7 @@ import type { z } from "zod";
 
 /**
  * What every guid-taking method accepts: the opaque decimal string the SDK
- * itself hands out (ADR-0017). The wire form is the same string.
+ * itself hands out. The wire form is the same string.
  */
 export type GuidArg = string;
 
@@ -116,7 +116,7 @@ export type GuidArg = string;
  * A `bigint` is not on the surface any more (nothing SDK-visible produces
  * one), but a model can still conjure one (`123n`) and it names exactly one
  * guid — so it is repaired to the string form rather than rejected, per
- * ADR-0016's deterministic-repair rule.
+ * the deterministic-repair rule.
  *
  * Everything else — objects, arrays, booleans — is rejected too, or the
  * `asserts` clause would be a lie: the commonest live mistake is passing the
@@ -162,7 +162,7 @@ export type GuidOrUnit = GuidArg | UnitView;
 /**
  * Resolve a helper's target to a guid string. A `UnitView` (or any object) has
  * its `.guid` taken; a missing or unusable one is rejected loudly with a
- * pointer back to where units come from (ADR-0016). A non-object falls through
+ * pointer back to where units come from. A non-object falls through
  * to `guidArg`, so a bare guid string keeps its exact existing validation — and
  * raw actions (`setTarget`, `attackStart`, `gossipSelect`) still take only that
  * string form, on purpose: referent selection is what this bench measures.
@@ -191,13 +191,13 @@ function showTarget(target: object): string {
 }
 
 /**
- * Deterministic repair (ADR-0016) for `moveTo(x, y, z)` written as three
+ * Deterministic repair for `moveTo(x, y, z)` written as three
  * positional numbers instead of one `{ x, y, z }`. That shape has exactly one
  * valid reading, and weak models write it across every family (nemotron, hy3,
  * gpt-oss trajectories 2026-08-22). Returns the repaired point, or null when
  * the call is not that shape — every other bad shape still hits the loud
  * assertMovePoint reject. Only the helper `moveTo` repairs the positional form;
- * raw `moveToAsync` stays strict about it (ADR-0015: raw actions do not soften).
+ * raw `moveToAsync` stays strict about it (raw actions do not soften).
  * Target *resolution* — point, unit, or guid — is shared by both: it is what the
  * call names, not a rewriting of what it said.
  */
@@ -258,7 +258,7 @@ function ownPoint(target: unknown): MovePoint | undefined {
 }
 
 /**
- * Resolve `moveTo`'s target to a point (ADR-0015 earned surface: 4 of 7 runs in
+ * Resolve `moveTo`'s target to a point (earned surface: 4 of 7 runs in
  * the 2026-08-23 fan-out threw a raw `TypeError: moveTo position x must be a
  * finite number, got undefined` from `.x` on a lookup that found nothing).
  *
@@ -266,7 +266,8 @@ function ownPoint(target: unknown): MovePoint | undefined {
  * or guid resolves through the state cache, exactly the position `state.units()`
  * would report; a unit the cache has lost falls back to the coordinates that
  * unit object itself carries *and says so*, because walking to where something
- * was without mentioning it is the silent-wrong-behaviour ADR-0016 forbids; and
+ * was without mentioning it is the silent wrong behaviour the softening policy
+ * forbids; and
  * a guid nothing can be found for is a typed answer, not a throw.
  */
 function resolveMoveTarget(target: unknown, state: StateCache, method: string): ResolvedMoveTarget {
@@ -374,7 +375,7 @@ export const KNOWN_ERROR_CODES = [
   // guid-taking actions
   "missing_guid",
   "invalid_guid",
-  // raw passthrough (ADR-0025)
+  // raw passthrough
   "opcode_not_allowed",
   "invalid_payload",
   "payload_too_large",
@@ -411,7 +412,7 @@ export class WrathTransportError extends Error {
 const CHAR_RESPONSE_HINTS: Record<number, string> = {
   0x30: "character creation error",
   0x31: "character creation failed",
-  // The name is the model's own choice (ADR-0050), so this one code is not a
+  // The name is the model's own choice, so this one code is not a
   // dead end but a retry: say what to do about it, in the game's own rules.
   0x32:
     "that name is already in use — choose a different character name and call createSession again " +
@@ -421,7 +422,7 @@ const CHAR_RESPONSE_HINTS: Record<number, string> = {
   0x36: "the account has reached its character limit",
   0x3a: "class requires an expansion the account lacks",
   0x3e: "that race/class combination is not allowed",
-  // The name is the caller's own (ADR-0050), so every naming refusal is a
+  // The name is the caller's own, so every naming refusal is a
   // retry: it says what the server objected to AND that another name is the
   // way out. Unreachable while the harness assigned the name; not any more.
   0x59: "no name given — choose a character name (2-12 letters, no spaces) and pass it to createSession",
@@ -528,7 +529,7 @@ export interface ConnectOptions {
   token: string;
   /**
    * The game account this run occupies, bound operator-side exactly like
-   * `token` (ADR-0016, addendum 2026-08-22). When set it is authoritative: it
+   * `token` (decided 2026-08-22). When set it is authoritative: it
    * fills an omitted `createSession`/`deleteCharacter` account and overrides any
    * account the model typed, so a snippet can never land on — or delete on —
    * the wrong account (the RUNNER6→RUNNER cross-account corruption this closes).
@@ -563,7 +564,7 @@ export interface ConnectOptions {
    * moment the sandbox will abandon the running snippet; nothing about a wait
    * changes because of it — it is used only to say, in a `moveTo` result's
    * `hint`, that the walk was always longer than the snippet had left
-   * (ADR-0016 rule 2: explain, do not cap). Undefined means no budget is known.
+   * (explain, do not cap). Undefined means no budget is known.
    */
   deadline?: number | (() => number | undefined);
 }
@@ -585,7 +586,7 @@ export interface MovePoint {
  * What `moveTo`/`moveToAsync` accept: a world point, or the thing standing at
  * one — a unit from `state.units(...)` / `state.closest(...)`, or its guid.
  * The unit forms resolve to that unit's position in the state cache at call
- * time (ADR-0015: earned by the 2026-08-23 fan-out, where 4 of 7 runs threw a
+ * time (earned by the 2026-08-23 fan-out, where 4 of 7 runs threw a
  * raw `TypeError` reading `.x` off a lookup that returned nothing).
  */
 export type MoveTarget = MovePoint | GuidOrUnit;
@@ -678,7 +679,7 @@ export type MoveResult =
        * Nothing was dispatched: the unit or guid handed to `moveTo` names no
        * position the state cache can see, so there is no point to walk to and
        * no move to have an outcome. Not a `WB_MOVE_RESULT` status — the module's
-       * status vocabulary is the module's word (ADR-0027); this arm is the SDK
+       * status vocabulary is the module's word; this arm is the SDK
        * answering before the wire, the way `killTarget` answers `lost`.
        */
       readonly ok: false;
@@ -714,7 +715,7 @@ export type MoveResult =
     };
 
 /**
- * Per-status recovery recipes (ADR-0016 rule 2: what happened, what it means,
+ * Per-status recovery recipes (what happened, what it means,
  * the next step), in the result rather than in a trajectory nobody reads twice.
  * Before the module split `no_path` into causes (FOLLOW-UPS 38 N1) one hint
  * covered four failures and qwen (2026-08-22 roster) spent 8 turns discovering
@@ -858,7 +859,7 @@ export interface WaitForTransferOptions {
 
 /**
  * The outcome of waiting for a map transfer — returned, never thrown, for the
- * same reason as `MoveResult` (ADR-0011): every arm is the game answering, and
+ * same reason as `MoveResult`: every arm is the game answering, and
  * the bounded-wait statuses FOLLOW-UPS 38 N1 asks for (`waiting`, `wrong_map`)
  * are answers too, not absences.
  */
@@ -969,7 +970,7 @@ interface KillResultFacts {
 }
 
 /**
- * How a fight ended, as a value (ADR-0011).
+ * How a fight ended, as a value.
  *
  * `killed` is the target's own observed health reaching zero — the thing a
  * player watches the health bar for. The failures are deliberately coarse, and
@@ -997,7 +998,7 @@ export type KillResult =
  * Straight-line yards to an object in view, rounded to 2dp — `undefined` when
  * either side's position is unobserved. The one distance every questgiver
  * failure message quotes. Module-level, not a method: it is an explanation
- * detail, not new public surface (ADR-0015).
+ * detail, not new public surface.
  */
 function distanceToUnit(state: StateCache, guid: GuidArg): number | undefined {
   const obj = state.nearby.get(guidKey(guid));
@@ -1139,7 +1140,7 @@ export interface StoredLootItem {
  * What a corpse actually gave up. `items` are the pushes the server confirmed
  * with `SMSG_ITEM_PUSH_RESULT` — reporting the loot *window* contents as a
  * success would call a possible no-op "looted", which is exactly the silent
- * wrong behavior ADR-0016 forbids (and exactly what happened while the module's
+ * wrong behavior the softening policy forbids (and exactly what happened while the module's
  * auto-loot replay was broken: window shown, nothing stored, `ok: true`).
  *
  * - `looted`: at least one item was stored, or the window held only gold.
@@ -1324,7 +1325,7 @@ export interface TrainerListResult {
 }
 
 /**
- * The outcome of buying one spell, as a value (ADR-0011): `buy_failed` is the
+ * The outcome of buying one spell, as a value: `buy_failed` is the
  * server answering the question that was asked, not the call being wrong.
  * `reason` is the raw `SMSG_TRAINER_BUY_FAILED` code.
  */
@@ -1353,7 +1354,7 @@ export interface EquipOptions {
 }
 
 /**
- * The outcome of one equip, as a value (ADR-0011). The server answers
+ * The outcome of one equip, as a value. The server answers
  * `CMSG_AUTOEQUIP_ITEM` either by moving the item into an equipment slot —
  * visible as the character's own `invSlot` update fields — or with
  * `SMSG_INVENTORY_CHANGE_FAILURE` carrying an `InventoryResult` code, and
@@ -1399,7 +1400,7 @@ export type EquipItemResult =
     };
 
 /**
- * The outcome of `learnTalent`, as a value (ADR-0011). The server always
+ * The outcome of `learnTalent`, as a value. The server always
  * answers `CMSG_LEARN_TALENT` with a fresh `SMSG_TALENTS_INFO`, whether or
  * not it learned anything; `learned` is read off that answer.
  */
@@ -1429,7 +1430,7 @@ export interface ReclaimCorpseOptions {
 }
 
 /**
- * The outcome of one corpse reclaim, as a value (ADR-0011).
+ * The outcome of one corpse reclaim, as a value.
  *
  * The core's handler (`WorldSession::HandleReclaimCorpseOpcode`) returns
  * *silently* for every refusal — alive, spirit not released, no corpse, the
@@ -1540,7 +1541,7 @@ export class WrathClient {
   readonly events: EventStream;
   readonly state: StateCache;
 
-  /** The operator-bound game account (ADR-0016). Authoritative when set; see ConnectOptions.account. */
+  /** The operator-bound game account. Authoritative when set; see ConnectOptions.account. */
   private readonly boundAccount: string | undefined;
   private readonly fetchImpl: typeof fetch;
   private readonly requestTimeoutMs: number;
@@ -1895,7 +1896,7 @@ export class WrathClient {
    * The convenience form throws (nothing is dispatched) when no menu is open
    * for the guid, when the text matches no option or more than one, or when a
    * numeric option is not on the menu — every rejection lists the options so
-   * the next call is obvious (ADR-0016). A menu is only ever read from the
+   * the next call is obvious. A menu is only ever read from the
    * `SMSG_GOSSIP_MESSAGE`/`SMSG_GOSSIP_COMPLETE` fold; the server is not
    * queried.
    */
@@ -1978,7 +1979,7 @@ export class WrathClient {
 
   /**
    * `CMSG_LOOT` plus the auto-loot follow-ups the client sends once the window
-   * arrives (ADR-0013). Fire-and-forget: prefer `lootCorpse`, which waits.
+   * arrives. Fire-and-forget: prefer `lootCorpse`, which waits.
    */
   lootAll(guid: GuidArg): Promise<ActionResponse> {
     return this.action({ action: "loot_all", guid: guidArg(guid, "lootAll(guid)") });
@@ -2033,7 +2034,7 @@ export class WrathClient {
    * `invSlot0..22` update fields) against `SMSG_INVENTORY_CHANGE_FAILURE`, so
    * a refusal is returned as `status: "not_equipped"` with the server's
    * `InventoryResult` code and a hint, not as success. The refusal is a value,
-   * not a throw: it is the game answering (ADR-0011).
+   * not a throw: it is the game answering.
    */
   async equipItem(bag: number, slot: number, options: EquipOptions = {}): Promise<EquipItemResult> {
     const before = this.state.bag().items.find((i) => i.bag === bag && i.slot === slot);
@@ -2463,7 +2464,7 @@ export class WrathClient {
   }
 
   /**
-   * The raw-action escape hatch (ADR-0025, ADR-0015). Sends one client opcode
+   * The raw-action escape hatch. Sends one client opcode
    * from the module's allowlist (module/PROTOCOL.md, "raw") with a body you
    * build: a hex string, bytes, or a field list the SDK packs little-endian —
    * `[{ u32: 5 }, { guid: unit.guid }, { cstring: "text" }]`. The ack means
@@ -2503,7 +2504,7 @@ export class WrathClient {
    * POST /character-delete — delete a character by name through the real
    * `CMSG_CHAR_DELETE` path. Not the session token: the module stands up its
    * own parked session, so this takes (and defaults) a throwaway one per
-   * attempt (ADR-0013).
+   * attempt.
    *
    * Retrying is in here rather than in the caller because the retry is a
    * property of the module's contract, not of any one script: for up to about
@@ -2536,7 +2537,7 @@ export class WrathClient {
             // parked session the previous attempt timed out on.
             token: `${this.token}-del${attempt}`,
             character,
-            // Bound account wins here too (ADR-0016): a run must only ever
+            // Bound account wins here too: a run must only ever
             // delete on its assigned account. Deleting on the wrong (idle)
             // account is a cross-account hazard even though character-delete
             // refuses an account another live token holds. Unbound, the
@@ -2649,7 +2650,8 @@ export class WrathClient {
     const point = resolved.point;
     // Notes that belong on whatever verdict comes back: a stale-position
     // fallback, and the budget estimate below. They explain the call, so they
-    // ride the `hint` rather than changing the module's status (ADR-0027).
+    // ride the `hint` rather than changing the module's status (the status
+    // vocabulary is the module's word).
     const extras: string[] = [];
     if (resolved.note !== undefined) extras.push(resolved.note);
     const from = this.state.self.position?.value;
@@ -2745,7 +2747,7 @@ export class WrathClient {
         void this.stop().catch(() => {});
         // The abandoning caller (the runner's snippet timeout) sees only the
         // error, so the error is where the two facts it needs go: how far this
-        // walk got, and the call that would have survived (ADR-0016 rule 2).
+        // walk got, and the call that would have survived.
         // `moveAbandon` carries the same sentence structurally, for the sandbox
         // to splice into its abandon notice.
         const note =
@@ -2843,7 +2845,7 @@ export class WrathClient {
       // fleet-nav-probe-sonnet-20260822-c3: a walking move superseded by a
       // 200-point sweep that all failed `start_off_mesh`, then ~10 minutes of
       // Hearthstone `use_item` answering 51 while stationary, ended by one
-      // `stop`. The repair is deterministic (ADR-0016 rule 1): after a move
+      // `stop`. The repair is deterministic: after a move
       // that did not move, "stop walking" has exactly one reading, it is what a
       // client sends when its run ends, and it is a no-op if the character was
       // already still. `superseded` is deliberately not in the set — a newer
@@ -3236,12 +3238,12 @@ export class WrathClient {
   /**
    * Empty a corpse and wait until the window is closed again.
    *
-   * `loot_all` is the module replaying the client's auto-loot sequence
-   * (ADR-0013): the window that says what was there, the release that says it
+   * `loot_all` is the module replaying the client's auto-loot sequence:
+   * the window that says what was there, the release that says it
    * is finished — and, between them, one `SMSG_ITEM_PUSH_RESULT` per item that
    * actually entered a bag. The pushes, not the window, decide the result:
    * a window is an offer, and calling an offer "looted" made a broken replay
-   * invisible for a whole run (morning-opus-1; ADR-0016 forbids exactly that).
+   * invisible for a whole run (morning-opus-1; the forbidden silent-wrong outcome).
    * A corpse with nothing on it releases without ever opening a window, which
    * is `{ ok: false, status: "empty" }` — an answer, not a failure. Silence is
    * neither, so it still throws `EventTimeoutError`.
@@ -3454,9 +3456,8 @@ export class WrathClient {
    *
    * Races `SMSG_TRAINER_BUY_SUCCEEDED` against `SMSG_TRAINER_BUY_FAILED` for
    * this spell id, so a refusal costs one round trip rather than the whole
-   * timeout. The refusal is returned, not thrown: it is the game answering
-   * (ADR-0011), and `hint` names the likely causes and points back at
-   * `trainerList` (ADR-0016).
+   * timeout. The refusal is returned, not thrown: it is the game answering,
+   * and `hint` names the likely causes and points back at `trainerList`.
    */
   async buySpell(
     npcGuid: GuidOrUnit,
@@ -3525,8 +3526,8 @@ export class WrathClient {
     // Out-of-range quest_complete is silently ignored by the server and burns
     // the whole timeout (roster-opus-20260822 turn ~28). Fail fast only when
     // the cache can prove the NPC is *grossly* far away — the 40y threshold
-    // leaves cached-position staleness no room to reject a legitimate call
-    // (ADR-0016); borderline cases still get the honest timeout.
+    // leaves cached-position staleness no room to reject a legitimate call;
+    // borderline cases still get the honest timeout.
     const distance = distanceToUnit(this.state, npcId);
     if (distance !== undefined && distance > 40) {
       return {
@@ -3625,7 +3626,7 @@ export class WrathClient {
    * completion bit in the served quest-log state field. Resolves with the log
    * entry, whose `counts` are the objective counters; throws
    * `EventTimeoutError` if it never completes, because a quest that is still
-   * unfinished is the absence of an outcome rather than one (ADR-0011).
+   * unfinished is the absence of an outcome rather than one.
    */
   waitForQuestObjective(questId: number, options: QuestOptions = {}): Promise<QuestLogEntry> {
     return this.waitForState(
@@ -3655,7 +3656,7 @@ export class WrathClient {
    * Resolve a `gossipSelect` option (text or numeric id) against the menu last
    * observed open for `guid`. Throws — nothing is dispatched — for a missing
    * menu, no match, an ambiguous text, or an id that is not on the menu, each
-   * message listing the options (ADR-0016).
+   * message listing the options.
    */
   private resolveGossipOption(guid: string, option: string | number): { menuId: number; optionId: number } {
     const menu = this.state.lastGossip(guidKey(guid));

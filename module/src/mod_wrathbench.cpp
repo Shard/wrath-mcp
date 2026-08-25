@@ -16,8 +16,8 @@
  * with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-// mod-wrathbench: the WrathBench control module. A thin bridge (ADR-0002): it
-// stands up headless WorldSessions (ADR-0009), synthesizes CMSG_* into their
+// mod-wrathbench: the WrathBench control module. A thin bridge: it
+// stands up headless WorldSessions, synthesizes CMSG_* into their
 // handlers, and taps the outbound SMSG_* stream into filtered JSON events. All
 // game semantics live in the TypeScript SDK; this module knows only opcodes and
 // sessions.

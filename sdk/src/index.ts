@@ -3,7 +3,7 @@
  *
  * The SDK's public shape is part of the harness version (docs/ARCHITECTURE.md).
  * Adding to it is a minor bump; changing or removing anything exported here is
- * a major one and wants an ADR under docs/decisions/.
+ * a major one and wants a note in docs/METHODOLOGY.md.
  */
 
 export {

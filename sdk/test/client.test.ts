@@ -128,7 +128,7 @@ describe("client: the happy path through the slice", () => {
   });
 });
 
-describe("client: operator-bound account (ADR-0016)", () => {
+describe("client: operator-bound account", () => {
   test("a bound account fills an omitted createSession account", async () => {
     const stub = startStub();
     const client = await connect({
@@ -260,7 +260,7 @@ describe("client: movement", () => {
   });
 
   test("moveTo(x, y, z) as three positional numbers is repaired to a point", async () => {
-    // ADR-0016 deterministic repair: weak models write moveTo this way across
+    // Deterministic repair: weak models write moveTo this way across
     // every family (nemotron/hy3/gpt-oss, 2026-08-22). Same outcome as the
     // object form; every other bad shape still throws.
     const stub = startStub({ onConnect: () => frames(loginSequence) });
@@ -311,8 +311,8 @@ describe("client: movement", () => {
     // a MSG_MOVE_STOP and a planning failure sends no packet at all, so the
     // server's last word stayed "walking forward": ~10 minutes of Hearthstone
     // use_item answering SMSG_CAST_FAILED result 51 (SPELL_FAILED_MOVING)
-    // while the character stood still, ended by one `stop`. ADR-0016 rule 1:
-    // after a move that did not move, "stop walking" has one reading.
+    // while the character stood still, ended by one `stop`. The repair is
+    // deterministic: after a move that did not move, "stop walking" has one reading.
     for (const status of ["too_far", "no_mesh", "target_off_mesh", "start_off_mesh", "path_incomplete", "drop"] as const) {
       const stub = startStub({ onConnect: () => frames(loginSequence) });
       const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
@@ -362,7 +362,7 @@ describe("client: movement", () => {
 
   test("each typed failure carries its own recovery hint; path_incomplete carries reachedPos", async () => {
     // FOLLOW-UPS 38 N1: the module now names the cause, so the hint is only
-    // the recovery that follows from it (ADR-0016 rule 2).
+    // the recovery that follows from it.
     const stub = startStub({ onConnect: () => frames(loginSequence) });
     const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
     await client.createSession({ character: "Fenwick" });
@@ -477,7 +477,7 @@ describe("client: movement", () => {
   });
 
   test("drop carries the edge, the step and the target, with a hint about levels", async () => {
-    // ADR-0027 amendment (nav-probe c4, map 369): a route that falls 7.64y
+    // Navigation-cause amendment earned by nav-probe c4 (map 369): a route that falls 7.64y
     // over 1y of 2D travel is a ledge. The module refuses the walk and says
     // where the edge is; the hint says to change level by ramp or stairs.
     const stub = startStub({ onConnect: () => frames(loginSequence) });
@@ -2060,7 +2060,7 @@ describe("client: deleteCharacter", () => {
   });
 });
 
-describe("ADR-0017: guid arguments at the client surface", () => {
+describe("guids are opaque decimal strings: guid arguments at the client surface", () => {
   test("a model-conjured bigint is repaired to the wire's decimal string", async () => {
     const stub = startStub();
     const client = await connect({ baseUrl: stub.baseUrl, token: "t", subscribeEvents: false });
@@ -2361,7 +2361,7 @@ describe("client: questgiver status and quest query, issued the way a client doe
   });
 });
 
-describe("client: talents and the raw escape hatch (FOLLOW-UPS 39, ADR-0025)", () => {
+describe("client: talents and the raw escape hatch (FOLLOW-UPS 39)", () => {
   const talentsInfo = (seq: number, talents: { talentId: number; rank: number }[], unspent = 0) =>
     JSON.stringify({
       seq,
@@ -2656,7 +2656,7 @@ describe("client: reclaimCorpse owns the delay and answers with a verdict", () =
 
 /**
  * `moveTo` taking the thing at the destination, not only the destination
- * (ADR-0015 earned surface). The trajectory: the 2026-08-23 navigation fan-out,
+ * (earned surface). The trajectory: the 2026-08-23 navigation fan-out,
  * where 4 of 7 runs threw a raw `TypeError` reading `.x` off a unit lookup that
  * had returned nothing — the model never learned it was the lookup that failed.
  */
@@ -2740,7 +2740,7 @@ describe("client: moveTo target resolution", () => {
     stub.push(JSON.stringify(moveResult("arrived", 1, 30)));
     const result = await walk;
     expect(result.ok).toBe(true);
-    // Silent wrong behaviour is the one forbidden outcome (ADR-0016).
+    // Silent wrong behaviour is the one forbidden outcome.
     expect(result.hint).toContain("not in view any more");
 
     client.close();

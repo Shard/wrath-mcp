@@ -6,7 +6,7 @@ state cache built purely from events.
 
 The SDK's public shape is part of the harness version (`docs/ARCHITECTURE.md`).
 Adding to it is a minor bump. Changing or removing anything exported from
-`src/index.ts` is a major bump and wants an ADR under `docs/decisions/`. Two
+`src/index.ts` is a major bump and wants a note in `docs/METHODOLOGY.md`. Two
 consequences worth stating: helpers are added because a run needed them, never
 in anticipation; and the cache never exposes a field no event carried, because
 a field that appears and later becomes trustworthy is a silent contract change.
@@ -93,7 +93,7 @@ class WrathClient {
 ```
 
 Every guid — state fields, helper returns, and every guid argument — is an
-opaque decimal string (ADR-0017), which is also exactly what the wire carries:
+opaque decimal string, which is also exactly what the wire carries:
 compare with `===`, use as Map keys, `JSON.stringify` freely. A `number` guid
 is rejected loudly (precision loss); a bigint you conjure yourself is converted
 for you.
@@ -133,8 +133,8 @@ snippet cap; longer fights belong in a background routine.
 `lootCorpse` sends `loot_all` — the module replaying the client's auto-loot
 sequence — and returns once the window has been emptied and released. Its
 `items` are what `SMSG_ITEM_PUSH_RESULT` confirmed *stored*, not what the
-window displayed (the window is an offer; the pushes are the receipt — ADR-0016
-forbids reporting a possible no-op as success). The window contents ride along
+window displayed (the window is an offer; the pushes are the receipt — a
+possible no-op is never reported as success). The window contents ride along
 as `window`. A corpse with nothing on it releases without ever opening a
 window, which is `{ ok: false, status: "empty" }`: an answer, not a failure.
 A window that showed items of which not one entered a bag — bags full, or a
@@ -213,7 +213,7 @@ call for a walk longer than your own time budget: dispatch, then watch
 `WB_MOVE_RESULT`.
 
 `moveTo` issues `move_to`, then resolves on the `WB_MOVE_RESULT` carrying the
-same `moveId`. **Game outcomes are returned, not thrown** (`docs/decisions/ADR-0011`):
+same `moveId`. **Game outcomes are returned, not thrown** (`docs/METHODOLOGY.md`, "The model surface"):
 `arrived` is `ok: true` (with `meshZ` when the mesh walked to a different z
 than asked); `too_far`, `no_mesh`, `target_off_mesh`, `start_off_mesh`,
 `path_incomplete` (with `reachedPos`), `interrupted`, `stopped` and
@@ -350,8 +350,8 @@ StateCache.replay(events, { seed })
 `questLog`, `inventory`, `money`, `xp`, `nextLevelXp` and `target` are *derived
 on read* from `self.fields` rather than kept as a second copy written by a
 second path. There is one write seam (the field merge), so replay-equals-live
-holds for them for free. The wire's shape is preserved on the way in
-(ADR-0013): the module serves `quest3State` and `invSlot23Lo` as raw per-u32
+holds for them for free. The wire's shape is preserved on the way in:
+the module serves `quest3State` and `invSlot23Lo` as raw per-u32
 fields and this is where they are folded.
 
 - A quest slot's four objective counters are two u32s of packed u16s, split
@@ -366,7 +366,7 @@ fields and this is where they are folded.
 - `bag()` is the backpack view of `inventory`, shaped for acting on it:
   `bag`/`slot` are exactly what `equipItem`, `useItem` and `destroyItem` take
   (bag 255, slots 23-38), `count` is the observed stack count, and `freeSlots`
-  counts the backpack slots holding nothing. Earned surface (ADR-0015):
+  counts the backpack slots holding nothing. Earned surface:
   morning-opus-1 rebuilt this from push-result listeners, invSlot regexes and a
   full relog when it was already in the cache. Two caveats: empty slots are
   zero fields the wire compresses away, so before our own create block arrives

@@ -37,7 +37,7 @@ describe("HTTP response schemas", () => {
     expect(parsed).toEqual(healthResponseFixture);
   });
 
-  test("session response decodes guid to an opaque decimal string (ADR-0017)", () => {
+  test("session response decodes guid to an opaque decimal string", () => {
     const parsed = sessionResponseSchema.parse(sessionResponseFixture);
     expect(parsed.guid).toBe("7");
     expect(parsed.character).toBe("Fenwick");
