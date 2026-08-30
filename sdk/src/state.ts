@@ -44,6 +44,42 @@ import {
   type CooldownEventData,
   type InitialSpellsData,
   type ItemQueryResponseData,
+  type ListInventoryData,
+  type LootItemData,
+  type LootResponseData,
+  type LootRemovedData,
+  type LootReleaseResponseData,
+  type LootStartRollData,
+  type LootRollData,
+  type LootRollWonData,
+  type LootAllPassedData,
+  type PageTextQueryResponseData,
+  type ItemTextQueryResponseData,
+  type TrainerListData,
+  type TrainerSpellData,
+  type VendorItem,
+  type InitializeFactionsData,
+  type ItemDamage,
+  type ItemSpell,
+  type ItemStat,
+  type SetFactionStandingData,
+  type SetFactionVisibleData,
+  type TalentTreeData,
+  type GroupInviteData,
+  type GroupListData,
+  type GroupMemberData,
+  type GroupNameData,
+  type MailEntryData,
+  type MailListResultData,
+  type PartyCommandResultData,
+  type PetActionBarButton,
+  type PetNameQueryResponseData,
+  type PetSpell,
+  type PetSpellsData,
+  type SendMailResultData,
+  type ShowFrameData,
+  type TradeStatusData,
+  type TradeStatusExtendedData,
   type LearnedSpellData,
   type MonsterMoveData,
   type RemovedSpellData,
@@ -53,6 +89,8 @@ import {
   type AchievementEarnedData,
   type AllAchievementData,
   type ActivateTaxiReplyData,
+  type BindPointUpdateData,
+  type ShowTaxiNodesData,
   type TransportProgressData,
   type QuestGiverStatusData,
   type QuestGiverStatusMultipleData,
@@ -63,9 +101,29 @@ import {
   type UpdateFields,
 } from "./protocol";
 import { STREAM_GAP, type StreamEvent } from "./events";
+import { resolveName, type Resolution } from "./resolve";
+
+/**
+ * A state *query* has no refusal channel — it answers a row or `undefined` —
+ * so both "nothing answers to that" and "two things do" read as `undefined`,
+ * and the caller falls back to the list accessor. Only actions refuse and say
+ * why (METHODOLOGY, "A name in view is a valid referent, with bounded fuzz").
+ */
+function only<T>(hit: Resolution<T>): T | undefined {
+  return hit.kind === "one" ? hit.value : undefined;
+}
 
 /** `UNIT_FLAG_TAXI_FLIGHT` — the bit a client reads to know it is being flown. */
 const UNIT_FLAG_TAXI_FLIGHT = 0x0010_0000;
+
+/**
+ * `PLAYER_FLAGS_RESTING` on 3.3.5a (AzerothCore `Player.h`, `PlayerFlags`) —
+ * the bit the server sets while the character stands in a rest area, and the
+ * one a client reads to draw the resting icon on the XP bar. Decoded here,
+ * from the `playerFlags` integer the module already serves: nothing new is
+ * observed, only named.
+ */
+const PLAYER_FLAGS_RESTING = 0x0000_0020;
 
 /** A value together with the event that carried it. */
 export interface Observed<T> {
@@ -287,11 +345,61 @@ export interface SelfState extends UnitFieldsState {
    */
   taxiFlight: Observed<boolean> | undefined;
   /**
+   * `PLAYER_FLAGS_RESTING` on our own `playerFlags`: true while the character
+   * is in a rest area — an inn or a city — which is what the client's own
+   * resting icon says. Read the same way `taxiFlight` reads `unitFlags`: only
+   * from a block that actually carried `playerFlags`, so an update that omits
+   * the field leaves the last observation standing rather than erasing it.
+   * `undefined` until a block has carried `playerFlags` at all.
+   */
+  resting: Observed<boolean> | undefined;
+  /**
    * The last `SMSG_ACTIVATETAXIREPLY` (the answer to a raw `CMSG_ACTIVATETAXI`).
    * Kept because it is the only thing that says a flight was *accepted*; the
    * ride itself shows on `taxiFlight`.
    */
   taxiReply: Observed<{ readonly reply: number; readonly ok: boolean }> | undefined;
+  /**
+   * Where the Hearthstone goes (`SMSG_BINDPOINTUPDATE`): sent once at login
+   * and again after every innkeeper bind, so this is always the server's
+   * current word. `undefined` only before the login packet has been seen.
+   */
+  bindPoint: Observed<BindPoint> | undefined;
+}
+
+/**
+ * The hearthstone's destination as the wire carries it: map, position, and
+ * the area id with the client's `AreaTable.dbc` name for it (`""` when the
+ * table has no row).
+ */
+export interface BindPoint {
+  readonly map: number;
+  readonly x: number;
+  readonly y: number;
+  readonly z: number;
+  readonly area: AreaRef;
+}
+
+/** One node in a flight master's window: the wire id and the client's TaxiNodes.dbc name (absent when unknown). */
+export interface TaxiNodeRef {
+  readonly nodeId: number;
+  readonly name: string | undefined;
+}
+
+/**
+ * The flight master's window last observed for one NPC: the fold of the last
+ * `SMSG_SHOWTAXINODES` for that guid. `current` is the node the master
+ * stands at (what `activateTaxi` sends as the source), `known` the nodes this
+ * character has visited — the only destinations the server will accept.
+ * `mask` is the taximask verbatim. Nothing here is a route or a fare.
+ */
+export interface TaxiWindow {
+  readonly guid: GuidKey;
+  readonly current: TaxiNodeRef;
+  readonly known: readonly TaxiNodeRef[];
+  readonly mask: readonly number[];
+  readonly seq: number;
+  readonly ts: number;
 }
 
 /**
@@ -388,7 +496,9 @@ export interface QuestCompletion {
 }
 
 /**
- * One occupied inventory slot: equipment and bags are 0-22, the backpack 23-38.
+ * One occupied inventory slot: equipment and bags are 0-22, the backpack 23-38,
+ * the bank 39-66 and the bank bags 67-73 (bank slots since item 100; an older
+ * module serves none).
  *
  * A three-way join, and each leg can be missing: the `invSlot<n>Lo`/`Hi` halves
  * give a guid, the item's own create block gives that guid an `entry`, and an
@@ -443,7 +553,15 @@ export interface BagContents {
   readonly bags: readonly WornBag[];
 }
 
-/** What an item query answered about one item entry. */
+/**
+ * What an item query answered about one item entry: the tooltip. The fields
+ * past `buyPrice` (item 97) are `undefined` on events from a module older
+ * than 2026-08-29 and on items that simply have none (no stats, no damage).
+ * `inventoryType` is the equip slot class (1 head, 13 one-hand, 17 two-hand,
+ * 21 main hand, 22 off hand, 15 ranged, 18 bag, ...); `class` 2 weapon, 4
+ * armor, 0 consumable, 1 container, 12 quest; `bonding` 1 binds on pickup,
+ * 2 on equip, 3 on use, 4 quest item; `speedMs` is the weapon's swing time.
+ */
 export interface ItemInfo {
   readonly itemId: number;
   readonly name: string;
@@ -453,6 +571,464 @@ export interface ItemInfo {
   readonly requiredLevel: number | undefined;
   readonly sellPrice: number | undefined;
   readonly buyPrice: number | undefined;
+  readonly class: number | undefined;
+  readonly subClass: number | undefined;
+  readonly requiredSkill: { readonly id: number; readonly rank: number; readonly name: string | undefined } | undefined;
+  readonly requiredReputation: { readonly factionId: number; readonly rank: number; readonly name: string | undefined } | undefined;
+  readonly maxCount: number | undefined;
+  readonly stackable: number | undefined;
+  readonly containerSlots: number | undefined;
+  readonly stats: readonly ItemStat[] | undefined;
+  readonly damage: readonly ItemDamage[] | undefined;
+  readonly armor: number | undefined;
+  readonly resistances: Readonly<Record<string, number>> | undefined;
+  readonly speedMs: number | undefined;
+  readonly spells: readonly ItemSpell[] | undefined;
+  readonly bonding: number | undefined;
+  readonly description: string | undefined;
+  readonly startQuest: number | undefined;
+  /** PageText id of the first page when the item can be read (a book, a letter); undefined otherwise. Item 103. */
+  readonly pageText: number | undefined;
+  readonly block: number | undefined;
+  readonly maxDurability: number | undefined;
+}
+
+/**
+ * One line of the character's skill pane (item 95), folded from the
+ * `PLAYER_SKILL_INFO` update fields. `value`/`max` are the pane's "150/225";
+ * `tempBonus`/`permBonus` the green modifier. `name` is the client's
+ * SkillLine.dbc text (`undefined` when the module could not read it).
+ */
+export interface SkillLine {
+  readonly skillId: number;
+  readonly name: string | undefined;
+  readonly value: number;
+  readonly max: number;
+  readonly tempBonus: number;
+  readonly permBonus: number;
+  readonly step: number;
+  readonly seq: number;
+  readonly ts: number;
+}
+
+/** The eight reputation ranks, as the client labels them. */
+export type ReputationRank = "Hated" | "Hostile" | "Unfriendly" | "Neutral" | "Friendly" | "Honored" | "Revered" | "Exalted";
+
+/**
+ * The client's rank for a reputation value (`base + standing`): the fixed
+ * 3.3.5 thresholds -42000/-6000/-3000/0/3000/9000/21000/42000.
+ */
+export function reputationRank(reputation: number): ReputationRank {
+  if (reputation >= 42000) return "Exalted";
+  if (reputation >= 21000) return "Revered";
+  if (reputation >= 9000) return "Honored";
+  if (reputation >= 3000) return "Friendly";
+  if (reputation >= 0) return "Neutral";
+  if (reputation >= -3000) return "Unfriendly";
+  if (reputation >= -6000) return "Hostile";
+  return "Hated";
+}
+
+/**
+ * One faction of the reputation pane (item 99): the fold of the login list
+ * (`SMSG_INITIALIZE_FACTIONS`) and every change since
+ * (`SMSG_SET_FACTION_STANDING`). `standing` is the wire's value, `base` the
+ * client's Faction.dbc base for this race/class, `reputation` their sum and
+ * `rank` its bucket. `visible` follows the login flags and
+ * `SMSG_SET_FACTION_VISIBLE`; the pane shows visible factions only.
+ */
+export interface ReputationEntry {
+  readonly repListId: number;
+  readonly factionId: number | undefined;
+  readonly name: string | undefined;
+  readonly standing: number;
+  readonly base: number | undefined;
+  readonly reputation: number;
+  readonly rank: ReputationRank;
+  readonly visible: boolean;
+  readonly atWar: boolean;
+  readonly seq: number;
+  readonly ts: number;
+}
+
+
+/** The pet's react state, as the pet frame labels it. */
+export type PetReaction = "passive" | "defensive" | "aggressive";
+/** The pet's standing order, as the pet frame labels it. */
+export type PetCommand = "stay" | "follow" | "attack" | "abandon";
+
+/** One spell of the pet's book, with its name and whether it autocasts. */
+export interface PetSpellEntry {
+  readonly spellId: number;
+  readonly name: string | undefined;
+  readonly rank: number | undefined;
+  readonly autocast: boolean;
+  /** True for a passive (never cast) ability. */
+  readonly passive: boolean;
+}
+
+/**
+ * The pet as the pet frame shows it (item 98): the control bar from the last
+ * `SMSG_PET_SPELLS`, joined at read time to the pet's own unit in view (level,
+ * health, power, the creature template's name) and to the given name the
+ * server answered for its pet number (`SMSG_PET_NAME_QUERY_RESPONSE`).
+ * `undefined` when there is no control bar — no pet, or it died / was
+ * dismissed and the server removed the bar.
+ */
+export interface PetState {
+  readonly guid: GuidKey;
+  /** The given name ("Fluffy"; a warlock demon's is its creature name), when the name query has answered. */
+  readonly name: string | undefined;
+  /** The creature template's name ("Imp", "Wolf"), when the creature query has answered. */
+  readonly creatureName: string | undefined;
+  readonly entry: number | undefined;
+  readonly level: number | undefined;
+  readonly health: number | undefined;
+  readonly maxHealth: number | undefined;
+  readonly power: number | undefined;
+  readonly maxPower: number | undefined;
+  /** `true` only when health was observed and is 0. */
+  readonly dead: boolean | undefined;
+  /** Whether the pet's unit is currently in view (its update blocks are what level/health come from). */
+  readonly inView: boolean;
+  /** CreatureFamily.dbc id (1 wolf, 2 cat, ... ; 0 for demons and vehicles). */
+  readonly family: number;
+  /** 0 for a permanent pet; else how long a temporary summon lasts. */
+  readonly durationMs: number;
+  readonly reaction: PetReaction;
+  readonly command: PetCommand;
+  readonly reactState: number;
+  readonly commandState: number;
+  readonly actionBar: readonly PetActionBarButton[];
+  readonly spells: readonly PetSpellEntry[];
+  readonly cooldowns: readonly { readonly spellId: number; readonly cooldownMs: number; readonly categoryCooldownMs: number }[];
+  readonly seq: number;
+  readonly ts: number;
+}
+
+/** One other member of the party, as `SMSG_GROUP_LIST` lists them (self is never in the list). */
+export interface GroupMember {
+  readonly guid: GuidKey;
+  readonly name: string;
+  readonly online: boolean;
+  readonly subGroup: number;
+  readonly assistant: boolean;
+  readonly leader: boolean;
+}
+
+/**
+ * The party (item 100): the last `SMSG_GROUP_LIST` plus the invitation and
+ * verdict packets around it. `inGroup` false with a `pendingInvite` is the
+ * "X invites you to a group" dialog; `lastResult` is the server's word on the
+ * last invite / uninvite / leave (`partyResultText` names it).
+ * `undefined` until any group packet has been observed.
+ */
+export interface GroupState {
+  readonly inGroup: boolean;
+  readonly raid: boolean;
+  readonly groupGuid: GuidKey | undefined;
+  readonly leaderGuid: GuidKey | undefined;
+  readonly leaderName: string | undefined;
+  /** True when the leader guid is our own. */
+  readonly leader: boolean;
+  readonly members: readonly GroupMember[];
+  readonly lootMethod: number | undefined;
+  readonly pendingInvite: { readonly inviterName: string; readonly seq: number; readonly ts: number } | undefined;
+  readonly lastResult:
+    | { readonly operation: number; readonly name: string; readonly result: number; readonly text: string; readonly seq: number; readonly ts: number }
+    | undefined;
+  /** The last member who declined an invitation from us, by name. */
+  readonly lastDecline: { readonly name: string; readonly seq: number; readonly ts: number } | undefined;
+  readonly seq: number;
+  readonly ts: number;
+}
+
+/** One attached item of a mail, with the template name joined when the item query has answered. */
+export interface MailItem {
+  readonly index: number;
+  /** What `takeMailItem(mailId, itemGuidLow)` sends. */
+  readonly itemGuidLow: number;
+  readonly itemId: number;
+  readonly name: string | undefined;
+  readonly count: number;
+}
+
+/** One mail of the inbox as the mailbox listed it. */
+export interface MailEntry {
+  readonly mailId: number;
+  /** 0 a player, 2 a creature, 3 a gameobject, 4 an auction, 5 the calendar. */
+  readonly type: number;
+  readonly senderGuid: GuidKey | undefined;
+  /** The sender's name, when a name query has answered for the guid. */
+  readonly senderName: string | undefined;
+  readonly senderId: number | undefined;
+  readonly subject: string;
+  readonly body: string;
+  readonly money: number;
+  readonly cod: number;
+  readonly read: boolean;
+  readonly daysLeft: number;
+  readonly items: readonly MailItem[];
+}
+
+/**
+ * The mailbox (item 100): the frame last opened (`openMailbox`, or an
+ * `SMSG_SHOW_MAILBOX` when the core does send one), the
+ * inbox as last listed (`SMSG_MAIL_LIST_RESULT`), whether new mail has
+ * arrived since (`SMSG_RECEIVED_MAIL`), and the last verdict
+ * (`SMSG_SEND_MAIL_RESULT`; `mailResultText` names it). `undefined` until any
+ * mail packet has been observed.
+ */
+export interface MailboxState {
+  /** The mailbox object the frame was last opened on. */
+  readonly guid: GuidKey | undefined;
+  readonly mails: readonly MailEntry[];
+  /** How many mails the server holds, including any the list could not fit. */
+  readonly total: number;
+  /** True after `SMSG_RECEIVED_MAIL` until the next list. */
+  readonly newMail: boolean;
+  readonly lastResult:
+    | { readonly mailId: number; readonly action: number; readonly result: number; readonly text: string; readonly inventoryResult: number | undefined; readonly seq: number; readonly ts: number }
+    | undefined;
+  readonly seq: number;
+  readonly ts: number;
+}
+
+/**
+ * The bank (item 100): the banker the frame was last opened at
+ * (`SMSG_SHOW_BANK`) and the bank slots, addressed the way the bank opcodes
+ * want them — `bag` 255 with `slot` 39-66 for the main bank, a bank bag's own
+ * slot (67-73) with `slot` 0..numSlots-1 for its contents. The slots come
+ * from the self update fields (a client has them from login), so `items` is
+ * populated whether or not a bank frame is open; depositing and withdrawing
+ * need the frame.
+ */
+export interface BankContents {
+  readonly guid: GuidKey | undefined;
+  readonly items: readonly BagSlotItem[];
+  readonly bags: readonly WornBag[];
+  /** Empty slots across the main bank slots the character has bought and every bank bag of known size. */
+  readonly freeSlots: number;
+  readonly totalSlots: number;
+}
+
+/**
+ * The trade window (item 100): the last `SMSG_TRADE_STATUS`
+ * (`tradeStatusText` names it) and both sides of the window from
+ * `SMSG_TRADE_STATUS_EXTENDED`. `open` is true from the window opening until
+ * a cancel, a completion or a close. `undefined` until any trade packet.
+ */
+export interface TradeState {
+  readonly status: number;
+  readonly statusText: string;
+  readonly open: boolean;
+  readonly traderGuid: GuidKey | undefined;
+  readonly mine: TradeSide | undefined;
+  readonly theirs: TradeSide | undefined;
+  readonly seq: number;
+  readonly ts: number;
+}
+
+export interface TradeSide {
+  readonly money: number;
+  readonly items: readonly { readonly slot: number; readonly itemId: number; readonly name: string | undefined; readonly count: number }[];
+  readonly seq: number;
+}
+
+const PET_REACTIONS: readonly PetReaction[] = ["passive", "defensive", "aggressive"];
+const PET_COMMANDS: readonly PetCommand[] = ["stay", "follow", "attack", "abandon"];
+
+const PARTY_RESULT_TEXT: Readonly<Record<number, string>> = {
+  0: "ok",
+  1: "cannot find that player",
+  2: "that player is not in your party",
+  3: "that player is not in your instance",
+  4: "your party is full",
+  5: "that player is already in a group",
+  6: "you are not in a group",
+  7: "you are not the party leader",
+  8: "that player is of the wrong faction",
+  9: "that player is ignoring you",
+  12: "that player is in the dungeon finder queue",
+  13: "invites are restricted",
+  14: "cannot invite while in combat",
+  15: "unknown realm",
+  16: "party server unavailable",
+  17: "the party is busy",
+  18: "ambiguous player name",
+};
+
+const MAIL_RESULT_TEXT: Readonly<Record<number, string>> = {
+  0: "ok",
+  1: "inventory problem (see inventoryResult)",
+  2: "cannot send mail to yourself",
+  3: "not enough money",
+  4: "recipient not found",
+  5: "recipient is not on your faction",
+  6: "internal mail error",
+  14: "mail is disabled for trial accounts",
+  15: "the recipient's mailbox is full",
+  16: "cannot send a wrapped item with COD",
+  17: "mail and chat are suspended",
+  18: "too many attachments",
+  19: "an attachment is invalid",
+  21: "the item has expired",
+};
+
+const TRADE_STATUS_TEXT: Readonly<Record<number, string>> = {
+  0: "busy",
+  1: "begin trade",
+  2: "window open",
+  3: "trade canceled",
+  4: "trade accepted",
+  5: "busy",
+  6: "no target",
+  7: "back to trade",
+  8: "trade complete",
+  9: "trade rejected",
+  10: "target too far away",
+  11: "wrong faction",
+  12: "window closed",
+  14: "target is ignoring you",
+  15: "you are stunned",
+  16: "target is stunned",
+  17: "you are dead",
+  18: "target is dead",
+  19: "you are logging out",
+  20: "target is logging out",
+  21: "trial account",
+  22: "wrong realm",
+  23: "not on the tap list",
+};
+
+const PET_TAME_FAILURE_TEXT: Readonly<Record<number, string>> = {
+  1: "invalid creature",
+  2: "you already have too many pets",
+  3: "that creature is already owned",
+  4: "that creature cannot be tamed",
+  5: "another summon is active",
+  6: "units cannot tame",
+  7: "no pet available",
+  8: "internal error",
+  9: "the creature's level is too high",
+  10: "the creature is dead",
+  11: "the creature is not dead",
+  12: "you cannot control exotic pets",
+  13: "unknown error",
+};
+
+const PET_FEEDBACK_TEXT: Readonly<Record<number, string>> = {
+  0: "none",
+  1: "your pet is dead",
+  2: "there is nothing to attack",
+  3: "your pet cannot attack that target",
+};
+
+/** The client's text for a `SMSG_PARTY_COMMAND_RESULT` code; the code itself when the SDK does not name it. */
+/** A vote on a group loot roll, as the roll frame's buttons name them. */
+export type RollChoice = "need" | "greed" | "pass" | "disenchant";
+
+/** The wire `RollVote` for each button (`CMSG_LOOT_ROLL`, `SMSG_LOOT_ROLL.rollType`). */
+export const ROLL_VOTE: Readonly<Record<RollChoice, number>> = { pass: 0, need: 1, greed: 2, disenchant: 3 };
+
+/** The button name for a wire `rollType`, or the number when it is none of them. */
+export function rollChoiceName(rollType: number): RollChoice | undefined {
+  return (["pass", "need", "greed", "disenchant"] as const)[rollType];
+}
+
+/**
+ * One open roll frame (item 102): an over-threshold item on a group-looted
+ * corpse the server asked this character to vote on (`SMSG_LOOT_START_ROLL`).
+ * `rollGuid` is what the vote names; `deadline` is when the frame closes
+ * (arrival plus the countdown, on the local clock); `allowed` lists the
+ * buttons the server offered — pass is always among them.
+ */
+export interface PendingRoll {
+  readonly rollGuid: GuidKey;
+  readonly slot: number;
+  readonly itemId: number;
+  /** From the item query, when answered. */
+  readonly name: string | undefined;
+  readonly quality: number | undefined;
+  readonly count: number;
+  readonly allowed: readonly RollChoice[];
+  readonly deadline: number;
+  readonly seq: number;
+  readonly ts: number;
+}
+
+/**
+ * The text of a carried item the character has read (item 103): a book's or
+ * letter's pages (`SMSG_PAGE_TEXT_QUERY_RESPONSE`, in chain order) or the
+ * player-written text on a mailed letter (`SMSG_ITEM_TEXT_QUERY_RESPONSE`).
+ */
+export interface ItemText {
+  readonly guid: GuidKey;
+  readonly itemId: number | undefined;
+  readonly name: string | undefined;
+  readonly pages: readonly string[];
+  /** Whether every page of the chain has arrived. */
+  readonly complete: boolean;
+}
+
+export function partyResultText(result: number): string {
+  return PARTY_RESULT_TEXT[result] ?? `party result ${result}`;
+}
+/** The client's text for a `SMSG_SEND_MAIL_RESULT` result code. */
+export function mailResultText(result: number): string {
+  return MAIL_RESULT_TEXT[result] ?? `mail result ${result}`;
+}
+/** The client's text for a `SMSG_TRADE_STATUS` code. */
+export function tradeStatusText(status: number): string {
+  return TRADE_STATUS_TEXT[status] ?? `trade status ${status}`;
+}
+/** The client's text for a `SMSG_PET_TAME_FAILURE` code. */
+export function petTameFailureText(result: number): string {
+  return PET_TAME_FAILURE_TEXT[result] ?? `tame failure ${result}`;
+}
+/** The client's text for a `SMSG_PET_ACTION_FEEDBACK` code. */
+export function petFeedbackText(feedback: number): string {
+  return PET_FEEDBACK_TEXT[feedback] ?? `pet feedback ${feedback}`;
+}
+
+/** One talent of the class tree, with the ranks this character has taken merged in from the last `SMSG_TALENTS_INFO`. */
+export interface TalentTreeTalent {
+  readonly talentId: number;
+  readonly name: string | undefined;
+  /** 0-based tier (each tier needs 5 points in the tab below it). */
+  readonly row: number;
+  readonly col: number;
+  readonly maxRank: number;
+  /** The rank spells, first to last. */
+  readonly ranks: readonly number[];
+  /** Points spent here, 0..maxRank (the wire's 0-based rank + 1). */
+  readonly pointsSpent: number;
+  readonly dependsOn: number | undefined;
+  /** 0-based, as on the wire: the prerequisite must hold rank `dependsOnRank + 1`. */
+  readonly dependsOnRank: number | undefined;
+}
+
+export interface TalentTreeTab {
+  readonly tabId: number;
+  readonly name: string | undefined;
+  readonly page: number;
+  readonly talents: readonly TalentTreeTalent[];
+  /** Points spent in this tab. */
+  readonly pointsSpent: number;
+}
+
+/**
+ * The class talent frame (item 96): the last `WB_TALENT_TREE` (the answer to
+ * `queryTalentTree`) with the learned ranks from the last `SMSG_TALENTS_INFO`
+ * merged in at read time. `unspentPoints` follows the talents packet when
+ * one has arrived since.
+ */
+export interface TalentTree {
+  readonly class: number;
+  readonly unspentPoints: number;
+  readonly tabs: readonly TalentTreeTab[];
+  readonly seq: number;
+  readonly ts: number;
 }
 
 /**
@@ -626,6 +1202,61 @@ export interface GossipMenu {
 }
 
 /**
+ * A vendor's stock, as `SMSG_LIST_INVENTORY` last carried it for one NPC.
+ *
+ * The rows are the packet's own — `slot` is the 1-based number `buyItem` takes,
+ * `price` is already the discounted copper the client shows, and
+ * `leftInStock` -1 means unlimited. Nothing is derived here: whether an item is
+ * affordable, or an upgrade, is the caller's read over `state.money` and the
+ * item template.
+ *
+ * "Last observed", not "open": no packet closes a vendor frame, so this is the
+ * last list this session saw for that guid and `seq`/`ts` are how stale it is.
+ */
+export interface VendorWindow {
+  readonly guid: GuidKey;
+  readonly items: readonly VendorItem[];
+  /** The server's reason for an empty list, when it gave one. */
+  readonly emptyReason: number | undefined;
+  readonly seq: number;
+  readonly ts: number;
+}
+
+/**
+ * What a trainer teaches, as `SMSG_TRAINER_LIST` last carried it for one NPC.
+ *
+ * Raw rows, exactly as `trainerList` receives them (`state` 0 available,
+ * 1 unavailable, 2 known); `learnable` and `affordable` are `trainerList`'s
+ * derivations and stay there. "Last observed", like the vendor window.
+ */
+export interface TrainerWindow {
+  readonly guid: GuidKey;
+  /** 0 class, 1 mount, 2 tradeskill, 3 pet — the server's own classification. */
+  readonly trainerType: number;
+  readonly spells: readonly TrainerSpellData[];
+  readonly greeting: string | undefined;
+  readonly seq: number;
+  readonly ts: number;
+}
+
+/**
+ * The open loot window, as `SMSG_LOOT_RESPONSE` opened it and the loot packets
+ * since have changed it: a taken slot leaves `items` (`SMSG_LOOT_REMOVED`),
+ * taken gold zeroes `gold` (`SMSG_LOOT_CLEAR_MONEY`), and
+ * `SMSG_LOOT_RELEASE_RESPONSE` for this guid closes it. One at a time, because
+ * a client has one loot frame.
+ */
+export interface LootWindow {
+  /** The corpse or object being looted. */
+  readonly guid: GuidKey;
+  readonly lootType: number;
+  readonly gold: number;
+  readonly items: readonly LootItemData[];
+  readonly seq: number;
+  readonly ts: number;
+}
+
+/**
  * A world object the update stream has put in view: created by a `create`
  * block, refreshed by `values`/`movement` blocks and `MSG_MOVE_*`, removed by
  * an `outOfRange` list or `SMSG_DESTROY_OBJECT`.
@@ -642,6 +1273,14 @@ export interface NearbyObject extends UnitFieldsState {
   /** From `SMSG_MONSTER_MOVE`: creatures move by spline, not by `MSG_MOVE_*`. */
   motion: Observed<Motion> | undefined;
   targetGuid: Observed<GuidKey> | undefined;
+  /**
+   * The master of a summoned or created unit (`UNIT_FIELD_SUMMONEDBY`, else
+   * `UNIT_FIELD_CREATEDBY`): a pet's owner, a totem's shaman. `"0"` reads as
+   * undefined. Item 98.
+   */
+  ownerGuid: Observed<GuidKey> | undefined;
+  /** Who mind-controls this unit (`UNIT_FIELD_CHARMEDBY`), when observed. */
+  charmedByGuid: Observed<GuidKey> | undefined;
   /**
    * Transports only: the animation clock and `docked`, from the create block's
    * `pathProgress` and then every `WB_TRANSPORT_PROGRESS`. Undefined for
@@ -689,6 +1328,8 @@ export interface UnitView {
   readonly z: number | undefined;
   /** What it is targeting, when observed. `"0"` (no target) reads as undefined. */
   readonly targetGuid: GuidKey | undefined;
+  /** Its master, for a pet, totem or other summon (`UNIT_FIELD_SUMMONEDBY` / `CREATEDBY`); undefined otherwise. */
+  readonly ownerGuid: GuidKey | undefined;
   /**
    * The questgiver marker the client shows over this object, named:
    * `available` (`!`), `reward` (`?` — a quest it ends is ready to turn in),
@@ -929,9 +1570,25 @@ export interface StateSnapshot {
   readonly anomalies: readonly Anomaly[];
   /** guid -> the gossip menu last observed open for that NPC (none after a close). */
   readonly gossip: ReadonlyMap<GuidKey, GossipMenu>;
+  /** guid -> the flight master window last observed for that NPC. */
+  readonly taxiWindows: ReadonlyMap<GuidKey, TaxiWindow>;
+  /** guid -> the stock list last observed for that vendor. */
+  readonly vendorWindows: ReadonlyMap<GuidKey, VendorWindow>;
+  /** guid -> the teaching list last observed for that trainer. */
+  readonly trainerWindows: ReadonlyMap<GuidKey, TrainerWindow>;
+  /** The open loot window, or undefined when none is open. */
+  readonly lootWindow: LootWindow | undefined;
   readonly spells: readonly KnownSpell[];
   readonly cooldowns: readonly SpellCooldown[];
   readonly talents: TalentState | undefined;
+  readonly talentTree: TalentTree | undefined;
+  readonly skills: readonly SkillLine[];
+  readonly reputation: readonly ReputationEntry[];
+  readonly pet: PetState | undefined;
+  readonly group: GroupState | undefined;
+  readonly mailbox: MailboxState | undefined;
+  readonly bank: BankContents;
+  readonly trade: TradeState | undefined;
   readonly lastSeq: number;
   readonly eventCount: number;
 }
@@ -951,7 +1608,9 @@ export class StateCache {
     targetGuid: undefined,
     achievements: undefined,
     taxiFlight: undefined,
+    resting: undefined,
     taxiReply: undefined,
+    bindPoint: undefined,
     health: undefined,
     power: undefined,
     fields: new Map<string, Observed<number>>(),
@@ -1015,6 +1674,65 @@ export class StateCache {
   private readonly gossipMenus = new Map<GuidKey, GossipMenu>();
 
   /**
+   * guid -> the flight master window last sent for that NPC
+   * (`SMSG_SHOWTAXINODES`). Not cleared by `SMSG_GOSSIP_COMPLETE`: the taxi
+   * window is its own frame on a client and the packet that opened it is the
+   * last word on what this character may fly to from there.
+   */
+  private readonly taxiWindows = new Map<GuidKey, TaxiWindow>();
+
+  /**
+   * guid -> the last vendor / trainer list seen for that NPC. Never cleared:
+   * no served packet closes either frame (module/PROTOCOL.md), and clearing
+   * them on some *other* window's close would be the cache inventing a server
+   * signal. They are "last observed", with seq/ts saying how long ago — the
+   * same shape `taxiWindows` already has.
+   */
+  private readonly vendorWindows = new Map<GuidKey, VendorWindow>();
+
+  private readonly trainerWindows = new Map<GuidKey, TrainerWindow>();
+
+  /** The open loot window. Cleared by the release the server does send. */
+  private lootWin: LootWindow | undefined;
+
+  /**
+   * Skill slot -> the SkillLine.dbc name the module put beside that slot's
+   * id (`skill<n>Name`, a string among the numeric update fields). Kept
+   * apart because `self.fields` holds numbers only.
+   */
+  private readonly skillNames = new Map<number, string>();
+
+  /** repListId -> the reputation row, in observation order. */
+  private readonly reputationMap = new Map<number, ReputationEntry>();
+
+  /** The last `WB_TALENT_TREE`, before the learned ranks are merged in. */
+  private talentTreeData: (TalentTreeData & { readonly seq: number; readonly ts: number }) | undefined;
+
+  /** The last `SMSG_PET_SPELLS` with a pet in it; cleared by the guid-0 removal (item 98). */
+  private petBar: (PetSpellsData & { readonly seq: number; readonly ts: number }) | undefined;
+
+  /** petNumber -> given name, from `SMSG_PET_NAME_QUERY_RESPONSE`. Never pruned: the module asks once per number. */
+  private readonly petNames = new Map<number, string>();
+
+  private groupState: GroupState | undefined;
+
+  /** rollGuid -> the open roll frame (item 102). Closed by the won / all-passed verdict, by our own counted vote, or by its deadline. */
+  private readonly rolls = new Map<GuidKey, PendingRoll>();
+
+  /** pageId -> one page of a book (item 103). A client-cache mirror: pages never change, so never pruned. */
+  private readonly pageTexts = new Map<number, { readonly text: string; readonly nextPageId: number }>();
+
+  /** item guid -> the player-written text on it, from `SMSG_ITEM_TEXT_QUERY_RESPONSE`. */
+  private readonly playerTexts = new Map<GuidKey, string>();
+
+  private mailState: MailboxState | undefined;
+
+  /** The banker the bank frame was last opened at. */
+  private bankGuid: { readonly value: GuidKey; readonly seq: number; readonly ts: number } | undefined;
+
+  private tradeState: TradeState | undefined;
+
+  /**
    * spellId -> spellbook row. Replaced wholesale by `SMSG_INITIAL_SPELLS`
    * (the login-time book), then edited by `SMSG_LEARNED_SPELL`,
    * `SMSG_REMOVED_SPELL` and `SMSG_SUPERCEDED_SPELL`. Empty until login has
@@ -1059,6 +1777,8 @@ export class StateCache {
   private readonly notificationTail: number;
 
   lastSeq = -1;
+  /** The `ts` of the last event folded: the stream's own clock, which timed things (a roll's deadline) are read against. */
+  lastTs = 0;
   eventCount = 0;
 
   /**
@@ -1307,7 +2027,7 @@ export class StateCache {
     const inventory = this.inventory;
     // Backpack first, then each worn bag in slot order.
     for (const i of inventory) {
-      if (i.slot >= BACKPACK_FIRST_SLOT) items.push(rowOf(BACKPACK_BAG, i.slot, i.guid));
+      if (i.slot >= BACKPACK_FIRST_SLOT && i.slot <= BACKPACK_LAST_SLOT) items.push(rowOf(BACKPACK_BAG, i.slot, i.guid));
     }
     for (const i of inventory) {
       if (i.slot < BAG_FIRST_SLOT || i.slot > BAG_LAST_SLOT) continue;
@@ -1354,6 +2074,45 @@ export class StateCache {
   }
 
   /**
+   * The flight master window last observed for `guid` (`SMSG_SHOWTAXINODES`),
+   * or `undefined` if none has been seen. What `activateTaxi(guid, dest)`
+   * resolves a destination name or node id against, and where the source
+   * node it sends comes from. Opened by choosing the taxi option on the
+   * flight master's gossip menu (`showTaxiNodes` does that in one call).
+   */
+  lastTaxiNodes(guid: GuidKey): TaxiWindow | undefined {
+    return this.taxiWindows.get(guid);
+  }
+
+  /**
+   * The stock list last observed for vendor `guid` (`SMSG_LIST_INVENTORY`),
+   * or `undefined` if none has been seen. Rows are the server's own; `slot` is
+   * what `buyItem(guid, itemId, slot)` takes. Nothing closes a vendor frame, so
+   * this survives walking away — read `seq`/`ts` for how old it is.
+   */
+  lastVendorList(guid: GuidKey): VendorWindow | undefined {
+    return this.vendorWindows.get(guid);
+  }
+
+  /**
+   * The teaching list last observed for trainer `guid` (`SMSG_TRAINER_LIST`),
+   * or `undefined` if none has been seen. Raw rows; `trainerList(npcGuid)` is
+   * the helper that asks and adds `learnable`/`affordable`.
+   */
+  lastTrainerList(guid: GuidKey): TrainerWindow | undefined {
+    return this.trainerWindows.get(guid);
+  }
+
+  /**
+   * The loot window currently open, or `undefined`. Its `items[].slot` is what
+   * `lootItem(slot)` takes; taken slots and taken gold leave it as the server
+   * says so, and the release closes it.
+   */
+  lastLoot(): LootWindow | undefined {
+    return this.lootWin;
+  }
+
+  /**
    * The spellbook as the server served it: every spell id the character
    * knows in its active spec, by id. Empty until `SMSG_INITIAL_SPELLS` has
    * arrived (it is sent during login, before the world is entered).
@@ -1383,6 +2142,395 @@ export class StateCache {
   /** The last `SMSG_TALENTS_INFO` for the player, or `undefined` before one arrived. */
   talents(): TalentState | undefined {
     return this.talentState;
+  }
+
+  /**
+   * The class talent frame: the last `WB_TALENT_TREE` (`queryTalentTree`)
+   * with each talent's `pointsSpent` read off the last `SMSG_TALENTS_INFO`.
+   * `undefined` until a tree has been queried.
+   */
+  talentTree(): TalentTree | undefined {
+    const tree = this.talentTreeData;
+    if (tree === undefined) return undefined;
+    const spent = new Map<number, number>();
+    for (const t of this.talentState?.talents ?? []) spent.set(t.talentId, t.rank + 1);
+    const tabs = tree.tabs.map((tab) => {
+      const talents = tab.talents.map((t) => ({
+        talentId: t.talentId,
+        name: t.name,
+        row: t.row,
+        col: t.col,
+        maxRank: t.maxRank,
+        ranks: [...t.ranks],
+        pointsSpent: spent.get(t.talentId) ?? 0,
+        dependsOn: t.dependsOn,
+        dependsOnRank: t.dependsOnRank,
+      }));
+      return { tabId: tab.tabId, name: tab.name, page: tab.page, talents, pointsSpent: talents.reduce((n, t) => n + t.pointsSpent, 0) };
+    });
+    const unspent =
+      this.talentState !== undefined && this.talentState.seq > tree.seq ? this.talentState.unspentPoints : tree.unspentPoints;
+    return { class: tree.class, unspentPoints: unspent, tabs, seq: tree.seq, ts: tree.ts };
+  }
+
+  /**
+   * The skill pane: every occupied `PLAYER_SKILL_INFO` slot on self, by
+   * skill id. Empty until the self create block has been seen.
+   */
+  skills(): SkillLine[] {
+    const out: SkillLine[] = [];
+    for (let slot = 0; slot < SKILL_SLOTS; slot++) {
+      const id = this.self.fields.get(`skill${slot}Id`);
+      if (!id || id.value === 0) continue;
+      const value = this.self.fields.get(`skill${slot}Value`);
+      const max = this.self.fields.get(`skill${slot}Max`);
+      const temp = this.self.fields.get(`skill${slot}TempBonus`);
+      const perm = this.self.fields.get(`skill${slot}PermBonus`);
+      const step = this.self.fields.get(`skill${slot}Step`);
+      let latest = id;
+      for (const f of [value, max, temp, perm]) if (f !== undefined && f.seq > latest.seq) latest = f;
+      out.push({
+        skillId: id.value,
+        name: this.skillNames.get(slot),
+        value: value?.value ?? 0,
+        max: max?.value ?? 0,
+        tempBonus: temp?.value ?? 0,
+        permBonus: perm?.value ?? 0,
+        step: step?.value ?? 0,
+        seq: latest.seq,
+        ts: latest.ts,
+      });
+    }
+    return out.sort((a, b) => a.skillId - b.skillId);
+  }
+
+  /**
+   * One skill line by id or by name, through the shared `resolveName`;
+   * `undefined` when the character lacks it. A query is a *read* here, not an
+   * action, so there is nowhere to put a refusal: an ambiguous name answers
+   * `undefined` the same as an unknown one, and the caller looks at
+   * `skills()`.
+   */
+  skill(key: number | string): SkillLine | undefined {
+    const all = this.skills();
+    if (typeof key === "number") return all.find((s) => s.skillId === key);
+    return only(resolveName(key, all, (s) => s.name));
+  }
+
+  /**
+   * The reputation pane: every faction the server has told this character
+   * about, visible ones first, then by name. Empty until login's
+   * `SMSG_INITIALIZE_FACTIONS`.
+   */
+  reputation(): ReputationEntry[] {
+    return [...this.reputationMap.values()].sort((a, b) =>
+      a.visible !== b.visible ? (a.visible ? -1 : 1) : (a.name ?? "").localeCompare(b.name ?? "") || a.repListId - b.repListId,
+    );
+  }
+
+  /** One reputation row by faction id or by name (shared `resolveName`; ambiguous reads `undefined`, as `skill` does). */
+  reputationWith(key: number | string): ReputationEntry | undefined {
+    const all = [...this.reputationMap.values()];
+    if (typeof key === "number") return all.find((r) => r.factionId === key);
+    return only(resolveName(key, all, (r) => r.name));
+  }
+
+  /**
+   * The pet frame (item 98): the control bar the server last sent
+   * (`SMSG_PET_SPELLS`) joined to the pet's unit in view and its given name.
+   * `undefined` when there is no pet — none summoned, or the server removed
+   * the bar (death, dismiss, abandon).
+   */
+  pet(): PetState | undefined {
+    const bar = this.petBar;
+    if (bar === undefined) return undefined;
+    const unit = this.nearby.get(bar.guid);
+    const petNumber = unit?.fields.get("petNumber")?.value;
+    const entry = unit?.entry?.value;
+    const health = unit?.fields.get("health")?.value;
+    const creatureName = entry === undefined ? undefined : this.creatures.get(entry)?.value.name;
+    const spells: PetSpellEntry[] = (bar.spells ?? []).map((sp: PetSpell) => ({
+      spellId: sp.spellId,
+      name: sp.name,
+      rank: sp.rank,
+      autocast: sp.autocast,
+      passive: sp.active === 0x01,
+    }));
+    return {
+      guid: bar.guid,
+      name: petNumber === undefined ? undefined : this.petNames.get(petNumber),
+      creatureName,
+      entry,
+      level: unit?.level?.value,
+      health,
+      maxHealth: unit?.fields.get("maxHealth")?.value,
+      power: unit?.power?.value.current,
+      maxPower: unit?.power?.value.max,
+      dead: health === undefined ? undefined : health === 0,
+      inView: unit !== undefined,
+      family: bar.family ?? 0,
+      durationMs: bar.durationMs ?? 0,
+      reaction: PET_REACTIONS[bar.reactState ?? 0] ?? "passive",
+      command: PET_COMMANDS[bar.commandState ?? 0] ?? "stay",
+      reactState: bar.reactState ?? 0,
+      commandState: bar.commandState ?? 0,
+      actionBar: bar.actionBar ?? [],
+      spells,
+      cooldowns: (bar.cooldowns ?? []).map((c) => ({ spellId: c.spellId, cooldownMs: c.cooldownMs, categoryCooldownMs: c.categoryCooldownMs })),
+      seq: bar.seq,
+      ts: bar.ts,
+    };
+  }
+
+  /**
+   * One of the pet's spells by id or by name (shared `resolveName`);
+   * `undefined` when the pet lacks it, there is no pet, or the name is
+   * ambiguous — a read has nowhere to put a refusal.
+   */
+  petSpell(key: number | string): PetSpellEntry | undefined {
+    const all = this.pet()?.spells ?? [];
+    if (typeof key === "number") return all.find((s) => s.spellId === key);
+    return only(resolveName(key, all, (s) => s.name));
+  }
+
+  /**
+   * The roll frames open right now (item 102), oldest first, named from the
+   * item query where it has answered. A frame whose deadline has passed is
+   * gone: the server decided it without us. `now` defaults to the stream's
+   * own clock (`lastTs`), the clock the deadline was set on.
+   */
+  pendingRolls(now: number = this.lastTs): PendingRoll[] {
+    const out: PendingRoll[] = [];
+    for (const [guid, roll] of this.rolls) {
+      if (roll.deadline <= now) {
+        this.rolls.delete(guid);
+        continue;
+      }
+      const info = this.items.get(roll.itemId)?.value;
+      out.push(roll.name === undefined && info !== undefined ? { ...roll, name: info.name, quality: info.quality } : roll);
+    }
+    return out;
+  }
+
+  /**
+   * The text of every carried item this character has read (item 103): a
+   * book's pages walked from the template's `pageText` through the cached
+   * chain, or the player-written text on a mailed letter. Items that were
+   * never read are absent; `complete` is false while a chain's later pages
+   * are still arriving.
+   */
+  itemTexts(): ItemText[] {
+    const out: ItemText[] = [];
+    for (const item of this.bag().items) {
+      const written = this.playerTexts.get(item.guid);
+      if (written !== undefined) {
+        out.push({ guid: item.guid, itemId: item.itemId, name: item.name, pages: [written], complete: true });
+        continue;
+      }
+      const first = item.itemId === undefined ? undefined : this.items.get(item.itemId)?.value.pageText;
+      if (first === undefined || first === 0) continue;
+      const pages: string[] = [];
+      let next = first;
+      // Cap the walk: a page chain is short and a cycle in the data must not hang a read.
+      for (let guard = 0; next !== 0 && guard < 64; guard++) {
+        const page = this.pageTexts.get(next);
+        if (page === undefined) break;
+        pages.push(page.text);
+        next = page.nextPageId;
+      }
+      if (pages.length === 0) continue;
+      out.push({ guid: item.guid, itemId: item.itemId, name: item.name, pages, complete: next === 0 });
+    }
+    return out;
+  }
+
+  /** The party (item 100), or `undefined` until any group packet has been observed. */
+  group(): GroupState | undefined {
+    return this.groupState;
+  }
+
+  /**
+   * The mailbox (item 100): the inbox as last listed, with item names and
+   * sender names joined at read time. `undefined` until any mail packet.
+   */
+  mailbox(): MailboxState | undefined {
+    const m = this.mailState;
+    if (m === undefined) return undefined;
+    const mails = m.mails.map((mail) => ({
+      ...mail,
+      senderName: mail.senderGuid === undefined ? undefined : this.names.get(mail.senderGuid)?.value,
+      items: mail.items.map((it) => ({ ...it, name: this.items.get(it.itemId)?.value.name })),
+    }));
+    return { ...m, mails };
+  }
+
+  /**
+   * The bank (item 100): the main bank slots (bag 255, slots 39-66) and each
+   * bank bag's contents (bag = the bank bag's slot 67-73), addressed the way
+   * `bankWithdraw(bag, slot)` takes them. The same three-way join as `bag()`.
+   * `guid` is the banker the frame was last opened at, or undefined.
+   */
+  bank(): BankContents {
+    const items: BagSlotItem[] = [];
+    const bags: WornBag[] = [];
+    const rowOf = (bag: number, slot: number, guid: GuidKey): BagSlotItem => {
+      const item = this.nearby.get(guid);
+      const itemId = item?.entry?.value;
+      const info = itemId === undefined ? undefined : this.items.get(itemId)?.value;
+      return { bag, slot, guid, itemId, name: info?.name, count: item?.fields.get("stackCount")?.value, quality: info?.quality };
+    };
+    const inventory = this.inventory;
+    // The main bank: a character starts with 28 slots and buys none (3.3.5
+    // bank *bag* slots are bought; the 28 item slots are free), so every
+    // slot in the range counts toward totalSlots.
+    let totalSlots = BANK_LAST_SLOT - BANK_FIRST_SLOT + 1;
+    for (const i of inventory) {
+      if (i.slot >= BANK_FIRST_SLOT && i.slot <= BANK_LAST_SLOT) items.push(rowOf(BACKPACK_BAG, i.slot, i.guid));
+    }
+    for (const i of inventory) {
+      if (i.slot < BANK_BAG_FIRST_SLOT || i.slot > BANK_BAG_LAST_SLOT) continue;
+      const container = this.nearby.get(i.guid);
+      const numSlots = container?.fields.get("numSlots")?.value ?? 0;
+      bags.push({ slot: i.slot, numSlots, name: i.name });
+      totalSlots += numSlots;
+      if (!container) continue;
+      for (let n = 0; n < numSlots; n++) {
+        const lo = container.fields.get(`bagSlot${n}Lo`);
+        const hi = container.fields.get(`bagSlot${n}Hi`);
+        if (!lo && !hi) continue;
+        const guid = formatGuid((BigInt(hi?.value ?? 0) << 32n) | BigInt((lo?.value ?? 0) >>> 0));
+        if (guid === "0") continue;
+        items.push(rowOf(i.slot, n, guid));
+      }
+    }
+    return { guid: this.bankGuid?.value, items, bags, freeSlots: totalSlots - items.length, totalSlots };
+  }
+
+  /** The trade window (item 100), or `undefined` until any trade packet. */
+  trade(): TradeState | undefined {
+    const t = this.tradeState;
+    if (t === undefined) return undefined;
+    const side = (s: TradeSide | undefined): TradeSide | undefined =>
+      s === undefined ? undefined : { ...s, items: s.items.map((it) => ({ ...it, name: this.items.get(it.itemId)?.value.name })) };
+    return { ...t, mine: side(t.mine), theirs: side(t.theirs) };
+  }
+
+  private foldGroupList(d: GroupListData, seq: number, ts: number): void {
+    const prev = this.groupState;
+    const members: GroupMember[] = d.left
+      ? []
+      : d.members.map((m: GroupMemberData) => ({
+          guid: m.guid,
+          name: m.name,
+          online: m.online,
+          subGroup: m.subGroup,
+          assistant: (m.flags & 0x01) !== 0,
+          leader: m.guid === d.leaderGuid,
+        }));
+    const leaderGuid = d.left || d.leaderGuid === "0" ? undefined : d.leaderGuid;
+    const leaderName =
+      leaderGuid === undefined
+        ? undefined
+        : members.find((m) => m.guid === leaderGuid)?.name ?? (this.self.guid === leaderGuid ? this.self.name : undefined) ?? this.names.get(leaderGuid)?.value;
+    this.groupState = {
+      inGroup: !d.left,
+      raid: d.raid,
+      groupGuid: d.left ? undefined : d.groupGuid,
+      leaderGuid,
+      leaderName,
+      leader: leaderGuid !== undefined && leaderGuid === this.self.guid,
+      members,
+      lootMethod: d.lootMethod,
+      // Joining a group is the invite answered; leaving it clears nothing.
+      pendingInvite: d.left ? prev?.pendingInvite : undefined,
+      lastResult: prev?.lastResult,
+      lastDecline: prev?.lastDecline,
+      seq,
+      ts,
+    };
+  }
+
+  private groupPatch(patch: Partial<GroupState>, seq: number, ts: number): void {
+    const prev: GroupState = this.groupState ?? {
+      inGroup: false,
+      raid: false,
+      groupGuid: undefined,
+      leaderGuid: undefined,
+      leaderName: undefined,
+      leader: false,
+      members: [],
+      lootMethod: undefined,
+      pendingInvite: undefined,
+      lastResult: undefined,
+      lastDecline: undefined,
+      seq,
+      ts,
+    };
+    this.groupState = { ...prev, ...patch, seq, ts };
+  }
+
+  /**
+   * Record the mailbox frame as open on `guid`. Called by `openMailbox` when
+   * the first `SMSG_MAIL_LIST_RESULT` answers a `CMSG_GET_MAIL_LIST` on it: the
+   * core sends no `SMSG_SHOW_MAILBOX` for a game-object mailbox, so the list
+   * answering is what proves the box is in reach.
+   */
+  mailboxOpened(guid: GuidKey, seq: number, ts: number): void {
+    this.mailPatch({ guid }, seq, ts);
+  }
+
+  /**
+   * Drop a pending roll the packet names. The core writes the roll guid on
+   * `SMSG_LOOT_START_ROLL` and `SMSG_LOOT_ALL_PASSED` but sends
+   * `ObjectGuid::Empty` ("0") as the source on every `SMSG_LOOT_ROLL` vote
+   * echo and on `SMSG_LOOT_ROLL_WON` (Group::CountRollVote / CountTheRoll —
+   * the field is unused by the client), so those resolve by slot and item.
+   */
+  private closeRoll(d: { rollGuid: string; slot: number; itemId: number }): void {
+    if (d.rollGuid !== "0") {
+      this.rolls.delete(d.rollGuid);
+      return;
+    }
+    for (const [guid, roll] of this.rolls) {
+      if (roll.slot === d.slot && roll.itemId === d.itemId) this.rolls.delete(guid);
+    }
+  }
+
+  /**
+   * Fold the pet's react or command state off our own accepted order. The
+   * core answers `CMSG_PET_ACTION` react and follow/stay buttons with no
+   * packet (a client updates its bar locally — seen live 2026-08-30: no
+   * `SMSG_PET_SPELLS` follows a react change), so the ack is the only signal
+   * the bar has changed. The next `SMSG_PET_SPELLS` replaces it wholesale.
+   */
+  petCommanded(patch: { reactState?: number; commandState?: number }, seq: number, ts: number): void {
+    if (this.petBar === undefined) return;
+    this.petBar = { ...this.petBar, ...patch, seq, ts };
+  }
+
+  private mailPatch(patch: Partial<MailboxState>, seq: number, ts: number): void {
+    const prev: MailboxState = this.mailState ?? { guid: undefined, mails: [], total: 0, newMail: false, lastResult: undefined, seq, ts };
+    this.mailState = { ...prev, ...patch, seq, ts };
+  }
+
+  private foldFactionRow(row: FactionRowLike, seq: number, ts: number): void {
+    const prev = this.reputationMap.get(row.repListId);
+    const standing = row.standing;
+    const base = row.base ?? prev?.base;
+    const reputation = row.reputation ?? (base !== undefined ? base + standing : standing);
+    this.reputationMap.set(row.repListId, {
+      repListId: row.repListId,
+      factionId: row.factionId ?? prev?.factionId,
+      name: row.name ?? prev?.name,
+      standing,
+      base,
+      reputation,
+      rank: reputationRank(reputation),
+      visible: row.visible ?? prev?.visible ?? false,
+      atWar: row.atWar ?? prev?.atWar ?? false,
+      seq,
+      ts,
+    });
   }
 
   /** Name for a guid, if a name query ever returned one. Never guessed. */
@@ -1416,9 +2564,21 @@ export class StateCache {
       gaps: [...this.gapBuf],
       anomalies: [...this.anomalyBuf],
       gossip: new Map(this.gossipMenus),
+      taxiWindows: new Map(this.taxiWindows),
+      vendorWindows: new Map(this.vendorWindows),
+      trainerWindows: new Map(this.trainerWindows),
+      lootWindow: this.lootWin,
       spells: this.spells(),
       cooldowns: this.cooldowns(),
       talents: this.talentState,
+      talentTree: this.talentTree(),
+      skills: this.skills(),
+      reputation: this.reputation(),
+      pet: this.pet(),
+      group: this.groupState,
+      mailbox: this.mailbox(),
+      bank: this.bank(),
+      trade: this.tradeState,
       lastSeq: this.lastSeq,
       eventCount: this.eventCount,
     };
@@ -1431,7 +2591,10 @@ export class StateCache {
     // churn), and holding the old max made `lastSeq` drift from the live
     // stream position for the rest of the run (seen in gate2-ox-2, +3).
     // `eventCount` stays a lifetime counter across sessions by design.
-    if (event.opcode !== STREAM_GAP) this.lastSeq = event.seq;
+    if (event.opcode !== STREAM_GAP) {
+      this.lastSeq = event.seq;
+      this.lastTs = event.ts;
+    }
 
     if (event.opcode === STREAM_GAP) {
       const d = event.data as GapRecord;
@@ -1719,6 +2882,236 @@ export class StateCache {
         this.self.taxiReply = { value: { reply: d.reply, ok: d.ok }, seq: event.seq, ts: event.ts };
         return;
       }
+      case "WB_TALENT_TREE": {
+        const d = event.data as TalentTreeData;
+        this.talentTreeData = { ...d, seq: event.seq, ts: event.ts };
+        return;
+      }
+      case "SMSG_PET_SPELLS": {
+        const d = event.data as PetSpellsData;
+        this.petBar = d.removed || d.guid === "0" ? undefined : { ...d, seq: event.seq, ts: event.ts };
+        return;
+      }
+      case "SMSG_PET_NAME_QUERY_RESPONSE": {
+        const d = event.data as PetNameQueryResponseData;
+        if (d.found && d.name !== undefined) this.petNames.set(d.petNumber, d.name);
+        return;
+      }
+      case "SMSG_LOOT_START_ROLL": {
+        const d = event.data as LootStartRollData;
+        const allowed: RollChoice[] = ["pass"];
+        if (d.canNeed) allowed.unshift("need");
+        if (d.canGreed) allowed.splice(allowed.length - 1, 0, "greed");
+        if (d.canDisenchant) allowed.splice(allowed.length - 1, 0, "disenchant");
+        const info = this.items.get(d.itemId)?.value;
+        this.rolls.set(d.rollGuid, {
+          rollGuid: d.rollGuid,
+          slot: d.slot,
+          itemId: d.itemId,
+          name: info?.name,
+          quality: info?.quality,
+          count: d.count,
+          allowed,
+          deadline: event.ts + d.countdownMs,
+          seq: event.seq,
+          ts: event.ts,
+        });
+        return;
+      }
+      case "SMSG_LOOT_ROLL": {
+        // Our own counted vote closes the frame on a client; other voters' do not.
+        const d = event.data as LootRollData;
+        if (this.self.guid !== undefined && d.playerGuid === this.self.guid) this.closeRoll(d);
+        return;
+      }
+      case "SMSG_LOOT_ROLL_WON":
+      case "SMSG_LOOT_ALL_PASSED": {
+        this.closeRoll(event.data as LootRollWonData | LootAllPassedData);
+        return;
+      }
+      case "SMSG_PAGE_TEXT_QUERY_RESPONSE": {
+        const d = event.data as PageTextQueryResponseData;
+        this.pageTexts.set(d.pageId, { text: d.text, nextPageId: d.nextPageId });
+        return;
+      }
+      case "SMSG_ITEM_TEXT_QUERY_RESPONSE": {
+        const d = event.data as ItemTextQueryResponseData;
+        if (d.found && d.guid !== undefined && d.text !== undefined) this.playerTexts.set(d.guid, d.text);
+        return;
+      }
+      case "SMSG_GROUP_INVITE": {
+        const d = event.data as GroupInviteData;
+        if (d.canAccept) this.groupPatch({ pendingInvite: { inviterName: d.inviterName, seq: event.seq, ts: event.ts } }, event.seq, event.ts);
+        return;
+      }
+      case "SMSG_GROUP_LIST": {
+        this.foldGroupList(event.data as GroupListData, event.seq, event.ts);
+        return;
+      }
+      case "SMSG_GROUP_DESTROYED":
+      case "SMSG_GROUP_UNINVITE": {
+        this.groupPatch({ inGroup: false, raid: false, groupGuid: undefined, leaderGuid: undefined, leaderName: undefined, leader: false, members: [], lootMethod: undefined }, event.seq, event.ts);
+        return;
+      }
+      case "SMSG_GROUP_SET_LEADER": {
+        const d = event.data as GroupNameData;
+        const prev = this.groupState;
+        const byName = prev?.members.find((m) => m.name === d.name);
+        const leaderGuid = byName?.guid ?? (this.self.name === d.name ? this.self.guid : undefined);
+        this.groupPatch(
+          {
+            leaderName: d.name,
+            leaderGuid: leaderGuid ?? prev?.leaderGuid,
+            leader: this.self.name === d.name,
+            members: (prev?.members ?? []).map((m) => ({ ...m, leader: m.name === d.name })),
+          },
+          event.seq,
+          event.ts,
+        );
+        return;
+      }
+      case "SMSG_GROUP_DECLINE": {
+        const d = event.data as GroupNameData;
+        this.groupPatch({ lastDecline: { name: d.name, seq: event.seq, ts: event.ts } }, event.seq, event.ts);
+        return;
+      }
+      case "SMSG_PARTY_COMMAND_RESULT": {
+        const d = event.data as PartyCommandResultData;
+        this.groupPatch(
+          { lastResult: { operation: d.operation, name: d.name, result: d.result, text: partyResultText(d.result), seq: event.seq, ts: event.ts } },
+          event.seq,
+          event.ts,
+        );
+        return;
+      }
+      case "SMSG_SHOW_MAILBOX": {
+        const d = event.data as ShowFrameData;
+        this.mailPatch({ guid: d.guid }, event.seq, event.ts);
+        return;
+      }
+      case "SMSG_RECEIVED_MAIL": {
+        this.mailPatch({ newMail: true }, event.seq, event.ts);
+        return;
+      }
+      case "SMSG_MAIL_LIST_RESULT": {
+        const d = event.data as MailListResultData;
+        const mails: MailEntry[] = d.mails.map((m: MailEntryData) => ({
+          mailId: m.mailId,
+          type: m.type,
+          senderGuid: m.senderGuid,
+          senderName: undefined,
+          senderId: m.senderId,
+          subject: m.subject,
+          body: m.body,
+          money: m.money,
+          cod: m.cod,
+          read: m.read,
+          daysLeft: m.daysLeft,
+          items: m.items.map((it) => ({ index: it.index, itemGuidLow: it.itemGuidLow, itemId: it.itemId, name: undefined, count: it.count })),
+        }));
+        this.mailPatch({ mails, total: d.total, newMail: false }, event.seq, event.ts);
+        return;
+      }
+      case "SMSG_SEND_MAIL_RESULT": {
+        const d = event.data as SendMailResultData;
+        const prev = this.mailState;
+        // The inbox the client shows updates itself off the verdict: taken
+        // money zeroes it, a taken item leaves the list, a delete removes the mail.
+        let mails = prev?.mails ?? [];
+        if (d.result === 0) {
+          if (d.action === 1) mails = mails.map((m) => (m.mailId === d.mailId ? { ...m, money: 0 } : m));
+          else if (d.action === 2) mails = mails.map((m) => (m.mailId === d.mailId ? { ...m, items: m.items.filter((it) => it.itemGuidLow !== d.itemGuidLow) } : m));
+          else if (d.action === 3 || d.action === 4) mails = mails.filter((m) => m.mailId !== d.mailId);
+        }
+        this.mailPatch(
+          {
+            mails,
+            lastResult: { mailId: d.mailId, action: d.action, result: d.result, text: mailResultText(d.result), inventoryResult: d.inventoryResult, seq: event.seq, ts: event.ts },
+          },
+          event.seq,
+          event.ts,
+        );
+        return;
+      }
+      case "SMSG_SHOW_BANK": {
+        const d = event.data as ShowFrameData;
+        this.bankGuid = { value: d.guid, seq: event.seq, ts: event.ts };
+        return;
+      }
+      case "SMSG_TRADE_STATUS": {
+        const d = event.data as TradeStatusData;
+        const prev = this.tradeState;
+        // 1 begin (the other side proposed), 2 the window opened, 7 back to
+        // trade; everything else ends or refuses it.
+        const open = d.status === 2 || d.status === 7 || d.status === 4 || (d.status === 1 && (prev?.open ?? false));
+        this.tradeState = {
+          status: d.status,
+          statusText: tradeStatusText(d.status),
+          open,
+          traderGuid: d.traderGuid ?? (open ? prev?.traderGuid : undefined),
+          mine: open ? prev?.mine : undefined,
+          theirs: open ? prev?.theirs : undefined,
+          seq: event.seq,
+          ts: event.ts,
+        };
+        return;
+      }
+      case "SMSG_TRADE_STATUS_EXTENDED": {
+        const d = event.data as TradeStatusExtendedData;
+        const prev = this.tradeState ?? { status: 2, statusText: tradeStatusText(2), open: true, traderGuid: undefined, mine: undefined, theirs: undefined, seq: event.seq, ts: event.ts };
+        const side: TradeSide = { money: d.money, items: d.items.map((it) => ({ slot: it.slot, itemId: it.itemId, name: undefined, count: it.count })), seq: event.seq };
+        this.tradeState = { ...prev, open: true, mine: d.theirs ? prev.mine : side, theirs: d.theirs ? side : prev.theirs, seq: event.seq, ts: event.ts };
+        return;
+      }
+      case "SMSG_INITIALIZE_FACTIONS": {
+        // The login list replaces whatever a previous session left: the
+        // server re-sends every row it has, and a faction it no longer
+        // lists is one the client would not show either.
+        const d = event.data as InitializeFactionsData;
+        this.reputationMap.clear();
+        for (const row of d.factions) this.foldFactionRow(row, event.seq, event.ts);
+        return;
+      }
+      case "SMSG_SET_FACTION_STANDING": {
+        const d = event.data as SetFactionStandingData;
+        for (const row of d.factions) this.foldFactionRow(row, event.seq, event.ts);
+        return;
+      }
+      case "SMSG_SET_FACTION_VISIBLE": {
+        const d = event.data as SetFactionVisibleData;
+        const prev = this.reputationMap.get(d.repListId);
+        if (prev !== undefined) {
+          this.reputationMap.set(d.repListId, { ...prev, visible: true, seq: event.seq, ts: event.ts });
+        } else {
+          this.foldFactionRow({ repListId: d.repListId, factionId: d.factionId, name: d.name, standing: 0, visible: true }, event.seq, event.ts);
+        }
+        return;
+      }
+      case "SMSG_SHOWTAXINODES": {
+        // The flight master's window, per NPC. `known` is the module's decode
+        // of the mask plus the client's TaxiNodes.dbc names; the mask itself
+        // rides along verbatim so nothing about the fold is unverifiable.
+        const d = event.data as ShowTaxiNodesData;
+        const known = d.known.map((n) => ({ nodeId: n.nodeId, name: n.name }));
+        this.taxiWindows.set(d.guid, {
+          guid: d.guid,
+          current: { nodeId: d.currentNode, name: d.currentNodeName ?? known.find((n) => n.nodeId === d.currentNode)?.name },
+          known,
+          mask: [...d.mask],
+          seq: event.seq,
+          ts: event.ts,
+        });
+        return;
+      }
+      case "SMSG_BINDPOINTUPDATE": {
+        const d = event.data as BindPointUpdateData;
+        this.self.bindPoint = {
+          value: { map: d.map, x: d.x, y: d.y, z: d.z, area: { id: d.areaId, name: d.areaName } },
+          seq: event.seq,
+          ts: event.ts,
+        };
+        return;
+      }
       case "SMSG_NAME_QUERY_RESPONSE": {
         const d = event.data as { guid: GuidKey; found: boolean; name?: string };
         if (d.found && d.name !== undefined) {
@@ -1811,6 +3204,31 @@ export class StateCache {
             requiredLevel: d.requiredLevel,
             sellPrice: d.sellPrice,
             buyPrice: d.buyPrice,
+            class: d.class,
+            subClass: d.subClass,
+            requiredSkill:
+              d.requiredSkill !== undefined && d.requiredSkill !== 0
+                ? { id: d.requiredSkill, rank: d.requiredSkillRank ?? 0, name: d.requiredSkillName }
+                : undefined,
+            requiredReputation:
+              d.requiredReputationFaction !== undefined && d.requiredReputationFaction !== 0
+                ? { factionId: d.requiredReputationFaction, rank: d.requiredReputationRank ?? 0, name: d.requiredReputationFactionName }
+                : undefined,
+            maxCount: d.maxCount,
+            stackable: d.stackable,
+            containerSlots: d.containerSlots,
+            stats: d.stats === undefined ? undefined : d.stats.map((s) => ({ type: s.type, value: s.value })),
+            damage: d.damage === undefined ? undefined : d.damage.map((x) => ({ min: x.min, max: x.max, type: x.type })),
+            armor: d.armor,
+            resistances: d.resistances === undefined ? undefined : { ...d.resistances },
+            speedMs: d.speedMs,
+            spells: d.spells === undefined ? undefined : d.spells.map((s) => ({ spellId: s.spellId, trigger: s.trigger, charges: s.charges, name: s.name })),
+            bonding: d.bonding,
+            description: d.description,
+            startQuest: d.startQuest,
+            pageText: d.pageText,
+            block: d.block,
+            maxDurability: d.maxDurability,
           },
           seq: event.seq,
           ts: event.ts,
@@ -1959,6 +3377,69 @@ export class StateCache {
         // only honest fold is "nothing is open" — keeping a per-guid menu alive
         // past this would let a select fire against a stale menu.
         this.gossipMenus.clear();
+        return;
+      }
+      case "SMSG_LIST_INVENTORY": {
+        // The vendor's stock, per NPC. The packet's rows are kept verbatim —
+        // the price is already the discounted one the client shows, and what is
+        // affordable or worth buying is the caller's read, not the cache's.
+        const d = event.data as ListInventoryData;
+        this.vendorWindows.set(d.vendorGuid, {
+          guid: d.vendorGuid,
+          items: d.items.map((i) => ({ ...i })),
+          emptyReason: d.emptyReason,
+          seq: event.seq,
+          ts: event.ts,
+        });
+        return;
+      }
+      case "SMSG_TRAINER_LIST": {
+        const d = event.data as TrainerListData;
+        this.trainerWindows.set(d.guid, {
+          guid: d.guid,
+          trainerType: d.trainerType,
+          spells: d.spells.map((sp) => ({ ...sp })),
+          greeting: d.greeting,
+          seq: event.seq,
+          ts: event.ts,
+        });
+        return;
+      }
+      case "SMSG_LOOT_RESPONSE": {
+        const d = event.data as LootResponseData;
+        this.lootWin = {
+          guid: d.guid,
+          lootType: d.lootType,
+          gold: d.gold,
+          items: d.items.map((i) => ({ ...i })),
+          seq: event.seq,
+          ts: event.ts,
+        };
+        return;
+      }
+      case "SMSG_LOOT_REMOVED": {
+        // One slot was taken (by us or, in a group, by someone else): the
+        // client removes that row from the frame, so the cache does too.
+        const d = event.data as LootRemovedData;
+        if (this.lootWin === undefined) return;
+        this.lootWin = {
+          ...this.lootWin,
+          items: this.lootWin.items.filter((i) => i.slot !== d.slot),
+          seq: event.seq,
+          ts: event.ts,
+        };
+        return;
+      }
+      case "SMSG_LOOT_CLEAR_MONEY": {
+        if (this.lootWin === undefined) return;
+        this.lootWin = { ...this.lootWin, gold: 0, seq: event.seq, ts: event.ts };
+        return;
+      }
+      case "SMSG_LOOT_RELEASE_RESPONSE": {
+        // The one close the server does send, and it names the object — so a
+        // release for something else leaves this window alone.
+        const d = event.data as LootReleaseResponseData;
+        if (this.lootWin?.guid === d.guid) this.lootWin = undefined;
         return;
       }
       default:
@@ -2345,6 +3826,25 @@ export class StateCache {
         }
         continue;
       }
+      // The skill pane's names ride beside the ids as strings (item 95);
+      // they live in their own map because `fields` holds numbers only.
+      if (target === this.self && typeof raw === "string") {
+        const m = /^skill(\d+)Name$/.exec(key);
+        if (m !== null) this.skillNames.set(Number(m[1]), raw);
+        continue;
+      }
+      // Owner guids (item 98): joined u64 halves the module serves as guid
+      // strings. SUMMONEDBY is the pet's master; CREATEDBY is the fallback
+      // the client draws the same conclusion from.
+      if (typeof raw === "string" && target !== this.self && "ownerGuid" in target) {
+        const obj = target as NearbyObject;
+        if (key === "summonedByGuid" || (key === "createdByGuid" && obj.ownerGuid?.value === undefined)) {
+          obj.ownerGuid = raw === "0" ? undefined : { value: raw, seq, ts };
+        } else if (key === "charmedByGuid") {
+          obj.charmedByGuid = raw === "0" ? undefined : { value: raw, seq, ts };
+        }
+        continue;
+      }
       // Unknown extras a newer module serves come through the loose schema as
       // non-numbers; only decoded numeric fields belong in the field record.
       if (typeof raw !== "number") continue;
@@ -2363,6 +3863,13 @@ export class StateCache {
       // keeps the provenance of the packet that made it.
       if (typeof fields.unitFlags === "number") {
         this.self.taxiFlight = { value: (fields.unitFlags & UNIT_FLAG_TAXI_FLIGHT) !== 0, seq, ts };
+      }
+      // `resting` is the same shape of reading off `playerFlags`, the players-
+      // only field the module whitelists (PROTOCOL.md). Guarded the same way:
+      // a delta that does not carry `playerFlags` says nothing about rest, and
+      // must not be read as "not resting".
+      if (typeof fields.playerFlags === "number") {
+        this.self.resting = { value: (fields.playerFlags & PLAYER_FLAGS_RESTING) !== 0, seq, ts };
       }
       const healthAfter = target.fields.get("health")?.value;
       const pos = this.self.position?.value;
@@ -2482,6 +3989,8 @@ export class StateCache {
         health: undefined,
         power: undefined,
         targetGuid: undefined,
+        ownerGuid: undefined,
+        charmedByGuid: undefined,
         transport: undefined,
         questGiver: undefined,
         fields: new Map<string, Observed<number>>(),
@@ -2525,6 +4034,7 @@ function toUnitView(obj: NearbyObject, from: UnitPosition | undefined): UnitView
     y: point?.y,
     z: point?.z,
     targetGuid: target === undefined || target === "0" ? undefined : target,
+    ownerGuid: obj.ownerGuid?.value,
     questGiver: obj.questGiver === undefined ? undefined : questGiverStatusName(obj.questGiver.value),
     questGiverStatus: obj.questGiver?.value,
     roles: npcRolesOf(obj.fields.get("npcFlags")?.value),
@@ -2899,10 +4409,32 @@ const QUEST_LOG_SLOTS = 25;
 /** The quest log's completion bit, the one the probe verified live. */
 const QUEST_STATE_COMPLETE = 1;
 /** Equipment + bags are 0-22, backpack 23-38 (PROTOCOL.md). */
-const INVENTORY_LAST_SLOT = 38;
+/** The last `invSlot<n>` the module serves: the bank bags (item 100). Older modules stop at 38. */
+const INVENTORY_LAST_SLOT = 73;
+/** `PLAYER_SKILL_INFO_1_1` holds 128 skill slots of three packed u32s each. */
+const SKILL_SLOTS = 128;
+
+/** What `foldFactionRow` needs of a wire row (the login flags are optional). */
+interface FactionRowLike {
+  readonly repListId: number;
+  readonly factionId?: number | undefined;
+  readonly name?: string | undefined;
+  readonly standing: number;
+  readonly base?: number | undefined;
+  readonly reputation?: number | undefined;
+  readonly visible?: boolean | undefined;
+  readonly atWar?: boolean | undefined;
+}
+
 /** First/last backpack slot in the `invSlot<n>` numbering, and its size. */
 const BACKPACK_FIRST_SLOT = 23;
 const BACKPACK_SIZE = 16;
+const BACKPACK_LAST_SLOT = BACKPACK_FIRST_SLOT + BACKPACK_SIZE - 1;
+/** Bank item slots (`BANK_SLOT_ITEM_START..END`) and bank bag slots (`BANK_SLOT_BAG_START..END`), the core's numbering. */
+const BANK_FIRST_SLOT = 39;
+const BANK_LAST_SLOT = 66;
+const BANK_BAG_FIRST_SLOT = 67;
+const BANK_BAG_LAST_SLOT = 73;
 /** `INVENTORY_SLOT_BAG_0` on the wire: the bag id the item actions take for the backpack. */
 const BACKPACK_BAG = 255;
 /** Worn-bag equipment slots (`INVENTORY_SLOT_BAG_START..END`): the bag ids the item actions take for them. */

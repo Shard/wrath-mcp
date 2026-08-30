@@ -999,3 +999,45 @@ export function selfArrived(seq: number, pos: { x: number; y: number; z: number 
     data: { moveId: seq, status: "arrived", pos: { ...pos, o: 0 } },
   };
 }
+
+// ---------------------------------------------------------------- chests
+//
+// A chest-type game object in view, and the cast verdicts a client gets when
+// it opens one: `CMSG_GAMEOBJ_USE` is ignored by the core for chests, so the
+// SDK casts the lock's Opening spell and reads the answer.
+
+export const CHEST_GUID = "17370386750538516234";
+export const CHEST_ENTRY = 178085;
+
+export const chestCreate = {
+  seq: 12,
+  opcode: "SMSG_UPDATE_OBJECT",
+  opcodeId: 0x0a9,
+  ts: 1_700_000_000_120,
+  data: {
+    blocks: 1,
+    objects: [
+      {
+        update: "create",
+        guid: CHEST_GUID,
+        objectType: "gameObject",
+        pos: { x: 2, y: 1, z: 0, o: 0 },
+        fields: { entry: CHEST_ENTRY, goType: 3, goDisplayId: 4991 },
+      },
+    ],
+  },
+};
+
+export function castFailed(seq: number, spellId: number, result = 12): unknown {
+  return { seq, opcode: "SMSG_CAST_FAILED", opcodeId: 0x130, ts: 1_700_000_000_000 + seq, data: { spellId, result } };
+}
+
+export function chestLootResponse(seq: number, gold = 0): unknown {
+  return {
+    seq,
+    opcode: "SMSG_LOOT_RESPONSE",
+    opcodeId: 0x160,
+    ts: 1_700_000_000_000 + seq,
+    data: { guid: CHEST_GUID, lootType: 6, gold, items: [{ slot: 0, itemId: ITEM_ENTRY, count: 1, slotType: 0 }] },
+  };
+}

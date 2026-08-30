@@ -22,6 +22,7 @@
 #include "AccountMgr.h"
 #include "Config.h"
 #include "DatabaseEnv.h"
+#include "DBCStores.h"
 #include "GameTime.h"
 #include "Item.h"
 #include "ItemTemplate.h"
@@ -182,6 +183,19 @@ namespace WrathBench
         std::string achPath = sWorld->GetDataPath() + "dbc/Achievement.dbc";
         if (!LoadAchievementDbc(achPath))
             LOG_ERROR("module", "wrathbench: Achievement.dbc not loaded from '{}'; achievement events will carry ids without names or points", achPath);
+        std::string taxiPath = sWorld->GetDataPath() + "dbc/TaxiNodes.dbc";
+        if (!LoadTaxiNodesDbc(taxiPath))
+            LOG_ERROR("module", "wrathbench: TaxiNodes.dbc not loaded from '{}'; SMSG_SHOWTAXINODES will carry node ids without names", taxiPath);
+        std::string tabPath = sWorld->GetDataPath() + "dbc/TalentTab.dbc";
+        if (!LoadTalentTabDbc(tabPath))
+            LOG_ERROR("module", "wrathbench: TalentTab.dbc not loaded from '{}'; talent_tree will carry tab ids without names", tabPath);
+        // Reputation index -> faction id, the join a client makes from its own
+        // Faction.dbc for every SMSG_INITIALIZE_FACTIONS position.
+        for (uint32 i = 0; i < sFactionStore.GetNumRows(); ++i)
+            if (FactionEntry const* f = sFactionStore.LookupEntry(i))
+                if (f->reputationListID >= 0)
+                    _repListToFaction[uint32(f->reputationListID)] = f->ID;
+        LOG_INFO("module", "wrathbench: {} reputation factions indexed from Faction.dbc", _repListToFaction.size());
 
         _http = std::make_unique<HttpServer>(_bindAddress, _port, this, _threads);
         try
@@ -461,6 +475,10 @@ namespace WrathBench
         // preview packet by hand)
         { "CMSG_LEARN_TALENT", CMSG_LEARN_TALENT },
         { "CMSG_LEARN_PREVIEW_TALENTS", CMSG_LEARN_PREVIEW_TALENTS },
+        // respec: the "yes" on the client's confirm dialog after the trainer's
+        // unlearn gossip option answered with MSG_TALENT_WIPE_CONFIRM (the
+        // opcode is bidirectional; body u64 trainer guid)
+        { "MSG_TALENT_WIPE_CONFIRM", MSG_TALENT_WIPE_CONFIRM },
         // chat and emotes (whisper/party/yell ride CMSG_MESSAGECHAT)
         { "CMSG_MESSAGECHAT", CMSG_MESSAGECHAT },
         { "CMSG_EMOTE", CMSG_EMOTE },
@@ -486,6 +504,9 @@ namespace WrathBench
         { "CMSG_TAXIQUERYAVAILABLENODES", CMSG_TAXIQUERYAVAILABLENODES },
         { "CMSG_ACTIVATETAXI", CMSG_ACTIVATETAXI },
         { "CMSG_ACTIVATETAXIEXPRESS", CMSG_ACTIVATETAXIEXPRESS },
+        // innkeeper bind: the "yes" on the client's confirm dialog after
+        // SMSG_BINDER_CONFIRM (the gossip option itself is gossip_select)
+        { "CMSG_BINDER_ACTIVATE", CMSG_BINDER_ACTIVATE },
         // bank
         { "CMSG_BANKER_ACTIVATE", CMSG_BANKER_ACTIVATE },
         { "CMSG_AUTOBANK_ITEM", CMSG_AUTOBANK_ITEM },
@@ -498,22 +519,45 @@ namespace WrathBench
         { "CMSG_MAIL_TAKE_MONEY", CMSG_MAIL_TAKE_MONEY },
         { "CMSG_MAIL_MARK_AS_READ", CMSG_MAIL_MARK_AS_READ },
         { "CMSG_MAIL_DELETE", CMSG_MAIL_DELETE },
+        { "CMSG_MAIL_RETURN_TO_SENDER", CMSG_MAIL_RETURN_TO_SENDER },
         // party
         { "CMSG_GROUP_INVITE", CMSG_GROUP_INVITE },
         { "CMSG_GROUP_ACCEPT", CMSG_GROUP_ACCEPT },
         { "CMSG_GROUP_DECLINE", CMSG_GROUP_DECLINE },
+        { "CMSG_GROUP_UNINVITE", CMSG_GROUP_UNINVITE },
         { "CMSG_GROUP_UNINVITE_GUID", CMSG_GROUP_UNINVITE_GUID },
         { "CMSG_GROUP_DISBAND", CMSG_GROUP_DISBAND },
         { "CMSG_GROUP_SET_LEADER", CMSG_GROUP_SET_LEADER },
         { "CMSG_LOOT_METHOD", CMSG_LOOT_METHOD },
+        // group loot roll (FOLLOW-UPS 102): the need/greed/pass/disenchant
+        // button on the roll frame SMSG_LOOT_START_ROLL opened (body u64 roll
+        // guid, u32 slot, u8 vote); the SDK's lootRoll builds it
+        { "CMSG_LOOT_ROLL", CMSG_LOOT_ROLL },
         // trade
         { "CMSG_INITIATE_TRADE", CMSG_INITIATE_TRADE },
         { "CMSG_BEGIN_TRADE", CMSG_BEGIN_TRADE },
         { "CMSG_ACCEPT_TRADE", CMSG_ACCEPT_TRADE },
+        { "CMSG_UNACCEPT_TRADE", CMSG_UNACCEPT_TRADE },
         { "CMSG_CANCEL_TRADE", CMSG_CANCEL_TRADE },
+        { "CMSG_BUSY_TRADE", CMSG_BUSY_TRADE },
+        { "CMSG_IGNORE_TRADE", CMSG_IGNORE_TRADE },
         { "CMSG_SET_TRADE_ITEM", CMSG_SET_TRADE_ITEM },
         { "CMSG_CLEAR_TRADE_ITEM", CMSG_CLEAR_TRADE_ITEM },
         { "CMSG_SET_TRADE_GOLD", CMSG_SET_TRADE_GOLD },
+        // pet control (FOLLOW-UPS 98): the pet action bar's buttons
+        // (CMSG_PET_ACTION carries a command, a react state or a spell), a
+        // direct pet cast, the bar edits, and the queries a client fires on
+        // its own (name by pet number, the bar on demand)
+        { "CMSG_PET_ACTION", CMSG_PET_ACTION },
+        { "CMSG_PET_CAST_SPELL", CMSG_PET_CAST_SPELL },
+        { "CMSG_PET_STOP_ATTACK", CMSG_PET_STOP_ATTACK },
+        { "CMSG_PET_ABANDON", CMSG_PET_ABANDON },
+        { "CMSG_PET_RENAME", CMSG_PET_RENAME },
+        { "CMSG_PET_SET_ACTION", CMSG_PET_SET_ACTION },
+        { "CMSG_PET_SPELL_AUTOCAST", CMSG_PET_SPELL_AUTOCAST },
+        { "CMSG_PET_CANCEL_AURA", CMSG_PET_CANCEL_AURA },
+        { "CMSG_PET_NAME_QUERY", CMSG_PET_NAME_QUERY },
+        { "CMSG_REQUEST_PET_INFO", CMSG_REQUEST_PET_INFO },
         // client-cache queries a real client issues on its own
         { "CMSG_NAME_QUERY", CMSG_NAME_QUERY },
         { "CMSG_CREATURE_QUERY", CMSG_CREATURE_QUERY },
@@ -521,6 +565,8 @@ namespace WrathBench
         { "CMSG_ITEM_QUERY_SINGLE", CMSG_ITEM_QUERY_SINGLE },
         { "CMSG_NPC_TEXT_QUERY", CMSG_NPC_TEXT_QUERY },
         { "CMSG_PAGE_TEXT_QUERY", CMSG_PAGE_TEXT_QUERY },
+        // player-written item text — a mailed letter (FOLLOW-UPS 103; body u64 item guid)
+        { "CMSG_ITEM_TEXT_QUERY", CMSG_ITEM_TEXT_QUERY },
         { "CMSG_PLAYED_TIME", CMSG_PLAYED_TIME },
         { "CMSG_QUERY_TIME", CMSG_QUERY_TIME },
         { "CMSG_SET_WATCHED_FACTION", CMSG_SET_WATCHED_FACTION },
@@ -600,6 +646,13 @@ namespace WrathBench
         else if (action == "stop")
         {
             PushTask([this, token, ack]() { DoStop(token, ack); });
+        }
+        else if (action == "talent_tree")
+        {
+            // A client-local read (Talent.dbc / TalentTab.dbc for the
+            // character's class), answered as a WB_TALENT_TREE event so the
+            // observation is logged like every other one. No packet is sent.
+            PushTask([this, token, ack]() { DoTalentTree(token, ack); });
         }
         else if (action == "face")
         {
@@ -1857,19 +1910,38 @@ namespace WrathBench
                         spellId = spell.SpellId;
                         break;
                     }
-            if (!spellId)
-                return err(400, "item_not_usable");
-            p = new WorldPacket(CMSG_USE_ITEM, 1 + 1 + 1 + 4 + 8 + 4 + 1 + 4 + 9);
-            *p << uint8(bag) << uint8(slot) << uint8(0) << uint32(spellId);
-            *p << uint64(item->GetGUID().GetRawValue()) << uint32(0) << uint8(0);
-            if (target)
+            uint32 startQuest = proto ? proto->StartQuest : 0;
+            if (spellId)
             {
-                *p << uint32(0x0002);                        // TARGET_FLAG_UNIT
-                p->appendPackGUID(target);
+                p = new WorldPacket(CMSG_USE_ITEM, 1 + 1 + 1 + 4 + 8 + 4 + 1 + 4 + 9);
+                *p << uint8(bag) << uint8(slot) << uint8(0) << uint32(spellId);
+                *p << uint64(item->GetGUID().GetRawValue()) << uint32(0) << uint8(0);
+                if (target)
+                {
+                    *p << uint32(0x0002);                        // TARGET_FLAG_UNIT
+                    p->appendPackGUID(target);
+                }
+                else
+                    *p << uint32(0);
+            }
+            else if (startQuest)
+            {
+                // A quest-start item with no on-use spell (Tome of Divinity,
+                // the starter-zone "found a letter" drops). A client never sends
+                // CMSG_USE_ITEM for one: HandleUseItemOpcode drops spell id 0
+                // as unknown before it looks at the item. Right-clicking it
+                // sends CMSG_QUESTGIVER_QUERY_QUEST with the item's own guid as
+                // the questgiver (the handler accepts TYPEMASK_ITEM), and the
+                // server answers with SMSG_QUESTGIVER_QUEST_DETAILS; the accept
+                // then names the item guid too. The quest id is the template's
+                // (client-cache knowledge, same as the spell id above).
+                p = new WorldPacket(CMSG_QUESTGIVER_QUERY_QUEST, 13);
+                *p << uint64(item->GetGUID().GetRawValue()) << uint32(startQuest) << uint8(0);
             }
             else
-                *p << uint32(0);
-            auditW.Add("bag", (uint32)bag).Add("slot", (uint32)slot).Add("spellId", spellId);
+                return err(400, "item_not_usable");
+            auditW.Add("bag", (uint32)bag).Add("slot", (uint32)slot).Add("spellId", spellId)
+                .AddGuid("itemGuid", item->GetGUID().GetRawValue()).Add("startQuest", startQuest);
         }
         else if (action == "destroy_item")
         {
@@ -2122,6 +2194,233 @@ namespace WrathBench
         _achievementsLoaded = loaded > 0;
         LOG_INFO("module", "wrathbench: loaded {} achievements from '{}'", loaded, path);
         return _achievementsLoaded;
+    }
+
+    // WDBC reader for TaxiNodes.dbc (3.3.5a: 24 fields of 4 bytes, record
+    // size 96 — verified against the shipped file: id, mapId, x, y, z,
+    // name[16 locales + flags] from field 5 with enUS first, mount creature
+    // ids). Only id, mapId and the enUS name are kept: the position is not
+    // served (the client draws the node on its taxi map from it, but the
+    // model-facing surface is names only until an operator decides
+    // otherwise). Same header as AreaTrigger.dbc above.
+    bool Manager::LoadTaxiNodesDbc(std::string const& path)
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (!in)
+            return false;
+        char magic[4];
+        uint32 recordCount = 0, fieldCount = 0, recordSize = 0, stringSize = 0;
+        in.read(magic, 4);
+        in.read(reinterpret_cast<char*>(&recordCount), 4);
+        in.read(reinterpret_cast<char*>(&fieldCount), 4);
+        in.read(reinterpret_cast<char*>(&recordSize), 4);
+        in.read(reinterpret_cast<char*>(&stringSize), 4);
+        if (!in || std::memcmp(magic, "WDBC", 4) != 0 || fieldCount != 24 || recordSize != 96)
+        {
+            LOG_ERROR("module", "wrathbench: '{}' is not a 3.3.5a TaxiNodes.dbc (fields {}, record size {})", path, fieldCount, recordSize);
+            return false;
+        }
+        std::vector<char> recs(size_t(recordCount) * recordSize);
+        in.read(recs.data(), recs.size());
+        std::vector<char> strings(stringSize);
+        in.read(strings.data(), stringSize);
+        if (!in)
+        {
+            LOG_ERROR("module", "wrathbench: '{}' truncated ({} records, {} string bytes expected)", path, recordCount, stringSize);
+            return false;
+        }
+        size_t loaded = 0;
+        for (uint32 i = 0; i < recordCount; ++i)
+        {
+            char const* rec = recs.data() + size_t(i) * recordSize;
+            uint32 id, map, nameOff;
+            std::memcpy(&id, rec, 4);
+            std::memcpy(&map, rec + 4, 4);
+            std::memcpy(&nameOff, rec + 5 * 4, 4);
+            TaxiNodeRec r;
+            r.mapId = map;
+            if (nameOff < stringSize)
+                r.name = std::string(strings.data() + nameOff, strnlen(strings.data() + nameOff, stringSize - nameOff));
+            _taxiNodes[id] = std::move(r);
+            ++loaded;
+        }
+        _taxiNodesLoaded = loaded > 0;
+        LOG_INFO("module", "wrathbench: loaded {} taxi nodes from '{}'", loaded, path);
+        return _taxiNodesLoaded;
+    }
+
+    // WDBC reader for TalentTab.dbc (3.3.5a: 24 fields of 4 bytes, record
+    // size 96 — verified against the shipped file: id, name[16 locales +
+    // flags] from field 1 with enUS first, spell icon, race mask, class mask
+    // (field 20), pet talent mask, tab page (field 22), internal name). Same
+    // header as AreaTrigger.dbc above.
+    bool Manager::LoadTalentTabDbc(std::string const& path)
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (!in)
+            return false;
+        char magic[4];
+        uint32 recordCount = 0, fieldCount = 0, recordSize = 0, stringSize = 0;
+        in.read(magic, 4);
+        in.read(reinterpret_cast<char*>(&recordCount), 4);
+        in.read(reinterpret_cast<char*>(&fieldCount), 4);
+        in.read(reinterpret_cast<char*>(&recordSize), 4);
+        in.read(reinterpret_cast<char*>(&stringSize), 4);
+        if (!in || std::memcmp(magic, "WDBC", 4) != 0 || fieldCount != 24 || recordSize != 96)
+        {
+            LOG_ERROR("module", "wrathbench: '{}' is not a 3.3.5a TalentTab.dbc (fields {}, record size {})", path, fieldCount, recordSize);
+            return false;
+        }
+        std::vector<char> recs(size_t(recordCount) * recordSize);
+        in.read(recs.data(), recs.size());
+        std::vector<char> strings(stringSize);
+        in.read(strings.data(), stringSize);
+        if (!in)
+        {
+            LOG_ERROR("module", "wrathbench: '{}' truncated ({} records, {} string bytes expected)", path, recordCount, stringSize);
+            return false;
+        }
+        size_t loaded = 0;
+        for (uint32 i = 0; i < recordCount; ++i)
+        {
+            char const* rec = recs.data() + size_t(i) * recordSize;
+            uint32 id, nameOff, classMask, page;
+            std::memcpy(&id, rec, 4);
+            std::memcpy(&nameOff, rec + 1 * 4, 4);
+            std::memcpy(&classMask, rec + 20 * 4, 4);
+            std::memcpy(&page, rec + 22 * 4, 4);
+            TalentTabRec r;
+            r.classMask = classMask;
+            r.page = page;
+            if (nameOff < stringSize)
+                r.name = std::string(strings.data() + nameOff, strnlen(strings.data() + nameOff, stringSize - nameOff));
+            _talentTabs[id] = std::move(r);
+            ++loaded;
+        }
+        _talentTabsLoaded = loaded > 0;
+        LOG_INFO("module", "wrathbench: loaded {} talent tabs from '{}'", loaded, path);
+        return _talentTabsLoaded;
+    }
+
+    std::string Manager::FactionJson(uint32 repListId, int32 standing, Player* player) const
+    {
+        Json::Writer w;
+        w.Add("repListId", repListId);
+        auto it = _repListToFaction.find(repListId);
+        FactionEntry const* fe = it == _repListToFaction.end() ? nullptr : sFactionStore.LookupEntry(it->second);
+        if (fe)
+        {
+            w.Add("factionId", fe->ID);
+            if (fe->name[0])
+                w.Add("name", fe->name[0]);
+        }
+        w.Add("standing", standing);
+        // The client adds its own Faction.dbc base for the character's race
+        // and class (ReputationMgr::GetBaseReputation is the same arithmetic
+        // over the same masks); `reputation` is what the pane shows and what
+        // the Neutral/Friendly/... rank is read off.
+        if (fe && player)
+        {
+            uint32 raceMask = player->getRaceMask();
+            uint32 classMask = player->getClassMask();
+            int32 base = 0;
+            for (int i = 0; i < 4; ++i)
+            {
+                if ((fe->BaseRepRaceMask[i] & raceMask || (fe->BaseRepRaceMask[i] == 0 && fe->BaseRepClassMask[i] != 0))
+                    && (fe->BaseRepClassMask[i] & classMask || fe->BaseRepClassMask[i] == 0))
+                {
+                    base = fe->BaseRepValue[i];
+                    break;
+                }
+            }
+            w.Add("base", base).Add("reputation", base + standing);
+        }
+        return w.Str();
+    }
+
+    // The talent frame's contents for the player's class: every tab whose
+    // TalentTab.dbc class mask includes the class, each talent's grid
+    // position, rank spells (named from Spell.dbc), and prerequisite — the
+    // static picture a client draws from its own DBCs. Which ranks are
+    // learned is SMSG_TALENTS_INFO's business; the SDK joins the two.
+    std::string Manager::TalentTreeJson(Player* player) const
+    {
+        uint8 cls = player->getClass();
+        uint32 clsMask = cls ? 1u << (cls - 1) : 0;
+        struct Tab { uint32 id; uint32 page; };
+        std::vector<Tab> tabs;
+        for (uint32 i = 0; i < sTalentTabStore.GetNumRows(); ++i)
+        {
+            TalentTabEntry const* t = sTalentTabStore.LookupEntry(i);
+            if (!t || !(t->ClassMask & clsMask))
+                continue;
+            tabs.push_back({ t->TalentTabID, t->tabpage });
+        }
+        std::sort(tabs.begin(), tabs.end(), [](Tab const& a, Tab const& b) { return a.page < b.page; });
+        std::string tabsJson = "[";
+        for (size_t ti = 0; ti < tabs.size(); ++ti)
+        {
+            std::vector<TalentEntry const*> talents;
+            for (uint32 i = 0; i < sTalentStore.GetNumRows(); ++i)
+            {
+                TalentEntry const* t = sTalentStore.LookupEntry(i);
+                if (t && t->TalentTab == tabs[ti].id)
+                    talents.push_back(t);
+            }
+            std::sort(talents.begin(), talents.end(), [](TalentEntry const* a, TalentEntry const* b) {
+                return a->Row != b->Row ? a->Row < b->Row : a->Col < b->Col;
+            });
+            std::string list = "[";
+            for (size_t k = 0; k < talents.size(); ++k)
+            {
+                TalentEntry const* t = talents[k];
+                Json::Writer tw;
+                tw.Add("talentId", t->TalentID);
+                uint32 maxRank = 0;
+                std::string ranks = "[";
+                for (uint32 r = 0; r < MAX_TALENT_RANK; ++r)
+                {
+                    if (!t->RankID[r]) break;
+                    if (r) ranks += ',';
+                    ranks += std::to_string(t->RankID[r]);
+                    ++maxRank;
+                }
+                ranks += "]";
+                if (SpellInfo const* info = sSpellMgr->GetSpellInfo(t->RankID[0]))
+                    if (info->SpellName[0])
+                        tw.Add("name", info->SpellName[0]);
+                tw.Add("row", t->Row).Add("col", t->Col).Add("maxRank", maxRank).Raw("ranks", ranks);
+                if (t->DependsOn)
+                    tw.Add("dependsOn", t->DependsOn).Add("dependsOnRank", t->DependsOnRank);
+                if (k) list += ',';
+                list += tw.Str();
+            }
+            list += "]";
+            Json::Writer tabW;
+            tabW.Add("tabId", tabs[ti].id);
+            auto nameIt = _talentTabs.find(tabs[ti].id);
+            if (nameIt != _talentTabs.end() && !nameIt->second.name.empty())
+                tabW.Add("name", nameIt->second.name);
+            tabW.Add("page", tabs[ti].page).Raw("talents", list);
+            if (ti) tabsJson += ',';
+            tabsJson += tabW.Str();
+        }
+        tabsJson += "]";
+        Json::Writer w;
+        w.Add("class", (uint32)cls).Add("unspentPoints", player->GetFreeTalentPoints()).Raw("tabs", tabsJson);
+        return w.Str();
+    }
+
+    void Manager::DoTalentTree(std::string token, std::shared_ptr<std::promise<HttpReply>> ack)
+    {
+        auto s = FindByToken(token);
+        Player* player = CheckActionSession(s, ack);
+        if (!player)
+            return;
+        std::string json = TalentTreeJson(player);
+        Audit(*s, "action", Json::Writer().Add("op", "talent_tree").Str());
+        EmitEvent(*s, "WB_TALENT_TREE", 0xFF08, json);
+        ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "talent_tree").Add("token", token).Str()});
     }
 
     // The wire carries dates as the client's packed bitfield
@@ -3185,8 +3484,22 @@ namespace WrathBench
 
     // One whitelisted update field -> named JSON key. Returns false if the index
     // is not served (caller has already consumed the value).
+    // A u64 update field arrives as two u32 halves under consecutive
+    // indices; the halves are collected here and joined into one guid
+    // string after the block (targetGuid and, since FOLLOW-UPS 98, the
+    // owner fields a client reads a pet's master off).
+    struct GuidHalves
+    {
+        uint32 lo{0}, hi{0};
+        bool hasLo{false}, hasHi{false};
+    };
+    struct PendingGuids
+    {
+        GuidHalves target, summonedBy, createdBy, charmedBy;
+    };
+
     static bool AppendNamedField(Json::Writer& f, uint8 typeId, uint32 index, uint32 v,
-        uint32& tLo, uint32& tHi, bool& hasLo, bool& hasHi, uint32* entryOut)
+        PendingGuids& g, uint32* entryOut, uint32* petNumberOut)
     {
         if (index == OBJECT_FIELD_ENTRY)
         {
@@ -3203,8 +3516,25 @@ namespace WrathBench
 
         if (typeId == TYPEID_UNIT || typeId == TYPEID_PLAYER)
         {
-            if (index == UNIT_FIELD_TARGET)     { tLo = v; hasLo = true; return true; }
-            if (index == UNIT_FIELD_TARGET + 1) { tHi = v; hasHi = true; return true; }
+            if (index == UNIT_FIELD_TARGET)     { g.target.lo = v; g.target.hasLo = true; return true; }
+            if (index == UNIT_FIELD_TARGET + 1) { g.target.hi = v; g.target.hasHi = true; return true; }
+            // Who this unit belongs to (PUBLIC, every client in range gets
+            // them): a pet's master is UNIT_FIELD_SUMMONEDBY / CREATEDBY, a
+            // mind-controlled unit's is CHARMEDBY.
+            if (index == UNIT_FIELD_SUMMONEDBY)     { g.summonedBy.lo = v; g.summonedBy.hasLo = true; return true; }
+            if (index == UNIT_FIELD_SUMMONEDBY + 1) { g.summonedBy.hi = v; g.summonedBy.hasHi = true; return true; }
+            if (index == UNIT_FIELD_CREATEDBY)      { g.createdBy.lo = v; g.createdBy.hasLo = true; return true; }
+            if (index == UNIT_FIELD_CREATEDBY + 1)  { g.createdBy.hi = v; g.createdBy.hasHi = true; return true; }
+            if (index == UNIT_FIELD_CHARMEDBY)      { g.charmedBy.lo = v; g.charmedBy.hasLo = true; return true; }
+            if (index == UNIT_FIELD_CHARMEDBY + 1)  { g.charmedBy.hi = v; g.charmedBy.hasHi = true; return true; }
+            // The pet number a client keys its CMSG_PET_NAME_QUERY on
+            // (UNIT_FIELD_PETNUMBER, PUBLIC; 0 on anything that is not a pet).
+            if (index == UNIT_FIELD_PETNUMBER)
+            {
+                f.Add("petNumber", v);
+                if (petNumberOut) *petNumberOut = v;
+                return true;
+            }
             switch (index)
             {
                 case UNIT_FIELD_BYTES_0:
@@ -3241,6 +3571,39 @@ namespace WrathBench
                 if (index == PLAYER_FIELD_COINAGE)  { f.Add("money", v); return true; }
                 if (index == PLAYER_XP)             { f.Add("xp", v); return true; }
                 if (index == PLAYER_NEXT_LEVEL_XP)  { f.Add("nextLevelXp", v); return true; }
+                // Unspent talent points (PLAYER_CHARACTER_POINTS1, PRIVATE):
+                // the number on the talent frame; SMSG_TALENTS_INFO carries the
+                // same figure.
+                if (index == PLAYER_CHARACTER_POINTS1) { f.Add("talentPoints", v); return true; }
+                // Skills (FOLLOW-UPS 95): 128 lines x 3 packed u32s, PRIVATE
+                // to self. Served raw per field the way the quest log is, plus
+                // the client's SkillLine.dbc name beside each id so the SDK
+                // needs no table. The SDK's fold keeps only numbers in
+                // `fields` and lifts the name strings into its skill rows.
+                if (index >= PLAYER_SKILL_INFO_1_1 && index < PLAYER_SKILL_INFO_1_1 + 384)
+                {
+                    uint32 rel = index - PLAYER_SKILL_INFO_1_1;
+                    std::string key = "skill" + std::to_string(rel / 3);
+                    switch (rel % 3)
+                    {
+                        case 0:
+                        {
+                            uint32 id = v & 0xFFFF;
+                            f.Add(key + "Id", id).Add(key + "Step", v >> 16);
+                            if (id)
+                                if (SkillLineEntry const* sl = sSkillLineStore.LookupEntry(id))
+                                    if (sl->name[0])
+                                        f.Add(key + "Name", sl->name[0]);
+                            return true;
+                        }
+                        case 1:
+                            f.Add(key + "Value", v & 0xFFFF).Add(key + "Max", v >> 16);
+                            return true;
+                        default:
+                            f.Add(key + "TempBonus", (int32)int16(v & 0xFFFF)).Add(key + "PermBonus", (int32)int16(v >> 16));
+                            return true;
+                    }
+                }
                 // Quest log: 25 slots x 5 fields (id, state, counts lo/hi, time).
                 // Served raw; the SDK reassembles its quest-log view from them.
                 if (index >= PLAYER_QUEST_LOG_1_1 && index < PLAYER_QUEST_LOG_25_1 + 5)
@@ -3250,10 +3613,12 @@ namespace WrathBench
                     f.Add("quest" + std::to_string(rel / 5) + offName[rel % 5], v);
                     return true;
                 }
-                // Equipment/bag/backpack item guids as lo/hi u32 halves keyed by
-                // inventory slot (0-22 equipment+bags, 23-38 backpack). Halves
-                // stay u32 JSON numbers; the SDK joins them into guids.
-                if (index >= PLAYER_FIELD_INV_SLOT_HEAD && index < PLAYER_FIELD_PACK_SLOT_1 + 32)
+                // Equipment/bag/backpack/bank item guids as lo/hi u32 halves
+                // keyed by inventory slot (0-22 equipment+bags, 23-38 backpack,
+                // 39-66 bank, 67-73 bank bags — the core's slot numbering, the
+                // fields are contiguous). Halves stay u32 JSON numbers; the
+                // SDK joins them into guids. Bank slots since FOLLOW-UPS 100.
+                if (index >= PLAYER_FIELD_INV_SLOT_HEAD && index < PLAYER_FIELD_BANKBAG_SLOT_1 + 14)
                 {
                     uint32 rel = index - PLAYER_FIELD_INV_SLOT_HEAD;
                     f.Add("invSlot" + std::to_string(rel / 2) + (rel % 2 ? "Hi" : "Lo"), v);
@@ -3309,7 +3674,13 @@ namespace WrathBench
 
     // Parse a BuildValuesUpdate mask+values run into the whitelisted named
     // fields. All values are consumed regardless of whitelist membership.
-    static std::string DecodeValuesBlock(WorldPacket& p, uint8 typeId, uint32* entryOut)
+    static void AddPendingGuid(Json::Writer& f, char const* key, GuidHalves const& h)
+    {
+        if (h.hasLo || h.hasHi)
+            f.AddGuid(key, uint64_t(h.lo) | (uint64_t(h.hi) << 32));
+    }
+
+    static std::string DecodeValuesBlock(WorldPacket& p, uint8 typeId, uint32* entryOut, uint32* petNumberOut = nullptr)
     {
         uint8 blockCount; p >> blockCount;
         uint32 mask[64]; // m_valuesCount caps far below 64*32 fields
@@ -3319,18 +3690,20 @@ namespace WrathBench
             p >> mask[i];
 
         Json::Writer f;
-        uint32 tLo = 0, tHi = 0;
-        bool hasLo = false, hasHi = false;
+        PendingGuids g;
         uint32 fieldCount = uint32(blockCount) * 32;
         for (uint32 i = 0; i < fieldCount; ++i)
         {
             if (!(mask[i >> 5] & (1u << (i & 31))))
                 continue;
             uint32 v; p >> v;
-            AppendNamedField(f, typeId, i, v, tLo, tHi, hasLo, hasHi, entryOut);
+            AppendNamedField(f, typeId, i, v, g, entryOut, petNumberOut);
         }
-        if (hasLo)
-            f.AddGuid("targetGuid", uint64_t(tLo) | (uint64_t(tHi) << 32));
+        if (g.target.hasLo)
+            f.AddGuid("targetGuid", uint64_t(g.target.lo) | (uint64_t(g.target.hi) << 32));
+        AddPendingGuid(f, "summonedByGuid", g.summonedBy);
+        AddPendingGuid(f, "createdByGuid", g.createdBy);
+        AddPendingGuid(f, "charmedByGuid", g.charmedBy);
         return f.Str();
     }
 
@@ -3343,6 +3716,9 @@ namespace WrathBench
         std::vector<std::pair<uint32, uint64_t>> gameObjectQueries;
         std::vector<uint64_t> nameQueries;
         std::vector<uint32_t> itemQueries;
+        // (petNumber, guid): a client asks a pet's given name once per pet
+        // number it sees (FOLLOW-UPS 98); the answer is SMSG_PET_NAME_QUERY_RESPONSE.
+        std::vector<std::pair<uint32, uint64_t>> petNameQueries;
 
         Json::Writer top;
         std::string objects = "[";
@@ -3387,12 +3763,14 @@ namespace WrathBench
                         o.Add("update", "create").AddGuid("guid", (uint64_t)guid)
                          .Add("objectType", TypeIdName(typeId));
                         DecodeMovementBlockUpd(p, o);
-                        uint32 entry = 0;
-                        std::string fields = DecodeValuesBlock(p, typeId, &entry);
+                        uint32 entry = 0, petNumber = 0;
+                        std::string fields = DecodeValuesBlock(p, typeId, &entry, &petNumber);
                         o.Raw("fields", fields);
                         {
                             std::lock_guard<std::mutex> lock(s.objMutex);
                             s.knownObjects[guid] = typeId;
+                            if (typeId == TYPEID_UNIT && petNumber && s.queriedPetNumbers.insert(petNumber).second)
+                                petNameQueries.emplace_back(petNumber, guid);
                             if (typeId == TYPEID_UNIT && entry && s.queriedCreatures.insert(entry).second)
                                 creatureQueries.emplace_back(entry, guid);
                             if (typeId == TYPEID_GAMEOBJECT && entry && s.queriedGameObjects.insert(entry).second)
@@ -3464,6 +3842,12 @@ namespace WrathBench
         {
             WorldPacket* q = new WorldPacket(CMSG_ITEM_QUERY_SINGLE, 4);
             *q << uint32(entry);
+            ws->QueuePacket(q);
+        }
+        for (auto const& [petNumber, guid] : petNameQueries)
+        {
+            WorldPacket* q = new WorldPacket(CMSG_PET_NAME_QUERY, 12);
+            *q << uint32(petNumber) << uint64(guid);
             ws->QueuePacket(q);
         }
         return top.Str();
@@ -4044,7 +4428,7 @@ namespace WrathBench
                 case SMSG_TALENTS_INFO:
                 {
                     // Player::BuildPlayerTalentsInfoData (pet variant is
-                    // served as { pet: true } only — no pet surface yet):
+                    // served as { pet: true } only; the pet bar itself is SMSG_PET_SPELLS):
                     // u32 unspent, u8 specCount, u8 activeSpec, per spec: u8
                     // talentCount, (u32 talentId, u8 rank) x count, u8
                     // glyphCount, u16 x glyphCount.
@@ -4129,6 +4513,577 @@ namespace WrathBench
                     name = "SMSG_ACTIVATETAXIREPLY";
                     uint32 reply = 0; p >> reply;
                     w.Add("reply", reply).Add("ok", reply == 0);
+                    break;
+                }
+                case SMSG_SHOWTAXINODES:
+                {
+                    // WorldSession::SendTaxiMenu: u32 1 (show window), u64
+                    // flight master guid, u32 current node, then the taximask
+                    // (TaxiMaskSize = 14 u32; node n is bit (n-1)%32 of word
+                    // (n-1)/32). Sent when the taxi gossip option is chosen —
+                    // the client never asks for it any other way. `known` is
+                    // the mask decoded, with the name a client reads from its
+                    // own TaxiNodes.dbc; nothing about routes or fares is here
+                    // (the client learns those only by asking to fly).
+                    name = "SMSG_SHOWTAXINODES";
+                    uint32 show = 0; uint64 guid = 0; uint32 cur = 0;
+                    p >> show >> guid >> cur;
+                    std::string mask = "[", known = "[";
+                    bool firstKnown = true;
+                    for (uint32 word = 0; word < 14 && p.rpos() + 4 <= p.size(); ++word)
+                    {
+                        uint32 bits; p >> bits;
+                        if (word) mask += ',';
+                        mask += std::to_string(bits);
+                        for (uint32 bit = 0; bit < 32; ++bit)
+                        {
+                            if (!(bits & (1u << bit))) continue;
+                            uint32 node = word * 32 + bit + 1;
+                            if (!firstKnown) known += ',';
+                            firstKnown = false;
+                            Json::Writer n;
+                            n.Add("nodeId", node);
+                            auto it = _taxiNodes.find(node);
+                            if (it != _taxiNodes.end())
+                                n.Add("name", it->second.name);
+                            known += n.Str();
+                        }
+                    }
+                    mask += "]"; known += "]";
+                    w.Add("showWindow", show == 1).AddGuid("guid", (uint64_t)guid).Add("currentNode", cur);
+                    auto curIt = _taxiNodes.find(cur);
+                    if (curIt != _taxiNodes.end())
+                        w.Add("currentNodeName", curIt->second.name);
+                    w.Raw("mask", mask).Raw("known", known);
+                    break;
+                }
+                // -------------------------------------------- reputation
+                case SMSG_INITIALIZE_FACTIONS:
+                {
+                    // ReputationMgr::SendInitialReputations: u32 count (128),
+                    // then per reputation index: u8 flags, u32 standing. Sent
+                    // once during login. Only indices the server has a row for
+                    // (non-zero flags or standing) are served; the position is
+                    // the client's key into its own Faction.dbc.
+                    name = "SMSG_INITIALIZE_FACTIONS";
+                    uint32 count; p >> count;
+                    if (count > 256) throw ByteBufferException();
+                    Player* pl = ws->GetPlayer();
+                    std::string factions = "[";
+                    bool first = true;
+                    for (uint32 i = 0; i < count; ++i)
+                    {
+                        uint8 flags; int32 standing; p >> flags >> standing;
+                        if (!flags && !standing) continue;
+                        if (!first) factions += ',';
+                        first = false;
+                        Json::Writer fw;
+                        fw.Add("flags", (uint32)flags).Add("visible", (flags & 0x01) != 0).Add("atWar", (flags & 0x02) != 0);
+                        std::string body = FactionJson(i, standing, pl);
+                        // merge: FactionJson's object minus its braces
+                        std::string merged = fw.Str();
+                        merged.pop_back();
+                        merged += "," + body.substr(1);
+                        factions += merged;
+                    }
+                    factions += "]";
+                    w.Add("count", count).Raw("factions", factions);
+                    break;
+                }
+                case SMSG_SET_FACTION_STANDING:
+                {
+                    // ReputationMgr::SendState: f32 (refer-a-friend bonus,
+                    // unused), u8 showVisual (the "reputation increased"
+                    // chat line), u32 count, then (u32 repListId, u32
+                    // standing) x count — every faction whose standing
+                    // changed since the last send.
+                    name = "SMSG_SET_FACTION_STANDING";
+                    float bonus; uint8 show; uint32 count;
+                    p >> bonus >> show >> count;
+                    if (count > 256) throw ByteBufferException();
+                    Player* pl = ws->GetPlayer();
+                    std::string factions = "[";
+                    for (uint32 i = 0; i < count; ++i)
+                    {
+                        uint32 repListId; int32 standing; p >> repListId >> standing;
+                        if (i) factions += ',';
+                        factions += FactionJson(repListId, standing, pl);
+                    }
+                    factions += "]";
+                    w.Add("showVisual", show != 0).Raw("factions", factions);
+                    break;
+                }
+                case SMSG_SET_FACTION_VISIBLE:
+                {
+                    // ReputationMgr::SendVisible: u32 repListId — the faction
+                    // appears in the client's reputation pane from now on.
+                    name = "SMSG_SET_FACTION_VISIBLE";
+                    uint32 repListId; p >> repListId;
+                    w.Add("repListId", repListId);
+                    auto it = _repListToFaction.find(repListId);
+                    if (it != _repListToFaction.end())
+                    {
+                        w.Add("factionId", it->second);
+                        if (FactionEntry const* fe = sFactionStore.LookupEntry(it->second))
+                            if (fe->name[0])
+                                w.Add("name", fe->name[0]);
+                    }
+                    break;
+                }
+                // ------------------------------------------------ respec
+                case MSG_TALENT_WIPE_CONFIRM:
+                {
+                    // Player::SendTalentWipeConfirm (u64 trainer guid, u32
+                    // cost in copper) after the trainer's unlearn gossip
+                    // option: the client shows "unlearn all talents for X?"
+                    // and answers yes by echoing the opcode with the guid
+                    // (raw). HandleTalentWipeConfirmOpcode answers a refusal
+                    // (no talents to reset) with guid 0 and cost 0; success
+                    // has no packet of its own — SMSG_TALENTS_INFO follows
+                    // with every rank at 0 and the points back.
+                    name = "MSG_TALENT_WIPE_CONFIRM";
+                    uint64 guid = 0; uint32 cost = 0;
+                    p >> guid >> cost;
+                    w.AddGuid("guid", (uint64_t)guid).Add("cost", cost).Add("nothingToReset", guid == 0);
+                    break;
+                }
+                // ------------------------------------------------- pets
+                // (FOLLOW-UPS 98). Everything below is what the client's pet
+                // frame is drawn from; spell ids carry their Spell.dbc name
+                // the way the spellbook rows do.
+                case SMSG_PET_SPELLS:
+                {
+                    // Player::PetSpellInitialize (and the possess/charm/vehicle
+                    // variants, same layout): u64 pet guid — 0 alone means
+                    // "remove the control bar" (Player::SendRemoveControlBar)
+                    // — then u16 creature family, u32 duration ms (0 =
+                    // permanent), u8 react state, u8 command state, u16 flags,
+                    // 10 x u32 action bar buttons (action | type << 24), u8
+                    // spell count + u32 per spell (spellId | active << 24), u8
+                    // cooldown count + (u32 spellId, u16 category, u32
+                    // cooldownMs, u32 categoryCooldownMs) per cooldown.
+                    name = "SMSG_PET_SPELLS";
+                    uint64 guid; p >> guid;
+                    w.AddGuid("guid", (uint64_t)guid);
+                    if (!guid)
+                    {
+                        w.Add("removed", true);
+                        break;
+                    }
+                    uint16 family; uint32 duration; uint8 react, command; uint16 flags;
+                    p >> family >> duration >> react >> command >> flags;
+                    w.Add("removed", false).Add("family", (uint32)family).Add("durationMs", duration)
+                     .Add("reactState", (uint32)react).Add("commandState", (uint32)command).Add("flags", (uint32)flags);
+                    std::string bar = "[";
+                    for (uint32 i = 0; i < 10; ++i)
+                    {
+                        uint32 packed; p >> packed;
+                        uint32 action = packed & 0x00FFFFFF;
+                        uint32 type = packed >> 24;
+                        if (i) bar += ',';
+                        Json::Writer b;
+                        b.Add("slot", i).Add("type", type);
+                        if (type == 0x07)                       // ACT_COMMAND: stay/follow/attack/abandon
+                            b.Add("command", action);
+                        else if (type == 0x06)                  // ACT_REACTION: passive/defensive/aggressive
+                            b.Add("reaction", action);
+                        else if (action)                        // a spell button (0x01 passive, 0x81 castable, 0xC1 autocast)
+                        {
+                            b.Add("spellId", action).Add("autocast", type == 0xC1);
+                            AddSpellFields(b, action);
+                        }
+                        bar += b.Str();
+                    }
+                    bar += "]";
+                    uint8 spellCount; p >> spellCount;
+                    std::string spells = "[";
+                    for (uint8 i = 0; i < spellCount; ++i)
+                    {
+                        uint32 packed; p >> packed;
+                        uint32 spellId = packed & 0x00FFFFFF;
+                        uint32 active = packed >> 24;
+                        if (i) spells += ',';
+                        Json::Writer sp;
+                        sp.Add("spellId", spellId).Add("active", active).Add("autocast", active == 0xC1);
+                        AddSpellFields(sp, spellId);
+                        spells += sp.Str();
+                    }
+                    spells += "]";
+                    uint8 cdCount; p >> cdCount;
+                    std::string cds = "[";
+                    for (uint8 i = 0; i < cdCount; ++i)
+                    {
+                        uint32 spellId, cd, catCd; uint16 category;
+                        p >> spellId >> category >> cd >> catCd;
+                        if (i) cds += ',';
+                        cds += Json::Writer().Add("spellId", spellId).Add("category", (uint32)category)
+                            .Add("cooldownMs", cd).Add("categoryCooldownMs", catCd).Str();
+                    }
+                    cds += "]";
+                    w.Raw("actionBar", bar).Raw("spells", spells).Raw("cooldowns", cds);
+                    break;
+                }
+                case SMSG_PET_ACTION_FEEDBACK:
+                {
+                    // Unit::SendPetActionFeedback: u8 (ActionFeedback: 1 pet
+                    // dead, 2 nothing to attack, 3 can't attack target).
+                    name = "SMSG_PET_ACTION_FEEDBACK";
+                    uint8 msg; p >> msg;
+                    w.Add("feedback", (uint32)msg);
+                    break;
+                }
+                case SMSG_PET_TAME_FAILURE:
+                {
+                    // Unit::SendTameFailure: u8 PetTameFailure.
+                    name = "SMSG_PET_TAME_FAILURE";
+                    uint8 result; p >> result;
+                    w.Add("result", (uint32)result);
+                    break;
+                }
+                case SMSG_PET_CAST_FAILED:
+                {
+                    // Spell::SendPetCastResult: the SMSG_CAST_FAILED layout
+                    // (u8 cast count, u32 spell, u8 SpellCastResult) for a
+                    // spell the pet was told to cast.
+                    name = "SMSG_PET_CAST_FAILED";
+                    uint8 castCount; uint32 spellId; uint8 result;
+                    p >> castCount >> spellId >> result;
+                    w.Add("spellId", spellId).Add("result", (uint32)result);
+                    AddSpellFields(w, spellId);
+                    break;
+                }
+                case SMSG_PET_NAME_QUERY_RESPONSE:
+                {
+                    // WorldSession::SendPetNameQuery: u32 pet number, cstring
+                    // name, u32 name timestamp, u8 declined (+5 cstrings). The
+                    // not-found form is the same bytes with an empty name and
+                    // zeros. The module asked on the client's behalf when a
+                    // unit with a pet number came into view; the SDK joins the
+                    // number back to that unit.
+                    name = "SMSG_PET_NAME_QUERY_RESPONSE";
+                    uint32 petNumber; std::string petName; uint32 stamp;
+                    p >> petNumber >> petName >> stamp;
+                    w.Add("petNumber", petNumber).Add("found", !petName.empty());
+                    if (!petName.empty())
+                        w.Add("name", petName);
+                    break;
+                }
+                case SMSG_PET_NAME_INVALID:
+                {
+                    // WorldSession::SendPetNameInvalid: u32 PetNameInvalidReason,
+                    // cstring the name that was refused.
+                    name = "SMSG_PET_NAME_INVALID";
+                    uint32 error; std::string petName;
+                    p >> error >> petName;
+                    w.Add("reason", error).Add("name", petName);
+                    break;
+                }
+                // ------------------------------------------------ group
+                // (FOLLOW-UPS 100). Group::SendUpdateToPlayer and the
+                // GroupHandler replies; codes are the core's PartyResult /
+                // PartyOperation, named by the SDK.
+                case SMSG_GROUP_INVITE:
+                {
+                    // u8 canAccept (1 = an invitation; 0 = "you were invited
+                    // but are already grouped" notice), cstring inviter, u32,
+                    // u8 count, u32.
+                    name = "SMSG_GROUP_INVITE";
+                    uint8 canAccept; std::string inviter;
+                    p >> canAccept >> inviter;
+                    w.Add("canAccept", canAccept != 0).Add("inviterName", inviter);
+                    break;
+                }
+                case SMSG_GROUP_DECLINE:
+                {
+                    name = "SMSG_GROUP_DECLINE";
+                    std::string who; p >> who;
+                    w.Add("name", who);
+                    break;
+                }
+                case SMSG_GROUP_SET_LEADER:
+                {
+                    name = "SMSG_GROUP_SET_LEADER";
+                    std::string who; p >> who;
+                    w.Add("name", who);
+                    break;
+                }
+                case SMSG_GROUP_UNINVITE:
+                    // Bodiless: this character was removed from the group.
+                    name = "SMSG_GROUP_UNINVITE";
+                    break;
+                case SMSG_GROUP_DESTROYED:
+                    name = "SMSG_GROUP_DESTROYED";
+                    break;
+                case SMSG_PARTY_COMMAND_RESULT:
+                {
+                    // WorldSession::SendPartyResult: u32 operation (0 invite,
+                    // 1 uninvite, 2 leave, 4 swap), cstring member name, u32
+                    // PartyResult (0 ok), u32 lfg value.
+                    name = "SMSG_PARTY_COMMAND_RESULT";
+                    uint32 op; std::string member; uint32 result, val;
+                    p >> op >> member >> result >> val;
+                    w.Add("operation", op).Add("name", member).Add("result", result).Add("value", val);
+                    break;
+                }
+                case SMSG_GROUP_LIST:
+                {
+                    // Group::SendUpdateToPlayer: u8 group type flags, u8 own
+                    // subgroup, u8 own member flags, u8 own lfg roles, [lfg
+                    // groups: u8 state, u32 dungeon], u64 group guid, u32
+                    // counter, u32 other-member count, per member: cstring
+                    // name, u64 guid, u8 online flags, u8 subgroup, u8 flags,
+                    // u8 roles; u64 leader guid; when there are other
+                    // members: u8 loot method, u64 looter guid, u8 loot
+                    // threshold, u8 dungeon difficulty, u8 raid difficulty,
+                    // u8 dynamic difficulty. The "you left" form is group
+                    // type 0x10 with no members and a zero leader.
+                    name = "SMSG_GROUP_LIST";
+                    uint8 groupType, subGroup, memberFlags, roles;
+                    p >> groupType >> subGroup >> memberFlags >> roles;
+                    if (groupType & 0x08)
+                        { uint8 st; uint32 dungeon; p >> st >> dungeon; }
+                    uint64 groupGuid; uint32 counter, count;
+                    p >> groupGuid >> counter >> count;
+                    if (count > 40) throw ByteBufferException();
+                    std::string members = "[";
+                    for (uint32 i = 0; i < count; ++i)
+                    {
+                        std::string mname; uint64 mguid; uint8 online, mgroup, mflags, mroles;
+                        p >> mname >> mguid >> online >> mgroup >> mflags >> mroles;
+                        if (i) members += ',';
+                        members += Json::Writer().Add("name", mname).AddGuid("guid", (uint64_t)mguid)
+                            .Add("online", (online & 0x01) != 0).Add("subGroup", (uint32)mgroup)
+                            .Add("flags", (uint32)mflags).Add("roles", (uint32)mroles).Str();
+                    }
+                    members += "]";
+                    uint64 leader; p >> leader;
+                    w.Add("groupType", (uint32)groupType).Add("left", (groupType & 0x10) != 0)
+                     .Add("raid", (groupType & 0x02) != 0).Add("subGroup", (uint32)subGroup)
+                     .Add("memberFlags", (uint32)memberFlags).Add("roles", (uint32)roles)
+                     .AddGuid("groupGuid", (uint64_t)groupGuid).Add("counter", counter)
+                     .Raw("members", members).AddGuid("leaderGuid", (uint64_t)leader);
+                    if (count)
+                    {
+                        uint8 lootMethod; uint64 looter; uint8 threshold, dungeonDiff, raidDiff, dynDiff;
+                        p >> lootMethod >> looter >> threshold >> dungeonDiff >> raidDiff >> dynDiff;
+                        w.Add("lootMethod", (uint32)lootMethod).AddGuid("looterGuid", (uint64_t)looter)
+                         .Add("lootThreshold", (uint32)threshold).Add("dungeonDifficulty", (uint32)dungeonDiff)
+                         .Add("raidDifficulty", (uint32)raidDiff);
+                    }
+                    break;
+                }
+                // ------------------------------------------------- mail
+                // (FOLLOW-UPS 100). MailHandler / Player::SendMailResult.
+                case SMSG_SHOW_MAILBOX:
+                {
+                    // WorldSession::SendShowMailBox: u64 mailbox guid — the
+                    // mailbox frame opens (after CMSG_GAMEOBJ_USE on one).
+                    name = "SMSG_SHOW_MAILBOX";
+                    uint64 guid; p >> guid;
+                    w.AddGuid("guid", (uint64_t)guid);
+                    break;
+                }
+                case SMSG_RECEIVED_MAIL:
+                    // Player::SendNewMail: u32 0 — "you have new mail".
+                    name = "SMSG_RECEIVED_MAIL";
+                    break;
+                case SMSG_SEND_MAIL_RESULT:
+                {
+                    // Player::SendMailResult: u32 mail id, u32 action
+                    // (MailResponseType: 0 send, 1 money taken, 2 item taken,
+                    // 3 returned, 4 deleted, 5 made permanent), u32 result
+                    // (MailResponseResult: 0 ok), then u32 InventoryResult
+                    // when result is 1 (equip error), or (u32 item guid low,
+                    // u32 count) when an item was taken.
+                    name = "SMSG_SEND_MAIL_RESULT";
+                    uint32 mailId, action, result;
+                    p >> mailId >> action >> result;
+                    w.Add("mailId", mailId).Add("action", action).Add("result", result);
+                    if (result == 1)
+                        { uint32 eq; p >> eq; w.Add("inventoryResult", eq); }
+                    else if (action == 2)
+                    {
+                        uint32 itemLow, count; p >> itemLow >> count;
+                        w.Add("itemGuidLow", itemLow).Add("count", count);
+                    }
+                    break;
+                }
+                case SMSG_MAIL_LIST_RESULT:
+                {
+                    // WorldSession::HandleGetMailList: u32 total mails, u8
+                    // listed mails; per mail: u16 size, u32 id, u8 type (0
+                    // player: u64 sender guid; else u32 sender entry / id),
+                    // u32 COD, u32, u32 stationery, u32 money, u32 flags
+                    // (1 read, 4 returned, 8 COD payment), f32 days left,
+                    // u32 template, cstring subject, cstring body, u8 item
+                    // count; per item: u8 index, u32 item guid low, u32 entry,
+                    // 7 x (u32 enchant id, u32 duration, u32 charges), i32
+                    // random property, u32 suffix factor, u32 count, u32
+                    // charges, u32 max durability, u32 durability, u8.
+                    name = "SMSG_MAIL_LIST_RESULT";
+                    uint32 total; uint8 count;
+                    p >> total >> count;
+                    std::string mails = "[";
+                    for (uint8 i = 0; i < count; ++i)
+                    {
+                        uint16 size; uint32 mailId; uint8 type;
+                        p >> size >> mailId >> type;
+                        Json::Writer m;
+                        m.Add("mailId", mailId).Add("type", (uint32)type);
+                        if (type == 0)
+                            { uint64 sender; p >> sender; m.AddGuid("senderGuid", (uint64_t)sender); }
+                        else
+                            { uint32 sender; p >> sender; m.Add("senderId", sender); }
+                        uint32 cod, unk, stationery, money, flags, templ; float days;
+                        p >> cod >> unk >> stationery >> money >> flags >> days >> templ;
+                        std::string subject, body; uint8 itemCount;
+                        p >> subject >> body >> itemCount;
+                        if (itemCount > 16) throw ByteBufferException();
+                        std::string items = "[";
+                        for (uint8 k = 0; k < itemCount; ++k)
+                        {
+                            uint8 idx; uint32 itemLow, entry;
+                            p >> idx >> itemLow >> entry;
+                            for (int e = 0; e < 7; ++e) { uint32 a, b, c; p >> a >> b >> c; }
+                            int32 randProp; uint32 suffix, cnt, charges, maxDur, dur; uint8 tail;
+                            p >> randProp >> suffix >> cnt >> charges >> maxDur >> dur >> tail;
+                            if (k) items += ',';
+                            items += Json::Writer().Add("index", (uint32)idx).Add("itemGuidLow", itemLow)
+                                .Add("itemId", entry).Add("count", cnt).Str();
+                            if (entry) itemEntries.push_back(entry);
+                        }
+                        items += "]";
+                        m.Add("cod", cod).Add("stationery", stationery).Add("money", money).Add("flags", flags)
+                         .Add("read", (flags & 0x01) != 0).Add("daysLeft", (double)days).Add("templateId", templ)
+                         .Add("subject", subject).Add("body", body).Raw("items", items);
+                        if (i) mails += ',';
+                        mails += m.Str();
+                    }
+                    mails += "]";
+                    w.Add("total", total).Add("count", (uint32)count).Raw("mails", mails);
+                    break;
+                }
+                // ------------------------------------------------- bank
+                // (FOLLOW-UPS 100). The slots themselves are the PLAYER_FIELD_
+                // BANK_SLOT_1 / BANKBAG_SLOT_1 update fields (invSlot39-73).
+                case SMSG_SHOW_BANK:
+                {
+                    // WorldSession::SendShowBank: u64 banker guid — the bank
+                    // frame opens (after CMSG_BANKER_ACTIVATE or a banker's
+                    // gossip option).
+                    name = "SMSG_SHOW_BANK";
+                    uint64 guid; p >> guid;
+                    w.AddGuid("guid", (uint64_t)guid);
+                    break;
+                }
+                case SMSG_BUY_BANK_SLOT_RESULT:
+                {
+                    // u32 BuyBankSlotResult (0 failed too many, 1 insufficient
+                    // funds, 2 not a banker, 3 ok).
+                    name = "SMSG_BUY_BANK_SLOT_RESULT";
+                    uint32 result; p >> result;
+                    w.Add("result", result);
+                    break;
+                }
+                // ------------------------------------------------ trade
+                // (FOLLOW-UPS 100). TradeHandler.
+                case SMSG_TRADE_STATUS:
+                {
+                    // WorldSession::SendTradeStatus: u32 TradeStatus, then per
+                    // status: 1 begin -> u64 trader guid; 2 open window ->
+                    // u32 trade id; 12 close window -> u32 InventoryResult,
+                    // u8 is target's error, u32 limiting item; 22/23 -> u8 slot.
+                    name = "SMSG_TRADE_STATUS";
+                    uint32 status; p >> status;
+                    w.Add("status", status);
+                    switch (status)
+                    {
+                        case 1: { uint64 g; p >> g; w.AddGuid("traderGuid", (uint64_t)g); break; }
+                        case 2: { uint32 id; p >> id; break; }
+                        case 12:
+                        {
+                            uint32 res; uint8 target; uint32 item;
+                            p >> res >> target >> item;
+                            w.Add("inventoryResult", res).Add("targetError", target != 0);
+                            if (item) w.Add("limitedItemId", item);
+                            break;
+                        }
+                        case 22: case 23: { uint8 slot; p >> slot; w.Add("slot", (uint32)slot); break; }
+                        default: break;
+                    }
+                    break;
+                }
+                case SMSG_TRADE_STATUS_EXTENDED:
+                {
+                    // WorldSession::SendUpdateTrade: u8 whose (1 = the other
+                    // trader's side, 0 = own), u32 trade id, u32 slot count,
+                    // u32 slot count, u32 money, u32 spell cast on the
+                    // enchant slot; 7 x (u8 slot, then either an item — u32
+                    // entry, u32 display, u32 count, u32 wrapped, u64 gift
+                    // creator, u32 enchant, 3 x u32 gems, u64 creator, u32
+                    // charges, u32 suffix, i32 random property, u32 lock, u32
+                    // max durability, u32 durability — or 18 zero u32s).
+                    // Slot 6 is the "will not be traded" enchant slot.
+                    name = "SMSG_TRADE_STATUS_EXTENDED";
+                    uint8 whose; uint32 tradeId, slots, slots2, money, spell;
+                    p >> whose >> tradeId >> slots >> slots2 >> money >> spell;
+                    if (slots > 7) throw ByteBufferException();
+                    std::string items = "[";
+                    bool firstItem = true;
+                    for (uint32 i = 0; i < slots; ++i)
+                    {
+                        uint8 slot; uint32 entry, display, count, wrapped; uint64 gift;
+                        p >> slot >> entry >> display >> count >> wrapped >> gift;
+                        uint32 ench, g1, g2, g3; uint64 creator; uint32 charges, suffix; int32 randProp; uint32 lock, maxDur, dur;
+                        p >> ench >> g1 >> g2 >> g3 >> creator >> charges >> suffix >> randProp >> lock >> maxDur >> dur;
+                        if (!entry) continue;
+                        if (!firstItem) items += ',';
+                        firstItem = false;
+                        items += Json::Writer().Add("slot", (uint32)slot).Add("itemId", entry).Add("count", count)
+                            .Add("wrapped", wrapped != 0).Str();
+                        itemEntries.push_back(entry);
+                    }
+                    items += "]";
+                    w.Add("theirs", whose != 0).Add("money", money).Add("spellId", spell).Raw("items", items);
+                    break;
+                }
+                // ----------------------------------------- innkeeper bind
+                case SMSG_BINDER_CONFIRM:
+                {
+                    // Player::SetBindPoint: u64 innkeeper guid. The answer to
+                    // the "Make this inn your home" gossip option; a client
+                    // shows a yes/no dialog and sends CMSG_BINDER_ACTIVATE
+                    // (raw) on yes.
+                    name = "SMSG_BINDER_CONFIRM";
+                    uint64 guid = 0; p >> guid;
+                    w.AddGuid("guid", (uint64_t)guid);
+                    break;
+                }
+                case SMSG_BINDPOINTUPDATE:
+                {
+                    // Spell::EffectBind / Player login: f32 x, y, z, u32 map,
+                    // u32 areaId — the hearthstone's destination. Once during
+                    // login and again after every bind. `areaName` is the
+                    // client's AreaTable.dbc text for the id ("" when unknown).
+                    name = "SMSG_BINDPOINTUPDATE";
+                    float x, y, z; uint32 map, areaId;
+                    p >> x >> y >> z >> map >> areaId;
+                    auto it = _areaTable.find(areaId);
+                    w.Add("x", (double)x).Add("y", (double)y).Add("z", (double)z)
+                     .Add("map", map).Add("areaId", areaId)
+                     .Add("areaName", it == _areaTable.end() ? std::string() : it->second.name);
+                    break;
+                }
+                case SMSG_PLAYERBOUND:
+                {
+                    // Spell::EffectBind: u64 binder guid, u32 areaId — the
+                    // "Your home is now X" line a client prints after a bind.
+                    name = "SMSG_PLAYERBOUND";
+                    uint64 guid = 0; uint32 areaId = 0;
+                    p >> guid >> areaId;
+                    auto it = _areaTable.find(areaId);
+                    w.AddGuid("guid", (uint64_t)guid).Add("areaId", areaId)
+                     .Add("areaName", it == _areaTable.end() ? std::string() : it->second.name);
                     break;
                 }
                 // -------------------------------------------------- progress
@@ -4537,6 +5492,132 @@ namespace WrathBench
                     w.AddGuid("guid", (uint64_t)guid);
                     break;
                 }
+                // ------------------------------------------- group loot rolls
+                // (FOLLOW-UPS 102). Group::SendLootStartRoll and friends: a
+                // roll is keyed by a fresh item guid the core mints for it
+                // (`rollGuid`), not by the loot slot alone.
+                case SMSG_LOOT_START_ROLL:
+                {
+                    // u64 roll guid, u32 map, u32 loot slot, u32 item entry,
+                    // u32 random suffix, u32 random property, u32 count, u32
+                    // countdown ms, u8 vote mask (1 need, 2 greed, 4
+                    // disenchant; pass is always allowed). The per-player form
+                    // (SendLootStartRollToPlayer) drops the need bit when this
+                    // character cannot need.
+                    name = "SMSG_LOOT_START_ROLL";
+                    uint64 rollGuid; uint32 mapId, slot, itemId, suffix, prop, count, countdown; uint8 mask;
+                    p >> rollGuid >> mapId >> slot >> itemId >> suffix >> prop >> count >> countdown >> mask;
+                    w.AddGuid("rollGuid", (uint64_t)rollGuid).Add("slot", slot).Add("itemId", itemId)
+                     .Add("count", count).Add("countdownMs", countdown).Add("voteMask", (uint32)mask)
+                     .Add("canNeed", (mask & 0x01) != 0).Add("canGreed", (mask & 0x02) != 0)
+                     .Add("canDisenchant", (mask & 0x04) != 0);
+                    itemEntries.push_back(itemId);
+                    break;
+                }
+                case SMSG_LOOT_ROLL:
+                {
+                    // u64 roll guid, u32 slot, u64 player, u32 item entry, u32
+                    // suffix, u32 property, u8 roll (1-100; 128 = passed), u8
+                    // vote (0 pass, 1 need, 2 greed, 3 disenchant), u8 auto
+                    // pass. One per counted vote, to every voter.
+                    name = "SMSG_LOOT_ROLL";
+                    uint64 rollGuid; uint32 slot; uint64 player; uint32 itemId, suffix, prop; uint8 roll, vote, autoPass;
+                    p >> rollGuid >> slot >> player >> itemId >> suffix >> prop >> roll >> vote >> autoPass;
+                    w.AddGuid("rollGuid", (uint64_t)rollGuid).Add("slot", slot).AddGuid("playerGuid", (uint64_t)player)
+                     .Add("itemId", itemId).Add("roll", (uint32)roll).Add("rollType", (uint32)vote).Add("autoPass", autoPass != 0);
+                    itemEntries.push_back(itemId);
+                    break;
+                }
+                case SMSG_LOOT_ROLL_WON:
+                {
+                    // u64 roll guid, u32 slot, u32 item entry, u32 suffix, u32
+                    // property, u64 winner, u8 winning roll, u8 vote.
+                    name = "SMSG_LOOT_ROLL_WON";
+                    uint64 rollGuid; uint32 slot, itemId, suffix, prop; uint64 winner; uint8 roll, vote;
+                    p >> rollGuid >> slot >> itemId >> suffix >> prop >> winner >> roll >> vote;
+                    w.AddGuid("rollGuid", (uint64_t)rollGuid).Add("slot", slot).Add("itemId", itemId)
+                     .AddGuid("winnerGuid", (uint64_t)winner).Add("roll", (uint32)roll).Add("rollType", (uint32)vote);
+                    itemEntries.push_back(itemId);
+                    break;
+                }
+                case SMSG_LOOT_ALL_PASSED:
+                {
+                    // u64 roll guid, u32 slot, u32 item entry, u32 property, u32 suffix.
+                    name = "SMSG_LOOT_ALL_PASSED";
+                    uint64 rollGuid; uint32 slot, itemId, prop, suffix;
+                    p >> rollGuid >> slot >> itemId >> prop >> suffix;
+                    w.AddGuid("rollGuid", (uint64_t)rollGuid).Add("slot", slot).Add("itemId", itemId);
+                    itemEntries.push_back(itemId);
+                    break;
+                }
+                case SMSG_LOOT_MASTER_LIST:
+                {
+                    // Group::MasterLoot: u8 count, count x u64 — who the master
+                    // looter may hand an over-threshold item to.
+                    name = "SMSG_LOOT_MASTER_LIST";
+                    uint8 count; p >> count;
+                    if (count > 40) throw ByteBufferException();
+                    std::string looters = "[";
+                    for (uint8 i = 0; i < count; ++i)
+                    {
+                        uint64 g; p >> g;
+                        if (i) looters += ',';
+                        looters += Json::Writer().AddGuid("guid", (uint64_t)g).Str();
+                    }
+                    looters += "]";
+                    w.Raw("looters", looters);
+                    break;
+                }
+                // ------------------------------------------------ item text
+                // (FOLLOW-UPS 103). Two reading paths a client has: a book or
+                // letter with a PageText id (CMSG_READ_ITEM -> SMSG_READ_ITEM_OK
+                // -> the client's CMSG_PAGE_TEXT_QUERY on the template's page
+                // id -> one SMSG_PAGE_TEXT_QUERY_RESPONSE per page, the core
+                // walks the NextPage chain itself), and player-written text on
+                // a mailed letter (CMSG_ITEM_TEXT_QUERY). The SDK sends the
+                // page query the client would, keyed by the pageText it was
+                // served on the item query.
+                case SMSG_READ_ITEM_OK:
+                {
+                    name = "SMSG_READ_ITEM_OK";
+                    uint64 guid; p >> guid;
+                    w.AddGuid("guid", (uint64_t)guid);
+                    break;
+                }
+                case SMSG_READ_ITEM_FAILED:
+                {
+                    // Same body; the equip error (SMSG_INVENTORY_CHANGE_FAILURE) precedes it.
+                    name = "SMSG_READ_ITEM_FAILED";
+                    uint64 guid; p >> guid;
+                    w.AddGuid("guid", (uint64_t)guid);
+                    break;
+                }
+                case SMSG_PAGE_TEXT_QUERY_RESPONSE:
+                {
+                    // WorldSession::HandlePageTextQueryOpcode: u32 page id,
+                    // cstring text, u32 next page (0 = last). A missing page
+                    // is served as the core's own "Item page missing." text.
+                    name = "SMSG_PAGE_TEXT_QUERY_RESPONSE";
+                    uint32 pageId; std::string text; uint32 next;
+                    p >> pageId >> text >> next;
+                    w.Add("pageId", pageId).Add("text", text).Add("nextPageId", next);
+                    break;
+                }
+                case SMSG_ITEM_TEXT_QUERY_RESPONSE:
+                {
+                    // WorldSession::HandleItemTextQuery: u8 1 = no such item;
+                    // else u8 0, u64 item guid, cstring text.
+                    name = "SMSG_ITEM_TEXT_QUERY_RESPONSE";
+                    uint8 noText; p >> noText;
+                    w.Add("found", noText == 0);
+                    if (noText == 0)
+                    {
+                        uint64 guid; std::string text;
+                        p >> guid >> text;
+                        w.AddGuid("guid", (uint64_t)guid).Add("text", text);
+                    }
+                    break;
+                }
                 // ---------------------------------------------------- vendor
                 case SMSG_LIST_INVENTORY:
                 {
@@ -4715,6 +5796,96 @@ namespace WrathBench
                      .Add("buyPrice", buyPrice).Add("sellPrice", sellPrice)
                      .Add("itemLevel", itemLevel).Add("requiredLevel", reqLevel)
                      .Add("class", itemClass).Add("subClass", subClass);
+                    // The rest of the tooltip (FOLLOW-UPS 97), in the order
+                    // WorldSession::HandleItemQuerySingleOpcode writes it:
+                    // requirements, stack/bag sizes, the stat list, two damage
+                    // ranges, armor and six resistances, speed, five spell
+                    // slots, bonding, description, then the page/quest/lock/
+                    // material block up to maxDurability. Everything after
+                    // (sockets, gems, duration, holiday) is left unread.
+                    uint32 reqSkill, reqSkillRank, reqSpell, reqHonor, reqCity, reqRepFaction, reqRepRank;
+                    p >> reqSkill >> reqSkillRank >> reqSpell >> reqHonor >> reqCity >> reqRepFaction >> reqRepRank;
+                    int32 maxCount, stackable; uint32 containerSlots, statsCount;
+                    p >> maxCount >> stackable >> containerSlots >> statsCount;
+                    if (statsCount > 10) throw ByteBufferException();
+                    std::string stats = "[";
+                    for (uint32 i = 0; i < statsCount; ++i)
+                    {
+                        uint32 type; int32 value; p >> type >> value;
+                        if (i) stats += ',';
+                        stats += Json::Writer().Add("type", type).Add("value", value).Str();
+                    }
+                    stats += "]";
+                    uint32 ssd, ssv; p >> ssd >> ssv;
+                    std::string damage = "[";
+                    bool firstDmg = true;
+                    for (int i = 0; i < 2; ++i)
+                    {
+                        float dmin, dmax; uint32 dtype; p >> dmin >> dmax >> dtype;
+                        if (dmin == 0 && dmax == 0) continue;
+                        if (!firstDmg) damage += ',';
+                        firstDmg = false;
+                        damage += Json::Writer().Add("min", (double)dmin).Add("max", (double)dmax).Add("type", dtype).Str();
+                    }
+                    damage += "]";
+                    uint32 armor; p >> armor;
+                    static char const* resName[6] = { "holy", "fire", "nature", "frost", "shadow", "arcane" };
+                    Json::Writer res; bool anyRes = false;
+                    for (int i = 0; i < 6; ++i)
+                    {
+                        uint32 r; p >> r;
+                        if (r) { res.Add(resName[i], r); anyRes = true; }
+                    }
+                    uint32 delay, ammoType; float rangedMod;
+                    p >> delay >> ammoType >> rangedMod;
+                    std::string spells = "[";
+                    bool firstSpell = true;
+                    for (int i = 0; i < 5; ++i)
+                    {
+                        uint32 spellId, trigger; int32 charges; uint32 cd, cat, catCd;
+                        p >> spellId >> trigger >> charges >> cd >> cat >> catCd;
+                        if (!spellId) continue;
+                        if (!firstSpell) spells += ',';
+                        firstSpell = false;
+                        Json::Writer sp;
+                        sp.Add("spellId", spellId).Add("trigger", trigger).Add("charges", charges);
+                        if (SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId))
+                            if (info->SpellName[0])
+                                sp.Add("name", info->SpellName[0]);
+                        spells += sp.Str();
+                    }
+                    spells += "]";
+                    uint32 bonding; std::string description;
+                    p >> bonding >> description;
+                    uint32 pageText, languageId, pageMaterial, startQuest, lockId; int32 material;
+                    uint32 sheath, randomProperty, randomSuffix, block, itemSet, maxDurability;
+                    p >> pageText >> languageId >> pageMaterial >> startQuest >> lockId >> material
+                      >> sheath >> randomProperty >> randomSuffix >> block >> itemSet >> maxDurability;
+                    w.Add("requiredSkill", reqSkill).Add("requiredSkillRank", reqSkillRank);
+                    if (reqSkill)
+                        if (SkillLineEntry const* sl = sSkillLineStore.LookupEntry(reqSkill))
+                            if (sl->name[0])
+                                w.Add("requiredSkillName", sl->name[0]);
+                    if (reqSpell) w.Add("requiredSpell", reqSpell);
+                    if (reqRepFaction)
+                    {
+                        w.Add("requiredReputationFaction", reqRepFaction).Add("requiredReputationRank", reqRepRank);
+                        if (FactionEntry const* fe = sFactionStore.LookupEntry(reqRepFaction))
+                            if (fe->name[0])
+                                w.Add("requiredReputationFactionName", fe->name[0]);
+                    }
+                    w.Add("maxCount", maxCount).Add("stackable", stackable).Add("containerSlots", containerSlots)
+                     .Raw("stats", stats).Raw("damage", damage).Add("armor", armor);
+                    if (anyRes) w.Raw("resistances", res.Str());
+                    w.Add("speedMs", delay).Raw("spells", spells).Add("bonding", bonding);
+                    if (!description.empty()) w.Add("description", description);
+                    if (startQuest) w.Add("startQuest", startQuest);
+                    // PageText.dbc-shaped id of the item's first page: a book
+                    // or letter the client can read (FOLLOW-UPS 103). 0 is
+                    // "nothing to read" and is not served.
+                    if (pageText) w.Add("pageText", pageText);
+                    if (block) w.Add("block", block);
+                    w.Add("maxDurability", maxDurability);
                     break;
                 }
                 // ----------------------------------------------------- death

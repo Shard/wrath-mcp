@@ -1,9 +1,10 @@
 # mod-wrathbench wire protocol
 
 The module exposes a small HTTP/WebSocket surface inside the worldserver. The SDK
-is generated against this document, so shapes are exact. This is the Stage-2
-vertical slice (PHASE-0): session lifecycle, one action (`say`), and a filtered
-outbound event stream. It is not the full action set.
+is generated against this document, so shapes are exact. It covers the whole
+surface the module serves today: session lifecycle, the action set of
+`docs/CONTRACTS.md` (including the raw passthrough), and the filtered outbound
+event stream.
 
 Transport: plain HTTP/1.1 and RFC6455 WebSocket on `WrathBench.BindAddress:Port`
 (default `0.0.0.0:8086`), reachable only from inside the private compose network.
@@ -137,7 +138,7 @@ Errors:
   capability over `/action`, `/events` and `DELETE /session`, so a guessable one
   (the old run-id default was a second-granularity timestamp) lets one run drive
   another; length is a proxy for entropy until the module issues the secret
-  itself (FOLLOW-UPS 19). Checked before the session is registered. The
+  itself (FOLLOW-UPS item 19, open). Checked before the session is registered. The
   `/characters` and `/character-delete` utility surfaces are deliberately not
   gated: they park at character-select, never enter world, and take no actions.
 - `400 {"ok":false,"error":"invalid_race_class","token":...}` — the character
@@ -198,7 +199,8 @@ quest/combat extension set (2026-08, additive): `set_target`, `clear_target`,
 `reclaim_corpse`, `spirit_healer_activate` (2026-08, additive), the trainer
 extension (2026-08, additive): `trainer_list`, `trainer_buy_spell`, and the
 spellbook/talent extension (2026-08, additive): `learn_talent`,
-`learn_preview_talents`, `raw`. Acks that the
+`learn_preview_talents`, `raw`, and the talent-frame read (2026-08-29,
+FOLLOW-UPS 96): `talent_tree`. Acks that the
 opcode was synthesized and queued; the game
 result (the chat echo, an arrival, or an error) arrives on the WebSocket.
 
@@ -303,14 +305,14 @@ them: `{ "ok": true, "action": "<name>", "token": ... }`.
 | `clear_target` | — | `CMSG_SET_SELECTION` | guid 0 |
 | `attack_start` | `guid` | `CMSG_ATTACKSWING` | melee auto-attack; server swings while in range |
 | `attack_stop` | — | `CMSG_ATTACKSTOP` | |
-| `cast_spell` | `spellId`, `targetGuid?` | `CMSG_CAST_SPELL` | no `targetGuid` = self/auto target (mask 0); with it, TARGET_FLAG_UNIT + packed guid |
+| `cast_spell` | `spellId`, `targetGuid?` | `CMSG_CAST_SPELL` | no `targetGuid` = self/auto target (mask 0); with it, TARGET_FLAG_UNIT + packed guid. A game object guid works too (the core resolves the packed guid by its type), which is how chests open; a client would set TARGET_FLAG_GAMEOBJECT for it — FOLLOW-UPS 105 |
 | `cancel_cast` | `spellId` | `CMSG_CANCEL_CAST` | |
-| `interact` | `guid` | `CMSG_GAMEOBJ_USE` | game objects (chests, doors, quest objects) |
+| `interact` | `guid` | `CMSG_GAMEOBJ_USE` | doors, buttons, quest objects, mailboxes. Not chests: the core's `GameObject::Use` has no chest case and returns silently; a client opens a chest with `cast_spell` of the lock's Opening spell at the object's guid (the SDK's `lootCorpse` does this) |
 | `gossip_hello` | `guid` | `CMSG_GOSSIP_HELLO` | opens the NPC gossip menu (`SMSG_GOSSIP_MESSAGE`) |
 | `gossip_select` | `guid`, `menuId`, `optionId` | `CMSG_GOSSIP_SELECT_OPTION` | ids from `SMSG_GOSSIP_MESSAGE` (`menuId`, `options[].optionId`) |
 | `quest_list` | `guid` | `CMSG_QUESTGIVER_HELLO` | `SMSG_QUESTGIVER_QUEST_LIST` or a gossip menu follows |
 | `quest_details` | `guid`, `questId` | `CMSG_QUESTGIVER_QUERY_QUEST` | quest text via `SMSG_QUESTGIVER_QUEST_DETAILS` |
-| `quest_accept` | `guid`, `questId` | `CMSG_QUESTGIVER_ACCEPT_QUEST` | |
+| `quest_accept` | `guid`, `questId` | `CMSG_QUESTGIVER_ACCEPT_QUEST` | `guid` may be a quest-start item's own guid (after `use_item` on it): the handler accepts TYPEMASK_ITEM |
 | `quest_complete` | `guid`, `questId` | `CMSG_QUESTGIVER_COMPLETE_QUEST` | server answers REQUEST_ITEMS or OFFER_REWARD |
 | `quest_choose_reward` | `guid`, `questId`, `rewardIndex` | `CMSG_QUESTGIVER_CHOOSE_REWARD` | `rewardIndex` 0-based into `choiceRewards`; 0 when there is no choice |
 | `quest_abandon` | `questId` | `CMSG_QUESTLOG_REMOVE_QUEST` | module maps quest id -> log slot (client-visible via quest-log fields); `400 quest_not_in_log` |
@@ -327,12 +329,13 @@ them: `{ "ok": true, "action": "<name>", "token": ... }`.
 | `sell_item` | `guid`, `itemGuid`, `count?` | `CMSG_SELL_ITEM` | `count` 0/omitted = whole stack |
 | `repair_all` | `guid` | `CMSG_REPAIR_ITEM` | item guid 0 = repair everything |
 | `equip_item` | `bag`, `slot` | `CMSG_AUTOEQUIP_ITEM` | `bag` 255 = backpack/equipment container, `slot` 23-38 = backpack slots |
-| `use_item` | `bag`, `slot`, `targetGuid?` | `CMSG_USE_ITEM` | module fills item guid + on-use spell id from the item (client-cache knowledge); `400 no_item_at_slot`, `400 item_not_usable` |
+| `use_item` | `bag`, `slot`, `targetGuid?` | `CMSG_USE_ITEM`, or `CMSG_QUESTGIVER_QUERY_QUEST` | module fills item guid + on-use spell id from the item (client-cache knowledge). An item with no on-use spell but a `startquest` is right-clicked the way a client does it: `CMSG_QUESTGIVER_QUERY_QUEST` with the item guid as the questgiver and the template's quest id (`HandleUseItemOpcode` drops spell id 0 as unknown, so `CMSG_USE_ITEM` is never the packet for it); the server answers `SMSG_QUESTGIVER_QUEST_DETAILS`, and `quest_accept` with the same item guid takes it. `400 no_item_at_slot`; `400 item_not_usable` only when the item has neither an on-use spell nor a quest to start. The audit row carries `spellId`, `itemGuid`, `startQuest` |
 | `destroy_item` | `bag`, `slot`, `count?` | `CMSG_DESTROYITEM` | `count` 0/omitted = whole stack |
 | `trainer_list` | `guid` | `CMSG_TRAINER_LIST` | `SMSG_TRAINER_LIST` follows — or nothing at all when the NPC is out of interaction range, is not a trainer, or trains another class (the handler returns silently) |
 | `trainer_buy_spell` | `guid`, `spellId` | `CMSG_TRAINER_BUY_SPELL` | costs the character's own money server-side; answered by `SMSG_TRAINER_BUY_SUCCEEDED` or `SMSG_TRAINER_BUY_FAILED` |
 | `learn_talent` | `talentId`, `rank` | `CMSG_LEARN_TALENT` | `talentId` from Talent.dbc, `rank` 0-based; the handler always answers `SMSG_TALENTS_INFO`, and a granted spell arrives as `SMSG_LEARNED_SPELL`; `400 missing_talent` |
 | `learn_preview_talents` | `talents` = `[[talentId, rank], ...]` | `CMSG_LEARN_PREVIEW_TALENTS` | the preview-mode "learn" button (at most 150 pairs); `400 missing_talents`, `400 invalid_talents` |
+| `talent_tree` | — | none (client-local read) | the class talent frame from the client's own Talent.dbc / TalentTab.dbc, answered as `WB_TALENT_TREE` on the stream so the observation is logged; no packet is sent (2026-08-29, FOLLOW-UPS 96) |
 | `raw` | `opcode`, `payload` | the named opcode | the escape hatch, below |
 | `repop` | — | `CMSG_REPOP_REQUEST` | release spirit while dead |
 | `reclaim_corpse` | `guid?` | `CMSG_RECLAIM_CORPSE` | resurrect at corpse; handler resolves the player's own corpse, guid optional. Refusals are silent (further than 39y, delay not elapsed, other map, no corpse); the SDK reads them off the corpse-query answer below |
@@ -378,7 +381,11 @@ and a hint), `invalid_payload` (not whole hex bytes), `payload_too_large`
 Allowlist — every entry is an opcode a stock client sends during ordinary play
 whose handler does nothing a non-GM client could not do:
 
-- talents: `CMSG_LEARN_TALENT`, `CMSG_LEARN_PREVIEW_TALENTS`
+- talents: `CMSG_LEARN_TALENT`, `CMSG_LEARN_PREVIEW_TALENTS`,
+  `MSG_TALENT_WIPE_CONFIRM` (body `u64 trainer guid` — the yes on the
+  "unlearn all talents for N gold?" dialog after the server's own
+  `MSG_TALENT_WIPE_CONFIRM`; the SDK's `resetTalents` sends it. The one
+  `MSG_*` on the list: the opcode is bidirectional and a client sends it)
 - chat/emotes: `CMSG_MESSAGECHAT` (whisper, party, yell and the rest ride this
   one), `CMSG_EMOTE`, `CMSG_TEXT_EMOTE`
 - inventory: `CMSG_SPLIT_ITEM`, `CMSG_SWAP_ITEM`, `CMSG_SWAP_INV_ITEM`,
@@ -388,20 +395,61 @@ whose handler does nothing a non-GM client could not do:
   `CMSG_CANCEL_CHANNELLING`, `CMSG_SET_SHEATHED`, `CMSG_STANDSTATECHANGE`,
   `CMSG_RESURRECT_RESPONSE`
 - flight paths: `CMSG_TAXINODE_STATUS_QUERY`, `CMSG_TAXIQUERYAVAILABLENODES`,
-  `CMSG_ACTIVATETAXI`, `CMSG_ACTIVATETAXIEXPRESS`
+  `CMSG_ACTIVATETAXI` (body `u64 guid, u32 fromNode, u32 toNode`; the SDK's
+  `activateTaxi` builds it), `CMSG_ACTIVATETAXIEXPRESS`
+- innkeeper bind: `CMSG_BINDER_ACTIVATE` (body `u64 guid` — the yes on the
+  confirm dialog after `SMSG_BINDER_CONFIRM`; the SDK's `bindAtInnkeeper`
+  sends it)
 - bank: `CMSG_BANKER_ACTIVATE`, `CMSG_AUTOBANK_ITEM`, `CMSG_AUTOSTORE_BANK_ITEM`,
   `CMSG_BUY_BANK_SLOT`
-- mail: `CMSG_SEND_MAIL`, `CMSG_GET_MAIL_LIST`, `CMSG_MAIL_TAKE_ITEM`,
-  `CMSG_MAIL_TAKE_MONEY`, `CMSG_MAIL_MARK_AS_READ`, `CMSG_MAIL_DELETE`
-- party: `CMSG_GROUP_INVITE`, `CMSG_GROUP_ACCEPT`, `CMSG_GROUP_DECLINE`,
-  `CMSG_GROUP_UNINVITE_GUID`, `CMSG_GROUP_DISBAND`, `CMSG_GROUP_SET_LEADER`,
-  `CMSG_LOOT_METHOD`
-- trade: `CMSG_INITIATE_TRADE`, `CMSG_BEGIN_TRADE`, `CMSG_ACCEPT_TRADE`,
-  `CMSG_CANCEL_TRADE`, `CMSG_SET_TRADE_ITEM`, `CMSG_CLEAR_TRADE_ITEM`,
-  `CMSG_SET_TRADE_GOLD`
+- mail: `CMSG_SEND_MAIL` (body `u64 mailbox, cstring to, cstring subject,
+  cstring body, u32 stationery (41), u32 0, u8 count, count × (u8 index, u64
+  item guid), u32 money, u32 cod, u64 0, u8 0`; the SDK's `sendMail` builds
+  it), `CMSG_GET_MAIL_LIST` (`u64 mailbox`), `CMSG_MAIL_TAKE_ITEM` (`u64
+  mailbox, u32 mailId, u32 item low guid`), `CMSG_MAIL_TAKE_MONEY` (`u64
+  mailbox, u32 mailId`), `CMSG_MAIL_MARK_AS_READ` (`u64 mailbox, u32
+  mailId`), `CMSG_MAIL_DELETE` (`u64 mailbox, u32 mailId, u32 0` — the
+  template id; without it HandleMailDelete throws and the core skips the
+  packet), `CMSG_MAIL_RETURN_TO_SENDER` (`u64 mailbox, u32 mailId, u64 0`).
+  Every mail handler checks the mailbox guid is a mailbox game object within
+  reach. The core sends no `SMSG_SHOW_MAILBOX` for `CMSG_GAMEOBJ_USE` on a
+  mailbox (GameObject::Use has no mailbox case; a client opens the frame
+  locally) — the first `SMSG_MAIL_LIST_RESULT` answering `CMSG_GET_MAIL_LIST`
+  is what proves the box is in reach, and the SDK's `openMailbox` waits for it
+- party: `CMSG_GROUP_INVITE` (`cstring name, u32 0`), `CMSG_GROUP_ACCEPT`
+  (`u32 0`), `CMSG_GROUP_DECLINE` (empty), `CMSG_GROUP_UNINVITE` (`cstring
+  name`), `CMSG_GROUP_UNINVITE_GUID` (`u64 guid, cstring reason`),
+  `CMSG_GROUP_DISBAND` (empty — "leave group"), `CMSG_GROUP_SET_LEADER` (`u64
+  guid`), `CMSG_LOOT_METHOD`, `CMSG_LOOT_ROLL` (`u64 roll guid, u32 loot
+  slot, u8 vote` — 0 pass, 1 need, 2 greed, 3 disenchant — on a frame
+  `SMSG_LOOT_START_ROLL` opened; the SDK's `lootRoll` builds it; 2026-08-29,
+  FOLLOW-UPS 102)
+- trade: `CMSG_INITIATE_TRADE` (`u64 guid`), `CMSG_BEGIN_TRADE`, `CMSG_ACCEPT_TRADE`,
+  `CMSG_UNACCEPT_TRADE`, `CMSG_CANCEL_TRADE`, `CMSG_BUSY_TRADE`,
+  `CMSG_IGNORE_TRADE`, `CMSG_SET_TRADE_ITEM` (`u8 trade slot, u8 bag, u8
+  slot`), `CMSG_CLEAR_TRADE_ITEM` (`u8 trade slot`), `CMSG_SET_TRADE_GOLD`
+  (`u32 copper`)
+- pet control (2026-08-29, FOLLOW-UPS 98): `CMSG_PET_ACTION` (`u64 pet guid,
+  u32 button, u64 target guid` — `button` is `action | type << 24` exactly as
+  the bar serves it: type 0x07 with a command 0 stay / 1 follow / 2 attack /
+  3 abandon, type 0x06 with a react state 0 passive / 1 defensive / 2
+  aggressive, type 0x81 / 0xC1 / 0x01 with a spell id; the SDK's `petAttack`,
+  `petFollow`, `petStay`, `petReact`, `petCast`, `petDismiss` build it),
+  `CMSG_PET_CAST_SPELL` (`u64 pet guid, u8 cast count, u32 spell, u8 flags,
+  SpellCastTargets`), `CMSG_PET_STOP_ATTACK` (`u64 pet guid`),
+  `CMSG_PET_ABANDON` (`u64 pet guid`), `CMSG_PET_RENAME` (`u64 pet guid,
+  cstring name, u8 declined`), `CMSG_PET_SET_ACTION` (`u64 pet guid, (u32
+  position, u32 button) × 1..2`), `CMSG_PET_SPELL_AUTOCAST` (`u64 pet guid,
+  u32 spell, u8 on`), `CMSG_PET_CANCEL_AURA` (`u64 pet guid, u32 spell`),
+  `CMSG_PET_NAME_QUERY` (`u32 pet number, u64 pet guid` — the module asks
+  once per pet number on the client's behalf), `CMSG_REQUEST_PET_INFO`
+  (empty — re-sends `SMSG_PET_SPELLS`)
 - client-cache queries: `CMSG_NAME_QUERY`, `CMSG_CREATURE_QUERY`,
   `CMSG_GAMEOBJECT_QUERY`, `CMSG_ITEM_QUERY_SINGLE`, `CMSG_NPC_TEXT_QUERY`,
-  `CMSG_PAGE_TEXT_QUERY`, `CMSG_PLAYED_TIME`, `CMSG_QUERY_TIME`,
+  `CMSG_PAGE_TEXT_QUERY` (`u32 page id, u64 item guid` — the SDK's `readItem`
+  sends it after `SMSG_READ_ITEM_OK`, on the template's `pageText`),
+  `CMSG_ITEM_TEXT_QUERY` (`u64 item guid` — the player-written text on a
+  mailed letter; FOLLOW-UPS 103), `CMSG_PLAYED_TIME`, `CMSG_QUERY_TIME`,
   `CMSG_SET_WATCHED_FACTION`, `CMSG_SET_ACTION_BUTTON`
 - corpse: `MSG_CORPSE_QUERY` (empty body) — re-ask where the corpse is; the
   module already asks once per death on the client's behalf (see "Death"), and
@@ -411,8 +459,9 @@ Deliberately absent: movement opcodes (the module drives them; a stray one
 desyncs the mover), session lifecycle (login, logout, character create/delete),
 every opcode that already has an action (one audited path per opcode), and
 anything GM-gated or teleport-shaped. Answers to raw actions reach the agent
-only through the event whitelist: most of the above have no whitelisted reply
-yet, which is exactly the evidence the hatch exists to produce.
+only through the event whitelist: the pet, party, mail, bank and trade
+replies are whitelisted (2026-08-29); the rest have none yet, which is
+exactly the evidence the hatch exists to produce.
 
 ### POST /characters
 
@@ -633,8 +682,16 @@ not need it, docs/CONTRACTS.md):
   `maxPower1`..`maxPower7`, `level`, `faction`, `unitFlags` (with
   `taxiFlight`, the `UNIT_FLAG_TAXI_FLIGHT` bit named), `displayId`,
   `dynamicFlags`, `npcFlags`, `targetGuid`, `race`, `class`, `gender`,
-  `powerType` (the last four unpacked from UNIT_FIELD_BYTES_0)
-- players additionally: `playerFlags`
+  `powerType` (the last four unpacked from UNIT_FIELD_BYTES_0), and (2026-08-29,
+  FOLLOW-UPS 98) `summonedByGuid`, `createdByGuid`, `charmedByGuid` (the
+  PUBLIC owner fields as guid strings — a pet's master; `"0"` when unset) and
+  `petNumber` (UNIT_FIELD_PETNUMBER; on first sight of a unit with a non-zero
+  one the module issues the `CMSG_PET_NAME_QUERY` a client does, once per
+  number per session)
+- players additionally: `playerFlags` (served as the raw integer; the module
+  names no bit off it. The SDK decodes `PLAYER_FLAGS_GHOST` and, from
+  2026-08-30, `PLAYER_FLAGS_RESTING` runner-side — a naming of already-served
+  data, not a new tap)
 - game objects: `goDisplayId`, `goFlags`, `goFaction`, `goLevel`, `goState`,
   `goType`
 
@@ -665,6 +722,7 @@ session's own identity). Their `opcodeId`s are outside the real opcode range.
 | `WB_TRANSPORT_PROGRESS` | 0xFF06 | `{ "guid": <guid-string>, "entry": <u32>, "pos": { "x","y","z","o" }, "progressMs": <u32>, "periodMs": <u32?>, "docked": <bool?> }` — at most 1/s per session, one per transport on the character's map whose create block the session has received: the car's current position on its `TransportAnimation.dbc` path (what a client animates locally from `pathProgress`), the clock and period, and `docked` when the keyframe segment the clock is on has no displacement (the car is dwelling at a platform; absent for transports without an animation path) |
 | `WB_AREATRIGGER` | 0xFF04 | `{ "triggerId": <u32>, "moveId": <number>, "pos": { "x","y","z","o" } }` — the mover entered an `AreaTrigger.dbc` volume and sent `CMSG_AREATRIGGER` for it (see below) |
 | `WB_AREA` | 0xFF07 | `{ "mapId": <u32>, "zoneId": <u32>, "zoneName": <str>, "areaId": <u32>, "areaName": <str> }` — the zone and subzone the character is in, named as the client names them; once when the character enters the world and once per change of either id, whatever moved it (walking, a teleport, a map transfer). See "Zone and area" below. |
+| `WB_TALENT_TREE` | 0xFF08 | the class talent frame, the answer to the `talent_tree` action; shape under "Spellbook, cooldowns, talents" below |
 | `WB_SESSION_STATE` | 0xFF03 | `{ "character": <str>, "guid": <guid-string>, "inWorld": true, "map": <n>, "x": <f>, "y": <f>, "z": <f>, "o": <f>, "level": <n>, "zoneId", "zoneName", "areaId", "areaName" }` — emitted once per WS subscribe to an already-in-world session (reattach semantics in the `/events` section above). Strictly client-visible facts: what `SMSG_LOGIN_VERIFY_WORLD` plus the session's own identity would carry, plus the same zone/area fields as `WB_AREA` so a reattached client starts where the stream cannot re-emit. |
 
 `moveId` is a plain JSON number: it is a per-session counter that cannot exceed
@@ -723,7 +781,7 @@ item 38 N1; the former undifferentiated `no_path` no longer exists):
 would render); `WB_MOVE_RESULT.pos` is read back from the live character, so an
 `arrived` result is proof the server accepted the synthesized movement.
 
-Transports (2026-08, FOLLOW-UPS 38 N1). A client standing on a tram car or
+Transports (2026-08, FOLLOW-UPS item 38, N1). A client standing on a tram car or
 boat sends movement packets flagged `MOVEMENTFLAG_ONTRANSPORT` with the
 transport guid and its transport-relative offset, because its physics put it
 on the transport's model; the server then carries it as a passenger and
@@ -749,7 +807,7 @@ therefore sees "Subway" standing at the platform or absent, and a `move_to`
 onto an empty rail bed still answers `target_off_mesh` — the SDK's hint
 names the docking car when one is known.
 
-Areatriggers (2026-08, FOLLOW-UPS 38 N1). A real client tests its own position
+Areatriggers (2026-08, FOLLOW-UPS item 38, N1). A real client tests its own position
 against the `AreaTrigger.dbc` volumes it ships and sends `CMSG_AREATRIGGER`
 the moment it enters one — the player never chooses to. The module does the
 same: it reads `AreaTrigger.dbc` from the server data volume (`DataDir/dbc`,
@@ -759,7 +817,7 @@ each heartbeat with the same sphere/oriented-box geometry as
 and never again while the mover lingers inside: the module keeps the set of
 volumes the character is in, fires only for ids newly inside, and forgets an
 id when the character leaves the volume, changes map or is teleported, so a
-re-entry fires again (FOLLOW-UPS 56). Because a client never reports a
+re-entry fires again (closed item 56, `../docs/worklogs/2026-08-23.md`). Because a client never reports a
 trigger from a position it has not sent, each entry packet is preceded by a
 `MSG_MOVE_HEARTBEAT` at the entry position (audited as a `move_pkt` with
 `cause: "areatrigger"`), so the server's applied position is the tested one
@@ -773,7 +831,7 @@ happen without an agent action, because they happen to a client without a
 player action. Triggers fire only while a `move_to` is in progress; the
 server's own radius check rejects any hit the interpolation got wrong.
 
-#### Zone and area (FOLLOW-UPS 38 N2)
+#### Zone and area (FOLLOW-UPS item 38, N2)
 
 No packet carries "Elwynn Forest / Northshire Valley" to a client. The client
 computes its current area id locally — from the area-id grid of the ADT it
@@ -869,7 +927,7 @@ Loot, vendor, inventory:
 | `SMSG_TRAINER_BUY_SUCCEEDED` | 0x1B3 | `{ "guid", "spellId" }` |
 | `SMSG_TRAINER_BUY_FAILED` | 0x1B4 | `{ "guid", "spellId", "reason": <i32> }` — 0 unavailable, 1 not enough money, 2 not enough skill (also level/prerequisites) |
 | `SMSG_INVENTORY_CHANGE_FAILURE` | 0x112 | `{ "result": <u8>, "itemGuid"?, "itemGuid2"?, "requiredLevel"? }` (InventoryResult code) |
-| `SMSG_ITEM_QUERY_SINGLE_RESPONSE` | 0x058 | `{ "itemId", "found", "name"?, "quality"?, "inventoryType"?, "buyPrice"?, "sellPrice"?, "itemLevel"?, "requiredLevel"?, "class"?, "subClass"? }` |
+| `SMSG_ITEM_QUERY_SINGLE_RESPONSE` | 0x058 | `{ "itemId", "found", "name"?, "quality"?, "inventoryType"?, "buyPrice"?, "sellPrice"?, "itemLevel"?, "requiredLevel"?, "class"?, "subClass"?, "requiredSkill", "requiredSkillRank", "requiredSkillName"?, "requiredSpell"?, "requiredReputationFaction"?, "requiredReputationRank"?, "requiredReputationFactionName"?, "maxCount", "stackable", "containerSlots", "stats": [{ "type", "value" }], "damage": [{ "min": <f>, "max": <f>, "type" }], "armor", "resistances"?: { "holy"?, "fire"?, ... }, "speedMs", "spells": [{ "spellId", "trigger", "charges", "name"? }], "bonding", "description"?, "startQuest"?, "pageText"?, "block"?, "maxDurability" }` — everything from `requiredSkill` on is the tooltip (2026-08-29, FOLLOW-UPS 97), read in `HandleItemQuerySingleOpcode`'s order up to `MaxDurability`; sockets, gem properties, duration and holiday are left unread. Zero damage ranges and empty spell slots are dropped; `resistances` only when one is non-zero. Names on `requiredSkill`, `requiredReputationFaction` and each spell are client-cache (SkillLine.dbc, Faction.dbc, Spell.dbc) knowledge like the rest |
 
 Item name resolution mirrors creature/name queries: on first sight of an item
 entry (item create block, loot window, vendor list, item push, quest reward
@@ -891,7 +949,107 @@ knowledge, like item-template fields:
 | `SMSG_SPELL_COOLDOWN` | 0x134 | `{ "guid", "flags": <u8>, "cooldowns": [{ "spellId", "cooldownMs" }] }` — cooldowns that just started for `guid` (self or pet); `flags & 1` = the GCD was triggered too; a 0 ms entry is a GCD-only marker |
 | `SMSG_COOLDOWN_EVENT` | 0x135 | `{ "spellId", "guid" }` — "start the timer you already know for this spell": the duration is Spell.dbc knowledge the module does not serve |
 | `SMSG_CLEAR_COOLDOWN` | 0x1DE | `{ "spellId", "guid" }` |
-| `SMSG_TALENTS_INFO` | 0x4C0 | `{ "pet": false, "unspentPoints", "specCount", "activeSpec", "specs": [{ "talents": [{ "talentId", "rank" }] }] }` — `rank` is 0-based; glyph slots are consumed and not served. The pet form is `{ "pet": true }` only (no pet surface). Sent on login, level-up, after every `CMSG_LEARN_TALENT`, and on spec change |
+| `SMSG_TALENTS_INFO` | 0x4C0 | `{ "pet": false, "unspentPoints", "specCount", "activeSpec", "specs": [{ "talents": [{ "talentId", "rank" }] }] }` — `rank` is 0-based; glyph slots are consumed and not served. The pet form is `{ "pet": true }` only (the pet bar itself is `SMSG_PET_SPELLS`; pet talents have not been asked for). Sent on login, level-up, after every `CMSG_LEARN_TALENT`, on spec change, and after a successful talent reset |
+| `MSG_TALENT_WIPE_CONFIRM` | 0x2AA | `{ "guid", "cost": <u32 copper>, "nothingToReset": <bool> }` — the trainer's "unlearn all talents?" dialog (`Player::SendTalentWipeConfirm`) after its unlearn gossip option; a client answers yes by echoing the opcode with the guid (raw). `nothingToReset` is the guid-0/cost-0 form `HandleTalentWipeConfirmOpcode` sends back when there are no talents to reset or the money is short; a successful reset has no packet of its own — `SMSG_TALENTS_INFO` follows with every rank gone (2026-08-29, FOLLOW-UPS 96) |
+| `WB_TALENT_TREE` | 0xFF08 | `{ "class": <u8>, "unspentPoints": <u32>, "tabs": [{ "tabId", "name"?, "page", "talents": [{ "talentId", "name"?, "row", "col", "maxRank", "ranks": [<spellId> × maxRank], "dependsOn"?, "dependsOnRank"? }] }] }` — the answer to the `talent_tree` action: every TalentTab.dbc tab whose class mask holds the character's class, in page order, and every Talent.dbc row in it sorted by row then column. `name` on a tab is the client's TalentTab.dbc text (the module reads the file: `dbc/TalentTab.dbc`, 24 fields, record size 96, refused otherwise), on a talent the first rank spell's Spell.dbc name; `dependsOnRank` is 0-based. What the talent frame draws, nothing more — no icons, no tooltips, and no server-side state (the ranks learned are `SMSG_TALENTS_INFO`'s, joined by the SDK) |
+
+Reputation (2026-08-29, FOLLOW-UPS 99). The wire keys factions by their
+`Faction.dbc` reputation index (`repListId`), not the faction id; the module
+makes the same join a client does and adds the client's base standing for
+the character's race and class (`ReputationMgr::GetBaseReputation` is the
+same arithmetic over the same masks), so `reputation` = `base` + `standing`
+is the number the pane shows and the one the rank thresholds apply to
+(Hated < -6000, Hostile, Unfriendly < 0, Neutral, Friendly ≥ 3000, Honored
+≥ 9000, Revered ≥ 21000, Exalted ≥ 42000). `base` and `reputation` are
+absent only when the player object was not reachable at decode time:
+
+| opcode | id | `data` fields |
+|---|---|---|
+| `SMSG_INITIALIZE_FACTIONS` | 0x122 | `{ "count": <u32>, "factions": [{ "repListId", "flags": <u8>, "visible", "atWar", "factionId"?, "name"?, "standing": <i32>, "base"?, "reputation"? }] }` — the login list (`ReputationMgr::SendInitialReputations`): 128 positions, only those with a non-zero flag or standing served. `flags`: 1 visible, 2 at war, 4 hidden, 8 invisible-forced, 16 peace-forced, 32 inactive |
+| `SMSG_SET_FACTION_STANDING` | 0x124 | `{ "showVisual": <bool>, "factions": [{ "repListId", "factionId"?, "name"?, "standing", "base"?, "reputation"? }] }` — every faction whose standing changed since the last send (`ReputationMgr::SendState`); `showVisual` is the "reputation with X increased" chat line |
+| `SMSG_SET_FACTION_VISIBLE` | 0x123 | `{ "repListId", "factionId"?, "name"? }` — the faction joins the pane |
+
+`SMSG_SET_FACTION_ATWAR` and the at-war/inactive toggles a client sends are
+not tapped or allowlisted: nothing in a trajectory has asked for them.
+
+Pets (2026-08-29, FOLLOW-UPS 98). The pet frame is drawn from one packet plus
+the pet's own unit in view: `SMSG_PET_SPELLS` carries the control bar, the
+unit's update fields (`health`, `level`, `power1`, `summonedByGuid`,
+`petNumber` above) carry the rest, and the given name comes back from the
+name query the module fires on the pet number. Spell ids carry their
+Spell.dbc `name`/`rank` as everywhere. `SMSG_PET_MODE` exists in the opcode
+table but the core never sends it (`STATUS_NEVER`, no builder), so the react
+and command states are read off `SMSG_PET_SPELLS`, which the core re-sends on
+every change. Pet talents (`CMSG_PET_LEARN_TALENT`, the pet form of
+`SMSG_TALENTS_INFO`) and the stable are not served: nothing has asked.
+
+| opcode | id | `data` fields |
+|---|---|---|
+| `SMSG_PET_SPELLS` | 0x179 | `{ "guid", "removed": <bool> }` when the bar is removed (guid 0: the pet died, was dismissed or abandoned); otherwise `{ "guid", "removed": false, "family": <u16>, "durationMs": <u32>, "reactState": <u8>, "commandState": <u8>, "flags": <u16>, "actionBar": [{ "slot", "type": <u8>, "command"? | "reaction"? | "spellId"?, "autocast"?, "rank"?, "name"? }] × 10, "spells": [{ "spellId", "active": <u8>, "autocast", "rank"?, "name"? }], "cooldowns": [{ "spellId", "category", "cooldownMs", "categoryCooldownMs" }] }` — `Player::PetSpellInitialize` (and the possess / charm / vehicle variants, same layout). `type` is the wire's button type: 0x07 a command (0 stay, 1 follow, 2 attack, 3 abandon), 0x06 a react state (0 passive, 1 defensive, 2 aggressive), 0x01 / 0x81 / 0xC1 a spell (passive / castable / autocast on); `active` on a spell row is the same byte. `family` is CreatureFamily.dbc (0 for demons); `durationMs` 0 is a permanent pet. Sent on summon, tame, login with a pet out, and after every bar, react or autocast change |
+| `SMSG_PET_ACTION_FEEDBACK` | 0x2C6 | `{ "feedback": <u8> }` — 1 the pet is dead, 2 nothing to attack, 3 cannot attack that target |
+| `SMSG_PET_TAME_FAILURE` | 0x173 | `{ "result": <u8> }` — `PetTameFailure`: 1 invalid creature, 2 too many, 3 already owned, 4 not tameable, 5 another summon active, 6 units can't tame, 7 no pet available, 8 internal error, 9 too high level, 10 dead, 11 not dead, 12 can't control exotic, 13 unknown |
+| `SMSG_PET_CAST_FAILED` | 0x138 | `{ "spellId", "result": <u8>, "rank"?, "name"? }` — the `SMSG_CAST_FAILED` layout for a spell the pet was told to cast |
+| `SMSG_PET_NAME_QUERY_RESPONSE` | 0x053 | `{ "petNumber", "found": <bool>, "name"? }` — the given name for a pet number (the name timestamp and declined-name block are consumed and not served) |
+| `SMSG_PET_NAME_INVALID` | 0x178 | `{ "reason": <u32>, "name" }` — a rename the server refused (`PetNameInvalidReason`) |
+
+Group, mail, bank and trade (2026-08-29, FOLLOW-UPS 100): the replies to the
+raw-allowlisted client opcodes above, so a raw send is answered. Result codes
+are the core's enums (`PartyResult`, `MailResponseResult`, `TradeStatus`),
+served as numbers; the SDK names them.
+
+| opcode | id | `data` fields |
+|---|---|---|
+| `SMSG_GROUP_INVITE` | 0x06F | `{ "canAccept": <bool>, "inviterName" }` — `canAccept` true is an invitation (answer with `CMSG_GROUP_ACCEPT` / `CMSG_GROUP_DECLINE`); false is the "you were invited but are already in a group" notice the inviter's failed invite sends |
+| `SMSG_GROUP_DECLINE` | 0x074 | `{ "name" }` — to the inviter: that player declined |
+| `SMSG_GROUP_SET_LEADER` | 0x079 | `{ "name" }` — the new leader, broadcast to the group |
+| `SMSG_GROUP_UNINVITE` | 0x077 | `{}` — this character was removed from the group |
+| `SMSG_GROUP_DESTROYED` | 0x07C | `{}` — the group was disbanded |
+| `SMSG_PARTY_COMMAND_RESULT` | 0x07F | `{ "operation": <u32>, "name", "result": <u32>, "value": <u32> }` — `WorldSession::SendPartyResult`: `operation` 0 invite, 1 uninvite, 2 leave, 4 swap; `result` `PartyResult` (0 ok, 1 bad player name, 2 not in your group, 4 group full, 5 already in a group, 6 not in a group, 7 not the leader, 8 wrong faction, 9 ignoring you, …) |
+| `SMSG_GROUP_LIST` | 0x07D | `{ "groupType": <u8>, "left": <bool>, "raid": <bool>, "subGroup", "memberFlags", "roles", "groupGuid", "counter", "members": [{ "name", "guid", "online": <bool>, "subGroup", "flags": <u8>, "roles" }], "leaderGuid", "lootMethod"?, "looterGuid"?, "lootThreshold"?, "dungeonDifficulty"?, "raidDifficulty"? }` — `Group::SendUpdateToPlayer`: the *other* members (self is never listed), the leader and, when there are any, the loot settings. `left` is the 0x10 group type the core sends with an empty list and a zero leader when this character leaves or the group is disbanded. `flags` 1 assistant, 2 main tank, 4 main assist; the LFG state/dungeon pair on LFG groups is consumed |
+| `SMSG_SHOW_MAILBOX` | 0x297 | `{ "guid" }` — the mailbox frame opened on that game object (after `CMSG_GAMEOBJ_USE` / the `interact` action on a mailbox) |
+| `SMSG_RECEIVED_MAIL` | 0x285 | `{}` — "you have new mail" |
+| `SMSG_SEND_MAIL_RESULT` | 0x239 | `{ "mailId", "action": <u32>, "result": <u32>, "inventoryResult"?, "itemGuidLow"?, "count"? }` — `Player::SendMailResult`: `action` 0 send, 1 money taken, 2 item taken, 3 returned to sender, 4 deleted, 5 made permanent; `result` `MailResponseResult` (0 ok, 1 equip error — `inventoryResult` is the InventoryResult — 2 cannot send to self, 3 not enough money, 4 recipient not found, 5 not your team, 6 internal error, 15 recipient cap reached, 18 too many attachments, …); `itemGuidLow`/`count` on a taken item |
+| `SMSG_MAIL_LIST_RESULT` | 0x23B | `{ "total": <u32>, "count": <u8>, "mails": [{ "mailId", "type": <u8>, "senderGuid"? (type 0, a player) | "senderId"? (creature / gameobject entry, auction or calendar id), "cod", "stationery", "money", "flags", "read": <bool>, "daysLeft": <f32>, "templateId", "subject", "body", "items": [{ "index", "itemGuidLow", "itemId", "count" }] }] }` — `WorldSession::HandleGetMailList`; `total` counts mails the packet could not fit (the client's "undelivered mail" warning). Per-item enchantments, random property, charges and durability are consumed and not served; item entries are queried like a cache miss so `SMSG_ITEM_QUERY_SINGLE_RESPONSE` names them |
+| `SMSG_SHOW_BANK` | 0x1B8 | `{ "guid" }` — the bank frame opened at that banker (after `CMSG_BANKER_ACTIVATE` or the banker's gossip option). The slots themselves are `invSlot39`–`invSlot73` on self (28 bank slots, then 7 bank bag slots whose containers serve their own `bagSlot<n>` fields) |
+| `SMSG_BUY_BANK_SLOT_RESULT` | 0x1BA | `{ "result": <u32> }` — 0 failed (too many), 1 not enough money, 2 not a banker, 3 ok |
+| `SMSG_TRADE_STATUS` | 0x120 | `{ "status": <u32>, "traderGuid"? (status 1), "inventoryResult"?, "targetError"?, "limitedItemId"? (status 12), "slot"? (22, 23) }` — `TradeStatus`: 0 busy, 1 begin trade (the other player proposed), 2 window open, 3 canceled, 4 accepted, 6 no target, 7 back to trade, 8 complete, 9 rejected, 10 too far, 11 wrong faction, 12 close window, 14 ignoring you, 15/16 stunned, 17/18 dead, 19/20 logging out, 21 trial account |
+| `SMSG_TRADE_STATUS_EXTENDED` | 0x121 | `{ "theirs": <bool>, "money", "spellId", "items": [{ "slot", "itemId", "count", "wrapped": <bool> }] }` — one side of the trade window (`theirs` false is own); slot 6 is the "will not be traded" enchant slot; empty slots and the per-item enchant / gem / creator / durability block are consumed and not served |
+
+Group loot rolls (2026-08-29, FOLLOW-UPS 102): the roll frame a group-looted
+corpse opens for each item at or above the group's loot threshold
+(`Group::GroupLoot`; uncommon by default, and the threshold cannot be set
+lower). A roll is keyed by the fresh item guid the core mints for it
+(`rollGuid`), which is what `CMSG_LOOT_ROLL` names. Every packet carries the
+item entry, queried like a cache miss so the SDK can name it.
+
+| opcode | id | `data` fields |
+|---|---|---|
+| `SMSG_LOOT_START_ROLL` | 0x2A1 | `{ "rollGuid", "slot", "itemId", "count", "countdownMs", "voteMask": <u8>, "canNeed": <bool>, "canGreed": <bool>, "canDisenchant": <bool> }` — the frame opens; pass is always allowed. The per-player form drops the need bit when this character cannot need. Map id, random suffix and property are consumed and not served |
+| `SMSG_LOOT_ROLL` | 0x2A2 | `{ "rollGuid", "slot", "playerGuid", "itemId", "roll": <u8>, "rollType": <u8>, "autoPass": <bool> }` — one counted vote, to every voter; `roll` 1-100, 128 for a pass; `rollType` 0 pass, 1 need, 2 greed, 3 disenchant. The *first* of these after a vote is only `Group::CountRollVote`'s acknowledgement of the button, and it is not a roll: need is acked as `roll` 0 with `rollType` 0 (which is pass), and greed / disenchant / pass as `roll` 128 with their own type. The numbers actually rolled arrive later, one per need (or per greed) voter, from `Group::CountTheRoll` once every vote is in. `rollGuid` is `"0"` here: the core writes `ObjectGuid::Empty` as the source (Group::CountRollVote / CountTheRoll), so `slot` + `itemId` name the roll |
+| `SMSG_LOOT_ROLL_WON` | 0x29F | `{ "rollGuid", "slot", "itemId", "winnerGuid", "roll": <u8>, "rollType": <u8> }` — the verdict. No `SMSG_ITEM_PUSH_RESULT` follows: `Group::CountTheRoll` stores the won item with `StoreNewItem` and never calls `SendNewItem` (Group.cpp has no such call), so the item shows up only in the object update the bag fold reads. `rollGuid` is `"0"` here too (same source field); `SMSG_LOOT_ALL_PASSED` and `SMSG_LOOT_START_ROLL` carry the real guid |
+| `SMSG_LOOT_ALL_PASSED` | 0x29E | `{ "rollGuid", "slot", "itemId" }` — everyone passed; the item stays on the corpse |
+| `SMSG_LOOT_MASTER_LIST` | 0x2A4 | `{ "looters": [{ "guid" }] }` — under master loot, who the master looter may assign an over-threshold item to |
+
+Item text (2026-08-29, FOLLOW-UPS 103): a client reads a book or letter with
+`CMSG_READ_ITEM`, and on the server's `SMSG_READ_ITEM_OK` asks
+`CMSG_PAGE_TEXT_QUERY` for the template's `pageText` (served on the item
+query above), which the core answers page by page down the `NextPage` chain
+in one go. The player-written text on a mailed letter is a different query
+(`CMSG_ITEM_TEXT_QUERY`). `SMSG_ITEM_TEXT_QUERY_RESPONSE` is the only reply
+to the latter; the core never sends it for books. Text only — no
+coordinates ride any of these.
+
+| opcode | id | `data` fields |
+|---|---|---|
+| `SMSG_READ_ITEM_OK` | 0x0AE | `{ "guid" }` — the item may be read; the pages follow the client's page query |
+| `SMSG_READ_ITEM_FAILED` | 0x0AF | `{ "guid" }` — the item has pages but this character may not read it (`SMSG_INVENTORY_CHANGE_FAILURE` precedes it with the reason). An item with no pages answers `SMSG_INVENTORY_CHANGE_FAILURE` alone (`EQUIP_ERR_ITEM_NOT_FOUND`) |
+| `SMSG_PAGE_TEXT_QUERY_RESPONSE` | 0x05B | `{ "pageId", "text", "nextPageId" }` — one page; `nextPageId` 0 is the last. A missing page is served as the core's own "Item page missing." text |
+| `SMSG_ITEM_TEXT_QUERY_RESPONSE` | 0x244 | `{ "found": <bool>, "guid"?, "text"? }` — `found` false is "no such carried item"; a carried item with nothing written on it answers `found` true with an empty `text` |
+
+The auction house stays outside both lists: `CMSG_AUCTION_*` is not
+allowlisted and no auction reply is tapped (operator decision 2026-08-29:
+deferred, with the dungeon finder, guilds, battlegrounds, glyphs, dual spec
+and equipment sets, until single-player play is validated; docs/CONTRACTS.md).
 
 Achievements and flight paths (2026-08-25, issue #8 first half):
 
@@ -900,6 +1058,7 @@ Achievements and flight paths (2026-08-25, issue #8 first half):
 | `SMSG_ACHIEVEMENT_EARNED` | 0x468 | `{ "guid", "self": <bool>, "achievement": { "achievementId", "date": <u32>, "time": "YYYY-MM-DD HH:MM", "name"?, "points"?, "categoryId"? } }` — the core broadcasts this in say range, so `guid` may be another player's; `self` is the equality with the session's own guid, nothing more |
 | `SMSG_ALL_ACHIEVEMENT_DATA` | 0x47D | `{ "count", "achievements": [ <same achievement object> ] }` — sent to self once during login: every achievement already earned. Only the completed block (to its 0xFFFFFFFF terminator) is decoded; the criteria-progress block that follows is consumed and not served |
 | `SMSG_ACTIVATETAXIREPLY` | 0x1AE | `{ "reply": <u32>, "ok": <bool> }` — the answer to `CMSG_ACTIVATETAXI[EXPRESS]` (raw). `ActivateTaxiReply`: 0 ok, 1 server error, 2 no such path, 3 not enough money, 4 too far away, 5 no vendor nearby, 6 not visited, 7 busy, 8 mounted, 9 shapeshifted, 10 moving, 11 same node, 12 not standing |
+| `SMSG_SHOWTAXINODES` | 0x1A9 | `{ "showWindow": <bool>, "guid", "currentNode": <u32>, "currentNodeName"?: <str>, "mask": [<u32> × 14], "known": [{ "nodeId": <u32>, "name"?: <str> }] }` — the flight master's window (`WorldSession::SendTaxiMenu`), sent when the taxi option of the master's gossip menu is chosen: the leading u32 (1 = show), the master's guid, the node it stands at, and the character's taximask verbatim (`TaxiMaskSize` 14 words; node *n* is bit `(n-1)%32` of word `(n-1)/32`). `known` is that mask decoded — the nodes this character has visited, the only destinations the server will sell — each named as the client names it from its own `TaxiNodes.dbc`. No route, fare or position is served |
 
 `date` is the wire's packed bitfield (`AppendPackedTime`: `(year-2000)<<24 |
 month<<20 | (day-1)<<14 | weekday<<11 | hour<<6 | minute`); `time` is its
@@ -914,9 +1073,35 @@ The flight itself has no event: `taxiFlight` on self in `SMSG_UPDATE_OBJECT`
 `fields` (below) is `UNIT_FLAG_TAXI_FLIGHT` read off `unitFlags`, so a
 `reply` of 0 followed by `taxiFlight: true` is the flight starting and the
 flip back to `false` is the landing, exactly as a client sees them. Nothing is
-inferred from the server's taxi state. `SMSG_CRITERIA_UPDATE` (0x46A),
-`SMSG_SHOWTAXINODES` and `SMSG_TAXINODE_STATUS` are not tapped: the agent finds
-flight masters the way it finds anything, and learns a node by visiting it.
+inferred from the server's taxi state. `SMSG_CRITERIA_UPDATE` (0x46A) and
+`SMSG_TAXINODE_STATUS` are not tapped: the agent finds flight masters the way
+it finds anything, and learns a node by visiting it.
+
+The window (2026-08-29, FOLLOW-UPS 38 N3): `SMSG_SHOWTAXINODES` is the one
+packet that tells a client what a flight master offers, and the client only
+ever gets it by choosing the taxi option on the master's gossip menu
+(`gossip_hello` then `gossip_select`; a master with no other menu entries
+sends it straight from the hello). Node names come from `TaxiNodes.dbc` on
+the data volume (`dbc/TaxiNodes.dbc`, 24 fields, record size 96; the loader
+refuses any other layout) and are ids only when it is absent — the same
+client-cache class as area and achievement names. The node positions the
+same table carries are deliberately not served, and `TaxiPath.dbc` is never
+read: which nodes connect, and for how much, the character learns by asking
+(`CMSG_ACTIVATETAXI` with the window's current node and a known node, body
+`u64 guid, u32 from, u32 to`, through raw).
+
+Innkeeper bind (2026-08-29, FOLLOW-UPS 38 N2) — the sequence a client runs
+when "Make this inn your home." is chosen:
+
+| opcode | id | `data` fields |
+|---|---|---|
+| `SMSG_BINDER_CONFIRM` | 0x2EB | `{ "guid" }` — the innkeeper asks; a client shows a yes/no dialog and answers yes with `CMSG_BINDER_ACTIVATE` (raw, body `u64 guid`) |
+| `SMSG_BINDPOINTUPDATE` | 0x155 | `{ "x", "y", "z", "map": <u32>, "areaId": <u32>, "areaName": <str> }` — where the hearthstone goes: once during login (`Player::SendInitialPacketsBeforeAddToMap`) and again after every bind (`Spell::EffectBind`). `areaName` is the client's `AreaTable.dbc` text for the id, `""` when it has no row |
+| `SMSG_PLAYERBOUND` | 0x158 | `{ "guid", "areaId", "areaName" }` — the "your home is now …" line; `guid` is the binder |
+
+The server declines a bind silently (not an innkeeper, out of range, dead,
+inside an instance): no packet follows the confirm, and the SDK reports that
+as the absence of an answer, never as a status.
 
 Death:
 
@@ -927,7 +1112,7 @@ Death:
 | `SMSG_DURABILITY_DAMAGE_DEATH` | 0x2BD | `{}` |
 | `MSG_CORPSE_QUERY` | 0x216 | `{ "found": <bool>, "map"?, "x"?, "y"?, "z"?, "corpseMap"? }` — the server's answer to the ghost's corpse query (`HandleCorpseQueryOpcode`); position fields only when `found`. `map`/`x`/`y`/`z` is where a client draws the corpse marker, `corpseMap` the map the corpse is actually on; they differ only for a corpse inside a dungeon, where the marker sits on the entrance. The trailing unused u32 is consumed |
 
-A ghost knows where its corpse is (2026-08-23, FOLLOW-UPS 53): a real client
+A ghost knows where its corpse is (2026-08-23, closed item 53 — `../docs/worklogs/2026-08-23.md`): a real client
 sends `MSG_CORPSE_QUERY` as soon as it is a ghost and the answer is the corpse
 marker on its map. The parked client has no map, so the module sends the same
 one query per death, once the repop teleport has been acked (the handler
@@ -955,7 +1140,7 @@ spline path points the client receives are consumed and dropped, because
 serving them would hand the agent the server's route in machine-readable form.
 A client player only sees the animation.
 
-Map transfers (navigation, 2026-08, FOLLOW-UPS 38 N1):
+Map transfers (navigation, 2026-08, FOLLOW-UPS item 38, N1):
 
 | opcode | id | `data` fields |
 |---|---|---|
@@ -975,7 +1160,15 @@ teleport: `teleported`, with the arrival on `MSG_MOVE_TELEPORT_ACK`).
 Served in `SMSG_UPDATE_OBJECT` `fields` alongside the existing set:
 
 - players (self only; the server marks these PRIVATE): `money` (copper),
-  `xp`, `nextLevelXp`; quest log as raw fields `quest<slot><Off>` with slot
+  `xp`, `nextLevelXp`, `talentPoints` (`PLAYER_CHARACTER_POINTS1`, the
+  unspent count); the skill pane (2026-08-29, FOLLOW-UPS 95) as raw fields
+  `skill<slot><Off>` with slot 0-127 (`PLAYER_SKILL_INFO_1_1`, three packed
+  u32s per line) and Off one of `Id`/`Step` (low/high u16 of the first),
+  `Value`/`Max` (the second), `TempBonus`/`PermBonus` (the third, as signed
+  i16), plus `skill<slot>Name`, a string beside each non-zero id with the
+  client's SkillLine.dbc text — the one non-numeric entry `fields` carries;
+  the SDK lifts it into its skill rows. There is no dedicated skill opcode in
+  3.3.5: every change is a values update on these fields. Quest log as raw fields `quest<slot><Off>` with slot
   0-24 and Off one of `Id`, `State`, `CountsLo`, `CountsHi`, `Time` (the
   3.3.5 layout: two u32s of packed u16 objective counters); inventory as
   `invSlot<n>Lo`/`invSlot<n>Hi` u32 guid halves, n 0-22 = equipment + bag
@@ -983,7 +1176,7 @@ Served in `SMSG_UPDATE_OBJECT` `fields` alongside the existing set:
   item create blocks.
 - items and containers: `stackCount`, `durability`, `maxDurability`,
   `itemFlags`, `ownerLo`/`ownerHi`, `containedLo`/`containedHi`.
-- containers only (worn bags, FOLLOW-UPS 50): `numSlots`
+- containers only (worn bags, closed item 50 — `../docs/worklogs/2026-08-23.md`): `numSlots`
   (`CONTAINER_FIELD_NUM_SLOTS`) and the bag's contents as
   `bagSlot<n>Lo`/`bagSlot<n>Hi` u32 guid halves, n 0-35
   (`CONTAINER_FIELD_SLOT_1`, 36 guid pairs). PUBLIC fields every client in

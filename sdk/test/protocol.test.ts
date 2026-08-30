@@ -140,6 +140,15 @@ describe("event frames", () => {
       "SMSG_LOOT_MONEY_NOTIFY",
       "SMSG_LOOT_CLEAR_MONEY",
       "SMSG_LOOT_RELEASE_RESPONSE",
+      "SMSG_LOOT_START_ROLL",
+      "SMSG_LOOT_ROLL",
+      "SMSG_LOOT_ROLL_WON",
+      "SMSG_LOOT_ALL_PASSED",
+      "SMSG_LOOT_MASTER_LIST",
+      "SMSG_READ_ITEM_OK",
+      "SMSG_READ_ITEM_FAILED",
+      "SMSG_PAGE_TEXT_QUERY_RESPONSE",
+      "SMSG_ITEM_TEXT_QUERY_RESPONSE",
       "SMSG_LIST_INVENTORY",
       "SMSG_BUY_ITEM",
       "SMSG_BUY_FAILED",
@@ -157,9 +166,39 @@ describe("event frames", () => {
       "SMSG_COOLDOWN_EVENT",
       "SMSG_CLEAR_COOLDOWN",
       "SMSG_TALENTS_INFO",
+      "MSG_TALENT_WIPE_CONFIRM",
+      "WB_TALENT_TREE",
+      "SMSG_INITIALIZE_FACTIONS",
+      "SMSG_SET_FACTION_STANDING",
+      "SMSG_SET_FACTION_VISIBLE",
+      "SMSG_PET_SPELLS",
+      "SMSG_PET_ACTION_FEEDBACK",
+      "SMSG_PET_TAME_FAILURE",
+      "SMSG_PET_CAST_FAILED",
+      "SMSG_PET_NAME_QUERY_RESPONSE",
+      "SMSG_PET_NAME_INVALID",
+      "SMSG_GROUP_INVITE",
+      "SMSG_GROUP_DECLINE",
+      "SMSG_GROUP_SET_LEADER",
+      "SMSG_GROUP_UNINVITE",
+      "SMSG_GROUP_DESTROYED",
+      "SMSG_PARTY_COMMAND_RESULT",
+      "SMSG_GROUP_LIST",
+      "SMSG_SHOW_MAILBOX",
+      "SMSG_RECEIVED_MAIL",
+      "SMSG_SEND_MAIL_RESULT",
+      "SMSG_MAIL_LIST_RESULT",
+      "SMSG_SHOW_BANK",
+      "SMSG_BUY_BANK_SLOT_RESULT",
+      "SMSG_TRADE_STATUS",
+      "SMSG_TRADE_STATUS_EXTENDED",
       "SMSG_ACHIEVEMENT_EARNED",
       "SMSG_ALL_ACHIEVEMENT_DATA",
       "SMSG_ACTIVATETAXIREPLY",
+      "SMSG_SHOWTAXINODES",
+      "SMSG_BINDER_CONFIRM",
+      "SMSG_BINDPOINTUPDATE",
+      "SMSG_PLAYERBOUND",
       "SMSG_DEATH_RELEASE_LOC",
       "SMSG_CORPSE_RECLAIM_DELAY",
       "SMSG_DURABILITY_DAMAGE_DEATH",
@@ -170,9 +209,9 @@ describe("event frames", () => {
     expect(isKnownOpcode("SMSG_MESSAGECHAT")).toBe(true);
     expect(isKnownOpcode("SMSG_UPDATE_OBJECT")).toBe(true);
     // An opcode outside the whitelist stays unknown (and still streams, as
-    // `UnknownEvent`). SMSG_TRAINER_LIST used to stand here; it is whitelisted
+    // `UnknownEvent`). SMSG_TRAINER_LIST and then SMSG_TRADE_STATUS stood here; both are whitelisted
     // now, so the negative case moved to one the module does not serve.
-    expect(isKnownOpcode("SMSG_TRADE_STATUS")).toBe(false);
+    expect(isKnownOpcode("SMSG_AUCTION_LIST_RESULT")).toBe(false);
   });
 
   test("every observed MSG_MOVE_* name shares the one movement payload", () => {

@@ -83,6 +83,24 @@ namespace WrathBench
         uint32 categoryId{0};       // Achievement_Category.dbc id
     };
 
+    // One TaxiNodes.dbc record (3.3.5a). Client-side knowledge: the client
+    // names the flight-master window's nodes from this table.
+    struct TaxiNodeRec
+    {
+        uint32 mapId{0};
+        std::string name;           // enUS column
+    };
+
+    // One TalentTab.dbc record (3.3.5a). Client-side knowledge: the tab
+    // names ("Arms", "Fury", ...) the talent frame draws; the core's own
+    // store drops the name column, so the module reads the file itself.
+    struct TalentTabRec
+    {
+        std::string name;           // enUS column
+        uint32 classMask{0};
+        uint32 page{0};
+    };
+
     // Per-session synthesized-movement state. Touched only on the
     // world thread (DoMoveTo/DoStop/DoFace and the Update tick), so unlocked.
     struct MoveState
@@ -204,6 +222,7 @@ namespace WrathBench
         std::unordered_set<uint32_t> queriedCreatures;           // creature entries
         std::unordered_set<uint64_t> queriedNames;               // player guids
         std::unordered_set<uint32_t> queriedItems;               // item entries
+        std::unordered_set<uint32_t> queriedPetNumbers;          // pet numbers whose name was asked (FOLLOW-UPS 98)
         std::unordered_set<uint32_t> queriedGameObjects;         // gameobject entries
 
         // loot_all: on the next SMSG_LOOT_RESPONSE the tap replays the client's
@@ -321,6 +340,33 @@ namespace WrathBench
         bool LoadAchievementDbc(std::string const& path);
         std::unordered_map<uint32, AchievementRec> _achievements;
         bool _achievementsLoaded{false};
+        // TaxiNodes.dbc as the client ships it (FOLLOW-UPS 38 N3): the name
+        // the client draws for each node id in SMSG_SHOWTAXINODES. Ids only
+        // when the file is absent. Never TaxiPath: routes stay the server's.
+        bool LoadTaxiNodesDbc(std::string const& path);
+        std::unordered_map<uint32, TaxiNodeRec> _taxiNodes;
+        bool _taxiNodesLoaded{false};
+        // TalentTab.dbc as the client ships it (FOLLOW-UPS 96): tab names for
+        // the talent tree the `talent_tree` action serves. Ids only when the
+        // file is absent; the tree itself comes from the core's Talent.dbc
+        // and TalentTab.dbc stores (the same files a client reads).
+        bool LoadTalentTabDbc(std::string const& path);
+        std::unordered_map<uint32, TalentTabRec> _talentTabs;
+        bool _talentTabsLoaded{false};
+        // Faction.dbc reputation index -> faction id, built once at startup
+        // from the core's store (FOLLOW-UPS 99). The wire carries the index
+        // (SMSG_INITIALIZE_FACTIONS position, SMSG_SET_FACTION_STANDING
+        // entries); a client names it through this table.
+        std::unordered_map<uint32, uint32> _repListToFaction;
+        // One `{ repListId, factionId, name, standing, base, reputation }`
+        // object: `standing` is the wire value, `base` the client's
+        // Faction.dbc base for this race/class, `reputation` their sum (what
+        // the reputation pane shows). Tap threads; `player` may be null.
+        std::string FactionJson(uint32 repListId, int32 standing, Player* player) const;
+        // The class talent tree as the client's talent frame renders it
+        // (`talent_tree` action, WB_TALENT_TREE). World thread only.
+        std::string TalentTreeJson(Player* player) const;
+        void DoTalentTree(std::string token, std::shared_ptr<std::promise<HttpReply>> ack);
         // One `{ achievementId, date, time, name?, points?, categoryId? }`
         // object; `date` is the wire's packed bitfield, `time` its reading.
         std::string AchievementJson(uint32 id, uint32 packedDate) const;

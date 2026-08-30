@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { connect, meshZHint, WrathRequestError, WrathTransportError } from "../src/client";
+import { connect, inventoryResultText, meshZHint, WrathRequestError, WrathTransportError } from "../src/client";
 import { EventAbortedError, EventTimeoutError } from "../src/events";
 import {
   addKill,
@@ -24,6 +24,9 @@ import {
   inventorySlotCleared,
   inventorySlotMove,
   ITEM_ENTRY,
+  ITEM_GUID,
+  ITEM_GUID_HI,
+  ITEM_GUID_LO,
   itemCreate,
   itemPushed,
   itemQuery,
@@ -38,6 +41,8 @@ import {
   transferPending,
   offerReward,
   OTHER_QUEST_ID,
+  playerCreate,
+  playerName,
   PLAYER_GUID,
   QUEST_ID,
   questAccepted,
@@ -58,6 +63,10 @@ import {
   trainerBuyFailed,
   trainerBuySucceeded,
   trainerList,
+  CHEST_GUID,
+  castFailed,
+  chestCreate,
+  chestLootResponse,
 } from "./fixtures";
 import { startStub, type StubServer } from "./server";
 
@@ -278,8 +287,12 @@ describe("client: movement", () => {
     // shape earns: two numbers are a half-written point, not a guid.
     // @ts-expect-error — deliberately wrong
     await expect(client.moveTo(-1205, 981)).rejects.toThrow(/needs a point object \{ x, y, z \}, got number/);
-    // A string is a guid-shaped argument now, so this is rejected as a guid.
-    await expect(client.moveTo("here")).rejects.toThrow(/neither a point nor a decimal guid string/);
+    // A non-numeric string is a name now: nothing in view answers to it, and
+    // moveTo answers an unresolvable target with a value, not a throw.
+    expect(await client.moveTo("here")).toMatchObject({ ok: false, status: "unknown_target" });
+    // A malformed guid on a unit-shaped object is still the loud reject.
+    // @ts-expect-error — deliberately wrong
+    await expect(client.moveTo({ guid: "12abc34" })).rejects.toThrow(/neither a point nor a decimal guid string/);
 
     client.close();
     await stub.stop();
@@ -342,6 +355,58 @@ describe("client: movement", () => {
       client.close();
       await stub.stop();
     }
+  });
+
+  test("hint-bearing failures are tallied per status on the client's own channel and drained once", async () => {
+    // The hint rides inside the result object, so a snippet that keeps only
+    // `.status` never shows it to the model (run a11: 41 `too_far`, hint read 0
+    // times). The client records it as well; the sandbox drains this.
+    const stub = startStub({ onConnect: () => frames(loginSequence) });
+    const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+    await client.createSession({ character: "Fenwick" });
+    expect(client.drainActionHints()).toEqual([]);
+
+    for (let i = 0; i < 3; i++) {
+      const pending = client.moveTo({ x: 10 + i, y: 20, z: 30 }, { timeout: 2000 });
+      stub.push(JSON.stringify(moveResult("too_far", i + 1, 30 + i)));
+      await pending;
+    }
+    const p = client.moveTo({ x: 99, y: 98, z: 97 }, { timeout: 2000 });
+    stub.push(JSON.stringify(moveResult("target_off_mesh", 4, 40)));
+    await p;
+    // An arrival is not a hint-bearing failure and must not be recorded.
+    const ok = client.moveTo({ x: 1, y: 2, z: 3 }, { timeout: 2000 });
+    stub.push(JSON.stringify(moveResult("arrived", 5, 41)));
+    await ok;
+
+    const drained = client.drainActionHints();
+    expect(drained.length).toBe(2);
+    const tooFar = drained.find((h) => h.status === "too_far");
+    expect(tooFar?.action).toBe("moveTo");
+    expect(tooFar?.count).toBe(3);
+    // The last occurrence's hint and point: nearest to where the character is.
+    expect(tooFar?.point).toEqual({ x: 12, y: 20, z: 30 });
+    expect(tooFar?.hint).toContain("a single moveTo covers ~250y");
+    expect(drained.find((h) => h.status === "target_off_mesh")?.count).toBe(1);
+    // Drained exactly once.
+    expect(client.drainActionHints()).toEqual([]);
+
+    client.close();
+    await stub.stop();
+  });
+
+  test("a moveTo to an unknown target is recorded too, and its hint is the one the caller got", async () => {
+    const stub = startStub({ onConnect: () => frames(loginSequence) });
+    const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+    await client.createSession({ character: "Fenwick" });
+    const r = await client.moveTo("999999999");
+    expect(r.ok).toBe(false);
+    const drained = client.drainActionHints();
+    expect(drained.length).toBe(1);
+    expect(drained[0]?.status).toBe("unknown_target");
+    expect(drained[0]?.hint).toBe(r.ok ? undefined : r.hint);
+    client.close();
+    await stub.stop();
   });
 
   test("a refused stop after a failed move never masks the move verdict", async () => {
@@ -1006,6 +1071,7 @@ async function untilAction(stub: StubServer, action: string, from = 0): Promise<
 }
 
 const combatWorld = () => frames([...loginSequence, selfCreate, creatureCreate, creatureQuery]);
+const chestWorld = () => frames([...loginSequence, selfCreate, chestCreate]);
 
 describe("client: killTarget", () => {
   test("targets, faces, swings, and settles when the target's health hits zero", async () => {
@@ -1139,7 +1205,7 @@ describe("client: killTarget", () => {
   test("a guid string that does not parse is rejected before any opcode", async () => {
     const stub = startStub({ onConnect: () => combatWorld() });
     const client = await inWorld(stub);
-    await expect(client.killTarget("Kobold Worker")).rejects.toThrow(/killTarget\(guid\).*decimal guid string/s);
+    await expect(client.killTarget("Kobold Worker")).rejects.toThrow(/neither a decimal guid nor the name of anything in view/);
     expect(stub.actions).toHaveLength(0);
     client.close();
     await stub.stop();
@@ -1372,6 +1438,79 @@ describe("client: killTarget", () => {
     expect(stub.actions.filter((a) => a.action === "attack_start")).toHaveLength(1);
     stub.push(JSON.stringify(creatureHealth(0, 97)));
     expect((await fight).ok).toBe(true);
+    client.close();
+    await stub.stop();
+  });
+});
+
+describe("client: chests", () => {
+  test("interact on a chest is refused with the way that works", async () => {
+    const stub = startStub({ onConnect: () => chestWorld() });
+    const client = await inWorld(stub);
+    await client.waitForNearby((o) => o.guid === CHEST_GUID, { timeout: 2000 });
+    const res = await client.interact(CHEST_GUID);
+    expect(res).toMatchObject({ ok: false, status: "chest" });
+    if (res.ok) throw new Error("unreachable");
+    expect(res.hint).toContain("lootCorpse");
+    expect(stub.actions.map((a) => a.action)).not.toContain("interact");
+    client.close();
+    await stub.stop();
+  });
+
+  test("lootCorpse on a chest casts the Opening ladder, then empties the window the client's way", async () => {
+    const stub = startStub({ onConnect: () => chestWorld() });
+    const client = await inWorld(stub);
+    await client.waitForNearby((o) => o.guid === CHEST_GUID, { timeout: 2000 });
+    const pending = client.lootCorpse(CHEST_GUID, { timeout: 2000 });
+    // Open Kneeling (6478) first; the lock is a plain "Open" (5), so the
+    // server refuses it before the cast starts and the ladder moves on.
+    const first = await untilAction(stub, "cast_spell");
+    expect(stub.actions[first]).toMatchObject({ action: "cast_spell", spellId: 6478, targetGuid: CHEST_GUID });
+    stub.push(JSON.stringify(castFailed(70, 6478)));
+    const second = await untilAction(stub, "cast_spell", first + 1);
+    expect(stub.actions[second]).toMatchObject({ action: "cast_spell", spellId: 3365, targetGuid: CHEST_GUID });
+    stub.push(JSON.stringify(chestLootResponse(71, 25)));
+    await untilAction(stub, "loot_release");
+    stub.push(JSON.stringify(itemPushed(72)));
+    stub.push(JSON.stringify(lootRelease(73)));
+    const loot = await pending;
+    expect(loot).toMatchObject({ ok: true, status: "looted", gold: 25, items: [{ itemId: ITEM_ENTRY, count: 1 }] });
+    // The auto-loot sequence is sent from the SDK: no loot_all (CMSG_LOOT is
+    // dropped for a game object guid), one store per slot, money, release.
+    const after = stub.actions.slice(second + 1).map((a) => a.action);
+    expect(after).toEqual(["loot_item", "loot_money", "loot_release"]);
+    expect(stub.actions.map((a) => a.action)).not.toContain("loot_all");
+    client.close();
+    await stub.stop();
+  });
+
+  test("a chest no open-hand spell fits is not_opened, with the last refusal", async () => {
+    const stub = startStub({ onConnect: () => chestWorld() });
+    const client = await inWorld(stub);
+    await client.waitForNearby((o) => o.guid === CHEST_GUID, { timeout: 2000 });
+    const pending = client.lootCorpse(CHEST_GUID, { timeout: 2000 });
+    let from = 0;
+    for (const [i, spellId] of [6478, 3365, 6247, 6477].entries()) {
+      from = (await untilAction(stub, "cast_spell", from)) + 1;
+      stub.push(JSON.stringify(castFailed(80 + i, spellId)));
+    }
+    const loot = await pending;
+    expect(loot).toMatchObject({ ok: false, status: "not_opened", reason: 12, items: [] });
+    expect(stub.actions.filter((a) => a.action === "cast_spell")).toHaveLength(4);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a refusal other than bad-targets ends the ladder at once", async () => {
+    const stub = startStub({ onConnect: () => chestWorld() });
+    const client = await inWorld(stub);
+    await client.waitForNearby((o) => o.guid === CHEST_GUID, { timeout: 2000 });
+    const pending = client.lootCorpse(CHEST_GUID, { timeout: 2000 });
+    await untilAction(stub, "cast_spell");
+    stub.push(JSON.stringify(castFailed(70, 6478, 45))); // SPELL_FAILED_MOVING
+    const loot = await pending;
+    expect(loot).toMatchObject({ ok: false, status: "not_opened", reason: 45 });
+    expect(stub.actions.filter((a) => a.action === "cast_spell")).toHaveLength(1);
     client.close();
     await stub.stop();
   });
@@ -2000,6 +2139,40 @@ describe("client: equipItem", () => {
     await stub.stop();
   });
 
+  test("a refusal is recorded for the harness, not only returned", async () => {
+    const stub = startStub({ onConnect: () => bagWorld() });
+    const client = await inWorld(stub);
+    const pending = client.equipItem(255, BACKPACK_SLOT, { timeout: 2000 });
+    await untilAction(stub, "equip_item");
+    // 60 is EQUIP_ERR_NOT_IN_COMBAT — the code a run reverse-engineered from
+    // context because nothing ever named it (FOLLOW-UPS 101a).
+    stub.push(JSON.stringify(inventoryChangeFailure(78, 60)));
+    const result = await pending;
+    if (result.ok || result.status !== "not_equipped") throw new Error("unreachable");
+    expect(result.hint).toContain("not while in combat");
+    const drained = client.drainActionHints();
+    expect(drained).toHaveLength(1);
+    expect(drained[0]!.action).toBe("equipItem");
+    expect(drained[0]!.status).toBe("not_equipped");
+    expect(drained[0]!.hint).toContain("not while in combat");
+    // Drained means drained: a second read is empty.
+    expect(client.drainActionHints()).toEqual([]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("an unconfirmed equip is recorded for the harness too", async () => {
+    const stub = startStub({ onConnect: () => bagWorld() });
+    const client = await inWorld(stub);
+    const result = await client.equipItem(255, BACKPACK_SLOT, { timeout: 60 });
+    expect(result.ok).toBe(false);
+    const drained = client.drainActionHints();
+    expect(drained).toHaveLength(1);
+    expect(drained[0]!.status).toBe("unconfirmed");
+    client.close();
+    await stub.stop();
+  });
+
   test("silence is unconfirmed, not success", async () => {
     const stub = startStub({ onConnect: () => bagWorld() });
     const client = await inWorld(stub);
@@ -2010,6 +2183,32 @@ describe("client: equipItem", () => {
     expect(result.hint).toContain("state.bag()");
     client.close();
     await stub.stop();
+  });
+});
+
+describe("inventoryResultText", () => {
+  test("names the codes runs actually hit, and stays silent on the rest", () => {
+    // Spot checks against the pinned core's Item.h EQUIP_ERR_* list.
+    expect(inventoryResultText(60)).toBe("not while in combat");
+    expect(inventoryResultText(50)).toBe("your bags are full");
+    expect(inventoryResultText(1)).toContain("level is too low");
+    expect(inventoryResultText(8)).toContain("proficiency");
+    expect(inventoryResultText(88)).toContain("talent");
+    // OK, NONE and the enum's gap carry no client string, so neither do we,
+    // and an out-of-range code is never guessed at.
+    expect(inventoryResultText(0)).toBeUndefined();
+    expect(inventoryResultText(59)).toBeUndefined();
+    expect(inventoryResultText(83)).toBeUndefined();
+    expect(inventoryResultText(999)).toBeUndefined();
+  });
+
+  test("every named code is a short sentence, never advice", () => {
+    for (let code = 1; code <= 89; code++) {
+      const text = inventoryResultText(code);
+      if (text === undefined) continue;
+      expect(text.length).toBeLessThanOrEqual(120);
+      expect(text).not.toContain("InventoryResult");
+    }
   });
 });
 
@@ -2086,6 +2285,217 @@ describe("guids are opaque decimal strings: guid arguments at the client surface
     expect(result.guid).toBe(CREATURE_GUID);
     expect(typeof result.guid).toBe("string");
     expect(() => JSON.stringify(result)).not.toThrow();
+    client.close();
+    await stub.stop();
+  });
+});
+
+describe("client: flight master window and activateTaxi (item 38 N3)", () => {
+  const TS = 1_700_000_000_000;
+  const menu = (seq: number, withTaxi = true): string =>
+    JSON.stringify({
+      seq,
+      opcode: "SMSG_GOSSIP_MESSAGE",
+      opcodeId: 0x17d,
+      ts: TS + seq,
+      data: {
+        guid: CREATURE_GUID,
+        menuId: 4360,
+        textId: 100,
+        options: withTaxi
+          ? [{ optionId: 0, icon: 2, text: "I need a ride." }, { optionId: 1, icon: 0, text: "Tell me about the city." }]
+          : [{ optionId: 1, icon: 0, text: "Tell me about the city." }],
+        quests: [],
+      },
+    });
+  const window = (seq: number): string =>
+    JSON.stringify({
+      seq,
+      opcode: "SMSG_SHOWTAXINODES",
+      opcodeId: 0x1a9,
+      ts: TS + seq,
+      data: {
+        showWindow: true,
+        guid: CREATURE_GUID,
+        currentNode: 6,
+        currentNodeName: "Ironforge, Dun Morogh",
+        mask: [0xa0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        known: [{ nodeId: 6, name: "Ironforge, Dun Morogh" }, { nodeId: 8, name: "Thelsamar, Loch Modan" }],
+      },
+    });
+  const reply = (seq: number, code: number): string =>
+    JSON.stringify({ seq, opcode: "SMSG_ACTIVATETAXIREPLY", opcodeId: 0x1ae, ts: TS + seq, data: { reply: code, ok: code === 0 } });
+
+  test("showTaxiNodes: hello, the taxi option by icon, then the window", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const pending = client.showTaxiNodes(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "gossip_hello");
+    stub.push(menu(300));
+    const at = await untilAction(stub, "gossip_select");
+    expect(stub.actions[at]).toMatchObject({ action: "gossip_select", guid: CREATURE_GUID, menuId: 4360, optionId: 0 });
+    stub.push(window(301));
+    const w = await pending;
+    expect(w.current).toEqual({ nodeId: 6, name: "Ironforge, Dun Morogh" });
+    expect(w.known.map((n) => n.nodeId)).toEqual([6, 8]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("showTaxiNodes: a master with nothing else to say sends the window straight from the hello", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const pending = client.showTaxiNodes(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "gossip_hello");
+    stub.push(window(310));
+    const w = await pending;
+    expect(w.current.nodeId).toBe(6);
+    expect(stub.actions.some((a) => a.action === "gossip_select")).toBe(false);
+    client.close();
+    await stub.stop();
+  });
+
+  test("showTaxiNodes: a menu without a taxi option throws and lists the options", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const pending = client.showTaxiNodes(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "gossip_hello");
+    stub.push(menu(320, false));
+    const err = await pending.catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toContain("no taxi option");
+    expect((err as Error).message).toContain("Tell me about the city.");
+    client.close();
+    await stub.stop();
+  });
+
+  test("activateTaxi: sends the window's current node and the resolved destination, and reads the reply", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    stub.push(window(330));
+    await client.events.waitForOpcode("SMSG_SHOWTAXINODES", { timeout: 2000 });
+    const pending = client.activateTaxi(CREATURE_GUID, "thelsamar", { timeout: 2000 });
+    const at = await untilAction(stub, "raw");
+    const guidHex = BigInt(CREATURE_GUID).toString(16).padStart(16, "0").match(/../g)!.reverse().join("");
+    expect(stub.actions[at]).toMatchObject({ action: "raw", opcode: "CMSG_ACTIVATETAXI", payload: `${guidHex}0600000008000000` });
+    stub.push(reply(331, 0));
+    expect(await pending).toEqual({
+      ok: true,
+      status: "accepted",
+      reply: 0,
+      from: { nodeId: 6, name: "Ironforge, Dun Morogh" },
+      to: { nodeId: 8, name: "Thelsamar, Loch Modan" },
+    });
+    client.close();
+    await stub.stop();
+  });
+
+  test("activateTaxi: a refusal is a value with the server's code and a hint, and is recorded for the harness", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    stub.push(window(340));
+    await client.events.waitForOpcode("SMSG_SHOWTAXINODES", { timeout: 2000 });
+    const pending = client.activateTaxi(CREATURE_GUID, 8, { timeout: 2000 });
+    await untilAction(stub, "raw");
+    stub.push(reply(341, 3));
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.status).toBe("refused");
+    expect(result.reply).toBe(3);
+    expect(result.hint).toContain("not enough money");
+    const hints = client.drainActionHints();
+    expect(hints).toHaveLength(1);
+    expect(hints[0]).toMatchObject({ action: "activateTaxi", status: "refused", count: 1 });
+    client.close();
+    await stub.stop();
+  });
+
+  test("activateTaxi: no window observed, an unknown name, or an ambiguous one throws before anything is sent", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const none = await client.activateTaxi(CREATURE_GUID, 7).catch((e: unknown) => e);
+    expect((none as Error).message).toContain("showTaxiNodes");
+    stub.push(window(350));
+    await client.events.waitForOpcode("SMSG_SHOWTAXINODES", { timeout: 2000 });
+    const unknown = await client.activateTaxi(CREATURE_GUID, "Stormwind").catch((e: unknown) => e);
+    expect((unknown as Error).message).toContain("Thelsamar");
+    const notKnown = await client.activateTaxi(CREATURE_GUID, 9).catch((e: unknown) => e);
+    expect((notKnown as Error).message).toContain("not in the window");
+    const ambiguous = await client.activateTaxi(CREATURE_GUID, "o").catch((e: unknown) => e);
+    expect((ambiguous as Error).message).toContain("matches 2 nodes");
+    expect(stub.actions.some((a) => a.action === "raw")).toBe(false);
+    client.close();
+    await stub.stop();
+  });
+});
+
+describe("client: bindAtInnkeeper (item 38 N2)", () => {
+  const TS = 1_700_000_000_000;
+  const menu = (seq: number): string =>
+    JSON.stringify({
+      seq,
+      opcode: "SMSG_GOSSIP_MESSAGE",
+      opcodeId: 0x17d,
+      ts: TS + seq,
+      data: {
+        guid: CREATURE_GUID,
+        menuId: 345,
+        textId: 100,
+        options: [
+          { optionId: 0, icon: 0, text: "Trick or Treat!" },
+          { optionId: 2, icon: 5, text: "Make this inn your home." },
+          { optionId: 3, icon: 1, text: "Let me browse your goods." },
+        ],
+        quests: [],
+      },
+    });
+  const confirm = (seq: number): string =>
+    JSON.stringify({ seq, opcode: "SMSG_BINDER_CONFIRM", opcodeId: 0x2eb, ts: TS + seq, data: { guid: CREATURE_GUID } });
+  const bound = (seq: number): string =>
+    JSON.stringify({
+      seq,
+      opcode: "SMSG_BINDPOINTUPDATE",
+      opcodeId: 0x155,
+      ts: TS + seq,
+      data: { x: -4840.7, y: -857.1, z: 502, map: 0, areaId: 1537, areaName: "Ironforge" },
+    });
+
+  test("hello, the home option, the confirm answered with CMSG_BINDER_ACTIVATE, the new bind point", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const pending = client.bindAtInnkeeper(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "gossip_hello");
+    stub.push(menu(400));
+    const sel = await untilAction(stub, "gossip_select");
+    expect(stub.actions[sel]).toMatchObject({ action: "gossip_select", guid: CREATURE_GUID, menuId: 345, optionId: 2 });
+    stub.push(confirm(401));
+    const rawAt = await untilAction(stub, "raw");
+    const guidHex = BigInt(CREATURE_GUID).toString(16).padStart(16, "0").match(/../g)!.reverse().join("");
+    expect(stub.actions[rawAt]).toMatchObject({ action: "raw", opcode: "CMSG_BINDER_ACTIVATE", payload: guidHex });
+    stub.push(bound(402));
+    const result = await pending;
+    expect(result).toEqual({
+      ok: true,
+      status: "bound",
+      bindPoint: { map: 0, x: -4840.7, y: -857.1, z: 502, area: { id: 1537, name: "Ironforge" } },
+    });
+    expect(client.state.self.bindPoint?.value.area.name).toBe("Ironforge");
+    client.close();
+    await stub.stop();
+  });
+
+  test("an explicit option is resolved against the open menu; a menu without a home option throws", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const pending = client.bindAtInnkeeper(CREATURE_GUID, { timeout: 2000, option: "browse" });
+    await untilAction(stub, "gossip_hello");
+    stub.push(menu(410));
+    const sel = await untilAction(stub, "gossip_select");
+    expect(stub.actions[sel]).toMatchObject({ optionId: 3 });
+    // No confirm ever comes for a vendor option: the absence is a timeout, not an outcome.
+    const err = await pending.catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(EventTimeoutError);
     client.close();
     await stub.stop();
   });
@@ -2329,14 +2739,20 @@ describe("client: questgiver status and quest query, issued the way a client doe
     await stub.stop();
   });
 
-  test("a quest-list silence names a `none` marker, and says nothing when no marker was observed", async () => {
+  test("a `none` marker answers a quest list before it is sent; no marker means the silence says nothing", async () => {
     const stub = startStub({ onConnect: () => combatWorld() });
     const client = await inWorld(stub);
     stub.push(JSON.stringify(questGiverStatus(CREATURE_GUID, 0, 91)));
     await Bun.sleep(20);
-    const err = (await client.questsAvailableFrom(CREATURE_GUID, { timeout: 150 }).catch((e: unknown) => e)) as Error;
-    expect(err).toBeInstanceOf(EventTimeoutError);
-    expect(err.message).toContain("questgiver status is `none`");
+    // 2026-08-30: the marker is the server's own answer, received before the
+    // call, so a 10s EventTimeoutError would only confirm it — a value instead.
+    const none = await client.questsAvailableFrom(CREATURE_GUID, { timeout: 150 });
+    expect(none).toMatchObject({ ok: false, status: "nothing_on_offer", quests: [] });
+    if (none.ok) throw new Error("unreachable");
+    expect(none.hint).toContain("questgiver status is `none`");
+    expect(none.hint).toContain("Nothing was sent");
+    expect(stub.actions.map((a) => a.action)).not.toContain("quest_list");
+    expect(client.drainActionHints()[0]).toMatchObject({ action: "questsAvailableFrom", status: "nothing_on_offer" });
     const bare = (await client.questsAvailableFrom(PLAYER_GUID, { timeout: 150 }).catch((e: unknown) => e)) as Error;
     expect(bare.message).not.toContain("questgiver status");
     client.close();
@@ -2380,7 +2796,7 @@ describe("client: talents and the raw escape hatch (FOLLOW-UPS 39)", () => {
     stub.push(talentsInfo(60, [{ talentId: 42, rank: 0 }]));
     const result = await pending;
     expect(result.ok).toBe(true);
-    expect(result.talents.talents).toEqual([{ talentId: 42, rank: 0 }]);
+    if (result.ok) expect(result.talents.talents).toEqual([{ talentId: 42, rank: 0 }]);
 
     const refused = client.learnTalent(43, 1, { timeout: 2000 });
     await untilAction(stub, "learn_talent", at + 1);
@@ -2419,7 +2835,7 @@ describe("client: talents and the raw escape hatch (FOLLOW-UPS 39)", () => {
     const stub = startStub({ onConnect: () => combatWorld() });
     const client = await inWorld(stub);
     const before = stub.actions.length;
-    expect(() => client.raw("say", "")).toThrow(/CMSG_\* name/);
+    expect(() => client.raw("say", "")).toThrow(/CMSG_\* \(or bidirectional MSG_\*\) name/);
     expect(() => client.raw("CMSG_EMOTE", "abc")).toThrow(/hex string/);
     expect(() => client.raw("CMSG_EMOTE", [{ u8: 300 }])).toThrow(/payload/);
     expect(() => client.raw("CMSG_EMOTE", [{ u9: 3 } as never])).toThrow(/field/);
@@ -2836,6 +3252,736 @@ describe("client: moveTo target resolution", () => {
     expect(plainHint).toContain("often outlasts a timeout that short");
 
     quiet.close();
+    client.close();
+    await stub.stop();
+  });
+});
+
+describe("client: queryTalentTree and resetTalents (item 96)", () => {
+  const TS = 1_700_000_000_000;
+  const tree = (seq: number): string =>
+    JSON.stringify({
+      seq,
+      opcode: "WB_TALENT_TREE",
+      opcodeId: 0xff08,
+      ts: TS + seq,
+      data: {
+        class: 1,
+        unspentPoints: 1,
+        tabs: [{ tabId: 161, name: "Arms", page: 0, talents: [{ talentId: 124, name: "Improved Heroic Strike", row: 0, col: 0, maxRank: 3, ranks: [12282, 12663, 12664] }] }],
+      },
+    });
+  const menu = (seq: number, withUnlearn = true): string =>
+    JSON.stringify({
+      seq,
+      opcode: "SMSG_GOSSIP_MESSAGE",
+      opcodeId: 0x17d,
+      ts: TS + seq,
+      data: {
+        guid: CREATURE_GUID,
+        menuId: 4675,
+        textId: 100,
+        options: withUnlearn
+          ? [{ optionId: 0, icon: 3, text: "I seek training." }, { optionId: 1, icon: 3, text: "I wish to unlearn my talents." }]
+          : [{ optionId: 0, icon: 3, text: "I seek training." }],
+        quests: [],
+      },
+    });
+  const confirm = (seq: number, cost: number, nothing = false): string =>
+    JSON.stringify({
+      seq,
+      opcode: "MSG_TALENT_WIPE_CONFIRM",
+      opcodeId: 0x2aa,
+      ts: TS + seq,
+      data: { guid: nothing ? "0" : CREATURE_GUID, cost, nothingToReset: nothing },
+    });
+  const talents = (seq: number, rows: { talentId: number; rank: number }[], unspent: number): string =>
+    JSON.stringify({
+      seq,
+      opcode: "SMSG_TALENTS_INFO",
+      opcodeId: 0x4c0,
+      ts: TS + seq,
+      data: { pet: false, unspentPoints: unspent, specCount: 1, activeSpec: 0, specs: [{ talents: rows }] },
+    });
+
+  test("queryTalentTree sends talent_tree and returns the folded tree with learned ranks", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    stub.push(talents(500, [{ talentId: 124, rank: 0 }], 1));
+    await client.events.waitForOpcode("SMSG_TALENTS_INFO", { timeout: 2000 });
+    const pending = client.queryTalentTree({ timeout: 2000 });
+    const at = await untilAction(stub, "talent_tree");
+    expect(stub.actions[at]).toMatchObject({ action: "talent_tree" });
+    stub.push(tree(501));
+    const t = await pending;
+    expect(t.tabs[0]!.name).toBe("Arms");
+    expect(t.tabs[0]!.talents[0]).toMatchObject({ talentId: 124, pointsSpent: 1, maxRank: 3 });
+    expect(client.state.talentTree()?.seq).toBe(501);
+    client.close();
+    await stub.stop();
+  });
+
+  test("resetTalents: hello, the unlearn option, the confirm echoed raw, the talents packet", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const pending = client.resetTalents(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "gossip_hello");
+    stub.push(menu(510));
+    const sel = await untilAction(stub, "gossip_select");
+    expect(stub.actions[sel]).toMatchObject({ action: "gossip_select", guid: CREATURE_GUID, menuId: 4675, optionId: 1 });
+    stub.push(confirm(511, 10000));
+    const rawAt = await untilAction(stub, "raw");
+    const guidHex = BigInt(CREATURE_GUID).toString(16).padStart(16, "0").match(/../g)!.reverse().join("");
+    expect(stub.actions[rawAt]).toMatchObject({ action: "raw", opcode: "MSG_TALENT_WIPE_CONFIRM", payload: guidHex });
+    stub.push(talents(512, [], 3));
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(result.cost).toBe(10000);
+    expect(result.talents.unspentPoints).toBe(3);
+    expect(result.talents.talents).toEqual([]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("resetTalents: the guid-0 confirm is a refusal value; a menu without the option throws", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const pending = client.resetTalents(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "gossip_hello");
+    stub.push(menu(520));
+    await untilAction(stub, "gossip_select");
+    stub.push(confirm(521, 0, true));
+    const result = await pending;
+    expect(result).toMatchObject({ ok: false, status: "refused", cost: 0 });
+    expect(stub.actions.some((a) => a.action === "raw")).toBe(false);
+    expect(client.drainActionHints()[0]).toMatchObject({ action: "resetTalents", status: "refused" });
+
+    const noOption = client.resetTalents(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "gossip_hello", 1);
+    stub.push(menu(530, false));
+    const noOptionResult = await noOption;
+    expect(noOptionResult).toMatchObject({ ok: false, status: "no_option" });
+    expect(client.drainActionHints()[0]).toMatchObject({ action: "resetTalents", status: "no_option" });
+    client.close();
+    await stub.stop();
+  });
+});
+
+describe("client: pet, group, mail and bank helpers (items 98 and 100)", () => {
+  const TS = 1_700_000_000_000;
+  const PET_GUID = "17365880163140632999";
+  const frame = (seq: number, opcode: string, data: unknown): string => JSON.stringify({ seq, opcode, opcodeId: 0x100, ts: TS + seq, data });
+  const guidHex = (g: string) => BigInt(g).toString(16).padStart(16, "0").match(/../g)!.reverse().join("");
+  const u32Hex = (n: number) => (n >>> 0).toString(16).padStart(8, "0").match(/../g)!.reverse().join("");
+  const petBar = (seq: number) =>
+    frame(seq, "SMSG_PET_SPELLS", {
+      guid: PET_GUID,
+      removed: false,
+      family: 0,
+      durationMs: 0,
+      reactState: 1,
+      commandState: 1,
+      flags: 0,
+      actionBar: [],
+      spells: [{ spellId: 3110, active: 0xc1, autocast: true, rank: 1, name: "Firebolt" }],
+      cooldowns: [],
+    });
+
+  test("petAttack / petFollow / petCast build the CMSG_PET_ACTION button the pet frame sends; no pet throws", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    expect(await client.petFollow()).toMatchObject({ ok: false, status: "no_pet" });
+    expect(client.drainActionHints()[0]?.hint).toContain("summon one first");
+    stub.push(petBar(500));
+    await client.events.waitForOpcode("SMSG_PET_SPELLS", { timeout: 2000 });
+    await client.petAttack(CREATURE_GUID);
+    let at = await untilAction(stub, "raw");
+    expect(stub.actions[at]).toMatchObject({ action: "raw", opcode: "CMSG_PET_ACTION", payload: guidHex(PET_GUID) + u32Hex(2 | (0x07 << 24)) + guidHex(CREATURE_GUID) });
+    await client.petFollow();
+    at = await untilAction(stub, "raw", at + 1);
+    expect(stub.actions[at]).toMatchObject({ payload: guidHex(PET_GUID) + u32Hex(1 | (0x07 << 24)) + guidHex("0") });
+    // No packet answers a react or follow/stay button (seen live); the ack folds the bar.
+    expect(client.state.pet()?.command).toBe("follow");
+    await client.petStay();
+    at = await untilAction(stub, "raw", at + 1);
+    expect(client.state.pet()?.command).toBe("stay");
+    await client.petReact("aggressive");
+    at = await untilAction(stub, "raw", at + 1);
+    expect(stub.actions[at]).toMatchObject({ payload: guidHex(PET_GUID) + u32Hex(2 | (0x06 << 24)) + guidHex("0") });
+    expect(client.state.pet()?.reaction).toBe("aggressive");
+    await client.petCast("fire", CREATURE_GUID);
+    at = await untilAction(stub, "raw", at + 1);
+    expect(stub.actions[at]).toMatchObject({ payload: guidHex(PET_GUID) + u32Hex(3110 | (0x81 << 24)) + guidHex(CREATURE_GUID) });
+    expect(await client.petCast("Growl")).toMatchObject({ ok: false, status: "unknown_spell" });
+    await client.petDismiss();
+    at = await untilAction(stub, "raw", at + 1);
+    expect(stub.actions[at]).toMatchObject({ payload: guidHex(PET_GUID) + u32Hex(3 | (0x07 << 24)) + guidHex("0") });
+    client.close();
+    await stub.stop();
+  });
+
+  test("inviteToGroup reads the party result; acceptGroupInvite and leaveGroup wait for the list", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const invite = client.inviteToGroup("Quilby", { timeout: 2000 });
+    let at = await untilAction(stub, "raw");
+    expect(stub.actions[at]).toMatchObject({ opcode: "CMSG_GROUP_INVITE", payload: "5175696c62790000000000" });
+    stub.push(frame(510, "SMSG_PARTY_COMMAND_RESULT", { operation: 0, name: "Quilby", result: 5, value: 0 }));
+    expect(await invite).toMatchObject({ ok: false, status: "refused", result: 5 });
+    expect(client.drainActionHints()[0]?.hint).toContain("already in a group");
+
+    expect(client.acceptGroupInvite({ timeout: 2000 })).rejects.toThrow(/no invitation is pending/);
+    stub.push(frame(511, "SMSG_GROUP_INVITE", { canAccept: true, inviterName: "Ordrick" }));
+    await client.events.waitForOpcode("SMSG_GROUP_INVITE", { timeout: 2000 });
+    const accept = client.acceptGroupInvite({ timeout: 2000 });
+    at = await untilAction(stub, "raw", at + 1);
+    expect(stub.actions[at]).toMatchObject({ opcode: "CMSG_GROUP_ACCEPT", payload: "00000000" });
+    stub.push(
+      frame(512, "SMSG_GROUP_LIST", {
+        groupType: 0, left: false, raid: false, subGroup: 0, memberFlags: 0, roles: 0, groupGuid: "1", counter: 1,
+        members: [{ name: "Ordrick", guid: "9", online: true, subGroup: 0, flags: 0, roles: 0 }], leaderGuid: "9", lootMethod: 0,
+      }),
+    );
+    expect((await accept).inGroup).toBe(true);
+    const leave = client.leaveGroup({ timeout: 2000 });
+    at = await untilAction(stub, "raw", at + 1);
+    expect(stub.actions[at]).toMatchObject({ opcode: "CMSG_GROUP_DISBAND", payload: "" });
+    stub.push(frame(513, "SMSG_GROUP_LIST", { groupType: 0x10, left: true, raid: false, subGroup: 0, memberFlags: 0, roles: 0, groupGuid: "1", counter: 2, members: [], leaderGuid: "0" }));
+    expect((await leave).inGroup).toBe(false);
+    client.close();
+    await stub.stop();
+  });
+
+  test("openMailbox, sendMail, mailList and takeMailMoney: the frame first, then the bodies and verdicts", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    expect(() => client.mailList()).toThrow(/no mailbox frame/);
+    expect(await client.deleteMail(1)).toMatchObject({ ok: false, status: "no_mailbox" });
+    const open = client.openMailbox(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "interact");
+    let at = await untilAction(stub, "raw");
+    // No SMSG_SHOW_MAILBOX: the core sends none for a game-object mailbox; the first list answering is the frame.
+    expect(stub.actions[at]).toMatchObject({ opcode: "CMSG_GET_MAIL_LIST", payload: guidHex(CREATURE_GUID) });
+    stub.push(frame(520, "SMSG_MAIL_LIST_RESULT", { total: 0, count: 0, mails: [] }));
+    expect((await open).guid).toBe(CREATURE_GUID);
+
+    const send = client.sendMail("Quilby", "hi", "text", { money: 100, timeout: 2000 });
+    at = await untilAction(stub, "raw", at + 1);
+    expect(stub.actions[at]).toMatchObject({
+      opcode: "CMSG_SEND_MAIL",
+      payload: guidHex(CREATURE_GUID) + "5175696c627900" + "686900" + "7465787400" + u32Hex(41) + u32Hex(0) + "00" + u32Hex(100) + u32Hex(0) + "0000000000000000" + "00",
+    });
+    stub.push(frame(521, "SMSG_SEND_MAIL_RESULT", { mailId: 0, action: 0, result: 0 }));
+    expect(await send).toMatchObject({ ok: true, status: "sent" });
+
+    const list = client.mailList({ timeout: 2000 });
+    at = await untilAction(stub, "raw", at + 1);
+    expect(stub.actions[at]).toMatchObject({ opcode: "CMSG_GET_MAIL_LIST", payload: guidHex(CREATURE_GUID) });
+    stub.push(
+      frame(522, "SMSG_MAIL_LIST_RESULT", {
+        total: 1, count: 1,
+        mails: [{ mailId: 7, type: 0, senderGuid: "9", cod: 0, stationery: 41, money: 100, flags: 0, read: false, daysLeft: 29, templateId: 0, subject: "hi", body: "text", items: [] }],
+      }),
+    );
+    // The sender is a guid the module has never named: the list asks CMSG_NAME_QUERY and joins the answer.
+    at = await untilAction(stub, "raw", at + 1);
+    expect(stub.actions[at]).toMatchObject({ opcode: "CMSG_NAME_QUERY", payload: guidHex("9") });
+    stub.push(frame(523, "SMSG_NAME_QUERY_RESPONSE", { guid: 9, found: true, name: "Ordrick" }));
+    expect((await list).mails[0]).toMatchObject({ mailId: 7, money: 100, senderName: "Ordrick" });
+
+    const take = client.takeMailMoney(7, { timeout: 2000 });
+    at = await untilAction(stub, "raw", at + 1);
+    expect(stub.actions[at]).toMatchObject({ opcode: "CMSG_MAIL_TAKE_MONEY", payload: guidHex(CREATURE_GUID) + u32Hex(7) });
+    stub.push(frame(524, "SMSG_SEND_MAIL_RESULT", { mailId: 7, action: 1, result: 6 }));
+    expect(await take).toMatchObject({ ok: false, status: "refused", result: 6 });
+    client.close();
+    await stub.stop();
+  });
+
+  test("openBank, bankDeposit (lands in a bank slot) and bankWithdraw (refused by the server)", async () => {
+    const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate, creatureCreate, creatureQuery, inventorySlot, itemCreate, itemQuery]) });
+    const client = await inWorld(stub);
+    await client.events.waitForOpcode("SMSG_ITEM_QUERY_SINGLE_RESPONSE", { timeout: 2000 });
+    const open = client.openBank(CREATURE_GUID, { timeout: 2000 });
+    let at = await untilAction(stub, "raw");
+    expect(stub.actions[at]).toMatchObject({ opcode: "CMSG_BANKER_ACTIVATE", payload: guidHex(CREATURE_GUID) });
+    stub.push(frame(530, "SMSG_SHOW_BANK", { guid: CREATURE_GUID }));
+    expect((await open).guid).toBe(CREATURE_GUID);
+
+    expect(await client.bankDeposit(255, 30)).toMatchObject({ ok: false, status: "no_item" });
+    const deposit = client.bankDeposit(255, BACKPACK_SLOT, { timeout: 2000 });
+    at = await untilAction(stub, "raw", at + 1);
+    expect(stub.actions[at]).toMatchObject({ opcode: "CMSG_AUTOBANK_ITEM", payload: "ff" + BACKPACK_SLOT.toString(16) });
+    stub.push(
+      frame(531, "SMSG_UPDATE_OBJECT", {
+        blocks: 1,
+        objects: [{ update: "values", guid: SELF_GUID, fields: { [`invSlot${BACKPACK_SLOT}Lo`]: 0, [`invSlot${BACKPACK_SLOT}Hi`]: 0, invSlot39Lo: ITEM_GUID_LO, invSlot39Hi: ITEM_GUID_HI } }],
+      }),
+    );
+    expect(await deposit).toMatchObject({ ok: true, status: "moved", bag: 255, slot: 39, guid: ITEM_GUID });
+
+    const withdraw = client.bankWithdraw(255, 39, { timeout: 2000 });
+    at = await untilAction(stub, "raw", at + 1);
+    expect(stub.actions[at]).toMatchObject({ opcode: "CMSG_AUTOSTORE_BANK_ITEM", payload: "ff27" });
+    stub.push(frame(532, "SMSG_INVENTORY_CHANGE_FAILURE", { result: 4 }));
+    expect(await withdraw).toMatchObject({ ok: false, status: "refused", result: 4 });
+    client.close();
+    await stub.stop();
+  });
+});
+
+describe("client: the softened inputs and the harness hints they refuse with (2026-08-29)", () => {
+  const TS = 1_700_000_000_000;
+  const PET_GUID = "17365880163140632999";
+  const frame = (seq: number, opcode: string, data: unknown): string => JSON.stringify({ seq, opcode, opcodeId: 0x100, ts: TS + seq, data });
+  const guidHex = (g: string) => BigInt(g).toString(16).padStart(16, "0").match(/../g)!.reverse().join("");
+  const u32Hex = (n: number) => (n >>> 0).toString(16).padStart(8, "0").match(/../g)!.reverse().join("");
+  const carried = () => frames([...loginSequence, selfCreate, creatureCreate, creatureQuery, inventorySlot, itemCreate, itemQuery]);
+
+  test("a helper target may be the name of something in view; two matches refuse and list them", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    // Exact name, case-insensitive and whitespace-tolerant.
+    await client.interact("  thistlebore ");
+    expect(stub.actions.at(-1)).toMatchObject({ action: "interact", guid: CREATURE_GUID });
+
+    // A second unit with a name the query matches makes it two readings.
+    stub.push(
+      frame(601, "SMSG_UPDATE_OBJECT", {
+        blocks: 1,
+        objects: [
+          {
+            update: "create", guid: "17365880163140632777", objectType: "unit", moveFlags: 0, runSpeed: 7.5,
+            pos: { x: -1201.0, y: 981.0, z: 42.0, o: 1.5 },
+            fields: { entry: 777, health: 10, maxHealth: 10, level: 2, faction: 7, unitFlags: 0, displayId: 1, powerType: 0, power1: 1, maxPower1: 1, race: 0, class: 0, gender: 0 },
+          },
+        ],
+      }),
+    );
+    stub.push(frame(602, "SMSG_CREATURE_QUERY_RESPONSE", { entry: 777, found: true, name: "Thistlebore Whelp" }));
+    await client.events.waitFor((e) => e.seq === 602, { timeout: 2000 });
+    await expect(client.killTarget(" thistle ")).rejects.toThrow(/matches 2 things in view/);
+    await expect(client.killTarget("nothing here")).rejects.toThrow(/neither a decimal guid nor the name of anything in view/);
+    client.close();
+    await stub.stop();
+  });
+
+  test("moveTo takes a name and answers an unresolvable one as a value with a hint", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const walk = client.moveTo("Thistlebore", { timeout: 2000 });
+    await untilAction(stub, "move_to");
+    stub.push(JSON.stringify(moveResult("arrived", 1, 700)));
+    expect((await walk).ok).toBe(true);
+    const miss = await client.moveTo("Ragnaros");
+    expect(miss).toMatchObject({ ok: false, status: "unknown_target" });
+    expect(client.drainActionHints()[0]).toMatchObject({ action: "moveTo", status: "unknown_target" });
+    client.close();
+    await stub.stop();
+  });
+
+  test("an item-taking call takes the item's name; a name that names nothing is a no_item value with a hint", async () => {
+    const stub = startStub({ onConnect: () => carried() });
+    const client = await inWorld(stub);
+    await client.events.waitForOpcode("SMSG_ITEM_QUERY_SINGLE_RESPONSE", { timeout: 2000 });
+    // The name form leaves argument 2 free, so the options object may sit there.
+    const equip = client.equipItem("gritstone", { timeout: 500 });
+    const at = await untilAction(stub, "equip_item");
+    expect(stub.actions[at]).toMatchObject({ action: "equip_item", bag: 255, slot: BACKPACK_SLOT });
+    await equip;
+    client.drainActionHints();
+
+    // …and a trailing count keeps its meaning rather than being read as a slot.
+    await client.destroyItem("Gritstone Charm", 5);
+    expect(stub.actions.at(-1)).toMatchObject({ action: "destroy_item", bag: 255, slot: BACKPACK_SLOT, count: 5 });
+    await client.useItem("Gritstone Charm", CREATURE_GUID);
+    expect(stub.actions.at(-1)).toMatchObject({ action: "use_item", bag: 255, slot: BACKPACK_SLOT, targetGuid: CREATURE_GUID });
+
+    const missing = await client.equipItem("Thunderfury");
+    expect(missing).toMatchObject({ ok: false, status: "no_item" });
+    if (!missing.ok && missing.status === "no_item") expect(missing.hint).toContain("Gritstone Charm");
+    expect(client.drainActionHints()[0]).toMatchObject({ action: "equipItem", status: "no_item" });
+    expect(() => client.useItem("Thunderfury")).toThrow(/nothing in state\.bag\(\) is named/);
+    // A numeric bag still needs its slot, and says so instead of guessing one.
+    expect(await client.equipItem(255)).toMatchObject({ ok: false, status: "no_item" });
+    client.close();
+    await stub.stop();
+  });
+
+  test("pet refusals are values with hints: no_pet, unknown_reaction, ambiguous_spell, passive_spell", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    expect(await client.petStay()).toMatchObject({ ok: false, status: "no_pet" });
+    expect(await client.petReact("berserk")).toMatchObject({ ok: false, status: "unknown_reaction" });
+    const early = client.drainActionHints();
+    expect(early.map((h) => `${h.action}:${h.status}`).sort()).toEqual(["petReact:unknown_reaction", "petStay:no_pet"]);
+
+    stub.push(
+      frame(610, "SMSG_PET_SPELLS", {
+        guid: PET_GUID, removed: false, family: 0, durationMs: 0, reactState: 1, commandState: 1, flags: 0, actionBar: [],
+        spells: [
+          { spellId: 3110, active: 0xc1, autocast: true, rank: 1, name: "Firebolt" },
+          { spellId: 3111, active: 0xc1, autocast: false, rank: 2, name: "Firebolt Rank 2" },
+          { spellId: 3112, active: 0x01, autocast: false, rank: 1, name: "Demon Armor" },
+        ],
+        cooldowns: [],
+      }),
+    );
+    await client.events.waitForOpcode("SMSG_PET_SPELLS", { timeout: 2000 });
+    // Case-insensitive react words reach the wire.
+    expect(await client.petReact("  Aggressive ")).toMatchObject({ ok: true, status: "sent" });
+    expect(stub.actions.at(-1)).toMatchObject({ opcode: "CMSG_PET_ACTION", payload: guidHex(PET_GUID) + u32Hex(2 | (0x06 << 24)) + guidHex("0") });
+    const ambiguous = await client.petCast("fire");
+    expect(ambiguous).toMatchObject({ ok: false, status: "ambiguous_spell" });
+    if (!ambiguous.ok) expect(ambiguous.hint).toContain("3111");
+    expect(await client.petCast("Demon Armor")).toMatchObject({ ok: false, status: "passive_spell" });
+    // The exact name still resolves past the substring tie.
+    expect(await client.petCast("Firebolt")).toMatchObject({ ok: true, status: "sent" });
+    expect(client.drainActionHints().map((h) => h.status).sort()).toEqual(["ambiguous_spell", "passive_spell"]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a bank move with no frame open is refused before anything is sent, and hints are labelled per call", async () => {
+    const stub = startStub({ onConnect: () => carried() });
+    const client = await inWorld(stub);
+    await client.events.waitForOpcode("SMSG_ITEM_QUERY_SINGLE_RESPONSE", { timeout: 2000 });
+    const before = stub.actions.length;
+    const closed = await client.bankDeposit("Gritstone Charm");
+    expect(closed).toMatchObject({ ok: false, status: "no_bank" });
+    if (!closed.ok) expect(closed.hint).toContain("openBank");
+    expect(stub.actions.length).toBe(before);
+    expect(client.drainActionHints()[0]).toMatchObject({ action: "bankDeposit", status: "no_bank" });
+
+    const open = client.openBank(CREATURE_GUID, { timeout: 2000 });
+    let at = await untilAction(stub, "raw");
+    stub.push(frame(620, "SMSG_SHOW_BANK", { guid: CREATURE_GUID }));
+    await open;
+    const deposit = client.bankDeposit("gritstone", { timeout: 2000 });
+    at = await untilAction(stub, "raw", at + 1);
+    expect(stub.actions[at]).toMatchObject({ opcode: "CMSG_AUTOBANK_ITEM", payload: "ff" + BACKPACK_SLOT.toString(16) });
+    stub.push(frame(621, "SMSG_INVENTORY_CHANGE_FAILURE", { result: 4 }));
+    expect(await deposit).toMatchObject({ ok: false, status: "refused" });
+    expect(client.drainActionHints()[0]).toMatchObject({ action: "bankDeposit", status: "refused" });
+    client.close();
+    await stub.stop();
+  });
+
+  test("mail refuses without a frame as a value, attaches items by name, and labels its hints per call", async () => {
+    const stub = startStub({ onConnect: () => carried() });
+    const client = await inWorld(stub);
+    await client.events.waitForOpcode("SMSG_ITEM_QUERY_SINGLE_RESPONSE", { timeout: 2000 });
+    expect(await client.sendMail("Quilby", "s", "b")).toMatchObject({ ok: false, status: "no_mailbox" });
+    expect(client.drainActionHints()[0]).toMatchObject({ action: "sendMail", status: "no_mailbox" });
+
+    const open = client.openMailbox(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "interact");
+    const opened = await untilAction(stub, "raw");
+    stub.push(frame(630, "SMSG_MAIL_LIST_RESULT", { total: 0, count: 0, mails: [] }));
+    await open;
+    const send = client.sendMail("  Quilby ", "s", "b", { items: ["gritstone"], timeout: 2000 });
+    const at = await untilAction(stub, "raw", opened + 1);
+    expect(stub.actions[at]).toMatchObject({ opcode: "CMSG_SEND_MAIL" });
+    // The named attachment resolved to the carried item's guid, indexed 0.
+    expect((stub.actions[at] as unknown as { payload: string }).payload).toContain("00" + guidHex(ITEM_GUID));
+    stub.push(frame(631, "SMSG_SEND_MAIL_RESULT", { mailId: 0, action: 0, result: 3 }));
+    expect(await send).toMatchObject({ ok: false, status: "refused" });
+    expect(client.drainActionHints()[0]).toMatchObject({ action: "sendMail", status: "refused" });
+    expect(await client.sendMail("Quilby", "s", "b", { items: ["Thunderfury"] })).toMatchObject({ ok: false, status: "no_item" });
+    client.close();
+    await stub.stop();
+  });
+
+  test("learnTalent takes a talent by name once the tree is read, and defaults rank to the next point", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    // Without the tree a name cannot be resolved, and the refusal says so.
+    expect(await client.learnTalent("Improved Heroic Strike")).toMatchObject({ ok: false, status: "no_tree" });
+    expect(client.drainActionHints()[0]).toMatchObject({ action: "learnTalent", status: "no_tree" });
+
+    const query = client.queryTalentTree({ timeout: 2000 });
+    await untilAction(stub, "talent_tree");
+    stub.push(
+      frame(640, "WB_TALENT_TREE", {
+        class: 1, unspentPoints: 2,
+        tabs: [{ tabId: 161, name: "Arms", page: 0, talents: [{ talentId: 124, name: "Improved Heroic Strike", row: 0, col: 0, maxRank: 3, ranks: [12282, 12663, 12664] }] }],
+      }),
+    );
+    await query;
+    stub.push(frame(641, "SMSG_TALENTS_INFO", { pet: false, unspentPoints: 2, specCount: 1, activeSpec: 0, specs: [{ talents: [{ talentId: 124, rank: 0 }] }] }));
+    await client.events.waitForOpcode("SMSG_TALENTS_INFO", { timeout: 2000 });
+
+    const learn = client.learnTalent("heroic strike", { timeout: 2000 });
+    const at = await untilAction(stub, "learn_talent");
+    // One point is already in, so the next one is wire rank 1.
+    expect(stub.actions[at]).toMatchObject({ action: "learn_talent", talentId: 124, rank: 1 });
+    stub.push(frame(642, "SMSG_TALENTS_INFO", { pet: false, unspentPoints: 1, specCount: 1, activeSpec: 0, specs: [{ talents: [{ talentId: 124, rank: 1 }] }] }));
+    expect(await learn).toMatchObject({ ok: true, status: "learned", talentId: 124, rank: 1 });
+    expect(await client.learnTalent("Bladestorm")).toMatchObject({ ok: false, status: "unknown_talent" });
+    client.close();
+    await stub.stop();
+  });
+});
+
+/**
+ * METHODOLOGY, "A name in view is a valid referent, with bounded fuzz": the
+ * three tiers reach the same unit, a non-exact match says so in the result
+ * rather than in a hint, two matches refuse, and nothing guid-shaped is ever
+ * fuzzed.
+ */
+describe("client: a name in view is a referent", () => {
+  const namedWorld = () =>
+    frames([...loginSequence, selfCreate, creatureCreate, creatureQuery, playerCreate, playerName]);
+
+  test("an exact name acts, and says nothing about resolving — there was nothing to resolve", async () => {
+    const stub = startStub({ onConnect: () => namedWorld() });
+    const client = await inWorld(stub);
+    const ack = await client.interact("  thistlebore ");
+    expect(stub.actions[0]?.guid).toBe(CREATURE_GUID);
+    expect(ack).not.toHaveProperty("resolved");
+    client.close();
+    await stub.stop();
+  });
+
+  test("a unique substring acts and the result carries what it landed on", async () => {
+    const stub = startStub({ onConnect: () => namedWorld() });
+    const client = await inWorld(stub);
+    const ack = await client.interact("thistle");
+    expect(stub.actions[0]?.guid).toBe(CREATURE_GUID);
+    expect(ack.resolved).toEqual({ input: "thistle", name: "Thistlebore", guid: CREATURE_GUID });
+    client.close();
+    await stub.stop();
+  });
+
+  test("a unique near-miss acts and the result carries what it landed on", async () => {
+    const stub = startStub({ onConnect: () => namedWorld() });
+    const client = await inWorld(stub);
+    const ack = await client.interact("Thistlebode");
+    expect(stub.actions[0]?.guid).toBe(CREATURE_GUID);
+    expect(ack.resolved).toEqual({ input: "Thistlebode", name: "Thistlebore", guid: CREATURE_GUID });
+    client.close();
+    await stub.stop();
+  });
+
+  test("a name two things answer to refuses with both, and dispatches nothing", async () => {
+    const stub = startStub({ onConnect: () => namedWorld() });
+    const client = await inWorld(stub);
+    // "b" is in both "Thistlebore" and "Quilby".
+    expect(() => client.interact("b")).toThrow(/matches 2 things in view.*does not choose between referents/s);
+    expect(stub.actions).toHaveLength(0);
+    client.close();
+    await stub.stop();
+  });
+
+  test("the raw tier takes a name too — setTarget reaches the wire as the guid", async () => {
+    const stub = startStub({ onConnect: () => namedWorld() });
+    const client = await inWorld(stub);
+    const ack = await client.setTarget("thistle");
+    expect(stub.actions.at(-1)).toMatchObject({ action: "set_target", guid: CREATURE_GUID });
+    expect(ack.resolved).toEqual({ input: "thistle", name: "Thistlebore", guid: CREATURE_GUID });
+    client.close();
+    await stub.stop();
+  });
+
+  test("sellItem's itemGuid stays strict — an item guid is not a unit in view", async () => {
+    const stub = startStub({ onConnect: () => namedWorld() });
+    const client = await inWorld(stub);
+    // The vendor resolves by name; the item does not, because there is no
+    // name-to-item-guid namespace to resolve it against — so a name there
+    // goes to the module as typed (and is refused there), never rewritten
+    // into the guid of a unit standing nearby.
+    await client.sellItem("thistle", "thistle");
+    expect(stub.actions.at(-1)).toMatchObject({ action: "sell_item", guid: CREATURE_GUID, itemGuid: "thistle" });
+    expect(() => client.sellItem("thistle", undefined as never)).toThrow(/sellItem\(\.\.\., itemGuid\)/);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a raw payload's guid field takes a name in view, resolved the same way", async () => {
+    const stub = startStub({ onConnect: () => namedWorld() });
+    const client = await inWorld(stub);
+    const ack = await client.raw("CMSG_TEXT_EMOTE", [{ u32: 1 }, { guid: "thistle" }]);
+    const exact = await client.raw("CMSG_TEXT_EMOTE", [{ u32: 1 }, { guid: "Thistlebore" }]);
+    expect(ack.payload).toBe(exact.payload); // the same bytes a guid would have produced
+    expect(ack.resolved).toEqual([{ input: "thistle", name: "Thistlebore", guid: CREATURE_GUID }]);
+    expect(exact.resolved).toBeUndefined();
+    // packedGuid encodes differently (mask + non-zero bytes), so it gets its
+    // own end-to-end check rather than riding on the guid one.
+    const packed = await client.raw("CMSG_TEXT_EMOTE", [{ packedGuid: "thistle" }]);
+    const packedExact = await client.raw("CMSG_TEXT_EMOTE", [{ packedGuid: CREATURE_GUID }]);
+    expect(packed.payload).toBe(packedExact.payload);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a raw payload refuses an ambiguous name rather than picking, and sends nothing", async () => {
+    const stub = startStub({ onConnect: () => namedWorld() });
+    const client = await inWorld(stub);
+    const before = stub.actions.length;
+    expect(() => client.raw("CMSG_TEXT_EMOTE", [{ packedGuid: "b" }])).toThrow(/matches 2 things in view/);
+    expect(stub.actions).toHaveLength(before);
+    client.close();
+    await stub.stop();
+  });
+
+  test("the rest of a raw payload is left alone — a cstring is not a referent, nor is a u64", async () => {
+    const stub = startStub({ onConnect: () => namedWorld() });
+    const client = await inWorld(stub);
+    // "Thistle" as a mail recipient or invite target is a player the server
+    // resolves; rewriting it against what is in view would retarget the call.
+    const ack = await client.raw("CMSG_TEXT_EMOTE", [{ cstring: "Thistle" }, { u64: "4294967296" }]);
+    expect(ack.payload).toBe("54686973746c6500" + "0000000001000000");
+    expect(ack.resolved).toBeUndefined();
+    client.close();
+    await stub.stop();
+  });
+
+  test("an opcode name is never fuzzed — a near miss goes to the module as typed", async () => {
+    const stub = startStub({ onConnect: () => namedWorld() });
+    const client = await inWorld(stub);
+    const ack = await client.raw("CMSG_TEXT_EMOT", [{ u32: 1 }]);
+    // The module owns the allowlist and answers for it; the SDK must not
+    // "correct" the name to the opcode it nearly spells.
+    expect(ack.opcode).toBe("CMSG_TEXT_EMOT");
+    expect(stub.actions.at(-1)).toMatchObject({ opcode: "CMSG_TEXT_EMOT" });
+    client.close();
+    await stub.stop();
+  });
+
+  test("a guid is never fuzzed — one digit off is that guid, not the unit it nearly names", async () => {
+    const stub = startStub({ onConnect: () => namedWorld() });
+    const client = await inWorld(stub);
+    const nearMiss = `${CREATURE_GUID.slice(0, -1)}9`;
+    expect(nearMiss).not.toBe(CREATURE_GUID);
+    const ack = await client.interact(nearMiss);
+    expect(stub.actions[0]?.guid).toBe(nearMiss);
+    expect(ack).not.toHaveProperty("resolved");
+    client.close();
+    await stub.stop();
+  });
+});
+
+describe("client: quest-start items and the questgiver marker pre-check (2026-08-30)", () => {
+  const TS = 1_700_000_000_000;
+  const START_QUEST = 1646;
+  const frame = (seq: number, opcode: string, data: unknown): string => JSON.stringify({ seq, opcode, opcodeId: 0x100, ts: TS + seq, data });
+  /** The Gritstone Charm carried, with a tooltip that says it starts a quest. */
+  const tome = () =>
+    frames([
+      ...loginSequence,
+      selfCreate,
+      creatureCreate,
+      creatureQuery,
+      inventorySlot,
+      itemCreate,
+      { ...(itemQuery as object), data: { ...(itemQuery as { data: object }).data, name: "Tome of Divinity", startQuest: START_QUEST } },
+    ]);
+  const details = (seq: number, guid: string, questId: number) =>
+    frame(seq, "SMSG_QUESTGIVER_QUEST_DETAILS", {
+      guid,
+      questId,
+      title: "The Tome of Divinity",
+      details: "Read it.",
+      objectives: "Speak to someone.",
+      choiceRewards: [],
+      rewards: [],
+      money: 0,
+      xp: 0,
+    });
+
+  test("useItem on a quest-start item waits for the server's offer and names the item as the questgiver", async () => {
+    const stub = startStub({ onConnect: () => tome() });
+    const client = await inWorld(stub);
+    await client.events.waitForOpcode("SMSG_ITEM_QUERY_SINGLE_RESPONSE", { timeout: 2000 });
+    const pending = client.useItem("Tome of Divinity", undefined, undefined, { timeout: 2000 });
+    const at = await untilAction(stub, "use_item");
+    expect(stub.actions[at]).toMatchObject({ action: "use_item", bag: 255, slot: BACKPACK_SLOT });
+    stub.push(details(90, ITEM_GUID, START_QUEST));
+    const used = await pending;
+    expect(used.ok).toBe(true);
+    expect(used.questOffer).toEqual({ questId: START_QUEST, title: "The Tome of Divinity", itemGuid: ITEM_GUID });
+
+    // Taking it: the item guid stands where an NPC guid would, and there is no
+    // quest list to ask for — the details query is the offer.
+    const accept = client.acceptQuestFrom(used.questOffer!.itemGuid, START_QUEST, { timeout: 2000 });
+    const q = await untilAction(stub, "quest_details");
+    expect(stub.actions[q]).toMatchObject({ action: "quest_details", guid: ITEM_GUID, questId: START_QUEST });
+    stub.push(details(91, ITEM_GUID, START_QUEST));
+    const a = await untilAction(stub, "quest_accept");
+    expect(stub.actions[a]).toMatchObject({ action: "quest_accept", guid: ITEM_GUID, questId: START_QUEST });
+    stub.push(frame(92, "SMSG_UPDATE_OBJECT", { blocks: 1, objects: [{ update: "values", guid: SELF_GUID, fields: { quest0Id: START_QUEST, quest0State: 0, quest0CountsLo: 0, quest0CountsHi: 0, quest0Time: 0, quest1Id: 0 } }] }));
+    const result = await accept;
+    expect(result).toMatchObject({ ok: true, status: "accepted", questId: START_QUEST, title: "The Tome of Divinity" });
+    expect(stub.actions.map((x) => x.action)).not.toContain("quest_list");
+    client.close();
+    await stub.stop();
+  });
+
+  test("acceptQuestFrom(itemGuid) refuses a quest the item's tooltip says it does not start", async () => {
+    const stub = startStub({ onConnect: () => tome() });
+    const client = await inWorld(stub);
+    await client.events.waitForOpcode("SMSG_ITEM_QUERY_SINGLE_RESPONSE", { timeout: 2000 });
+    await expect(client.acceptQuestFrom(ITEM_GUID, OTHER_QUEST_ID, { timeout: 200 })).rejects.toThrow(/starts quest 1646, not 909/);
+    expect(stub.actions.map((x) => x.action)).not.toContain("quest_details");
+    client.close();
+    await stub.stop();
+  });
+
+  test("useItem on an ordinary item is the plain ack: nothing is waited for", async () => {
+    const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate, creatureCreate, creatureQuery, inventorySlot, itemCreate, itemQuery]) });
+    const client = await inWorld(stub);
+    await client.events.waitForOpcode("SMSG_ITEM_QUERY_SINGLE_RESPONSE", { timeout: 2000 });
+    const used = await client.useItem("Gritstone Charm");
+    expect(used.ok).toBe(true);
+    expect(used).not.toHaveProperty("questOffer");
+    client.close();
+    await stub.stop();
+  });
+
+  test("item_not_usable says what is known: no spell and no quest, or a module build that predates quest-start items", async () => {
+    const refuse = (a: string) => (a === "use_item" ? json({ ok: false, error: "item_not_usable", action: a }, 400) : undefined);
+    const plain = startStub({ onConnect: () => frames([...loginSequence, selfCreate, creatureCreate, creatureQuery, inventorySlot, itemCreate, itemQuery]), failAction: refuse });
+    const c1 = await inWorld(plain);
+    await c1.events.waitForOpcode("SMSG_ITEM_QUERY_SINGLE_RESPONSE", { timeout: 2000 });
+    const e1 = (await c1.useItem("Gritstone Charm").catch((e: unknown) => e)) as WrathRequestError;
+    expect(e1).toBeInstanceOf(WrathRequestError);
+    expect(e1.message).toContain("no on-use spell and no quest to start");
+    expect(e1.message).not.toContain("no on-use effect");
+    c1.close();
+    await plain.stop();
+
+    const start = startStub({ onConnect: () => tome(), failAction: refuse });
+    const c2 = await inWorld(start);
+    await c2.events.waitForOpcode("SMSG_ITEM_QUERY_SINGLE_RESPONSE", { timeout: 2000 });
+    const e2 = (await c2.useItem("Tome of Divinity").catch((e: unknown) => e)) as WrathRequestError;
+    expect(e2.message).toContain(`starts quest ${START_QUEST}`);
+    expect(e2.message).toContain("predates quest-start items");
+    c2.close();
+    await start.stop();
+  });
+
+  test("acceptQuestFrom on a turn-in-only NPC is nothing_on_offer at once, with the marker's hint and nothing sent", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    stub.push(JSON.stringify(questGiverStatus(CREATURE_GUID, 6, 91))); // reward_rep
+    await Bun.sleep(20);
+    const before = Date.now();
+    const result = await client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 10_000 });
+    expect(Date.now() - before).toBeLessThan(1000);
+    expect(result).toMatchObject({ ok: false, status: "nothing_on_offer", questId: QUEST_ID, offered: [] });
+    if (result.ok || result.status !== "nothing_on_offer") throw new Error("unreachable");
+    expect(result.hint).toContain("questgiver status is `reward_rep`");
+    expect(stub.actions.map((a) => a.action)).not.toContain("quest_list");
+    expect(client.drainActionHints()[0]).toMatchObject({ action: "acceptQuestFrom", status: "nothing_on_offer" });
+
+    // An offering marker still asks, as before.
+    stub.push(JSON.stringify(questGiverStatus(CREATURE_GUID, 8, 92))); // available
+    await Bun.sleep(20);
+    const pending = client.questsAvailableFrom(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify(questGiverList([QUEST_ID], 93)));
+    expect((await pending).quests.map((q) => q.questId)).toEqual([QUEST_ID]);
     client.close();
     await stub.stop();
   });

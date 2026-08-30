@@ -8,6 +8,7 @@
 
 export {
   connect,
+  inventoryResultText,
   KNOWN_ERROR_CODES,
   TRAINER_SPELL_STATE,
   WrathClient,
@@ -15,6 +16,9 @@ export {
   WrathTransportError,
 } from "./client";
 export type {
+  ActivateTaxiResult,
+  BindOptions,
+  BindResult,
   BuySpellResult,
   ConnectOptions,
   DeleteCharacterOptions,
@@ -36,8 +40,26 @@ export type {
   MoveToOptions,
   QuestAcceptResult,
   QuestOptions,
+  QuestsAvailableResult,
   QuestTurnInResult,
+  UseItemResult,
   StoredLootItem,
+  TaxiOptions,
+  ResetTalentsOptions,
+  ResetTalentsResult,
+  BankMoveResult,
+  BankOptions,
+  GroupOptions,
+  InviteResult,
+  LootRollOptions,
+  LootRollRefusalStatus,
+  LootRollResult,
+  ReadItemOptions,
+  ReadItemResult,
+  MailOptions,
+  MailResult,
+  SendMailOptions,
+  TalentTreeOptions,
   TrainerListResult,
   TrainerOptions,
   TrainerSpell,
@@ -45,6 +67,7 @@ export type {
   WaitForChatOptions,
   WaitForNearbyOptions,
   WaitForTransferOptions,
+  WithResolved,
 } from "./client";
 
 export {
@@ -65,7 +88,23 @@ export type {
   WaitForOptions,
 } from "./events";
 
-export { GAME_OBJECT_TYPE_NAMES, NPC_ROLES, gameObjectTypeName, npcRolesOf, pointOf, questGiverStatusName, StateCache } from "./state";
+export {
+  GAME_OBJECT_TYPE_NAMES,
+  NPC_ROLES,
+  gameObjectTypeName,
+  mailResultText,
+  npcRolesOf,
+  partyResultText,
+  petFeedbackText,
+  rollChoiceName,
+  ROLL_VOTE,
+  petTameFailureText,
+  pointOf,
+  questGiverStatusName,
+  reputationRank,
+  StateCache,
+  tradeStatusText,
+} from "./state";
 export type {
   Anomaly,
   AreaRef,
@@ -84,14 +123,41 @@ export type {
   TransportState,
   GapRecord,
   Gauge,
+  BindPoint,
   GossipMenu,
   GossipMenuOption,
+  LootWindow,
   InventoryItem,
   ItemInfo,
+  ItemText,
+  PendingRoll,
+  RollChoice,
   KnownSpell,
   SpellCooldown,
   TalentEntry,
   TalentState,
+  TalentTree,
+  TalentTreeTab,
+  TalentTreeTalent,
+  SkillLine,
+  ReputationEntry,
+  ReputationRank,
+  BankContents,
+  GroupMember,
+  GroupState,
+  MailEntry,
+  MailItem,
+  MailboxState,
+  PetCommand,
+  PetReaction,
+  PetSpellEntry,
+  PetState,
+  TradeSide,
+  TradeState,
+  TaxiNodeRef,
+  TaxiWindow,
+  TrainerWindow,
+  VendorWindow,
   Motion,
   NearbyObject,
   NotificationEntry,
@@ -113,6 +179,9 @@ export type {
   UnitView,
   WorldPosition,
 } from "./state";
+
+export { editBudget, editDistance, normaliseName, resolveName } from "./resolve";
+export type { Resolution, ResolvedRef, ResolveTier } from "./resolve";
 
 export {
   guidKey,

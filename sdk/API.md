@@ -27,8 +27,21 @@ game answer you asked for.
 **Two tiers.** A **helper** waits for the game's verdict and returns it. A **raw
 action** is one opcode acknowledged over HTTP; its outcome arrives later on the
 event stream (`sdk.events`). The tier is about where the outcome lands, not
-about the argument type — `interact` is a raw action that still accepts a unit
-object. Endpoints (session, health) return their HTTP answer directly.
+about the argument type: every call that takes a guid takes a unit object or a
+name in view just the same. Endpoints (session, health) return their HTTP
+answer directly.
+
+**Names are referents.** Anywhere a guid is taken — helpers, raw actions, and a
+`{ guid }` / `{ packedGuid }` field inside a `raw()` payload — you may instead
+pass the name of something you can currently see, exactly as a player points at
+things by name. Resolution ignores case, spacing and apostrophes, then takes an
+exact name, else a unique substring, else a unique near-miss (one typo, two in a
+name of eight characters or more). One match acts; nothing matching, or two
+things matching, refuses and lists what is in view — the SDK never picks between
+referents. When the match was not exact the answer carries
+`resolved: { input, name, guid }` so you can see what you acted on. Items work
+the same way in place of a bag number (`equipItem("Bronze Axe")`), against what
+you carry. Guids and opcode names are never fuzzed.
 
 ## Session & connection
 
@@ -51,16 +64,35 @@ own client — not for snippets, where `sdk` already exists.) Then, on the clien
 
 | Method | Signature | Purpose |
 | --- | --- | --- |
-| `moveTo` | `moveTo(target, options?): Promise<MoveResult>` | Walk to a point { x, y, z }, a unit, or a guid (its cached position; the guid rides along so the module resolves z to the ground under the unit) and wait for the server's arrive/target_off_mesh/transferred/teleported/… verdict; a target nothing in view answers to comes back as status "unknown_target". An arrival aboard a tram car or boat carries onTransport { guid, entry }, and state.self.position then follows the ride (WB_RIDE_PROGRESS). |
+| `moveTo` | `moveTo(target, options?): Promise<MoveResult>` | Walk to a point { x, y, z }, a unit, a guid, or the name of something in view (its cached position; the guid rides along so the module resolves z to the ground under the unit) and wait for the server's arrive/target_off_mesh/transferred/teleported/… verdict; a target nothing in view answers to comes back as status "unknown_target". An arrival aboard a tram car or boat carries onTransport { guid, entry }, and state.self.position then follows the ride (WB_RIDE_PROGRESS). |
 | `killTarget` | `killTarget(target: GuidOrUnit, options?): Promise<KillResult>` | Approach and auto-attack until the target or we drop; returns how the fight ended. |
 | `lootCorpse` | `lootCorpse(target: GuidOrUnit, options?): Promise<LootResult>` | Empty a corpse and report what actually entered the bags (confirmed pushes, not the window). |
-| `acceptQuestFrom` | `acceptQuestFrom(npcGuid: GuidOrUnit, questId, options?): Promise<QuestAcceptResult>` | Take a quest from an NPC and confirm it landed in the quest log. |
+| `acceptQuestFrom` | `acceptQuestFrom(npcGuid: GuidOrUnit, questId, options?): Promise<QuestAcceptResult>` | Take a quest from an NPC and confirm it landed in the quest log. The guid may be a quest-start item's own guid (`state.bag()`, or `useItem(...).questOffer.itemGuid`). `{ status: "nothing_on_offer", hint }` when the NPC's observed questgiver marker already says it offers nothing (turn-in-only, empty-handed) — answered at once, nothing sent. |
 | `turnInQuest` | `turnInQuest(npcGuid: GuidOrUnit, questId, rewardIndex?, options?): Promise<QuestTurnInResult>` | Hand a finished quest back and take a reward. |
-| `questsAvailableFrom` | `questsAvailableFrom(npcGuid: GuidOrUnit, options?): Promise<{ ok, quests }>` | What an NPC is offering right now; an empty list is an answer, not an error. |
+| `questsAvailableFrom` | `questsAvailableFrom(npcGuid: GuidOrUnit, options?): Promise<QuestsAvailableResult>` | What an NPC is offering right now; an empty list is an answer, not an error. `{ ok: false, status: "nothing_on_offer", hint }` at once when the NPC's observed questgiver marker already says it offers nothing. |
 | `trainerList` | `trainerList(npcGuid: GuidOrUnit, options?): Promise<TrainerListResult>` | What a trainer teaches, each row with derived learnable/affordable. |
 | `buySpell` | `buySpell(npcGuid: GuidOrUnit, spellId, options?): Promise<BuySpellResult>` | Learn one spell from a trainer for money; returns learned or buy_failed. |
-| `equipItem` | `equipItem(bag, slot, options?): Promise<EquipItemResult>` | Equip a carried item (bag/slot as `state.bag()` lists them: 255/23-38 for the backpack, a worn bag's equip slot 19-22 with slots 0..numSlots-1) and wait for the server's verdict; returns equipped, or not_equipped with the InventoryResult reason (proficiency, level, a two-hander blocking a shield, …). |
-| `learnTalent` | `learnTalent(talentId, rank, options?): Promise<LearnTalentResult>` | Spend a talent point (rank is 0-based) and read the verdict off the SMSG_TALENTS_INFO answer; returns learned or not_learned with the new state.talents(). |
+| `equipItem` | `equipItem(bagOrName: number | string, slot?, options?): Promise<EquipItemResult>` | Equip a carried item — its bag/slot as `state.bag()` lists them (255/23-38 for the backpack, a worn bag's equip slot 19-22 with slots 0..numSlots-1), or its name in place of the bag — and wait for the server's verdict; returns equipped, not_equipped with the InventoryResult reason (proficiency, level, a two-hander blocking a shield, …), or no_item when the name matches nothing carried or more than one thing. |
+| `showTaxiNodes` | `showTaxiNodes(npcGuid: GuidOrUnit, options?): Promise<TaxiWindow>` | Open a flight master's window (gossipHello, then its taxi option) and return it: the node the master stands at and the nodes this character has visited — the only destinations the server accepts. |
+| `activateTaxi` | `activateTaxi(npcGuid: GuidOrUnit, dest: string | number, options?): Promise<ActivateTaxiResult>` | Fly from the master's node to a known node by name or id (resolved against state.lastTaxiNodes(guid)); returns accepted or refused with the server's reply code and a hint. The ride is state.self.taxiFlight. |
+| `bindAtInnkeeper` | `bindAtInnkeeper(npcGuid: GuidOrUnit, options?): Promise<BindResult>` | Make an inn the Hearthstone's home the way a client does (gossip, the home option, confirm) and return the new bind point (also state.self.bindPoint). |
+| `learnTalent` | `learnTalent(talentIdOrName: number | string, rank?, options?): Promise<LearnTalentResult>` | Spend a talent point — a talent id, or a name from the tree once queryTalentTree() has been called; rank is 0-based on the wire and defaults to the next point in that talent — and read the verdict off the SMSG_TALENTS_INFO answer; returns learned, not_learned, or unknown_talent / ambiguous_talent / no_tree. |
+| `queryTalentTree` | `queryTalentTree(options?): Promise<TalentTree>` | The class talent frame: tabs [{ tabId, name, page, pointsSpent, talents: [{ talentId, name, row, col, maxRank, ranks, pointsSpent, dependsOn, dependsOnRank }] }] plus unspentPoints; static per class, also state.talentTree(). |
+| `resetTalents` | `resetTalents(npcGuid: GuidOrUnit, options?): Promise<ResetTalentsResult>` | Unlearn all talents at a class trainer the way a client does (gossip, the unlearn option, confirm at the quoted cost); returns reset with the new state.talents(), refused (nothing to unlearn / not enough money), or no_option when the menu has no unlearn entry. |
+| `inviteToGroup` | `inviteToGroup(name, options?): Promise<InviteResult>` | Invite a player by name and return the server's verdict on the invite (invited = delivered, not yet accepted; refused carries the reason). Their answer lands in state.group(): inGroup, or lastDecline. |
+| `acceptGroupInvite` | `acceptGroupInvite(options?): Promise<GroupState>` | Accept the pending invitation (state.group().pendingInvite) and return the party once the server lists it. |
+| `leaveGroup` | `leaveGroup(options?): Promise<GroupState>` | Leave the party and return the state once the server confirms. |
+| `openMailbox` | `openMailbox(mailbox: GuidOrUnit, options?): Promise<MailboxState>` | Use a mailbox game object (goType "mailbox", within reach) and wait for its frame; every other mail helper needs this open. |
+| `sendMail` | `sendMail(to, subject, body, { money?, cod?, items?: ({ bag, slot } | name)[] }?): Promise<MailResult>` | Send a mail from the open mailbox with optional money, COD and up to 12 carried items (each a bag/slot pair or an item name); returns sent, refused with the server's reason (postage 30c comes out of state.money), or no_mailbox / no_item. |
+| `mailList` | `mailList(options?): Promise<MailboxState>` | List the inbox at the open mailbox: mails [{ mailId, senderName, subject, body, money, cod, read, items: [{ itemGuidLow, itemId, name, count }] }]. |
+| `takeMailMoney` | `takeMailMoney(mailId, options?): Promise<MailResult>` | Take the money out of one mail (money_taken, or refused). |
+| `takeMailItem` | `takeMailItem(mailId, itemGuidLow, options?): Promise<MailResult>` | Take one attached item out of a mail into the bags (item_taken, or refused with the inventory reason). |
+| `deleteMail` | `deleteMail(mailId, options?): Promise<MailResult>` | Delete one mail (deleted, or refused). |
+| `openBank` | `openBank(npcGuid: GuidOrUnit, options?): Promise<BankContents>` | Open the bank at a banker (state.units({ role: "banker" }), within reach) and return it; deposits and withdrawals need this open. |
+| `bankDeposit` | `bankDeposit(bagOrName: number | string, slot?, options?): Promise<BankMoveResult>` | Put a carried item (bag/slot as state.bag() lists it, or its name) in the bank; returns where it landed in state.bank(), refused with the inventory reason, or no_bank / no_item when nothing was sent. |
+| `lootRoll` | `lootRoll(itemNameOrIdOrRollGuid, choice: "need" | "greed" | "pass" | "disenchant", options?): Promise<LootRollResult>` | Vote on an open roll frame from state.pendingRolls() (by the item's name — exact, else a unique substring — its id, or the roll guid); rolled carries the number rolled, while no_pending_roll / ambiguous_roll / roll_not_allowed mean nothing was sent. The winner arrives as SMSG_LOOT_ROLL_WON. |
+| `readItem` | `readItem(bagOrName: number | string, slot?, options?): Promise<ReadItemResult>` | Read a carried book or letter (bag/slot as state.bag() lists it, or its name) and return its pages and text; no_item / not_readable mean nothing to read. The pages stay in state.itemTexts(). |
+| `bankWithdraw` | `bankWithdraw(bagOrName: number | string, slot?, options?): Promise<BankMoveResult>` | Take an item out of the bank (bag/slot as state.bank() lists it, or its name) into the bags; returns where it landed in state.bag(), refused, or no_bank / no_item. |
 | `waitForChat` | `waitForChat(match: string | (entry) => boolean, options?): Promise<ChatEntry>` | Wait for a chat line matching a string or predicate. |
 | `waitForNearby` | `waitForNearby(predicate: (obj) => boolean, options?): Promise<NearbyObject>` | Wait until an object in view satisfies the predicate. |
 | `waitForTransfer` | `waitForTransfer({ timeout?, sinceSeq?, expectMap? }): Promise<TransferResult>` | Wait for a map transfer's server verdict: transferred (SMSG_NEW_WORLD) / aborted / waiting / no_transfer / wrong_map. moveTo already does this when a portal takes the character. |
@@ -74,41 +106,49 @@ own client — not for snippets, where `sdk` already exists.) Then, on the clien
 | `moveToAsync` | `moveToAsync(target): Promise<MoveToResponse>` | Queue a move without waiting — the call for a walk longer than your own time budget; same targets as moveTo. |
 | `stop` | `stop(): Promise<ActionResponse>` | Queue a movement stop; the in-flight moveTo resolves with status 'stopped'. |
 | `face` | `face(orientationOrPoint: number | { x, y }): Promise<FaceResponse>` | Turn in place toward an orientation (radians) or a point. |
-| `setTarget` | `setTarget(guid: GuidArg): Promise<ActionResponse>` | Set the current target (guid string only). |
+| `setTarget` | `setTarget(target: GuidOrUnit): Promise<ActionResponse>` | Set the current target. |
 | `clearTarget` | `clearTarget(): Promise<ActionResponse>` | Clear the current target. |
-| `attackStart` | `attackStart(guid: GuidArg): Promise<ActionResponse>` | Start melee auto-attack (guid string only). |
+| `attackStart` | `attackStart(target: GuidOrUnit): Promise<ActionResponse>` | Start melee auto-attack. |
 | `attackStop` | `attackStop(): Promise<ActionResponse>` | Stop melee auto-attack. |
-| `castSpell` | `castSpell(spellId, targetGuid?: GuidArg): Promise<ActionResponse>` | Cast a spell; no target means self/auto-target. |
+| `castSpell` | `castSpell(spellId, targetGuid?: GuidOrUnit): Promise<ActionResponse>` | Cast a spell; no target means self/auto-target. |
 | `cancelCast` | `cancelCast(spellId): Promise<ActionResponse>` | Cancel a cast in progress. |
-| `interact` | `interact(target: GuidOrUnit): Promise<ActionResponse>` | Use a gameobject — chest, door, quest object (accepts a unit or its guid). |
-| `gossipHello` | `gossipHello(guid: GuidArg): Promise<ActionResponse>` | Open an NPC's gossip menu (guid string only). |
-| `gossipSelect` | `gossipSelect(guid: GuidArg, option: string | number) | gossipSelect(guid, menuId, optionId): Promise<ActionResponse>` | Choose a gossip option by visible text (from the last observed menu) or by numeric ids. |
-| `questList` | `questList(guid: GuidArg): Promise<ActionResponse>` | Ask an NPC for its quest list. |
-| `questDetails` | `questDetails(guid: GuidArg, questId): Promise<ActionResponse>` | Request a quest's text. |
-| `questAccept` | `questAccept(guid: GuidArg, questId): Promise<ActionResponse>` | Accept a quest (prefer acceptQuestFrom, which confirms). |
-| `questComplete` | `questComplete(guid: GuidArg, questId): Promise<ActionResponse>` | Ask to complete a quest (prefer turnInQuest, which waits). |
-| `questChooseReward` | `questChooseReward(guid: GuidArg, questId, rewardIndex?): Promise<ActionResponse>` | Choose a quest reward by index. |
+| `interact` | `interact(target: GuidOrUnit): Promise<ActionResponse>` | Use a gameobject — chest, door, quest object. |
+| `gossipHello` | `gossipHello(target: GuidOrUnit): Promise<ActionResponse>` | Open an NPC's gossip menu. |
+| `gossipSelect` | `gossipSelect(guid: GuidOrUnit, option: string | number) | gossipSelect(guid, menuId, optionId): Promise<ActionResponse>` | Choose a gossip option by visible text (from the last observed menu) or by numeric ids. |
+| `questList` | `questList(guid: GuidOrUnit): Promise<ActionResponse>` | Ask an NPC for its quest list. |
+| `questDetails` | `questDetails(guid: GuidOrUnit, questId): Promise<ActionResponse>` | Request a quest's text. |
+| `questAccept` | `questAccept(guid: GuidOrUnit, questId): Promise<ActionResponse>` | Accept a quest (prefer acceptQuestFrom, which confirms). |
+| `questComplete` | `questComplete(guid: GuidOrUnit, questId): Promise<ActionResponse>` | Ask to complete a quest (prefer turnInQuest, which waits). |
+| `questChooseReward` | `questChooseReward(guid: GuidOrUnit, questId, rewardIndex?): Promise<ActionResponse>` | Choose a quest reward by index. |
 | `questAbandon` | `questAbandon(questId): Promise<ActionResponse>` | Abandon a quest from the log. |
 | `questQuery` | `questQuery(questId): Promise<ActionResponse>` | Fetch a quest template (title, objective text, required entries/counts) into state.quests; the SDK already does this for every quest entering the log. |
-| `questGiverStatusQuery` | `questGiverStatusQuery(guid?: GuidArg): Promise<ActionResponse>` | Refresh the questgiver marker (state.units(...).questGiver) for one guid, or for everything in view when called with no guid; the SDK already does this on sight and on quest-log changes. |
-| `loot` | `loot(guid: GuidArg): Promise<ActionResponse>` | Open the loot window on a corpse. |
-| `lootAll` | `lootAll(guid: GuidArg): Promise<ActionResponse>` | Open and auto-loot; fire-and-forget (prefer lootCorpse, which waits). |
+| `questGiverStatusQuery` | `questGiverStatusQuery(guid?: GuidOrUnit): Promise<ActionResponse>` | Refresh the questgiver marker (state.units(...).questGiver) for one guid, or for everything in view when called with no guid; the SDK already does this on sight and on quest-log changes. |
+| `loot` | `loot(guid: GuidOrUnit): Promise<ActionResponse>` | Open the loot window on a corpse. |
+| `lootAll` | `lootAll(guid: GuidOrUnit): Promise<ActionResponse>` | Open and auto-loot; fire-and-forget (prefer lootCorpse, which waits). |
 | `lootItem` | `lootItem(slot): Promise<ActionResponse>` | Store one loot slot into the bags. |
 | `lootMoney` | `lootMoney(): Promise<ActionResponse>` | Take the money from the open loot window. |
-| `lootRelease` | `lootRelease(guid: GuidArg): Promise<ActionResponse>` | Close the loot window. |
-| `vendorList` | `vendorList(guid: GuidArg): Promise<ActionResponse>` | Ask a vendor for its inventory list. |
-| `buyItem` | `buyItem(guid: GuidArg, itemId, slot, count?): Promise<ActionResponse>` | Buy an item from a vendor (slot is the 1-based vendor slot). |
-| `sellItem` | `sellItem(guid: GuidArg, itemGuid: GuidArg, count?): Promise<ActionResponse>` | Sell an item to a vendor; omit count to sell the whole stack. |
-| `repairAll` | `repairAll(guid: GuidArg): Promise<ActionResponse>` | Repair everything at a repair vendor. |
-| `useItem` | `useItem(bag, slot, targetGuid?: GuidArg): Promise<ActionResponse>` | Use a bag item's on-use effect. |
-| `destroyItem` | `destroyItem(bag, slot, count?): Promise<ActionResponse>` | Destroy a bag item; omit count to destroy the whole stack. |
+| `lootRelease` | `lootRelease(guid: GuidOrUnit): Promise<ActionResponse>` | Close the loot window. |
+| `vendorList` | `vendorList(guid: GuidOrUnit): Promise<ActionResponse>` | Ask a vendor for its inventory list. |
+| `buyItem` | `buyItem(guid: GuidOrUnit, itemId, slot, count?): Promise<ActionResponse>` | Buy an item from a vendor (slot is the 1-based vendor slot). |
+| `sellItem` | `sellItem(vendor: GuidOrUnit, itemGuid: GuidArg, count?): Promise<ActionResponse>` | Sell an item to a vendor; omit count to sell the whole stack. The vendor takes a name in view, itemGuid stays the item's own guid string — there is no name-to-item-guid namespace. |
+| `repairAll` | `repairAll(guid: GuidOrUnit): Promise<ActionResponse>` | Repair everything at a repair vendor. |
+| `useItem` | `useItem(bagOrName: number | string, slot?, targetGuid?: GuidOrUnit, options?): Promise<UseItemResult>` | Use a bag item's on-use effect; the item is its bag/slot or its name (with a name, the next argument is the target guid). A quest-start item with no on-use spell (a found letter, the Tome of Divinity) is right-clicked instead: the server offers its quest, and the result carries `questOffer: { questId, title, itemGuid }` — take it with `acceptQuestFrom(questOffer.itemGuid, questOffer.questId)`. |
+| `destroyItem` | `destroyItem(bagOrName: number | string, slot?, count?): Promise<ActionResponse>` | Destroy a bag item by bag/slot or by name (with a name, the next argument is the count); omit count to destroy the whole stack. |
 | `repop` | `repop(): Promise<ActionResponse>` | Release the spirit while dead. |
-| `reclaimCorpse` | `reclaimCorpse(guid?: GuidArg, options?: ReclaimCorpseOptions): Promise<ReclaimCorpseResult>` | Wait out the server's corpse reclaim delay, reclaim, and report the verdict: reclaimed / not_reclaimed / unconfirmed. |
-| `reclaimCorpseAsync` | `reclaimCorpseAsync(guid?: GuidArg): Promise<ActionResponse>` | CMSG_RECLAIM_CORPSE, dispatch only. Prefer reclaimCorpse. |
-| `spiritHealerActivate` | `spiritHealerActivate(guid: GuidArg): Promise<ActionResponse>` | Resurrect at a graveyard spirit healer (durability cost, resurrection sickness). |
-| `trainerListAsync` | `trainerListAsync(guid: GuidArg): Promise<ActionResponse>` | Ask a trainer for its list without waiting (prefer trainerList). |
-| `trainerBuySpellAsync` | `trainerBuySpellAsync(guid: GuidArg, spellId): Promise<ActionResponse>` | Buy a spell without waiting (prefer buySpell). |
+| `reclaimCorpse` | `reclaimCorpse(guid?: GuidOrUnit, options?: ReclaimCorpseOptions): Promise<ReclaimCorpseResult>` | Wait out the server's corpse reclaim delay, reclaim, and report the verdict: reclaimed / not_reclaimed / unconfirmed. |
+| `reclaimCorpseAsync` | `reclaimCorpseAsync(guid?: GuidOrUnit): Promise<ActionResponse>` | CMSG_RECLAIM_CORPSE, dispatch only. Prefer reclaimCorpse. |
+| `spiritHealerActivate` | `spiritHealerActivate(guid: GuidOrUnit): Promise<ActionResponse>` | Resurrect at a graveyard spirit healer (durability cost, resurrection sickness). |
+| `trainerListAsync` | `trainerListAsync(guid: GuidOrUnit): Promise<ActionResponse>` | Ask a trainer for its list without waiting (prefer trainerList). |
+| `trainerBuySpellAsync` | `trainerBuySpellAsync(guid: GuidOrUnit, spellId): Promise<ActionResponse>` | Buy a spell without waiting (prefer buySpell). |
 | `learnTalentAsync` | `learnTalentAsync(talentId, rank): Promise<ActionResponse>` | Spend a talent point without waiting (prefer learnTalent). |
+| `talentTreeAsync` | `talentTreeAsync(): Promise<ActionResponse>` | Ask for the class talent tree without waiting for the WB_TALENT_TREE answer (prefer queryTalentTree). |
+| `petAttack` | `petAttack(target: GuidOrUnit): Promise<PetActionResult>` | Order the pet (state.pet()) to attack a unit; sent is an ack and the server's refusal arrives as SMSG_PET_ACTION_FEEDBACK, while no_pet means nothing was sent. |
+| `petFollow` | `petFollow(): Promise<PetActionResult>` | Order the pet to follow you. |
+| `petStay` | `petStay(): Promise<PetActionResult>` | Order the pet to stay where it is. |
+| `petReact` | `petReact(reaction: "passive" | "defensive" | "aggressive"): Promise<PetActionResult>` | Set the pet's react state (case-insensitive); anything else is unknown_reaction. |
+| `petCast` | `petCast(spellNameOrId, target?: GuidOrUnit): Promise<PetActionResult>` | Have the pet cast one of its own spells (state.pet().spells, by name or by id) at a unit or at nothing; the server's refusal arrives as SMSG_PET_CAST_FAILED, while unknown_spell / ambiguous_spell / passive_spell mean nothing was sent. |
+| `petDismiss` | `petDismiss(): Promise<PetActionResult>` | Send the pet away: a hunter casts Dismiss Pet (the pet can be called back), any other pet is abandoned (a demon or temporary summon just goes). state.pet() is undefined once the bar is removed. |
+| `declineGroupInvite` | `declineGroupInvite(): Promise<RawActionResponse>` | Decline the pending invitation. |
 | `raw` | `raw(opcode: string, payload?: hex | Uint8Array | RawField[]): Promise<RawActionResponse>` | Escape hatch: send one allowlisted CMSG_* opcode with a body you build — a field list like [{ u32: 5 }, { guid: unit.guid }, { cstring: "x" }] is packed little-endian for you. Allowlist and field types: module/PROTOCOL.md "raw". The answer arrives on sdk.events only if its opcode is whitelisted there. |
 
 ## State reads (`state.*`)
@@ -131,12 +171,29 @@ zero.
 | `bag` | `state.bag(): BagContents` | The whole carried inventory — backpack plus worn bags — as { items: [{ bag, slot, guid, itemId, name, count, quality? }], freeSlots, totalSlots, bags: [{ slot, numSlots, name }] }; each item's bag/slot is what the item actions take. |
 | `quest` | `state.quest(questId): QuestLogEntry | undefined` | One quest-log entry by id: questId, title, complete bit, counts, and objectives: [{ kind: "kill"|"interact"|"collect"|"event", entry, text, required, have, done }] (objectives/title are undefined until the quest template answer has arrived, usually within a second of accepting). |
 | `questLog` | `get state.questLog: QuestLogEntry[]` | All quest-log entries. |
+| `lastTaxiNodes` | `state.lastTaxiNodes(guid): TaxiWindow | undefined` | The flight master window last observed for a guid: current node, known (visited) nodes with their names, the taximask verbatim (what activateTaxi resolves against). |
 | `lastGossip` | `state.lastGossip(guid): GossipMenu | undefined` | The gossip menu last observed open for a guid (what gossipSelect-by-text resolves against). |
+| `lastVendorList` | `state.lastVendorList(guid): VendorWindow | undefined` | The stock last observed for a vendor: { items: [{ slot (1-based, what buyItem takes), itemId, price (discounted copper), buyCount, leftInStock (-1 unlimited), extendedCost }], emptyReason, seq, ts }. Last observed, not open: nothing closes a vendor frame. |
+| `lastTrainerList` | `state.lastTrainerList(guid): TrainerWindow | undefined` | The teaching list last observed for a trainer: { trainerType, spells: [{ spellId, state (0 available, 1 unavailable, 2 known), cost, reqLevel, reqSkill, reqSkillValue }], greeting, seq, ts }. Raw rows; trainerList(npcGuid) asks and adds learnable/affordable. |
+| `lastLoot` | `state.lastLoot(): LootWindow | undefined` | The open loot window: { guid, lootType, gold, items: [{ slot (what lootItem takes), itemId, count, slotType }], seq, ts }. Taken slots and taken gold leave it; the release closes it. |
 | `aurasOf` | `state.aurasOf(guid): AuraEntry[]` | Observed auras on a unit, by slot. |
 | `spells` | `state.spells(): KnownSpell[]` | The spellbook the server served: [{ spellId, rank, name }] for every spell the character knows (empty until login's SMSG_INITIAL_SPELLS; kept current by learned/removed/superseded events). |
 | `spell` | `state.spell(spellId): KnownSpell | undefined` | One spellbook row by id; undefined means the character does not know that spell. |
 | `cooldowns` | `state.cooldowns(now?): SpellCooldown[]` | Spells still on cooldown: [{ spellId, readyAt (epoch ms, or undefined when the server gave no duration), cooldownMs }]. |
 | `talents` | `state.talents(): TalentState | undefined` | Last SMSG_TALENTS_INFO: { unspentPoints, activeSpec, specCount, talents: [{ talentId, rank (0-based) }] }. |
+| `talentTree` | `state.talentTree(): TalentTree | undefined` | The class talent frame last answered by queryTalentTree, with pointsSpent per talent merged from the latest SMSG_TALENTS_INFO; undefined until queried. |
+| `skills` | `state.skills(): SkillLine[]` | The skill pane: [{ skillId, name, value, max, tempBonus, permBonus }] for every skill line the character has (weapons, armor, professions, languages), from the self update fields. |
+| `skill` | `state.skill(idOrName): SkillLine | undefined` | One skill line by id or name; undefined when the character lacks it, and also when the name is ambiguous — a read has no way to refuse. |
+| `reputation` | `state.reputation(): ReputationEntry[]` | The reputation pane: [{ factionId, name, standing, base, reputation, rank: "Hated"…"Exalted", visible, atWar }] from login's SMSG_INITIALIZE_FACTIONS and every SMSG_SET_FACTION_STANDING since; visible factions first. |
+| `reputationWith` | `state.reputationWith(factionIdOrName): ReputationEntry | undefined` | One reputation row by faction id or name; undefined when there is none or the name is ambiguous. |
+| `pet` | `state.pet(): PetState | undefined` | The pet frame: { guid, name, creatureName, level, health, maxHealth, power, maxPower, dead, inView, reaction: "passive"|"defensive"|"aggressive", command: "stay"|"follow"|"attack", actionBar, spells: [{ spellId, name, rank, autocast, passive }], cooldowns }; undefined when there is no pet (none summoned, or its bar was removed). |
+| `petSpell` | `state.petSpell(idOrName): PetSpellEntry | undefined` | One of the pet's spells by id or name; undefined when there is none or the name is ambiguous. |
+| `group` | `state.group(): GroupState | undefined` | The party: { inGroup, raid, leaderGuid, leaderName, leader (you), members: [{ guid, name, online, leader, assistant }], pendingInvite: { inviterName }, lastResult: { operation, name, result, text }, lastDecline }; undefined until any group packet. |
+| `mailbox` | `state.mailbox(): MailboxState | undefined` | The mailbox: { guid (the open mailbox), mails: [{ mailId, senderName, subject, body, money, cod, read, daysLeft, items }], total, newMail, lastResult: { action, result, text } }; undefined until any mail packet. |
+| `bank` | `state.bank(): BankContents` | The bank: { guid (the banker the frame was opened at), items: [{ bag (255 for the main bank, else the bank bag's slot 67-73), slot, guid, itemId, name, count }], bags, freeSlots, totalSlots }; the slots are known from login, moving items needs openBank. |
+| `pendingRolls` | `state.pendingRolls(): PendingRoll[]` | The open group-loot roll frames: [{ rollGuid, itemId, name, quality, count, allowed: ["need"|"greed"|"disenchant"|"pass"], deadline }]; empty when nothing is up for a roll. |
+| `itemTexts` | `state.itemTexts(): ItemText[]` | The text of every carried item read so far: [{ guid, itemId, name, pages, complete }]. |
+| `trade` | `state.trade(): TradeState | undefined` | The trade window: { status, statusText, open, traderGuid, mine: { money, items }, theirs: { money, items } }; undefined until any trade packet. |
 | `nameOf` | `state.nameOf(guid): string | undefined` | The name for a guid, if a name query ever returned one. |
 | `snapshot` | `state.snapshot(): StateSnapshot` | A frozen plain-object copy of the whole cache. |
 | `target` | `get state.target: NearbyObject | undefined` | The object our own target points at, when it is also in view. |

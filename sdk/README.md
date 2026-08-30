@@ -80,7 +80,7 @@ class WrathClient {
   moveTo(target: MoveTarget, o?: MoveToOptions): Promise<MoveResult>
   waitForNearby(p: (o: NearbyObject) => boolean, o?: WaitForNearbyOptions): Promise<NearbyObject>
   killTarget(guid, o?: KillTargetOptions): Promise<KillResult>
-  lootCorpse(guid, o?: LootOptions): Promise<LootResult>
+  lootCorpse(guid, o?: LootOptions): Promise<LootResult>              // corpses and chests alike
   questsAvailableFrom(npcGuid, o?: QuestOptions): Promise<{ ok: true; quests: readonly OfferedQuest[] }>
   acceptQuestFrom(npcGuid, questId, o?: QuestOptions): Promise<QuestAcceptResult>
   turnInQuest(npcGuid, questId, rewardIndex?, o?: QuestOptions): Promise<QuestTurnInResult>
@@ -91,6 +91,12 @@ class WrathClient {
   get selfKey(): string | undefined
 }
 ```
+
+Not in that list, because it is not a helper: `raw()` queues one allowlisted
+client opcode with a caller-built body. It is the escape hatch the surface
+philosophy promises (`docs/METHODOLOGY.md`, "The model surface") — the way a
+trajectory shows a surface is needed before one is built, not a second path to
+anything above. The allowlist is `module/PROTOCOL.md` ("raw").
 
 Every guid — state fields, helper returns, and every guid argument — is an
 opaque decimal string, which is also exactly what the wire carries:
@@ -131,7 +137,15 @@ again. The default `timeout` is 25s, deliberately under the runner's 30s
 snippet cap; longer fights belong in a background routine.
 
 `lootCorpse` sends `loot_all` — the module replaying the client's auto-loot
-sequence — and returns once the window has been emptied and released. Its
+sequence — and returns once the window has been emptied and released. A
+chest-type game object goes the way a client opens one: the core ignores
+`CMSG_GAMEOBJ_USE` on a chest and drops `CMSG_LOOT` on a game object guid, so
+the helper casts the lock's Opening spell at it (6478, 3365, 6247, 6477 — one
+per open-hand lock type, tried in order until the server accepts one) and
+sends the store/money/release sequence itself once the window arrives; a
+chest none of them fits is `{ ok: false, status: "not_opened", reason, hint }`.
+`interact(guid)` on a chest is refused with `{ status: "chest" }` and a hint,
+because the ack it would return means nothing. Its
 `items` are what `SMSG_ITEM_PUSH_RESULT` confirmed *stored*, not what the
 window displayed (the window is an offer; the pushes are the receipt — a
 possible no-op is never reported as success). The window contents ride along
@@ -145,7 +159,7 @@ throws `EventTimeoutError`.
 it returns whatever the NPC offers right now, `{ ok: true, quests: [...] }`,
 and an empty list is an answer rather than an error. It exists because models
 kept rebuilding it by hand over `questList` plus event scraping and getting
-confused by their own nulls (FOLLOW-UPS 9a).
+confused by their own nulls (closed item 9a, `docs/worklogs/2026-08-22.md`).
 
 `acceptQuestFrom` reads the quest log *first*, because a turn-in chain may
 already have added the quest (the core auto-advances, so an explicit accept can

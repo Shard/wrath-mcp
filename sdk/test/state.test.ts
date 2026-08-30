@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import { parseEventFrame, type GameEvent } from "../src/protocol";
 import { STREAM_GAP, type StreamEvent, type StreamGapEvent } from "../src/events";
-import { gameObjectTypeName, pointOf, StateCache, type UnitFilter } from "../src/state";
+import { gameObjectTypeName, pointOf, reputationRank, StateCache, type UnitFilter } from "../src/state";
 import {
   addKill,
   auraRemoved,
@@ -20,6 +20,11 @@ import {
   inventorySlot,
   ITEM_ENTRY,
   ITEM_GUID,
+  ITEM_GUID_HI,
+  ITEM_GUID_LO,
+  BAG_GUID_HI,
+  BAG_GUID_LO,
+  nameQuery,
   itemCreate,
   itemQuery,
   monsterMove,
@@ -1412,6 +1417,144 @@ describe("state cache: the gossip menu fold (item 3c)", () => {
   });
 });
 
+describe("state cache: vendor, trainer and loot windows (item 101b)", () => {
+  const ts = (seq: number) => 1_700_000_000_000 + seq;
+  const vendorList = (guid: string, seq: number, items = [{ slot: 1, itemId: 117, price: 25, buyCount: 1, leftInStock: -1, extendedCost: 0 }]) => ({
+    seq,
+    opcode: "SMSG_LIST_INVENTORY",
+    opcodeId: 0x19f,
+    ts: ts(seq),
+    data: { vendorGuid: guid, items },
+  });
+  const trainerList = (guid: string, seq: number) => ({
+    seq,
+    opcode: "SMSG_TRAINER_LIST",
+    opcodeId: 0x1b1,
+    ts: ts(seq),
+    data: {
+      guid,
+      trainerType: 0,
+      spells: [{ spellId: 1180, state: 0, cost: 100, reqLevel: 4, reqSkill: 0, reqSkillValue: 0 }],
+      greeting: "I can teach you.",
+    },
+  });
+  const lootResponse = (guid: string, seq: number) => ({
+    seq,
+    opcode: "SMSG_LOOT_RESPONSE",
+    opcodeId: 0x160,
+    ts: ts(seq),
+    data: {
+      guid,
+      lootType: 1,
+      gold: 42,
+      items: [
+        { slot: 0, itemId: 2589, count: 2, slotType: 0 },
+        { slot: 1, itemId: 769, count: 1, slotType: 0 },
+      ],
+    },
+  });
+  const lootRemoved = (slot: number, seq: number) => ({
+    seq,
+    opcode: "SMSG_LOOT_REMOVED",
+    opcodeId: 0x162,
+    ts: ts(seq),
+    data: { slot },
+  });
+  const lootClearMoney = (seq: number) => ({
+    seq,
+    opcode: "SMSG_LOOT_CLEAR_MONEY",
+    opcodeId: 0x165,
+    ts: ts(seq),
+    data: {},
+  });
+  const lootRelease = (guid: string, seq: number) => ({
+    seq,
+    opcode: "SMSG_LOOT_RELEASE_RESPONSE",
+    opcodeId: 0x161,
+    ts: ts(seq),
+    data: { guid },
+  });
+  const withWorld = (extra: readonly unknown[]) =>
+    StateCache.replay(toEvents([...worldStream, ...extra]), { seed: SEED });
+
+  test("a vendor list folds per guid, rows verbatim, and reaches the snapshot", () => {
+    const c = withWorld([vendorList("3001", 70)]);
+    const win = c.lastVendorList("3001");
+    expect(win?.items).toEqual([
+      { slot: 1, itemId: 117, price: 25, buyCount: 1, leftInStock: -1, extendedCost: 0 },
+    ]);
+    expect(win?.seq).toBe(70);
+    expect(c.snapshot().vendorWindows.get("3001")?.items).toHaveLength(1);
+    // Another vendor is another window, not a replacement.
+    expect(c.lastVendorList("3002")).toBeUndefined();
+  });
+
+  test("a second list for the same vendor replaces the first", () => {
+    const c = withWorld([
+      vendorList("3001", 70),
+      vendorList("3001", 71, [
+        { slot: 1, itemId: 117, price: 25, buyCount: 1, leftInStock: 0, extendedCost: 0 },
+      ]),
+    ]);
+    expect(c.lastVendorList("3001")?.items[0]?.leftInStock).toBe(0);
+    expect(c.lastVendorList("3001")?.seq).toBe(71);
+  });
+
+  test("a trainer list folds per guid with the server's raw rows", () => {
+    const c = withWorld([trainerList("3003", 70)]);
+    const win = c.lastTrainerList("3003");
+    expect(win?.trainerType).toBe(0);
+    expect(win?.greeting).toBe("I can teach you.");
+    expect(win?.spells[0]).toEqual({
+      spellId: 1180,
+      state: 0,
+      cost: 100,
+      reqLevel: 4,
+      reqSkill: 0,
+      reqSkillValue: 0,
+    });
+    // No derivation: learnable/affordable are trainerList()'s, not the cache's.
+    expect(Object.keys(win!.spells[0]!)).not.toContain("learnable");
+    expect(c.snapshot().trainerWindows.get("3003")?.spells).toHaveLength(1);
+  });
+
+  test("neither window is cleared by a gossip close, because nothing closes them", () => {
+    const c = withWorld([
+      vendorList("3001", 70),
+      trainerList("3003", 71),
+      { seq: 72, opcode: "SMSG_GOSSIP_COMPLETE", opcodeId: 0x17e, ts: ts(72), data: {} },
+    ]);
+    expect(c.lastVendorList("3001")).toBeDefined();
+    expect(c.lastTrainerList("3003")).toBeDefined();
+  });
+
+  test("a loot window opens, loses taken slots and taken gold, and closes on its release", () => {
+    const open = withWorld([lootResponse("4001", 70)]);
+    expect(open.lastLoot()?.gold).toBe(42);
+    expect(open.lastLoot()?.items).toHaveLength(2);
+    expect(open.snapshot().lootWindow?.guid).toBe("4001");
+
+    const partial = withWorld([lootResponse("4001", 70), lootRemoved(0, 71), lootClearMoney(72)]);
+    expect(partial.lastLoot()?.items.map((i) => i.slot)).toEqual([1]);
+    expect(partial.lastLoot()?.gold).toBe(0);
+    expect(partial.lastLoot()?.seq).toBe(72);
+
+    const closed = withWorld([lootResponse("4001", 70), lootRelease("4001", 71)]);
+    expect(closed.lastLoot()).toBeUndefined();
+    expect(closed.snapshot().lootWindow).toBeUndefined();
+  });
+
+  test("a release for a different object leaves the open window alone", () => {
+    const c = withWorld([lootResponse("4001", 70), lootRelease("4002", 71)]);
+    expect(c.lastLoot()?.guid).toBe("4001");
+  });
+
+  test("loot packets with no window open change nothing", () => {
+    const c = withWorld([lootRemoved(0, 70), lootClearMoney(71), lootRelease("4001", 72)]);
+    expect(c.lastLoot()).toBeUndefined();
+  });
+});
+
 describe("state cache: questgiver markers (FOLLOW-UPS 27)", () => {
   const withWorld = (extra: readonly unknown[]) =>
     StateCache.replay(toEvents([...worldStream, ...extra]), { seed: SEED });
@@ -1929,6 +2072,53 @@ describe("achievements and flight paths", () => {
     expect(cache.self.taxiFlight).toEqual({ value: false, seq: 4, ts: 2004 });
   });
 
+  test("SMSG_SHOWTAXINODES folds into lastTaxiNodes(guid): current node, known nodes, the mask verbatim", () => {
+    const window = (seq: number) => ({
+      seq,
+      opcode: "SMSG_SHOWTAXINODES",
+      opcodeId: 0x1a9,
+      ts: 2000 + seq,
+      data: {
+        showWindow: true,
+        guid: "17365880163140632581",
+        currentNode: 6,
+        currentNodeName: "Ironforge, Dun Morogh",
+        mask: [0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        known: [{ nodeId: 6, name: "Ironforge, Dun Morogh" }, { nodeId: 7 }],
+      },
+    });
+    const cache = StateCache.replay(toEvents([window(1)]), { seed: SEED });
+    const w = cache.lastTaxiNodes("17365880163140632581");
+    expect(w?.current).toEqual({ nodeId: 6, name: "Ironforge, Dun Morogh" });
+    expect(w?.known).toEqual([
+      { nodeId: 6, name: "Ironforge, Dun Morogh" },
+      { nodeId: 7, name: undefined },
+    ]);
+    expect(w?.mask).toEqual([0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    expect(w?.seq).toBe(1);
+    expect(cache.lastTaxiNodes("8")).toBeUndefined();
+    expect(cache.snapshot().taxiWindows.get("17365880163140632581")?.current.nodeId).toBe(6);
+  });
+
+  test("SMSG_BINDPOINTUPDATE is self.bindPoint, the last one winning", () => {
+    const bind = (seq: number, areaId: number, areaName: string, x: number) => ({
+      seq,
+      opcode: "SMSG_BINDPOINTUPDATE",
+      opcodeId: 0x155,
+      ts: 2000 + seq,
+      data: { x, y: -132.5, z: 83.5, map: 0, areaId, areaName },
+    });
+    const cache = StateCache.replay(toEvents([bind(1, 9, "Northshire Valley", -8949.9), bind(2, 1537, "Ironforge", -4840.6)]), {
+      seed: SEED,
+    });
+    expect(cache.self.bindPoint).toEqual({
+      value: { map: 0, x: -4840.6, y: -132.5, z: 83.5, area: { id: 1537, name: "Ironforge" } },
+      seq: 2,
+      ts: 2002,
+    });
+    expect(StateCache.replay([], { seed: SEED }).self.bindPoint).toBeUndefined();
+  });
+
   test("a refused flight is an ok:false reply and no flag", () => {
     const cache = StateCache.replay(toEvents([taxiReply(1, 3)]), { seed: SEED });
     expect(cache.self.taxiReply?.value).toEqual({ reply: 3, ok: false });
@@ -1941,5 +2131,449 @@ describe("achievements and flight paths", () => {
       { seed: SEED },
     );
     expect(cache.self.taxiFlight).toEqual({ value: true, seq: 1, ts: 2001 });
+  });
+
+  /** A self values block carrying `playerFlags`, the players-only field. */
+  const playerFlags = (seq: number, flags: number) => ({
+    seq,
+    opcode: "SMSG_UPDATE_OBJECT",
+    opcodeId: 0x0a9,
+    ts: 2000 + seq,
+    data: {
+      blocks: 1,
+      objects: [{ update: "values", guid: SEED.guid, fields: { playerFlags: flags } }],
+    },
+  });
+
+  test("resting is the PLAYER_FLAGS_RESTING bit on self, and unobserved until a block carries it", () => {
+    expect(StateCache.replay([], { seed: SEED }).self.resting).toBeUndefined();
+    // 0x20 is PLAYER_FLAGS_RESTING; 0x10 (ghost) alone is not resting.
+    expect(
+      StateCache.replay(toEvents([playerFlags(1, 0x10)]), { seed: SEED }).self.resting,
+    ).toEqual({ value: false, seq: 1, ts: 2001 });
+    expect(
+      StateCache.replay(toEvents([playerFlags(1, 0x30)]), { seed: SEED }).self.resting,
+    ).toEqual({ value: true, seq: 1, ts: 2001 });
+  });
+
+  test("a block with no playerFlags leaves resting alone rather than reading it as false", () => {
+    const cache = StateCache.replay(toEvents([playerFlags(1, 0x20), selfProgress]), { seed: SEED });
+    expect(cache.self.resting).toEqual({ value: true, seq: 1, ts: 2001 });
+  });
+});
+
+describe("skills, talent tree, item stats, reputation (items 95-99)", () => {
+  const TS = 1_700_000_000_000;
+  const selfValues = (seq: number, fields: Record<string, number | string>) => ({
+    seq,
+    opcode: "SMSG_UPDATE_OBJECT",
+    opcodeId: 0x0a9,
+    ts: TS + seq,
+    data: { blocks: 1, objects: [{ update: "values", guid: SELF_GUID, fields }] },
+  });
+
+  test("skill fields fold into skills(): id, name beside it, value/max, bonuses; an empty slot is no line", () => {
+    const cache = StateCache.replay(
+      toEvents([
+        selfValues(1, {
+          skill0Id: 43,
+          skill0Step: 0,
+          skill0Name: "Swords",
+          skill0Value: 5,
+          skill0Max: 20,
+          skill0TempBonus: 0,
+          skill0PermBonus: 0,
+          skill1Id: 98,
+          skill1Name: "Language: Common",
+          skill1Value: 300,
+          skill1Max: 300,
+          skill2Id: 0,
+          skill2Value: 0,
+          skill2Max: 0,
+        }),
+        selfValues(2, { skill0Value: 7, skill0TempBonus: -1 }),
+      ]),
+      { seed: SEED },
+    );
+    const skills = cache.skills();
+    expect(skills.map((s) => [s.skillId, s.name, s.value, s.max, s.tempBonus, s.seq])).toEqual([
+      [43, "Swords", 7, 20, -1, 2],
+      [98, "Language: Common", 300, 300, 0, 1],
+    ]);
+    expect(cache.skill("swords")?.value).toBe(7);
+    expect(cache.skill("Language")?.skillId).toBe(98);
+    expect(cache.skill(999)).toBeUndefined();
+    // The name string never lands in the numeric field record.
+    expect(cache.self.fields.get("skill0Name")).toBeUndefined();
+    expect(cache.snapshot().skills).toHaveLength(2);
+  });
+
+  test("the login faction list, a standing change and a visible flip fold into reputation() with the client's rank", () => {
+    const init = {
+      seq: 1,
+      opcode: "SMSG_INITIALIZE_FACTIONS",
+      opcodeId: 0x122,
+      ts: TS + 1,
+      data: {
+        count: 128,
+        factions: [
+          { flags: 1, visible: true, atWar: false, repListId: 5, factionId: 47, name: "Ironforge", standing: 0, base: 2500, reputation: 2500 },
+          { flags: 3, visible: true, atWar: true, repListId: 9, factionId: 76, name: "Orgrimmar", standing: 0, base: -42000, reputation: -42000 },
+          { flags: 0, visible: false, atWar: false, repListId: 30, factionId: 529, name: "Argent Dawn", standing: 150, base: 0, reputation: 150 },
+        ],
+      },
+    };
+    const gain = {
+      seq: 2,
+      opcode: "SMSG_SET_FACTION_STANDING",
+      opcodeId: 0x124,
+      ts: TS + 2,
+      data: { showVisual: true, factions: [{ repListId: 5, factionId: 47, name: "Ironforge", standing: 600, base: 2500, reputation: 3100 }] },
+    };
+    const visible = { seq: 3, opcode: "SMSG_SET_FACTION_VISIBLE", opcodeId: 0x123, ts: TS + 3, data: { repListId: 30, factionId: 529, name: "Argent Dawn" } };
+    const cache = StateCache.replay(toEvents([init, gain, visible]), { seed: SEED });
+    const rep = cache.reputation();
+    expect(rep.map((r) => [r.name, r.reputation, r.rank, r.visible, r.seq])).toEqual([
+      ["Argent Dawn", 150, "Neutral", true, 3],
+      ["Ironforge", 3100, "Friendly", true, 2],
+      ["Orgrimmar", -42000, "Hated", true, 1],
+    ]);
+    expect(cache.reputationWith(47)?.standing).toBe(600);
+    expect(cache.reputationWith("orgrimmar")?.atWar).toBe(true);
+    expect(cache.reputationWith("nowhere")).toBeUndefined();
+    expect(cache.snapshot().reputation).toHaveLength(3);
+    // A module that served no base leaves reputation = standing.
+    const bare = StateCache.replay(
+      toEvents([{ ...init, data: { count: 128, factions: [{ repListId: 5, standing: 9000 }] } }]),
+      { seed: SEED },
+    );
+    expect(bare.reputation()[0]).toMatchObject({ repListId: 5, factionId: undefined, reputation: 9000, rank: "Honored", visible: false });
+  });
+
+  test("reputationRank buckets at the client's thresholds", () => {
+    expect([-42001, -6000, -3000, -1, 0, 2999, 3000, 9000, 21000, 42000].map(reputationRank)).toEqual([
+      "Hated", "Hostile", "Unfriendly", "Unfriendly", "Neutral", "Neutral", "Friendly", "Honored", "Revered", "Exalted",
+    ]);
+  });
+
+  test("WB_TALENT_TREE is talentTree(), with pointsSpent merged from the latest SMSG_TALENTS_INFO", () => {
+    const tree = {
+      seq: 1,
+      opcode: "WB_TALENT_TREE",
+      opcodeId: 0xff08,
+      ts: TS + 1,
+      data: {
+        class: 1,
+        unspentPoints: 2,
+        tabs: [
+          {
+            tabId: 161,
+            name: "Arms",
+            page: 0,
+            talents: [
+              { talentId: 124, name: "Improved Heroic Strike", row: 0, col: 0, maxRank: 3, ranks: [12282, 12663, 12664] },
+              { talentId: 128, name: "Deflection", row: 0, col: 1, maxRank: 5, ranks: [16462, 16463, 16464, 16465, 16466] },
+              { talentId: 121, name: "Tactical Mastery", row: 1, col: 1, maxRank: 3, ranks: [12295, 12676, 12677], dependsOn: 128, dependsOnRank: 2 },
+            ],
+          },
+          { tabId: 164, name: "Fury", page: 1, talents: [] },
+        ],
+      },
+    };
+    const talents = (seq: number, rows: { talentId: number; rank: number }[], unspent: number) => ({
+      seq,
+      opcode: "SMSG_TALENTS_INFO",
+      opcodeId: 0x4c0,
+      ts: TS + seq,
+      data: { pet: false, unspentPoints: unspent, specCount: 1, activeSpec: 0, specs: [{ talents: rows }] },
+    });
+    expect(StateCache.replay([], { seed: SEED }).talentTree()).toBeUndefined();
+    const cache = StateCache.replay(toEvents([tree, talents(2, [{ talentId: 124, rank: 1 }], 1)]), { seed: SEED });
+    const t = cache.talentTree()!;
+    expect(t.class).toBe(1);
+    expect(t.unspentPoints).toBe(1);
+    expect(t.tabs.map((tab) => [tab.name, tab.pointsSpent])).toEqual([["Arms", 2], ["Fury", 0]]);
+    expect(t.tabs[0]!.talents.map((x) => [x.talentId, x.pointsSpent, x.dependsOn])).toEqual([
+      [124, 2, undefined],
+      [128, 0, undefined],
+      [121, 0, 128],
+    ]);
+    expect(cache.snapshot().talentTree?.tabs).toHaveLength(2);
+  });
+
+  test("the item query's tooltip fields land on ItemInfo, and an old module's short answer still does", () => {
+    const full = {
+      seq: 1,
+      opcode: "SMSG_ITEM_QUERY_SINGLE_RESPONSE",
+      opcodeId: 0x058,
+      ts: TS + 1,
+      data: {
+        itemId: 2028,
+        found: true,
+        name: "Wooden Mallet",
+        quality: 1,
+        inventoryType: 17,
+        buyPrice: 205,
+        sellPrice: 41,
+        itemLevel: 6,
+        requiredLevel: 1,
+        class: 2,
+        subClass: 5,
+        requiredSkill: 160,
+        requiredSkillRank: 1,
+        requiredSkillName: "Two-Handed Maces",
+        maxCount: 0,
+        stackable: 1,
+        containerSlots: 0,
+        stats: [{ type: 4, value: 1 }],
+        damage: [{ min: 8, max: 13, type: 0 }],
+        armor: 0,
+        speedMs: 2800,
+        spells: [],
+        bonding: 0,
+        maxDurability: 40,
+      },
+    };
+    const cache = StateCache.replay(toEvents([full]), { seed: SEED });
+    const info = cache.items.get(2028)?.value;
+    expect(info).toMatchObject({
+      name: "Wooden Mallet",
+      class: 2,
+      subClass: 5,
+      requiredSkill: { id: 160, rank: 1, name: "Two-Handed Maces" },
+      requiredReputation: undefined,
+      stats: [{ type: 4, value: 1 }],
+      damage: [{ min: 8, max: 13, type: 0 }],
+      speedMs: 2800,
+      maxDurability: 40,
+    });
+    const short = { ...full, data: { itemId: 2028, found: true, name: "Wooden Mallet", quality: 1 } };
+    const old = StateCache.replay(toEvents([short]), { seed: SEED });
+    expect(old.items.get(2028)?.value).toMatchObject({ name: "Wooden Mallet", stats: undefined, damage: undefined, requiredSkill: undefined });
+  });
+});
+
+describe("pets, group, mail, bank, trade (items 98 and 100)", () => {
+  const TS = 1_700_000_000_000;
+  const PET_GUID = "17365880163140632999";
+  const frame = (seq: number, opcode: string, data: unknown) => ({ seq, opcode, opcodeId: 0x100, ts: TS + seq, data });
+  const petCreate = (seq: number) =>
+    frame(seq, "SMSG_UPDATE_OBJECT", {
+      blocks: 1,
+      objects: [
+        {
+          update: "create",
+          guid: PET_GUID,
+          objectType: "unit",
+          pos: { x: -1201, y: 981, z: 42, o: 0 },
+          fields: { entry: 416, health: 80, maxHealth: 90, level: 3, power1: 100, maxPower1: 120, powerType: 0, petNumber: 77, summonedByGuid: SELF_GUID, createdByGuid: SELF_GUID },
+        },
+      ],
+    });
+  const petBar = (seq: number) =>
+    frame(seq, "SMSG_PET_SPELLS", {
+      guid: PET_GUID,
+      removed: false,
+      family: 0,
+      durationMs: 0,
+      reactState: 1,
+      commandState: 1,
+      flags: 0,
+      actionBar: [
+        { slot: 0, type: 7, command: 2 },
+        { slot: 1, type: 7, command: 1 },
+        { slot: 2, type: 7, command: 0 },
+        { slot: 3, type: 0xc1, spellId: 3110, autocast: true, rank: 1, name: "Firebolt" },
+        { slot: 7, type: 6, reaction: 2 },
+      ],
+      spells: [
+        { spellId: 3110, active: 0xc1, autocast: true, rank: 1, name: "Firebolt" },
+        { spellId: 4511, active: 0x01, autocast: false, name: "Phase Shift" },
+      ],
+      cooldowns: [{ spellId: 3110, category: 0, cooldownMs: 1500, categoryCooldownMs: 0 }],
+    });
+
+  test("the control bar joins the pet's unit, its creature name and its given name into pet(); the removal clears it", () => {
+    const cache = StateCache.replay(
+      toEvents([
+        ...loginSequence,
+        petCreate(10),
+        frame(11, "SMSG_CREATURE_QUERY_RESPONSE", { entry: 416, found: true, name: "Imp", subname: "" }),
+        frame(12, "SMSG_PET_NAME_QUERY_RESPONSE", { petNumber: 77, found: true, name: "Zilkip" }),
+        petBar(13),
+      ]),
+      { seed: SEED },
+    );
+    const pet = cache.pet();
+    expect(pet).toMatchObject({
+      guid: PET_GUID,
+      name: "Zilkip",
+      creatureName: "Imp",
+      entry: 416,
+      level: 3,
+      health: 80,
+      maxHealth: 90,
+      power: 100,
+      maxPower: 120,
+      dead: false,
+      inView: true,
+      reaction: "defensive",
+      command: "follow",
+      seq: 13,
+    });
+    expect(pet!.spells.map((s) => [s.spellId, s.name, s.autocast, s.passive])).toEqual([
+      [3110, "Firebolt", true, false],
+      [4511, "Phase Shift", false, true],
+    ]);
+    expect(cache.petSpell("fire")?.spellId).toBe(3110);
+    expect(cache.petSpell(4511)?.name).toBe("Phase Shift");
+    expect(cache.nearbyUnits().find((u) => u.guid === PET_GUID)?.ownerGuid?.value).toBe(SELF_GUID);
+    expect(cache.units().find((u) => u.guid === PET_GUID)?.ownerGuid).toBe(SELF_GUID);
+    expect(cache.snapshot().pet?.name).toBe("Zilkip");
+
+    cache.apply(toEvents([frame(14, "SMSG_PET_SPELLS", { guid: "0", removed: true })])[0]!);
+    expect(cache.pet()).toBeUndefined();
+    expect(cache.petSpell("fire")).toBeUndefined();
+  });
+
+  test("a bar for a pet not yet in view still reads, with inView false and nothing invented", () => {
+    const cache = StateCache.replay(toEvents([...loginSequence, petBar(5)]), { seed: SEED });
+    expect(cache.pet()).toMatchObject({ guid: PET_GUID, inView: false, name: undefined, health: undefined, level: undefined });
+  });
+
+  test("invite, list, leader change, decline, result and destroy fold into group()", () => {
+    const cache = StateCache.replay(toEvents([...loginSequence]), { seed: SEED });
+    expect(cache.group()).toBeUndefined();
+    const fold = (f: unknown) => cache.apply(toEvents([f])[0]!);
+    fold(frame(20, "SMSG_GROUP_INVITE", { canAccept: true, inviterName: "Ordrick" }));
+    expect(cache.group()).toMatchObject({ inGroup: false, pendingInvite: { inviterName: "Ordrick", seq: 20 } });
+    fold(
+      frame(21, "SMSG_GROUP_LIST", {
+        groupType: 0,
+        left: false,
+        raid: false,
+        subGroup: 0,
+        memberFlags: 0,
+        roles: 0,
+        groupGuid: "1",
+        counter: 1,
+        members: [{ name: "Ordrick", guid: "9", online: true, subGroup: 0, flags: 0, roles: 0 }],
+        leaderGuid: "9",
+        lootMethod: 0,
+        looterGuid: "0",
+        lootThreshold: 2,
+        dungeonDifficulty: 0,
+        raidDifficulty: 0,
+      }),
+    );
+    expect(cache.group()).toMatchObject({ inGroup: true, leaderGuid: "9", leaderName: "Ordrick", leader: false, pendingInvite: undefined, lootMethod: 0 });
+    expect(cache.group()!.members).toEqual([{ guid: "9", name: "Ordrick", online: true, subGroup: 0, assistant: false, leader: true }]);
+    fold(frame(22, "SMSG_GROUP_SET_LEADER", { name: "Fenwick" }));
+    expect(cache.group()).toMatchObject({ leader: true, leaderName: "Fenwick", leaderGuid: SELF_GUID });
+    expect(cache.group()!.members[0]!.leader).toBe(false);
+    fold(frame(23, "SMSG_PARTY_COMMAND_RESULT", { operation: 0, name: "Quilby", result: 5, value: 0 }));
+    expect(cache.group()!.lastResult).toMatchObject({ result: 5, text: "that player is already in a group", name: "Quilby" });
+    fold(frame(24, "SMSG_GROUP_DECLINE", { name: "Quilby" }));
+    expect(cache.group()!.lastDecline?.name).toBe("Quilby");
+    fold(frame(25, "SMSG_GROUP_LIST", { groupType: 0x10, left: true, raid: false, subGroup: 0, memberFlags: 0, roles: 0, groupGuid: "1", counter: 2, members: [], leaderGuid: "0" }));
+    expect(cache.group()).toMatchObject({ inGroup: false, members: [], leaderGuid: undefined, seq: 25 });
+    fold(frame(26, "SMSG_GROUP_DESTROYED", {}));
+    expect(cache.group()!.inGroup).toBe(false);
+  });
+
+  test("the mailbox frame, the inbox with joined names, new-mail, and the verdicts edit the list the way the client does", () => {
+    const cache = StateCache.replay(
+      toEvents([
+        ...loginSequence,
+        nameQuery,
+        frame(30, "SMSG_SHOW_MAILBOX", { guid: "555" }),
+        frame(31, "SMSG_MAIL_LIST_RESULT", {
+          total: 1,
+          count: 1,
+          mails: [
+            {
+              mailId: 42,
+              type: 0,
+              senderGuid: "9",
+              cod: 0,
+              stationery: 41,
+              money: 300,
+              flags: 0,
+              read: false,
+              daysLeft: 29.9,
+              templateId: 0,
+              subject: "hello",
+              body: "a body",
+              items: [{ index: 0, itemGuidLow: 4321, itemId: ITEM_ENTRY, count: 2 }],
+            },
+          ],
+        }),
+        itemQuery,
+      ]),
+      { seed: SEED },
+    );
+    let box = cache.mailbox()!;
+    expect(box.guid).toBe("555");
+    expect(box.mails[0]).toMatchObject({ mailId: 42, senderName: "Ordrick", money: 300, subject: "hello" });
+    expect(box.mails[0]!.items[0]!.name).toBeDefined();
+    const fold = (f: unknown) => cache.apply(toEvents([f])[0]!);
+    fold(frame(40, "SMSG_RECEIVED_MAIL", {}));
+    expect(cache.mailbox()!.newMail).toBe(true);
+    fold(frame(41, "SMSG_SEND_MAIL_RESULT", { mailId: 42, action: 1, result: 0 }));
+    box = cache.mailbox()!;
+    expect(box.mails[0]!.money).toBe(0);
+    expect(box.lastResult).toMatchObject({ action: 1, result: 0, text: "ok" });
+    fold(frame(42, "SMSG_SEND_MAIL_RESULT", { mailId: 42, action: 2, result: 0, itemGuidLow: 4321, count: 2 }));
+    expect(cache.mailbox()!.mails[0]!.items).toEqual([]);
+    fold(frame(43, "SMSG_SEND_MAIL_RESULT", { mailId: 42, action: 4, result: 0 }));
+    expect(cache.mailbox()!.mails).toEqual([]);
+    fold(frame(44, "SMSG_SEND_MAIL_RESULT", { mailId: 0, action: 0, result: 3 }));
+    expect(cache.mailbox()!.lastResult).toMatchObject({ result: 3, text: "not enough money" });
+    expect(cache.snapshot().mailbox?.total).toBe(1);
+  });
+
+  test("bank slots 39-73 fold into bank() and stay out of bag(); the frame's banker rides along", () => {
+    const selfValues = (seq: number, fields: Record<string, number>) => frame(seq, "SMSG_UPDATE_OBJECT", { blocks: 1, objects: [{ update: "values", guid: SELF_GUID, fields }] });
+    const cache = StateCache.replay(
+      toEvents([
+        ...loginSequence,
+        selfValues(50, { invSlot40Lo: ITEM_GUID_LO, invSlot40Hi: ITEM_GUID_HI, invSlot67Lo: BAG_GUID_LO, invSlot67Hi: BAG_GUID_HI }),
+        itemCreate,
+        itemQuery,
+        wornBagCreate,
+        wornBagQuery,
+        frame(60, "SMSG_SHOW_BANK", { guid: "777" }),
+      ]),
+      { seed: SEED },
+    );
+    const bank = cache.bank();
+    expect(bank.guid).toBe("777");
+    expect(bank.items.map((i) => [i.bag, i.slot, i.guid, i.itemId])).toEqual([
+      [255, 40, ITEM_GUID, ITEM_ENTRY],
+      [67, 2, BAGGED_GUID, ITEM_ENTRY],
+    ]);
+    expect(bank.bags).toEqual([{ slot: 67, numSlots: BAG_NUM_SLOTS, name: expect.any(String) }]);
+    expect(bank.totalSlots).toBe(28 + BAG_NUM_SLOTS);
+    expect(bank.freeSlots).toBe(28 + BAG_NUM_SLOTS - 2);
+    expect(cache.bag().items).toEqual([]);
+    expect(cache.inventory.map((i) => i.slot)).toEqual([40, 67]);
+    expect(cache.snapshot().bank.items).toHaveLength(2);
+  });
+
+  test("trade status and both sides of the window fold into trade(); a cancel closes it", () => {
+    const cache = StateCache.replay(toEvents([...loginSequence, itemQuery]), { seed: SEED });
+    const fold = (f: unknown) => cache.apply(toEvents([f])[0]!);
+    fold(frame(70, "SMSG_TRADE_STATUS", { status: 1, traderGuid: "9" }));
+    expect(cache.trade()).toMatchObject({ status: 1, statusText: "begin trade", open: false, traderGuid: "9" });
+    fold(frame(71, "SMSG_TRADE_STATUS", { status: 2 }));
+    expect(cache.trade()).toMatchObject({ open: true, traderGuid: "9" });
+    fold(frame(72, "SMSG_TRADE_STATUS_EXTENDED", { theirs: true, money: 500, spellId: 0, items: [{ slot: 0, itemId: ITEM_ENTRY, count: 1, wrapped: false }] }));
+    fold(frame(73, "SMSG_TRADE_STATUS_EXTENDED", { theirs: false, money: 0, spellId: 0, items: [] }));
+    const t = cache.trade()!;
+    expect(t.theirs).toMatchObject({ money: 500 });
+    expect(t.theirs!.items[0]!.name).toBeDefined();
+    expect(t.mine).toMatchObject({ money: 0, items: [] });
+    fold(frame(74, "SMSG_TRADE_STATUS", { status: 3 }));
+    expect(cache.trade()).toMatchObject({ open: false, statusText: "trade canceled", mine: undefined, theirs: undefined });
   });
 });

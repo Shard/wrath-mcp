@@ -48,22 +48,23 @@ describe("guid argument validation", () => {
     expect(() => client.sellItem("1", undefined as unknown as string)).toThrow(/sellItem\(\.\.\., itemGuid\)/);
   });
 
-  test("a whole object (the unit instead of unit.guid) is rejected, naming the .guid fix", () => {
-    // The commonest live mistake: sdk.setTarget(state.closest(...)) instead of
-    // .guid. It must be caught client-side with the call site named, not
-    // serialized to the wire for a generic invalid_guid.
+  test("an object with no usable .guid is rejected, naming the .guid fix", () => {
+    // A unit object is now a referent everywhere (METHODOLOGY, "A name in view
+    // is a valid referent"), so sdk.setTarget(state.closest(...)) works; an
+    // object that is not a unit still has to be caught client-side with the
+    // call site named, not serialized to the wire for a generic invalid_guid.
     const client = makeClient();
     try {
-      client.setTarget({ guid: "7", name: "Kobold Worker" } as unknown as string);
+      client.setTarget({ name: "Kobold Worker" } as unknown as string);
       throw new Error("did not throw");
     } catch (e) {
       expect(e).toBeInstanceOf(TypeError);
       const msg = (e as Error).message;
       expect(msg).toContain("setTarget(guid)");
-      expect(msg).toContain("an object");
-      expect(msg).toContain("unit.guid");
+      expect(msg).toContain("no usable .guid");
+      expect(msg).toContain("state.units");
     }
-    expect(() => client.attackStart(["7"] as unknown as string)).toThrow(/an array.*unit\.guid/s);
+    expect(() => client.attackStart(["7"] as unknown as string)).toThrow(/no usable \.guid.*state\.units/s);
     expect(() => client.interact(true as unknown as string)).toThrow(/a boolean.*unit\.guid/s);
   });
 
