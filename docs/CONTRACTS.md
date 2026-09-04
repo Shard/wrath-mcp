@@ -62,33 +62,54 @@ Pathing: the module resolves "move to position" into the client movement packet 
 
 Every observation served and every action dispatched is logged at the module boundary with session id and timestamp. This log is both the trajectory's ground truth and the evidence that the contracts held for a given run.
 
-## Accepted risk: token-bearer control surface (pre-0.2)
+## Control-surface authentication (the former accepted risk)
 
-Stated precisely so nobody re-derives it the hard way (fan-out review 2026-08,
-finding: predictable bearer tokens; tracked as FOLLOW-UPS item 19):
+Stated precisely so nobody re-derives it the hard way. The fan-out review of
+2026-08 found the control surface a token-bearer one: `POST /action` and
+`DELETE /session` authenticated by the session token alone, the runner
+defaulted that token to an enumerable run id, the snippet sandbox could reach
+the port with any token, and a snippet in run A could therefore drive or tear
+down run B — across the per-run isolation boundary the harness measures
+inside. That was accepted while every job was operator-launched on a private
+compose network, and tracked as FOLLOW-UPS item 19.
 
-- `POST /action` and `DELETE /session` authenticate solely by the session
-  token in the request body. The token is a bearer capability with no binding
-  to the caller, and the runner defaults it to the run id — a
-  second-granularity timestamp (`run-YYYYMMDD-HHMMSS`), enumerable.
-- The snippet sandbox's egress allowlist permits exactly the module host, so a
-  snippet can reach these endpoints with any token. The module's distinct
-  action statuses (`404 no_session` / `409 not_in_world` / `200`) double as a
-  liveness oracle for guessing a neighbor's token.
-- Consequence: a malicious or confused snippet in run A can drive actions in,
-  or tear down, a concurrent run B on the same module. This crosses the
-  per-run isolation boundary and can silently corrupt what the harness
-  measures.
+The floor that closes it (2026-09-01; module side built to
+`wrathbench/worldserver:next`, deploys in the next window — until then the
+running module is still the pre-auth one and the statement above is still the
+live posture):
 
-This is accepted for now because every job is operator-launched from one
-tree on a private compose network with no external callers, and the audit log
-records every dispatched action per token. It is a blocker, before any public
-or MCP-exposed deployment and before any adversarial multi-run result is
-trusted, to make tokens unguessable: a random secret issued at session create,
-returned only to the creator, required on every subsequent token-bearing call
-(module and runner change together; no backward compatibility). The account
-allowlist (`WrathBench.Accounts`) gates only session/character surfaces and is
-not caller authentication.
+- **A secret on the port.** Every request and every `/events` upgrade carries
+  `Authorization: Bearer`; the module refuses anything else with `401` before a
+  route runs, and does not listen at all without a configured secret
+  (`WrathBench.Secret`, from `WRATHBENCH_MODULE_SECRET`; docs/OPERATIONS.md
+  "Secrets"). There is no unauthenticated path and no backward compatibility.
+- **A per-run secret the module issues, before the session exists.** The
+  runner host, holding the port secret, calls `POST /lease` for the run's
+  token and receives a random 64-hex secret bound to that token and the run's
+  account. That secret is the only credential the snippet child gets. It is
+  honoured for the token's own `/session`, `/action`, `DELETE /session` and
+  `/events` (validated against the lease, so the SDK still subscribes before it
+  creates and loses none of the login burst) and refused everywhere else:
+  another token is `403 token_mismatch`, and leasing, `/characters` and
+  `/character-delete` are `403 operator_only`.
+- **Token-to-account and token-to-character binding.** A leased token lands on
+  its lease's account whatever the body says, and the first create that
+  succeeds under it binds the character; a later same-token create for another
+  is `409 character_bound`. A snippet cannot delete any character — its own
+  included — and cannot open a session on any account or character but the
+  one it was launched as.
+- **The snippet child cannot read what it was not given.** The child is
+  exec'd under a Linux Landlock ruleset (`runner/src/sandbox/confine.ts`) that
+  allows reads only of the interpreter, system libraries, `runner/`, `sdk/`,
+  `node_modules/` and the workspace manifests; `.env`, the repo root, the home
+  directory and `/tmp` answer `EACCES` from the kernel however the read is
+  attempted, and the sandbox refuses to start rather than run unconfined.
+
+The account allowlist (`WrathBench.Accounts`) is unchanged and still gates
+only which accounts the module serves; it was never caller authentication and
+is not now. What this does not do: it does not authenticate the operator's
+own tooling to anything finer than "holds the port secret", and the audit log
+remains the record of what each token actually dispatched.
 
 ## Changing the contracts
 

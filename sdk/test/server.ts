@@ -25,6 +25,13 @@ export interface StubOptions {
    * Return undefined to fall through to the default ack.
    */
   failAction?: (action: string) => Response | undefined;
+  /**
+   * The port secret (PROTOCOL.md, "Authentication"). When set, every request
+   * and every `/events` upgrade must carry `Authorization: Bearer <secret>`
+   * or `Bearer <leased secret>`; anything else is `401 unauthorized`, as the
+   * module answers. Unset, the stub accepts everything (pre-auth shape).
+   */
+  secret?: string;
 }
 
 export interface CharacterDeleteBody {
@@ -64,6 +71,10 @@ export interface StubServer {
   sessions: CreateSessionBody[];
   /** Every `POST /character-delete` body, in order. */
   characterDeletes: CharacterDeleteBody[];
+  /** The `Authorization` header of every request (HTTP and upgrade), in order; `null` when absent. */
+  authorizations: (string | null)[];
+  /** Secrets issued by `POST /lease`, by token. */
+  leases: Map<string, string>;
   stop(): Promise<void>;
 }
 
@@ -81,11 +92,39 @@ export function startStub(options: StubOptions = {}): StubServer {
   const actions: RecordedAction[] = [];
   const sessions: CreateSessionBody[] = [];
   const characterDeletes: CharacterDeleteBody[] = [];
+  const authorizations: (string | null)[] = [];
+  const leases = new Map<string, string>();
+  let leaseCounter = 0;
+
+  const authorized = (req: Request): boolean => {
+    if (options.secret === undefined) return true;
+    const header = req.headers.get("authorization") ?? "";
+    const bearer = header.startsWith("Bearer ") ? header.slice(7) : "";
+    if (bearer === options.secret) return true;
+    for (const s of leases.values()) if (s === bearer) return true;
+    return false;
+  };
 
   const server = Bun.serve<{ token: string }, never>({
     port: 0,
     fetch(req, srv) {
       const url = new URL(req.url);
+      authorizations.push(req.headers.get("authorization"));
+      if (!authorized(req)) return json({ ok: false, error: "unauthorized" }, 401);
+      if (url.pathname === "/lease" && req.method === "POST") {
+        return req.json().then((body) => {
+          const b = body as { token?: string; account?: string };
+          const secret = `leased-${++leaseCounter}-`.padEnd(64, "f");
+          leases.set(b.token ?? "", secret);
+          return json({ ok: true, token: b.token ?? "", account: b.account ?? "RUNNER", secret });
+        });
+      }
+      if (url.pathname === "/lease" && req.method === "DELETE") {
+        return req.json().then((body) => {
+          const t = (body as { token?: string }).token ?? "";
+          return json({ ok: true, token: t, released: leases.delete(t) });
+        });
+      }
       if (url.pathname === "/events") {
         const token = url.searchParams.get("token") ?? "";
         if (srv.upgrade(req, { data: { token } })) return undefined;
@@ -199,6 +238,8 @@ export function startStub(options: StubOptions = {}): StubServer {
     actions,
     sessions,
     characterDeletes,
+    authorizations,
+    leases,
     async stop() {
       await server.stop(true);
     },

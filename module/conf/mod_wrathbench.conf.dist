@@ -63,11 +63,27 @@ WrathBench.Account = "RUNNER"
 #                     serves (case-insensitive). Every surface that takes an
 #                     "account" parameter (/session, /characters,
 #                     /character-delete) refuses accounts not on this list with
-#                     403 account_not_permitted (FOLLOW-UPS 14).
+#                     403 account_not_permitted (item 14).
 #        Default:     the WrathBench.Account value (single-account behaviour)
 #
 
 WrathBench.Accounts = "RUNNER,RUNNER2,SHAKEOUT,PROBE"
+
+#
+#    WrathBench.Secret
+#        Description: The port secret (PROTOCOL.md, "Authentication"). Every
+#                     HTTP request and /events upgrade must carry
+#                     `Authorization: Bearer <credential>`; this value is the
+#                     operator credential that may use every route, and the one
+#                     the runner presents to lease per-run session secrets. At
+#                     least 32 characters; with it unset or shorter the module
+#                     does not listen at all. Never put a real value in this
+#                     file: infra/compose.yml passes it as AC_WRATH_BENCH_SECRET
+#                     from WRATHBENCH_MODULE_SECRET in the operator's .env.
+#        Default:     "" (control surface disabled)
+#
+
+WrathBench.Secret = ""
 
 #
 #    WrathBench.AuditDir

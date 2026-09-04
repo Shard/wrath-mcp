@@ -28,11 +28,60 @@ Two error channels, deliberately separated (docs/CONTRACTS.md):
   `SMSG_CHARACTER_LOGIN_FAILED` or `SMSG_NOTIFICATION` event), because that is how
   a real client would learn of them.
 
+## Authentication
+
+Every HTTP request and every `/events` upgrade carries
+`Authorization: Bearer <credential>` (FOLLOW-UPS 19; the accepted-risk statement
+in docs/CONTRACTS.md). A request without a valid one is `401 unauthorized`
+before any route runs, including `GET /health`. There is no unauthenticated
+path and no backward compatibility with callers that send none.
+
+Two credential classes:
+
+- **Operator** — the bearer is the *port secret*, `WrathBench.Secret`
+  (`AC_WRATH_BENCH_SECRET` in infra/compose.yml, from `WRATHBENCH_MODULE_SECRET`
+  in the operator's `.env`; docs/OPERATIONS.md "Secrets"). May use every route
+  with any token. Held by the runner host process, the fleet supervisor and the
+  smoke scripts; never by the snippet child (the sandbox strips it from the
+  child's environment).
+- **Session** — the bearer is a *lease secret*, a 64-hex-character random value
+  the module issued on `POST /lease` for exactly one token. It authenticates
+  `POST /session`, `POST /action`, `DELETE /session` and the `/events` upgrade
+  for that token alone (`403 token_mismatch` for any other), plus `GET /health`.
+  Everything else — leasing, `/characters`, `/character-delete` — is
+  `403 operator_only`. This is what the runner hands the snippet child, so a
+  snippet in run A holds no credential that reaches run B.
+
+The lease is what binds a token to an account and a character:
+
+- `POST /lease { token, account }` (operator) records `token → account` and
+  returns the secret. Re-leasing a token rotates its secret (a resumed run
+  re-leases the token it stored) and keeps its character binding unless the
+  account changed.
+- A session-class `POST /session` lands on the lease's account whatever the body
+  says (`403 account_not_leased` if the body names another). The first create
+  that succeeds binds the token to that character; a later same-token create
+  naming a different one is `409 character_bound` with `bound: <name>`. A create
+  the core refused (name taken, bad race/class) binds nothing.
+- The secret exists before the session does, which is why a subscriber can open
+  `/events` first — as the SDK does, to catch the login burst — and still be
+  validated: the upgrade is checked against the lease, not against a live
+  session. (The alternative, requiring an existing session to subscribe, would
+  have flipped the connect-before-create order the whole state cache depends on
+  and lost every `SMSG_UPDATE_OBJECT` of the login.)
+- `DELETE /lease { token }` (operator) revokes the credential; it does not touch
+  a live session under the token.
+
+The module never logs a secret; `POST /lease` is the only response that carries
+one. Secrets are compared in constant time. With `WrathBench.Secret` unset or
+shorter than 32 characters the module does not listen at all (logged at ERROR),
+so a mis-deployed worldserver is unreachable rather than open.
+
 ## Endpoints
 
 ### GET /health
 
-Module and world status. No auth, no body.
+Module and world status. Either credential class, no body.
 
 Two views (2026-08). Callers on the compose network — the runner and, through
 it, the snippet sandbox — get liveness plus build identity: `ok`, `module`,
@@ -42,8 +91,8 @@ with `sessions` / `droppedPackets` / `droppedPacketsLive` present but zeroed
 session count and the drop census describe module internals and other runs'
 sessions, which the observation contract never serves to a snippet. The full
 view below is served only to loopback callers — an operator inside the
-worldserver container, e.g.
-`docker compose -f infra/compose.yml exec worldserver curl -s localhost:8086/health`.
+worldserver container, with the port secret the container already holds, e.g.
+`docker compose -f infra/compose.yml exec worldserver sh -c 'curl -s -H "Authorization: Bearer $AC_WRATH_BENCH_SECRET" localhost:8086/health'`.
 
 Operator (loopback) response `200`:
 ```json
@@ -134,13 +183,20 @@ Errors:
 - `400 {"ok":false,"error":"missing_token"}`
 - `400 {"ok":false,"error":"missing_character"}`
 - `400 {"ok":false,"error":"weak_token","received":<len>,"minimum":32,"hint":...}` —
-  the token is shorter than 32 characters. The session token is a bearer
-  capability over `/action`, `/events` and `DELETE /session`, so a guessable one
-  (the old run-id default was a second-granularity timestamp) lets one run drive
-  another; length is a proxy for entropy until the module issues the secret
-  itself (FOLLOW-UPS item 19, open). Checked before the session is registered. The
-  `/characters` and `/character-delete` utility surfaces are deliberately not
-  gated: they park at character-select, never enter world, and take no actions.
+  the token is shorter than 32 characters. The token is no longer the credential
+  (the lease secret is; "Authentication" above) but it still keys every session,
+  audit file and event stream, so a guessable one lets an operator-class caller
+  collide with another run by accident. Checked before the session is
+  registered. `POST /lease` applies the same floor; the `/characters` and
+  `/character-delete` utility surfaces do not (they park at character-select and
+  are operator-only anyway).
+- `401 {"ok":false,"error":"unauthorized"}` — no valid credential ("Authentication").
+- `403 {"ok":false,"error":"token_mismatch"}` — a session-class caller named a
+  token other than its lease's.
+- `403 {"ok":false,"error":"account_not_leased"}` — a session-class body named an
+  account other than the lease's.
+- `409 {"ok":false,"error":"character_bound","bound":"<name>"}` — a session-class
+  create for a different character than the one this token already played.
 - `400 {"ok":false,"error":"invalid_race_class","token":...}` — the character
   does not exist and race/class are not both in [1,11] (see above; decided at
   char-enum time, before any char-create packet is synthesized).
@@ -200,7 +256,7 @@ quest/combat extension set (2026-08, additive): `set_target`, `clear_target`,
 extension (2026-08, additive): `trainer_list`, `trainer_buy_spell`, and the
 spellbook/talent extension (2026-08, additive): `learn_talent`,
 `learn_preview_talents`, `raw`, and the talent-frame read (2026-08-29,
-FOLLOW-UPS 96): `talent_tree`. Acks that the
+item 96): `talent_tree`. Acks that the
 opcode was synthesized and queued; the game
 result (the chat echo, an arrival, or an error) arrives on the WebSocket.
 
@@ -305,7 +361,7 @@ them: `{ "ok": true, "action": "<name>", "token": ... }`.
 | `clear_target` | — | `CMSG_SET_SELECTION` | guid 0 |
 | `attack_start` | `guid` | `CMSG_ATTACKSWING` | melee auto-attack; server swings while in range |
 | `attack_stop` | — | `CMSG_ATTACKSTOP` | |
-| `cast_spell` | `spellId`, `targetGuid?` | `CMSG_CAST_SPELL` | no `targetGuid` = self/auto target (mask 0); with it, TARGET_FLAG_UNIT + packed guid. A game object guid works too (the core resolves the packed guid by its type), which is how chests open; a client would set TARGET_FLAG_GAMEOBJECT for it — FOLLOW-UPS 105 |
+| `cast_spell` | `spellId`, `targetGuid?` | `CMSG_CAST_SPELL` | no `targetGuid` = self/auto target (mask 0); with it, TARGET_FLAG_UNIT + packed guid. A game object guid works too (the core resolves the packed guid by its type), which is how chests open; a client would set TARGET_FLAG_GAMEOBJECT for it — item 105 |
 | `cancel_cast` | `spellId` | `CMSG_CANCEL_CAST` | |
 | `interact` | `guid` | `CMSG_GAMEOBJ_USE` | doors, buttons, quest objects, mailboxes. Not chests: the core's `GameObject::Use` has no chest case and returns silently; a client opens a chest with `cast_spell` of the lock's Opening spell at the object's guid (the SDK's `lootCorpse` does this) |
 | `gossip_hello` | `guid` | `CMSG_GOSSIP_HELLO` | opens the NPC gossip menu (`SMSG_GOSSIP_MESSAGE`) |
@@ -335,7 +391,7 @@ them: `{ "ok": true, "action": "<name>", "token": ... }`.
 | `trainer_buy_spell` | `guid`, `spellId` | `CMSG_TRAINER_BUY_SPELL` | costs the character's own money server-side; answered by `SMSG_TRAINER_BUY_SUCCEEDED` or `SMSG_TRAINER_BUY_FAILED` |
 | `learn_talent` | `talentId`, `rank` | `CMSG_LEARN_TALENT` | `talentId` from Talent.dbc, `rank` 0-based; the handler always answers `SMSG_TALENTS_INFO`, and a granted spell arrives as `SMSG_LEARNED_SPELL`; `400 missing_talent` |
 | `learn_preview_talents` | `talents` = `[[talentId, rank], ...]` | `CMSG_LEARN_PREVIEW_TALENTS` | the preview-mode "learn" button (at most 150 pairs); `400 missing_talents`, `400 invalid_talents` |
-| `talent_tree` | — | none (client-local read) | the class talent frame from the client's own Talent.dbc / TalentTab.dbc, answered as `WB_TALENT_TREE` on the stream so the observation is logged; no packet is sent (2026-08-29, FOLLOW-UPS 96) |
+| `talent_tree` | — | none (client-local read) | the class talent frame from the client's own Talent.dbc / TalentTab.dbc, answered as `WB_TALENT_TREE` on the stream so the observation is logged; no packet is sent (2026-08-29, item 96) |
 | `raw` | `opcode`, `payload` | the named opcode | the escape hatch, below |
 | `repop` | — | `CMSG_REPOP_REQUEST` | release spirit while dead |
 | `reclaim_corpse` | `guid?` | `CMSG_RECLAIM_CORPSE` | resurrect at corpse; handler resolves the player's own corpse, guid optional. Refusals are silent (further than 39y, delay not elapsed, other map, no corpse); the SDK reads them off the corpse-query answer below |
@@ -423,13 +479,13 @@ whose handler does nothing a non-GM client could not do:
   guid`), `CMSG_LOOT_METHOD`, `CMSG_LOOT_ROLL` (`u64 roll guid, u32 loot
   slot, u8 vote` — 0 pass, 1 need, 2 greed, 3 disenchant — on a frame
   `SMSG_LOOT_START_ROLL` opened; the SDK's `lootRoll` builds it; 2026-08-29,
-  FOLLOW-UPS 102)
+  item 102)
 - trade: `CMSG_INITIATE_TRADE` (`u64 guid`), `CMSG_BEGIN_TRADE`, `CMSG_ACCEPT_TRADE`,
   `CMSG_UNACCEPT_TRADE`, `CMSG_CANCEL_TRADE`, `CMSG_BUSY_TRADE`,
   `CMSG_IGNORE_TRADE`, `CMSG_SET_TRADE_ITEM` (`u8 trade slot, u8 bag, u8
   slot`), `CMSG_CLEAR_TRADE_ITEM` (`u8 trade slot`), `CMSG_SET_TRADE_GOLD`
   (`u32 copper`)
-- pet control (2026-08-29, FOLLOW-UPS 98): `CMSG_PET_ACTION` (`u64 pet guid,
+- pet control (2026-08-29, item 98): `CMSG_PET_ACTION` (`u64 pet guid,
   u32 button, u64 target guid` — `button` is `action | type << 24` exactly as
   the bar serves it: type 0x07 with a command 0 stay / 1 follow / 2 attack /
   3 abandon, type 0x06 with a react state 0 passive / 1 defensive / 2
@@ -449,7 +505,7 @@ whose handler does nothing a non-GM client could not do:
   `CMSG_PAGE_TEXT_QUERY` (`u32 page id, u64 item guid` — the SDK's `readItem`
   sends it after `SMSG_READ_ITEM_OK`, on the template's `pageText`),
   `CMSG_ITEM_TEXT_QUERY` (`u64 item guid` — the player-written text on a
-  mailed letter; FOLLOW-UPS 103), `CMSG_PLAYED_TIME`, `CMSG_QUERY_TIME`,
+  mailed letter; item 103), `CMSG_PLAYED_TIME`, `CMSG_QUERY_TIME`,
   `CMSG_SET_WATCHED_FACTION`, `CMSG_SET_ACTION_BUTTON`
 - corpse: `MSG_CORPSE_QUERY` (empty body) — re-ask where the corpse is; the
   module already asks once per death on the client's behalf (see "Death"), and
@@ -463,15 +519,34 @@ only through the event whitelist: the pet, party, mail, bank and trade
 replies are whitelisted (2026-08-29); the rest have none yet, which is
 exactly the evidence the hatch exists to produce.
 
+### POST /lease
+
+Operator only. `{ "token": <str>, "account"?: <str> }` →
+`200 { "ok": true, "token", "account", "secret", "character"? }`. Binds the
+token to the account (default `WrathBench.Account`) and issues — or, for a
+token already leased, rotates — its session secret; `character` is present when
+an earlier create under this token already bound one. Errors: `400
+missing_token`, `400 weak_token`, `403 account_not_permitted`, `403
+operator_only`. See "Authentication".
+
+### DELETE /lease
+
+Operator only. `{ "token": <str> }` → `200 { "ok": true, "token", "released": <bool> }`.
+Revokes the token's lease secret; a live session under the token is untouched.
+
 ### POST /characters
 
+Operator only (`403 operator_only` for a session-class caller).
 `{ "token": <str>, "account"?: <str> }` → `200 { "ok": true, "token", "enum": { "count": <number>, "characters": [ { "guid", "name", "race", "class", "gender", "level" }, ... ] } }`.
 A parked utility session (never enters world) answers with the decoded `SMSG_CHAR_ENUM` for the account — the same data a client's character-select screen shows. Exists for the runner's episode hygiene (list-then-delete leftover characters); errors mirror `/character-delete` (`missing_token`, `token_in_use`, `account_not_permitted`, `unknown_account`, `account_in_use` when a live session holds the account, `504 timeout`).
 
 ### POST /character-delete
 
-Delete a character by name through the real `CMSG_CHAR_DELETE` path (added in
-the quest/combat extension, 2026-08). Needed because per-episode fresh
+Operator only (`403 operator_only` for a session-class caller; the snippet
+child therefore cannot delete any character, its own included — a fresh start
+is the operator's episode reset, not the model's). Delete a character by name
+through the real `CMSG_CHAR_DELETE` path (added in the quest/combat extension,
+2026-08). Needed because per-episode fresh
 characters accumulate against the realm's 10-characters-per-account
 cap. The module stands up a short-lived parked session, authenticates, walks
 the character list, sends `CMSG_CHAR_DELETE` for the matching name, and tears
@@ -523,11 +598,14 @@ Request:
 ```
 
 Success `200`: `{ "ok": true, "token": "run-abc123" }`
-Errors: `400 missing_token`, `404 no_session`.
+Errors: `400 missing_token`, `404 no_session`, `401 unauthorized`, `403 token_mismatch`.
 
 ## WebSocket /events?token=...
 
-Upgrade request to `/events` with the session token in the query string. The
+Upgrade request to `/events` with the session token in the query string and
+the credential in the `Authorization` header ("Authentication": the port
+secret, or the lease secret issued for this token; anything else is refused
+with a plain `401` before the handshake and no subscriber is registered). The
 server streams that session's whitelisted outbound packets as JSON text frames,
 one object per frame. The channel is send-only (server→client); frames the client
 sends are ignored. Multiple sockets may subscribe to the same token; each gets
@@ -683,7 +761,7 @@ not need it, docs/CONTRACTS.md):
   `taxiFlight`, the `UNIT_FLAG_TAXI_FLIGHT` bit named), `displayId`,
   `dynamicFlags`, `npcFlags`, `targetGuid`, `race`, `class`, `gender`,
   `powerType` (the last four unpacked from UNIT_FIELD_BYTES_0), and (2026-08-29,
-  FOLLOW-UPS 98) `summonedByGuid`, `createdByGuid`, `charmedByGuid` (the
+  item 98) `summonedByGuid`, `createdByGuid`, `charmedByGuid` (the
   PUBLIC owner fields as guid strings — a pet's master; `"0"` when unset) and
   `petNumber` (UNIT_FIELD_PETNUMBER; on first sight of a unit with a non-zero
   one the module issues the `CMSG_PET_NAME_QUERY` a client does, once per
@@ -927,7 +1005,7 @@ Loot, vendor, inventory:
 | `SMSG_TRAINER_BUY_SUCCEEDED` | 0x1B3 | `{ "guid", "spellId" }` |
 | `SMSG_TRAINER_BUY_FAILED` | 0x1B4 | `{ "guid", "spellId", "reason": <i32> }` — 0 unavailable, 1 not enough money, 2 not enough skill (also level/prerequisites) |
 | `SMSG_INVENTORY_CHANGE_FAILURE` | 0x112 | `{ "result": <u8>, "itemGuid"?, "itemGuid2"?, "requiredLevel"? }` (InventoryResult code) |
-| `SMSG_ITEM_QUERY_SINGLE_RESPONSE` | 0x058 | `{ "itemId", "found", "name"?, "quality"?, "inventoryType"?, "buyPrice"?, "sellPrice"?, "itemLevel"?, "requiredLevel"?, "class"?, "subClass"?, "requiredSkill", "requiredSkillRank", "requiredSkillName"?, "requiredSpell"?, "requiredReputationFaction"?, "requiredReputationRank"?, "requiredReputationFactionName"?, "maxCount", "stackable", "containerSlots", "stats": [{ "type", "value" }], "damage": [{ "min": <f>, "max": <f>, "type" }], "armor", "resistances"?: { "holy"?, "fire"?, ... }, "speedMs", "spells": [{ "spellId", "trigger", "charges", "name"? }], "bonding", "description"?, "startQuest"?, "pageText"?, "block"?, "maxDurability" }` — everything from `requiredSkill` on is the tooltip (2026-08-29, FOLLOW-UPS 97), read in `HandleItemQuerySingleOpcode`'s order up to `MaxDurability`; sockets, gem properties, duration and holiday are left unread. Zero damage ranges and empty spell slots are dropped; `resistances` only when one is non-zero. Names on `requiredSkill`, `requiredReputationFaction` and each spell are client-cache (SkillLine.dbc, Faction.dbc, Spell.dbc) knowledge like the rest |
+| `SMSG_ITEM_QUERY_SINGLE_RESPONSE` | 0x058 | `{ "itemId", "found", "name"?, "quality"?, "inventoryType"?, "buyPrice"?, "sellPrice"?, "itemLevel"?, "requiredLevel"?, "class"?, "subClass"?, "requiredSkill", "requiredSkillRank", "requiredSkillName"?, "requiredSpell"?, "requiredReputationFaction"?, "requiredReputationRank"?, "requiredReputationFactionName"?, "maxCount", "stackable", "containerSlots", "stats": [{ "type", "value" }], "damage": [{ "min": <f>, "max": <f>, "type" }], "armor", "resistances"?: { "holy"?, "fire"?, ... }, "speedMs", "spells": [{ "spellId", "trigger", "charges", "name"? }], "bonding", "description"?, "startQuest"?, "pageText"?, "block"?, "maxDurability" }` — everything from `requiredSkill` on is the tooltip (2026-08-29, item 97), read in `HandleItemQuerySingleOpcode`'s order up to `MaxDurability`; sockets, gem properties, duration and holiday are left unread. Zero damage ranges and empty spell slots are dropped; `resistances` only when one is non-zero. Names on `requiredSkill`, `requiredReputationFaction` and each spell are client-cache (SkillLine.dbc, Faction.dbc, Spell.dbc) knowledge like the rest |
 
 Item name resolution mirrors creature/name queries: on first sight of an item
 entry (item create block, loot window, vendor list, item push, quest reward
@@ -950,10 +1028,10 @@ knowledge, like item-template fields:
 | `SMSG_COOLDOWN_EVENT` | 0x135 | `{ "spellId", "guid" }` — "start the timer you already know for this spell": the duration is Spell.dbc knowledge the module does not serve |
 | `SMSG_CLEAR_COOLDOWN` | 0x1DE | `{ "spellId", "guid" }` |
 | `SMSG_TALENTS_INFO` | 0x4C0 | `{ "pet": false, "unspentPoints", "specCount", "activeSpec", "specs": [{ "talents": [{ "talentId", "rank" }] }] }` — `rank` is 0-based; glyph slots are consumed and not served. The pet form is `{ "pet": true }` only (the pet bar itself is `SMSG_PET_SPELLS`; pet talents have not been asked for). Sent on login, level-up, after every `CMSG_LEARN_TALENT`, on spec change, and after a successful talent reset |
-| `MSG_TALENT_WIPE_CONFIRM` | 0x2AA | `{ "guid", "cost": <u32 copper>, "nothingToReset": <bool> }` — the trainer's "unlearn all talents?" dialog (`Player::SendTalentWipeConfirm`) after its unlearn gossip option; a client answers yes by echoing the opcode with the guid (raw). `nothingToReset` is the guid-0/cost-0 form `HandleTalentWipeConfirmOpcode` sends back when there are no talents to reset or the money is short; a successful reset has no packet of its own — `SMSG_TALENTS_INFO` follows with every rank gone (2026-08-29, FOLLOW-UPS 96) |
+| `MSG_TALENT_WIPE_CONFIRM` | 0x2AA | `{ "guid", "cost": <u32 copper>, "nothingToReset": <bool> }` — the trainer's "unlearn all talents?" dialog (`Player::SendTalentWipeConfirm`) after its unlearn gossip option; a client answers yes by echoing the opcode with the guid (raw). `nothingToReset` is the guid-0/cost-0 form `HandleTalentWipeConfirmOpcode` sends back when there are no talents to reset or the money is short; a successful reset has no packet of its own — `SMSG_TALENTS_INFO` follows with every rank gone (2026-08-29, item 96) |
 | `WB_TALENT_TREE` | 0xFF08 | `{ "class": <u8>, "unspentPoints": <u32>, "tabs": [{ "tabId", "name"?, "page", "talents": [{ "talentId", "name"?, "row", "col", "maxRank", "ranks": [<spellId> × maxRank], "dependsOn"?, "dependsOnRank"? }] }] }` — the answer to the `talent_tree` action: every TalentTab.dbc tab whose class mask holds the character's class, in page order, and every Talent.dbc row in it sorted by row then column. `name` on a tab is the client's TalentTab.dbc text (the module reads the file: `dbc/TalentTab.dbc`, 24 fields, record size 96, refused otherwise), on a talent the first rank spell's Spell.dbc name; `dependsOnRank` is 0-based. What the talent frame draws, nothing more — no icons, no tooltips, and no server-side state (the ranks learned are `SMSG_TALENTS_INFO`'s, joined by the SDK) |
 
-Reputation (2026-08-29, FOLLOW-UPS 99). The wire keys factions by their
+Reputation (2026-08-29, item 99). The wire keys factions by their
 `Faction.dbc` reputation index (`repListId`), not the faction id; the module
 makes the same join a client does and adds the client's base standing for
 the character's race and class (`ReputationMgr::GetBaseReputation` is the
@@ -972,7 +1050,7 @@ absent only when the player object was not reachable at decode time:
 `SMSG_SET_FACTION_ATWAR` and the at-war/inactive toggles a client sends are
 not tapped or allowlisted: nothing in a trajectory has asked for them.
 
-Pets (2026-08-29, FOLLOW-UPS 98). The pet frame is drawn from one packet plus
+Pets (2026-08-29, item 98). The pet frame is drawn from one packet plus
 the pet's own unit in view: `SMSG_PET_SPELLS` carries the control bar, the
 unit's update fields (`health`, `level`, `power1`, `summonedByGuid`,
 `petNumber` above) carry the rest, and the given name comes back from the
@@ -992,7 +1070,7 @@ every change. Pet talents (`CMSG_PET_LEARN_TALENT`, the pet form of
 | `SMSG_PET_NAME_QUERY_RESPONSE` | 0x053 | `{ "petNumber", "found": <bool>, "name"? }` — the given name for a pet number (the name timestamp and declined-name block are consumed and not served) |
 | `SMSG_PET_NAME_INVALID` | 0x178 | `{ "reason": <u32>, "name" }` — a rename the server refused (`PetNameInvalidReason`) |
 
-Group, mail, bank and trade (2026-08-29, FOLLOW-UPS 100): the replies to the
+Group, mail, bank and trade (2026-08-29, item 100): the replies to the
 raw-allowlisted client opcodes above, so a raw send is answered. Result codes
 are the core's enums (`PartyResult`, `MailResponseResult`, `TradeStatus`),
 served as numbers; the SDK names them.
@@ -1015,7 +1093,7 @@ served as numbers; the SDK names them.
 | `SMSG_TRADE_STATUS` | 0x120 | `{ "status": <u32>, "traderGuid"? (status 1), "inventoryResult"?, "targetError"?, "limitedItemId"? (status 12), "slot"? (22, 23) }` — `TradeStatus`: 0 busy, 1 begin trade (the other player proposed), 2 window open, 3 canceled, 4 accepted, 6 no target, 7 back to trade, 8 complete, 9 rejected, 10 too far, 11 wrong faction, 12 close window, 14 ignoring you, 15/16 stunned, 17/18 dead, 19/20 logging out, 21 trial account |
 | `SMSG_TRADE_STATUS_EXTENDED` | 0x121 | `{ "theirs": <bool>, "money", "spellId", "items": [{ "slot", "itemId", "count", "wrapped": <bool> }] }` — one side of the trade window (`theirs` false is own); slot 6 is the "will not be traded" enchant slot; empty slots and the per-item enchant / gem / creator / durability block are consumed and not served |
 
-Group loot rolls (2026-08-29, FOLLOW-UPS 102): the roll frame a group-looted
+Group loot rolls (2026-08-29, item 102): the roll frame a group-looted
 corpse opens for each item at or above the group's loot threshold
 (`Group::GroupLoot`; uncommon by default, and the threshold cannot be set
 lower). A roll is keyed by the fresh item guid the core mints for it
@@ -1030,7 +1108,7 @@ item entry, queried like a cache miss so the SDK can name it.
 | `SMSG_LOOT_ALL_PASSED` | 0x29E | `{ "rollGuid", "slot", "itemId" }` — everyone passed; the item stays on the corpse |
 | `SMSG_LOOT_MASTER_LIST` | 0x2A4 | `{ "looters": [{ "guid" }] }` — under master loot, who the master looter may assign an over-threshold item to |
 
-Item text (2026-08-29, FOLLOW-UPS 103): a client reads a book or letter with
+Item text (2026-08-29, item 103): a client reads a book or letter with
 `CMSG_READ_ITEM`, and on the server's `SMSG_READ_ITEM_OK` asks
 `CMSG_PAGE_TEXT_QUERY` for the template's `pageText` (served on the item
 query above), which the core answers page by page down the `NextPage` chain
@@ -1161,7 +1239,7 @@ Served in `SMSG_UPDATE_OBJECT` `fields` alongside the existing set:
 
 - players (self only; the server marks these PRIVATE): `money` (copper),
   `xp`, `nextLevelXp`, `talentPoints` (`PLAYER_CHARACTER_POINTS1`, the
-  unspent count); the skill pane (2026-08-29, FOLLOW-UPS 95) as raw fields
+  unspent count); the skill pane (2026-08-29, item 95) as raw fields
   `skill<slot><Off>` with slot 0-127 (`PLAYER_SKILL_INFO_1_1`, three packed
   u32s per line) and Off one of `Id`/`Step` (low/high u16 of the first),
   `Value`/`Max` (the second), `TempBonus`/`PermBonus` (the third, as signed

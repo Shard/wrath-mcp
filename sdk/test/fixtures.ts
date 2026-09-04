@@ -425,7 +425,7 @@ export const itemCreate = {
 };
 
 /**
- * A worn bag in equipment slot 19 (FOLLOW-UPS 50): the player's `invSlot19`
+ * A worn bag in equipment slot 19 (item 50): the player's `invSlot19`
  * halves name the container, the container's own create block carries
  * `numSlots` and its `bagSlot<n>Lo/Hi` halves, and one of those names a second
  * copy of the charm. Guid high halves are non-zero to prove reassembly.
@@ -873,7 +873,7 @@ export function frames(objects: readonly unknown[]): string[] {
 
 // ---------------------------------------------------------------- quest info
 //
-// Synthetic captures of the two packets behind FOLLOW-UPS 27/28, in the exact
+// Synthetic captures of the two packets behind item 27/28, in the exact
 // JSON shape PROTOCOL.md gives for the module's decode.
 
 /** A kobold entry for the objectives fixture; `| 0x80000000` marks a gameobject on the wire. */

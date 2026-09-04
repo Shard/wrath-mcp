@@ -195,7 +195,7 @@ describe("client: operator-bound account", () => {
 });
 
 describe("client: movement", () => {
-  test("the default signal aborts a pending moveTo, issues one stop, and leaves later waits alive (FOLLOW-UPS 44)", async () => {
+  test("the default signal aborts a pending moveTo, issues one stop, and leaves later waits alive (item 44)", async () => {
     const stub = startStub({ onConnect: () => frames(loginSequence) });
     // A provider, as the runner passes it: consulted at the start of each wait.
     let current: AbortSignal | undefined;
@@ -652,7 +652,7 @@ describe("client: movement", () => {
   });
 
   test("teleported (same-map port) resolves on the own-guid MSG_MOVE_TELEPORT_ACK, never waits for NEW_WORLD", async () => {
-    // FOLLOW-UPS 46: a Hearthstone mid-move used to answer `transferred`, and
+    // item 46: a Hearthstone mid-move used to answer `transferred`, and
     // moveTo then waited 90s for an SMSG_NEW_WORLD that never comes on a
     // same-map port. The module now says `teleported`, and the arrival point
     // is the server's own teleport ack, sent before the result.
@@ -2145,7 +2145,7 @@ describe("client: equipItem", () => {
     const pending = client.equipItem(255, BACKPACK_SLOT, { timeout: 2000 });
     await untilAction(stub, "equip_item");
     // 60 is EQUIP_ERR_NOT_IN_COMBAT — the code a run reverse-engineered from
-    // context because nothing ever named it (FOLLOW-UPS 101a).
+    // context because nothing ever named it (item 101a).
     stub.push(JSON.stringify(inventoryChangeFailure(78, 60)));
     const result = await pending;
     if (result.ok || result.status !== "not_equipped") throw new Error("unreachable");
@@ -2777,7 +2777,7 @@ describe("client: questgiver status and quest query, issued the way a client doe
   });
 });
 
-describe("client: talents and the raw escape hatch (FOLLOW-UPS 39)", () => {
+describe("client: talents and the raw escape hatch (item 39)", () => {
   const talentsInfo = (seq: number, talents: { talentId: number; rank: number }[], unspent = 0) =>
     JSON.stringify({
       seq,

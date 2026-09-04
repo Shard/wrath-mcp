@@ -449,7 +449,12 @@ Two rules the tests enforce:
 **Extension point.** `apply()` is a switch on opcode and every world write goes
 through `upsertNearby()`. Landing a new event means: add the schema in
 `src/protocol.ts`, add one `case` in `src/state.ts`, and derive rather than
-duplicate if it belongs to `self`. Unknown opcodes,
+duplicate if it belongs to `self`. The pets, group, mail, bank, trade, loot-roll
+and item-text families live in `src/protocol-social.ts` and
+`src/state-social.ts` instead — the same two steps, one file over in each case
+(item 108). `src/guid.ts` is the leaf both halves of the protocol import for
+`guidSchema`; it exists so `protocol-social.ts` never reaches back into
+`protocol.ts` at value level, which is a module-eval cycle `tsc` cannot see. Unknown opcodes,
 unknown update-block kinds and unknown `data` fields all already pass through
 rather than failing, so an SDK built against today's whitelist keeps streaming
 when the module's widens.
@@ -477,6 +482,7 @@ running game (`CLAUDE.md`).
 
 ## Dependencies
 
-Zod, and only at the external boundary: `src/protocol.ts` validates module
-messages and hands plain TypeScript types to everything downstream. Transport is
+Zod, and only at the external boundary: `src/protocol.ts` (with
+`src/protocol-social.ts`) validates module messages and hands plain TypeScript
+types to everything downstream. Transport is
 Bun's built-in `fetch` and `WebSocket`.

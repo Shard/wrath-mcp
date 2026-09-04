@@ -90,6 +90,10 @@ import {
   type TrainerBuyFailedData,
   type TrainerListData,
   type TrainerSpellData,
+  leaseResponseSchema,
+  releaseLeaseResponseSchema,
+  type LeaseResponse,
+  type ReleaseLeaseResponse,
 } from "./protocol";
 import {
   EventAbortedError,
@@ -534,6 +538,12 @@ type ActionBody = ActionRequest extends infer T
  * `internal` (not reachable through the typed client methods).
  */
 export const KNOWN_ERROR_CODES = [
+  // authentication (PROTOCOL.md, "Authentication")
+  "unauthorized",
+  "operator_only",
+  "token_mismatch",
+  "account_not_leased",
+  "character_bound",
   "missing_token",
   "missing_character",
   "token_in_use",
@@ -669,6 +679,20 @@ const ERROR_CODE_HINTS: Record<string, string> = {
   weak_token:
     "the session token is shorter than 32 characters — the module refuses guessable tokens; " +
     "the runner issues a random one per run, so this means a hand-passed token needs replacing",
+  unauthorized:
+    "the request carried no valid credential — the client must be constructed with the `secret` the " +
+    "runner obtained for this token (or, for operator tooling, the port secret from WRATHBENCH_MODULE_SECRET)",
+  operator_only:
+    "this route (lease, list or delete characters) is for operator tooling holding the port secret; " +
+    "a session works only with its own character through createSession/deleteSession",
+  token_mismatch:
+    "this session's credential is bound to one token and the request named another — use the client " +
+    "as constructed; there is no other session to reach",
+  account_not_leased:
+    "the account named is not the one this session was leased for — omit `account`; the run's account is fixed",
+  character_bound:
+    "this session already played a character (see `bound`) and cannot create another — call createSession " +
+    "with that name, or deleteSession and continue with it",
   item_not_usable:
     "the module refused use_item for that bag/slot — the item there has no on-use spell and no quest to start, " +
     "or the slot is empty or shifted (slots move after looting/selling); check state.bag()",
@@ -711,6 +735,16 @@ export interface ConnectOptions {
   baseUrl: string;
   /** Opaque session id chosen by the caller; scopes both actions and events. */
   token: string;
+  /**
+   * The credential sent as `Authorization: Bearer` on every request and on
+   * the `/events` upgrade (module/PROTOCOL.md, "Authentication"). For the
+   * snippet child this is the lease secret the runner obtained for `token`
+   * (`POST /lease`); for operator tooling — smokes, hygiene, the fleet — it
+   * is the port secret. The SDK reads no environment: the caller passes it.
+   * Undefined sends no header, which the module answers with
+   * `401 unauthorized`.
+   */
+  secret?: string;
   /**
    * The game account this run occupies, bound operator-side exactly like
    * `token` (decided 2026-08-22). When set it is authoritative: it
@@ -2161,6 +2195,7 @@ export class WrathClient {
 
   /** The operator-bound game account. Authoritative when set; see ConnectOptions.account. */
   private readonly boundAccount: string | undefined;
+  private readonly secret: string | undefined;
   private readonly fetchImpl: typeof fetch;
   private readonly requestTimeoutMs: number;
   private readonly defaultSignal: (() => AbortSignal | undefined) | undefined;
@@ -2172,6 +2207,7 @@ export class WrathClient {
   constructor(options: ConnectOptions) {
     this.token = options.token;
     this.boundAccount = options.account;
+    this.secret = options.secret;
     const sig = options.signal;
     this.defaultSignal = sig === undefined ? undefined : typeof sig === "function" ? sig : () => sig;
     const dl = options.deadline;
@@ -2185,6 +2221,7 @@ export class WrathClient {
       ...options.events,
       url: `${wsBase.replace(/\/+$/, "")}/events`,
       token: options.token,
+      secret: options.secret,
     });
     this.state = new StateCache(options.state ?? {});
     // Registered before the socket opens, so the cache sees every frame.
@@ -4231,6 +4268,30 @@ export class WrathClient {
     );
   }
 
+  /**
+   * POST /lease — operator only (the caller's `secret` must be the port
+   * secret). Binds this client's token to `account` (the bound account when
+   * set, else the module default) and returns the session secret a
+   * session-class client for the same token should be constructed with. The
+   * runner calls this once per launch and hands `secret` to the snippet
+   * child; a snippet has no use for it (its own class is refused with
+   * `403 operator_only`). See module/PROTOCOL.md, "Authentication".
+   */
+  lease(account?: string): Promise<LeaseResponse> {
+    const bound = this.boundAccount ?? account;
+    return this.request(
+      "POST",
+      "/lease",
+      bound === undefined ? { token: this.token } : { token: this.token, account: bound },
+      leaseResponseSchema,
+    );
+  }
+
+  /** DELETE /lease — operator only. Revokes this token's session secret; a live session is untouched. */
+  releaseLease(): Promise<ReleaseLeaseResponse> {
+    return this.request("DELETE", "/lease", { token: this.token }, releaseLeaseResponseSchema);
+  }
+
   /** DELETE /session — log the character out (a real client-style disconnect). */
   deleteSession(): Promise<DeleteSessionResponse> {
     return this.request(
@@ -4476,7 +4537,7 @@ export class WrathClient {
     if (status === "teleported") {
       // A same-map port: no SMSG_NEW_WORLD is coming, so waiting for one
       // (what `transferred` does) would be a full-timeout hang ending in a
-      // false "still pending" (FOLLOW-UPS 46). The arrival point is the
+      // false "still pending" (item 46). The arrival point is the
       // server's own MSG_MOVE_TELEPORT_ACK, sent before the result — so this
       // is a buffer lookup from before the move, and the short timeout only
       // covers a module that did not serve it.
@@ -5075,7 +5136,7 @@ export class WrathClient {
    * with `SMSG_GOSSIP_MESSAGE` carrying the quests instead of
    * `SMSG_QUESTGIVER_QUEST_LIST` — with none of the accepting. Models kept
    * rebuilding exactly this by hand over `questList` plus event scraping and
-   * getting confused by their own nulls (FOLLOW-UPS 9a).
+   * getting confused by their own nulls (item 9a).
    *
    * An empty `quests` is an answer: the NPC has nothing for this character
    * right now. Silence is not, so it still throws `EventTimeoutError`.
@@ -5806,9 +5867,12 @@ export class WrathClient {
     const url = `${this.baseUrl}${path}`;
     let res: Response;
     try {
+      const headers: Record<string, string> = {};
+      if (body !== undefined) headers["content-type"] = "application/json";
+      if (this.secret !== undefined) headers["authorization"] = `Bearer ${this.secret}`;
       res = await this.fetchImpl(url, {
         method,
-        headers: body === undefined ? undefined : { "content-type": "application/json" },
+        headers,
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: AbortSignal.timeout(this.requestTimeoutMs),
       });

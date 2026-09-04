@@ -70,6 +70,13 @@ export interface EventStreamOptions {
   /** Full websocket URL, e.g. `ws://worldserver:8086/events`. */
   url: string;
   token: string;
+  /**
+   * The credential for the upgrade's `Authorization: Bearer` header
+   * (PROTOCOL.md, "Authentication"): the lease secret issued for `token`, or
+   * the operator's port secret. Undefined sends no header, which the module
+   * refuses with 401 — only a stub or a pre-auth module accepts that.
+   */
+  secret?: string;
   /** How many events to retain for `waitFor`/`recent`. Default 500. */
   bufferSize?: number;
   /** First seq expected on a fresh session. Default 0 (the module starts there). */
@@ -79,6 +86,17 @@ export interface EventStreamOptions {
   /** Backoff bounds in ms. Defaults 250 / 5000. */
   reconnectMinDelayMs?: number;
   reconnectMaxDelayMs?: number;
+  /**
+   * Per-attempt bound on the WebSocket handshake, in ms. Default 5000.
+   *
+   * The reconnect ladder only reschedules on close or error, so without this a
+   * handshake that stalls in `CONNECTING` never fails and never retries — one
+   * stuck TCP/WS connect silently consumes the caller's whole wait budget. At
+   * expiry the pending socket is closed and the attempt counts as failed, which
+   * advances the backoff ladder. Kept well under `waitFor`'s 10000ms default so
+   * a stall inside a wait still gets a retry before the wait gives up.
+   */
+  connectTimeoutMs?: number;
   /** Injectable for tests; defaults to the global. */
   webSocketImpl?: typeof WebSocket;
   now?: () => number;
@@ -190,21 +208,34 @@ interface Consumer {
   done: boolean;
 }
 
+/** A caller awaiting `connect()`, with the failed attempts it has sat through so far. */
+interface ConnectWaiter {
+  resolve: () => void;
+  reject: (err: Error) => void;
+  failures: number;
+}
+
 export class EventStream implements AsyncIterable<StreamEvent> {
   readonly token: string;
 
   private readonly url: string;
+  private readonly secret: string | undefined;
   private readonly bufferSize: number;
   private readonly reconnectEnabled: boolean;
   private readonly minDelay: number;
   private readonly maxDelay: number;
+  private readonly connectTimeout: number;
   private readonly WS: typeof WebSocket;
   private readonly now: () => number;
 
   private socket: WebSocket | undefined;
   private closedByUser = false;
-  private openPromise: Promise<void> | undefined;
+  private readonly connectWaiters = new Set<ConnectWaiter>();
+  /** Failed attempts a `connect()` caller sits through before giving up; see `connect`. */
+  private readonly connectPatience: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Deadline on the attempt currently in `CONNECTING`, if any. */
+  private openTimer: ReturnType<typeof setTimeout> | undefined;
   private attempt = 0;
 
   private readonly buffer: StreamEvent[] = [];
@@ -224,22 +255,49 @@ export class EventStream implements AsyncIterable<StreamEvent> {
   constructor(options: EventStreamOptions) {
     this.token = options.token;
     this.url = `${options.url}?token=${encodeURIComponent(options.token)}`;
+    this.secret = options.secret;
     this.bufferSize = options.bufferSize ?? 500;
     this.expectedSeq = options.expectFromSeq ?? 0;
     this.reconnectEnabled = options.reconnect ?? true;
     this.minDelay = options.reconnectMinDelayMs ?? 250;
     this.maxDelay = options.reconnectMaxDelayMs ?? 5000;
+    this.connectTimeout = options.connectTimeoutMs ?? 5000;
     this.WS = options.webSocketImpl ?? WebSocket;
     this.now = options.now ?? Date.now;
+    // One failed attempt per growing rung of the backoff ladder, plus the one
+    // that would first be scheduled at the flat cap. Defaults (250/5000): 6.
+    // Bounded so a degenerate min delay of 0 cannot loop.
+    let patience = 1;
+    while (patience < 32 && this.minDelay * 2 ** (patience - 1) < this.maxDelay) patience++;
+    this.connectPatience = patience;
   }
 
   // ------------------------------------------------------------- lifecycle
 
-  /** Opens the socket. Resolves once it is open; rejects if the first connect fails. */
+  /**
+   * Resolves once the socket is open. Rejects only when the stream cannot get
+   * there on its own: `close()` was called, reconnect is disabled and the
+   * attempt failed, or the server stayed unreachable through a whole climb of
+   * the backoff ladder (every growing rung, so ~8s of immediate refusals or up
+   * to ~38s of stalled handshakes with the defaults).
+   *
+   * The promise tracks the *stream*, not one attempt: a first handshake that
+   * stalls in a loaded container fails its attempt, the ladder retries, and the
+   * caller sees the retry's success. Exactly one attempt is ever in flight —
+   * `connect()` joins an attempt or pending retry rather than opening a second
+   * socket — so calling it again after a rejection is safe and, if the ladder
+   * has since brought the stream back, resolves at once.
+   */
   connect(): Promise<void> {
-    if (this.openPromise) return this.openPromise;
-    this.openPromise = this.openSocket();
-    return this.openPromise;
+    if (this.closedByUser) return Promise.reject(new EventStreamClosedError());
+    if (this.connected) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      this.connectWaiters.add({ resolve, reject, failures: 0 });
+      // A socket in CONNECTING (or CLOSING, whose close will reschedule) or a
+      // pending retry already owns the next attempt. Otherwise nothing will
+      // try — never started, or reconnect is off and the last attempt failed.
+      if (this.socket === undefined && this.reconnectTimer === undefined) this.openSocket();
+    });
   }
 
   get connected(): boolean {
@@ -275,8 +333,12 @@ export class EventStream implements AsyncIterable<StreamEvent> {
 
   close(): void {
     this.closedByUser = true;
+    // Before the socket goes: a fake that dispatches `close` synchronously would
+    // otherwise settle these as an attempt failure instead of a user close.
+    this.rejectConnectWaiters(new EventStreamClosedError());
     if (this.reconnectTimer !== undefined) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
+    this.clearOpenTimer();
     this.socket?.close();
     this.socket = undefined;
     for (const w of this.waiters) {
@@ -292,37 +354,120 @@ export class EventStream implements AsyncIterable<StreamEvent> {
     }
   }
 
-  private openSocket(): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      let settled = false;
-      const ws = new this.WS(this.url);
-      this.socket = ws;
+  private clearOpenTimer(): void {
+    if (this.openTimer !== undefined) clearTimeout(this.openTimer);
+    this.openTimer = undefined;
+  }
 
-      ws.addEventListener("open", () => {
-        this.attempt = 0;
-        if (!settled) {
-          settled = true;
-          resolve();
-        }
-      });
-      ws.addEventListener("message", (ev: MessageEvent) => {
-        this.ingest(typeof ev.data === "string" ? ev.data : String(ev.data));
-      });
-      ws.addEventListener("error", () => {
-        if (!settled) {
-          settled = true;
-          reject(new EventStreamClosedError(`failed to connect to ${this.url}`));
-        }
-      });
-      ws.addEventListener("close", () => {
-        if (!settled) {
-          settled = true;
-          reject(new EventStreamClosedError(`connection to ${this.url} closed before open`));
-        }
-        if (this.socket === ws) this.socket = undefined;
-        this.scheduleReconnect();
-      });
+  /**
+   * One connect attempt. Its outcome settles the `connect()` waiters through
+   * `attemptOpened`/`attemptFailed`; nobody holds a promise on the attempt
+   * itself, which is what keeps one attempt's failure from being sticky.
+   */
+  private openSocket(): void {
+    let settled = false;
+    // Set by the open deadline below. The deadline already closed this socket
+    // and advanced the ladder, so the `close` it provokes must not do either
+    // again — otherwise one stalled attempt burns two rungs.
+    let timedOut = false;
+    // Bun's WebSocket takes request headers as a second-argument option (the
+    // WHATWG signature has only protocols there, hence the cast). Custom
+    // implementations receive the same object and may ignore it.
+    const ws =
+      this.secret === undefined
+        ? new this.WS(this.url)
+        : new (this.WS as unknown as new (url: string, init: { headers: Record<string, string> }) => WebSocket)(
+            this.url,
+            { headers: { authorization: `Bearer ${this.secret}` } },
+          );
+    this.socket = ws;
+
+    // A handshake still pending at the deadline is a failed attempt: close the
+    // half-open socket, fail the attempt, and let the ladder move on.
+    this.clearOpenTimer();
+    this.openTimer = setTimeout(() => {
+      this.openTimer = undefined;
+      if (settled) return;
+      settled = true;
+      timedOut = true;
+      if (this.socket === ws) this.socket = undefined;
+      try {
+        ws.close();
+      } catch {
+        /* a half-open socket that refuses to close is still abandoned here */
+      }
+      this.attemptFailed(
+        new EventStreamClosedError(`connection to ${this.url} did not open within ${this.connectTimeout}ms`),
+      );
+      this.scheduleReconnect();
+    }, this.connectTimeout);
+
+    ws.addEventListener("open", () => {
+      this.clearOpenTimer();
+      this.attempt = 0;
+      if (!settled) {
+        settled = true;
+        this.attemptOpened();
+      }
     });
+    ws.addEventListener("message", (ev: MessageEvent) => {
+      this.ingest(typeof ev.data === "string" ? ev.data : String(ev.data));
+    });
+    ws.addEventListener("error", () => {
+      if (timedOut) return;
+      this.clearOpenTimer();
+      if (!settled) {
+        settled = true;
+        this.attemptFailed(new EventStreamClosedError(`failed to connect to ${this.url}`));
+      }
+    });
+    ws.addEventListener("close", () => {
+      if (timedOut) return;
+      this.clearOpenTimer();
+      if (this.socket === ws) this.socket = undefined;
+      if (!settled) {
+        settled = true;
+        this.attemptFailed(new EventStreamClosedError(`connection to ${this.url} closed before open`));
+      } else if (this.closedByUser || !this.reconnectEnabled) {
+        // An open socket dropped and nothing will retry: a caller that joined
+        // during CLOSING must not wait for an attempt that never comes.
+        this.rejectConnectWaiters(new EventStreamClosedError(`connection to ${this.url} closed`));
+      }
+      this.scheduleReconnect();
+    });
+  }
+
+  /** The attempt in flight opened: every `connect()` caller is satisfied. */
+  private attemptOpened(): void {
+    const waiters = [...this.connectWaiters];
+    this.connectWaiters.clear();
+    for (const w of waiters) w.resolve();
+  }
+
+  /**
+   * The attempt in flight failed. A caller gives up when no retry is coming,
+   * or once it has sat through `connectPatience` failures — a whole climb of
+   * the ladder. The stream itself keeps retrying at the cap regardless; the
+   * rejection is the caller's verdict, not the stream's.
+   */
+  private attemptFailed(err: Error): void {
+    const willRetry = this.reconnectEnabled && !this.closedByUser;
+    for (const w of [...this.connectWaiters]) {
+      w.failures++;
+      if (willRetry && w.failures < this.connectPatience) continue;
+      this.connectWaiters.delete(w);
+      w.reject(
+        w.failures > 1
+          ? new EventStreamClosedError(`${err.message} (${w.failures} attempts; the stream keeps retrying)`)
+          : err,
+      );
+    }
+  }
+
+  private rejectConnectWaiters(err: Error): void {
+    const waiters = [...this.connectWaiters];
+    this.connectWaiters.clear();
+    for (const w of waiters) w.reject(err);
   }
 
   private scheduleReconnect(): void {
@@ -332,9 +477,7 @@ export class EventStream implements AsyncIterable<StreamEvent> {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
       if (this.closedByUser) return;
-      this.openSocket().catch(() => {
-        /* the close handler reschedules */
-      });
+      this.openSocket();
     }, delay);
   }
 

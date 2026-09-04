@@ -199,15 +199,24 @@ namespace WrathBench
             std::string path, token;
             SplitTarget(std::string(_req.target()), path, token);
 
-            // WebSocket upgrade on /events becomes a WsSession that outlives us.
+            std::string authorization(_req[http::field::authorization]);
+
+            // WebSocket upgrade on /events becomes a WsSession that outlives us
+            // — once the credential has been checked. A refused upgrade is a
+            // plain 401 response on the not-yet-upgraded stream.
             if (websocket::is_upgrade(_req) && path == "/events")
             {
+                if (!_sink->AuthorizeWs(token, authorization))
+                {
+                    SendReply({401, R"({"ok":false,"error":"unauthorized"})"}, false);
+                    return;
+                }
                 std::make_shared<WsSession>(_stream.release_socket(), _sink, token)->Run(_req);
                 return; // socket ownership handed off
             }
 
             std::string method(_req.method_string());
-            HttpReply reply = _sink->HandleHttp(method, path, _req.body(), _loopbackPeer);
+            HttpReply reply = _sink->HandleHttp(method, path, _req.body(), authorization, _loopbackPeer);
             SendReply(reply, _req.keep_alive());
         }
 

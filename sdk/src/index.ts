@@ -269,6 +269,8 @@ export type {
   DeleteSessionRequest,
   DeleteSessionResponse,
   DestroyObjectData,
+  LeaseResponse,
+  ReleaseLeaseResponse,
   ErrorBody,
   FaceResponse,
   GameEvent,

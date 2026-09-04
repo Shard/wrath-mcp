@@ -54,7 +54,14 @@ namespace WrathBench
         // worldserver container, as opposed to a caller on the compose network
         // (runner, snippet sandbox). Lets diagnostics endpoints serve their
         // verbose view to operators only.
-        virtual HttpReply HandleHttp(std::string const& method, std::string const& target, std::string const& body, bool loopbackPeer) = 0;
+        // authorization: the request's Authorization header verbatim ("" when
+        // absent). Every route authenticates on it (PROTOCOL.md,
+        // "Authentication"); the server never interprets it itself.
+        virtual HttpReply HandleHttp(std::string const& method, std::string const& target, std::string const& body,
+            std::string const& authorization, bool loopbackPeer) = 0;
+        // Decide an /events upgrade before the handshake: false refuses the
+        // socket with 401 so an unauthenticated subscriber never registers.
+        virtual bool AuthorizeWs(std::string const& token, std::string const& authorization) = 0;
         virtual void OnWsOpen(std::string const& token, std::shared_ptr<IWsConn> conn) = 0;
         virtual void OnWsClose(std::string const& token, IWsConn* conn) = 0;
     };

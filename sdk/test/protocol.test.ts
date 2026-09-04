@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { describe, expect, test } from "bun:test";
 
 import {
@@ -232,7 +234,7 @@ describe("event frames", () => {
       expect((parsed.event.data as { guid: string }).guid).toBe("42");
     }
     // The server's own-guid teleport ack is in the observed set since
-    // FOLLOW-UPS 46; the client's WORLDPORT echo never is.
+    // item 46; the client's WORLDPORT echo never is.
     expect(isMoveOpcode("MSG_MOVE_TELEPORT_ACK")).toBe(true);
     expect(isMoveOpcode("MSG_MOVE_WORLDPORT_ACK")).toBe(false);
   });
@@ -352,5 +354,131 @@ describe("event frames", () => {
   test("a broken envelope is a parse failure, not a silent drop", () => {
     expect(parseEventFrame("not json").ok).toBe(false);
     expect(parseEventFrame(JSON.stringify({ opcode: "SMSG_MOTD" })).ok).toBe(false);
+  });
+});
+
+describe("the social seam decodes across the protocol / protocol-social split", () => {
+  // These are the frames the split could break silently. `eventDataSchemas`
+  // lives in `protocol.ts` and names schemas defined in `protocol-social.ts`,
+  // which needs `guidSchema` at module-evaluation time; take that schema back
+  // from `protocol.ts` instead of from the `./guid` leaf and the const lands
+  // in the TDZ — a ReferenceError on import that types erase past and `tsc`
+  // cannot see. One frame per seam family, each asserting the guid transform
+  // actually ran, so a schema lost behind a broken re-export fails here rather
+  // than passing data through unvalidated. The import-shape test below is the
+  // other half: decoding proves today's graph evaluates, not that the arrow
+  // between the two files still points the only way that is safe.
+
+  const frame = (opcode: string, opcodeId: number, data: unknown): string =>
+    JSON.stringify({ seq: 1, opcode, opcodeId, ts: 1_000, data });
+
+  const decode = (opcode: string, opcodeId: number, data: unknown): Record<string, unknown> => {
+    const result = parseEventFrame(frame(opcode, opcodeId, data));
+    if (!result.ok) throw new Error(`${opcode}: frame did not parse`);
+    const schemaError = (result.event as { schemaError?: string }).schemaError;
+    if (schemaError !== undefined) throw new Error(`${opcode}: ${schemaError}`);
+    if (isDecodeError(result.event.data)) throw new Error(`${opcode}: decode error`);
+    return result.event.data as Record<string, unknown>;
+  };
+
+  // The decode tests above prove today's graph works. This one pins the arrow
+  // direction that makes it work, which is the part a future edit breaks
+  // silently: one IDE auto-import of `guidSchema` from "./protocol" instead of
+  // "./guid" restores the cycle, and it survives today only because
+  // `protocol.ts` happens to import (and re-export) `./guid` first. Whichever
+  // module the graph is entered through, one of the two sides ends up reading
+  // a `const` that has not been initialised.
+  test("protocol-social reaches for nothing in protocol, and state-social only for types", () => {
+    const importsOf = (file: string): string[] =>
+      readFileSync(new URL(`../src/${file}`, import.meta.url), "utf8")
+        .split("\n")
+        .filter((l) => l.startsWith("import"));
+
+    expect(importsOf("protocol-social.ts").filter((l) => l.includes('from "./protocol"'))).toEqual([]);
+
+    // The state half is acyclic for a weaker reason — its back-reference is
+    // erased — so the `type` keyword is the whole guarantee.
+    const back = importsOf("state-social.ts").filter((l) => l.includes('from "./state"'));
+    expect(back.length).toBe(1);
+    expect(back.filter((l) => !l.startsWith("import type "))).toEqual([]);
+  });
+
+  test("every seam opcode is still in the known whitelist", () => {
+    for (const opcode of [
+      "SMSG_PET_SPELLS",
+      "SMSG_GROUP_LIST",
+      "SMSG_MAIL_LIST_RESULT",
+      "SMSG_TRADE_STATUS",
+      "SMSG_LOOT_START_ROLL",
+      "SMSG_ITEM_TEXT_QUERY_RESPONSE",
+    ]) {
+      expect(isKnownOpcode(opcode)).toBe(true);
+    }
+  });
+
+  test("pets: SMSG_PET_SPELLS", () => {
+    const data = decode("SMSG_PET_SPELLS", 0x0179, {
+      guid: "007",
+      removed: false,
+      reactState: 1,
+      commandState: 1,
+      actionBar: [{ slot: 0, type: 0x07, command: 1 }],
+      spells: [{ spellId: 2649, active: 0xc1, autocast: true }],
+    });
+    expect(data.guid).toBe("7");
+    expect((data.actionBar as { command: number }[])[0]?.command).toBe(1);
+  });
+
+  test("group: SMSG_GROUP_LIST", () => {
+    const data = decode("SMSG_GROUP_LIST", 0x007d, {
+      groupType: 0,
+      left: false,
+      raid: false,
+      subGroup: 0,
+      memberFlags: 0,
+      roles: 0,
+      groupGuid: "0x0",
+      counter: 1,
+      leaderGuid: "007",
+      members: [{ name: "Quilby", guid: "0000009", online: true, subGroup: 0, flags: 0, roles: 0 }],
+    });
+    expect(data.leaderGuid).toBe("7");
+    expect((data.members as { guid: string }[])[0]?.guid).toBe("9");
+  });
+
+  test("mail: SMSG_MAIL_LIST_RESULT", () => {
+    const data = decode("SMSG_MAIL_LIST_RESULT", 0x023b, {
+      total: 1,
+      count: 1,
+      mails: [{
+        mailId: 42, type: 0, senderGuid: "007", cod: 0, stationery: 41, money: 100,
+        flags: 0, read: false, daysLeft: 30, templateId: 0, subject: "hi", body: "there", items: [],
+      }],
+    });
+    expect((data.mails as { senderGuid: string }[])[0]?.senderGuid).toBe("7");
+  });
+
+  test("trade: SMSG_TRADE_STATUS", () => {
+    const data = decode("SMSG_TRADE_STATUS", 0x0120, { status: 1, traderGuid: "007" });
+    expect(data.traderGuid).toBe("7");
+  });
+
+  test("group loot rolls: SMSG_LOOT_START_ROLL", () => {
+    const data = decode("SMSG_LOOT_START_ROLL", 0x02a1, {
+      rollGuid: "007", slot: 0, itemId: 2589, count: 1, countdownMs: 60_000,
+      voteMask: 7, canNeed: true, canGreed: true, canDisenchant: false,
+    });
+    expect(data.rollGuid).toBe("7");
+  });
+
+  test("item text: SMSG_ITEM_TEXT_QUERY_RESPONSE", () => {
+    const data = decode("SMSG_ITEM_TEXT_QUERY_RESPONSE", 0x0244, { found: true, guid: "007", text: "a letter" });
+    expect(data.guid).toBe("7");
+    expect(data.text).toBe("a letter");
+  });
+
+  test("bank: SMSG_SHOW_BANK carries the banker's guid", () => {
+    const data = decode("SMSG_SHOW_BANK", 0x01b7, { guid: "007" });
+    expect(data.guid).toBe("7");
   });
 });

@@ -160,6 +160,10 @@ const CLIENT_RAW: readonly Row[] = [
 /** WrathClient prototype members that are internal plumbing, deliberately undocumented. */
 const CLIENT_INTERNAL = new Set([
   "action",
+  // Operator-only (module/PROTOCOL.md "Authentication"): a snippet's own
+  // credential is refused on these, so the model is not shown them.
+  "lease",
+  "releaseLease",
   "noteActionHint",
   "drainActionHints",
   "request",
@@ -169,6 +173,9 @@ const CLIENT_INTERNAL = new Set([
   "latestReclaimDelay",
   "resolveGossipOption",
   "petGuidOrRefuse",
+  "petCommand",
+  "nameMailSenders",
+  "questDetailsFrom",
   "petRefusal",
   "lootRollRefusal",
   "targetGuid",
@@ -267,6 +274,9 @@ const STATE_ROWS: readonly Row[] = [
  */
 const STATE_INTERNAL = new Set([
   "addAchievement",
+  "closeRoll",
+  "mailboxOpened",
+  "petCommanded",
   "apply",
   "applyQuestGiverStatus",
   "questObjectives",
@@ -311,6 +321,10 @@ const EVENT_INTERNAL = new Set([
   "ingest",
   "openSocket",
   "scheduleReconnect",
+  "clearOpenTimer",
+  "attemptOpened",
+  "attemptFailed",
+  "rejectConnectWaiters",
   "advanceEpoch",
   "epoch",
   "gaps",

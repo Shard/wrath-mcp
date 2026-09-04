@@ -390,7 +390,7 @@ describe("state cache: self, from the wire", () => {
   });
 
   test("an own-guid MSG_MOVE_TELEPORT_ACK moves self, and the `teleported` result after it does not", () => {
-    // FOLLOW-UPS 46: a same-map port sends no SMSG_NEW_WORLD; the server's
+    // item 46: a same-map port sends no SMSG_NEW_WORLD; the server's
     // teleport ack under our guid is the arrival point. The `teleported` move
     // result that follows carries the pre-teleport position and must not win.
     const cache = StateCache.replay(toEvents([...loginSequence, selfCreate, teleportAck(40)]), { seed: SEED });
@@ -1555,7 +1555,7 @@ describe("state cache: vendor, trainer and loot windows (item 101b)", () => {
   });
 });
 
-describe("state cache: questgiver markers (FOLLOW-UPS 27)", () => {
+describe("state cache: questgiver markers (item 27)", () => {
   const withWorld = (extra: readonly unknown[]) =>
     StateCache.replay(toEvents([...worldStream, ...extra]), { seed: SEED });
 
@@ -1658,7 +1658,7 @@ describe("state cache: questgiver markers (FOLLOW-UPS 27)", () => {
   });
 });
 
-describe("state cache: quest objectives from the quest query (FOLLOW-UPS 28)", () => {
+describe("state cache: quest objectives from the quest query (item 28)", () => {
   const withWorld = (extra: readonly unknown[]) =>
     StateCache.replay(toEvents([...worldStream, ...extra]), { seed: SEED });
 
@@ -1709,7 +1709,7 @@ describe("state cache: quest objectives from the quest query (FOLLOW-UPS 28)", (
   });
 });
 
-describe("state cache: spellbook, cooldowns and talents (FOLLOW-UPS 39)", () => {
+describe("state cache: spellbook, cooldowns and talents (item 39)", () => {
   const at = (seq: number, opcode: string, opcodeId: number, data: unknown) => ({
     seq,
     opcode,

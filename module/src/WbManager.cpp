@@ -21,6 +21,7 @@
 
 #include "AccountMgr.h"
 #include "Config.h"
+#include "CryptoRandom.h"
 #include "DatabaseEnv.h"
 #include "DBCStores.h"
 #include "GameTime.h"
@@ -48,8 +49,10 @@
 #include "WorldSession.h"
 #include "WorldSessionMgr.h"
 #include "WorldSocket.h"
+#include "Util.h"
 
 #include <boost/asio/ip/tcp.hpp>
+#include <openssl/crypto.h>
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -110,6 +113,7 @@ namespace WrathBench
         _port = static_cast<uint16_t>(sConfigMgr->GetOption<uint32>("WrathBench.Port", 8086));
         _threads = std::max<unsigned>(1, sConfigMgr->GetOption<uint32>("WrathBench.Threads", 2));
         std::string account = sConfigMgr->GetOption<std::string>("WrathBench.Account", "RUNNER");
+        std::string secret = sConfigMgr->GetOption<std::string>("WrathBench.Secret", "");
         _auditDir = sConfigMgr->GetOption<std::string>("WrathBench.AuditDir", "/azerothcore/env/dist/logs/wrathbench");
 
         // Account allowlist: the accounts this module serves at all. Comma
@@ -139,7 +143,14 @@ namespace WrathBench
             std::lock_guard<std::mutex> lock(_accountMutex);
             _account = std::move(account);
             _accounts = std::move(parsed);
+            _secret = std::move(secret);
         }
+    }
+
+    std::string Manager::PortSecret() const
+    {
+        std::lock_guard<std::mutex> lock(_accountMutex);
+        return _secret;
     }
 
     bool Manager::AccountPermitted(std::string const& account) const
@@ -196,6 +207,17 @@ namespace WrathBench
                 if (f->reputationListID >= 0)
                     _repListToFaction[uint32(f->reputationListID)] = f->ID;
         LOG_INFO("module", "wrathbench: {} reputation factions indexed from Faction.dbc", _repListToFaction.size());
+
+        // The port secret is the floor under every route (PROTOCOL.md,
+        // "Authentication"): without one the control surface does not listen
+        // at all. Fail closed and say exactly what is missing — the deploy
+        // script reads the silence as "never became healthy" and rolls back.
+        if (PortSecret().size() < 32)
+        {
+            LOG_ERROR("module", "wrathbench: WrathBench.Secret (AC_WRATH_BENCH_SECRET) is unset or shorter than 32 characters; "
+                "the HTTP/WS control surface is NOT listening. Set WRATHBENCH_MODULE_SECRET in .env (docs/OPERATIONS.md, Secrets).");
+            return;
+        }
 
         _http = std::make_unique<HttpServer>(_bindAddress, _port, this, _threads);
         try
@@ -286,29 +308,209 @@ namespace WrathBench
     }
 
     // ------------------------------------------------------------- HTTP
-    HttpReply Manager::HandleHttp(std::string const& method, std::string const& target, std::string const& body, bool loopbackPeer)
+    // Constant-time equality for secrets. Length is not secret (both sides
+    // are module-issued or operator-configured), so a mismatch there returns
+    // early; the bytes are compared with OpenSSL's CRYPTO_memcmp.
+    static bool SecretEquals(std::string const& a, std::string const& b)
+    {
+        if (a.empty() || a.size() != b.size())
+            return false;
+        return CRYPTO_memcmp(a.data(), b.data(), a.size()) == 0;
+    }
+
+    // "Bearer <credential>" -> credential; anything else -> "".
+    static std::string BearerOf(std::string const& authorization)
+    {
+        static char const kPrefix[] = "Bearer ";
+        size_t const n = sizeof(kPrefix) - 1;
+        if (authorization.size() <= n || strncasecmp(authorization.c_str(), kPrefix, n) != 0)
+            return "";
+        std::string cred = authorization.substr(n);
+        while (!cred.empty() && std::isspace(static_cast<unsigned char>(cred.back()))) cred.pop_back();
+        while (!cred.empty() && std::isspace(static_cast<unsigned char>(cred.front()))) cred.erase(cred.begin());
+        return cred;
+    }
+
+    Cred Manager::Authenticate(std::string const& authorization, std::string* leaseToken, Lease* lease) const
+    {
+        std::string const cred = BearerOf(authorization);
+        if (cred.empty())
+            return Cred::None;
+        if (SecretEquals(cred, PortSecret()))
+            return Cred::Operator;
+        // A lease secret. Scanned rather than indexed: the map holds one entry
+        // per live run, and a scan keeps the check independent of whatever
+        // token the body names (GET /health has none).
+        std::lock_guard<std::mutex> lock(_leaseMutex);
+        for (auto const& [token, l] : _leases)
+        {
+            if (SecretEquals(cred, l.secret))
+            {
+                if (leaseToken) *leaseToken = token;
+                if (lease) *lease = l;
+                return Cred::Session;
+            }
+        }
+        return Cred::None;
+    }
+
+    bool Manager::AuthorizeWs(std::string const& token, std::string const& authorization)
+    {
+        std::string leaseToken;
+        switch (Authenticate(authorization, &leaseToken, nullptr))
+        {
+            case Cred::Operator: return true;
+            case Cred::Session:  return !token.empty() && token == leaseToken;
+            default:             return false;
+        }
+    }
+
+    static HttpReply ErrorReply(int status, char const* code)
+    {
+        return {status, Json::Writer().Add("ok", false).Add("error", code).Str()};
+    }
+
+    HttpReply Manager::HandleHttp(std::string const& method, std::string const& target, std::string const& body,
+        std::string const& authorization, bool loopbackPeer)
     {
         try
         {
+            // Every route authenticates first (PROTOCOL.md, "Authentication").
+            // The port secret is the operator class and may do anything; a lease
+            // secret is the session class and may only act as its own token.
+            std::string leaseToken;
+            Lease lease;
+            Cred const cred = Authenticate(authorization, &leaseToken, &lease);
+            if (cred == Cred::None)
+                return ErrorReply(401, "unauthorized");
+
             if (method == "GET" && target == "/health")
                 return HttpHealth(loopbackPeer);
-            if (method == "POST" && target == "/session")
-                return HttpCreateSession(body);
-            if (method == "POST" && target == "/action")
-                return HttpAction(body);
-            if (method == "DELETE" && target == "/session")
-                return HttpDeleteSession(body);
+
+            // Operator-only surfaces: leasing itself, and the character-select
+            // utilities that act on an account rather than a session.
+            bool const operatorOnly =
+                target == "/lease" || target == "/character-delete" || target == "/characters";
+            if (operatorOnly && cred != Cred::Operator)
+                return ErrorReply(403, "operator_only");
+
+            if (method == "POST" && target == "/lease")
+                return HttpLease(body);
+            if (method == "DELETE" && target == "/lease")
+                return HttpReleaseLease(body);
             if (method == "POST" && target == "/character-delete")
                 return HttpCharacterDelete(body);
             if (method == "POST" && target == "/characters")
                 return HttpCharacterList(body);
 
-            return {404, Json::Writer().Add("ok", false).Add("error", "not_found").Str()};
+            bool const tokenRoute =
+                (method == "POST" && target == "/session") ||
+                (method == "POST" && target == "/action") ||
+                (method == "DELETE" && target == "/session");
+            if (!tokenRoute)
+                return ErrorReply(404, "not_found");
+
+            std::string forcedAccount;
+            if (cred == Cred::Session)
+            {
+                // The token in the body must be the lease's own: a lease
+                // secret is a capability over exactly one token.
+                Json::Value req = Json::Parse(body);
+                if (req.GetString("token") != leaseToken)
+                    return ErrorReply(403, "token_mismatch");
+                if (method == "POST" && target == "/session")
+                {
+                    // Token-to-account and token-to-character binding. The
+                    // account is the lease's, full stop; the character is bound
+                    // by the first create that succeeds and fixed thereafter.
+                    std::string const account = req.GetString("account");
+                    if (!account.empty() && strcasecmp(account.c_str(), lease.account.c_str()) != 0)
+                        return ErrorReply(403, "account_not_leased");
+                    std::string const character = req.GetString("character");
+                    if (!lease.character.empty() && strcasecmp(character.c_str(), lease.character.c_str()) != 0)
+                        return {409, Json::Writer().Add("ok", false).Add("error", "character_bound")
+                            .Add("bound", lease.character).Str()};
+                    forcedAccount = lease.account;
+                }
+            }
+
+            if (method == "POST" && target == "/session")
+            {
+                HttpReply reply = HttpCreateSession(body, forcedAccount);
+                if (cred == Cred::Session && reply.status == 200 && lease.character.empty())
+                {
+                    // Bind on success only: a create the core refused (name
+                    // taken, bad race/class) must not pin the token to a
+                    // character that never existed.
+                    std::string const character = Json::Parse(body).GetString("character");
+                    std::lock_guard<std::mutex> lock(_leaseMutex);
+                    auto it = _leases.find(leaseToken);
+                    if (it != _leases.end() && it->second.character.empty())
+                        it->second.character = character;
+                }
+                return reply;
+            }
+            if (method == "POST" && target == "/action")
+                return HttpAction(body);
+            return HttpDeleteSession(body);
         }
         catch (std::exception const& e)
         {
             return {500, Json::Writer().Add("ok", false).Add("error", "internal").Add("message", e.what()).Str()};
         }
+    }
+
+    // POST /lease: bind a token to an account and issue its secret. Operator
+    // only. Re-leasing a token rotates its secret and keeps its character
+    // binding (a resumed run re-leases the token it stored; the character it
+    // played stays its own).
+    HttpReply Manager::HttpLease(std::string const& body)
+    {
+        Json::Value req = Json::Parse(body);
+        std::string token = req.GetString("token");
+        if (token.empty())
+            return ErrorReply(400, "missing_token");
+        if (token.size() < 32)
+            return {400, Json::Writer().Add("ok", false).Add("error", "weak_token")
+                .Add("received", (uint32_t)token.size()).Add("minimum", (uint32_t)32).Str()};
+        std::string account = req.GetString("account", DefaultAccount());
+        if (!AccountPermitted(account))
+            return ErrorReply(403, "account_not_permitted");
+
+        std::array<uint8, 32> const bytes = Acore::Crypto::GetRandomBytes<32>();
+        std::string secret = ByteArrayToHexStr(bytes);
+        std::string character;
+        {
+            std::lock_guard<std::mutex> lock(_leaseMutex);
+            Lease& l = _leases[token];
+            if (strcasecmp(l.account.c_str(), account.c_str()) != 0)
+                l.character.clear(); // a token re-leased onto another account starts unbound
+            l.account = account;
+            l.secret = secret;
+            character = l.character;
+        }
+        LOG_INFO("module", "wrathbench: leased token {} to account {}", token, account);
+        Json::Writer w;
+        w.Add("ok", true).Add("token", token).Add("account", account).Add("secret", secret);
+        if (!character.empty())
+            w.Add("character", character);
+        return {200, w.Str()};
+    }
+
+    // DELETE /lease: forget a token's lease. Does not touch a live session
+    // under it (DELETE /session does that); it only revokes the credential.
+    HttpReply Manager::HttpReleaseLease(std::string const& body)
+    {
+        Json::Value req = Json::Parse(body);
+        std::string token = req.GetString("token");
+        if (token.empty())
+            return ErrorReply(400, "missing_token");
+        bool released;
+        {
+            std::lock_guard<std::mutex> lock(_leaseMutex);
+            released = _leases.erase(token) > 0;
+        }
+        return {200, Json::Writer().Add("ok", true).Add("token", token).Add("released", released).Str()};
     }
 
     // Name an opcode id for the /health drop histogram: the core's opcode
@@ -378,30 +580,27 @@ namespace WrathBench
         return {200, w.Str()};
     }
 
-    HttpReply Manager::HttpCreateSession(std::string const& body)
+    HttpReply Manager::HttpCreateSession(std::string const& body, std::string const& forcedAccount)
     {
         Json::Value req = Json::Parse(body);
         std::string token = req.GetString("token");
         if (token.empty())
             return {400, Json::Writer().Add("ok", false).Add("error", "missing_token").Str()};
 
-        // Minimum-entropy gate (FOLLOW-UPS 19, docs/CONTRACTS.md accepted risk).
-        // The session token is a bearer capability over /action, /events and
-        // DELETE /session, and the historical default was the run id — a
-        // second-granularity timestamp another run could enumerate. Length is a
-        // proxy for entropy, not a substitute for a random secret issued by the
-        // module (still item 19), but it takes guessable tokens off the table.
-        // Checked before the session is registered so a rejected token leaves
-        // nothing behind. Every rejection is actionable: a human reading the
-        // hint should know what to do.
+        // Minimum-length gate (FOLLOW-UPS 19). The token is no longer the
+        // credential — the lease secret is (PROTOCOL.md, "Authentication") —
+        // but it is still the key every session, audit file and event stream
+        // is addressed by, so a guessable one still lets an operator-class
+        // caller collide with another run by accident. Checked before the
+        // session is registered so a rejected token leaves nothing behind.
         static constexpr size_t kMinTokenChars = 32;
         if (token.size() < kMinTokenChars)
             return {400, Json::Writer().Add("ok", false).Add("error", "weak_token")
                 .Add("received", (uint32_t)token.size())
                 .Add("minimum", (uint32_t)kMinTokenChars)
-                .Add("hint", "session tokens are bearer capabilities and must be at least 32 characters; "
-                             "the runner generates one per run — pass that token through instead of a "
-                             "hand-written or run-id-derived string, or append random hex to it")
+                .Add("hint", "session tokens must be at least 32 characters; the runner generates one per "
+                             "run — pass that token through instead of a hand-written or run-id-derived "
+                             "string, or append random hex to it")
                 .Str()};
 
         // Same-token handling (idempotent create / self-reclaim) is decided on
@@ -413,7 +612,9 @@ namespace WrathBench
 
         auto s = std::make_shared<BenchSession>();
         s->token = token;
-        s->account = req.GetString("account", DefaultAccount());
+        // A session-class caller's account is its lease's, whatever the body
+        // says (HandleHttp already refused a body naming another one).
+        s->account = forcedAccount.empty() ? req.GetString("account", DefaultAccount()) : forcedAccount;
         // Same allowlist as /character-delete: the module serves only its
         // configured bench accounts, on every surface.
         if (!AccountPermitted(s->account))
@@ -529,7 +730,7 @@ namespace WrathBench
         { "CMSG_GROUP_DISBAND", CMSG_GROUP_DISBAND },
         { "CMSG_GROUP_SET_LEADER", CMSG_GROUP_SET_LEADER },
         { "CMSG_LOOT_METHOD", CMSG_LOOT_METHOD },
-        // group loot roll (FOLLOW-UPS 102): the need/greed/pass/disenchant
+        // group loot roll (item 102): the need/greed/pass/disenchant
         // button on the roll frame SMSG_LOOT_START_ROLL opened (body u64 roll
         // guid, u32 slot, u8 vote); the SDK's lootRoll builds it
         { "CMSG_LOOT_ROLL", CMSG_LOOT_ROLL },
@@ -544,7 +745,7 @@ namespace WrathBench
         { "CMSG_SET_TRADE_ITEM", CMSG_SET_TRADE_ITEM },
         { "CMSG_CLEAR_TRADE_ITEM", CMSG_CLEAR_TRADE_ITEM },
         { "CMSG_SET_TRADE_GOLD", CMSG_SET_TRADE_GOLD },
-        // pet control (FOLLOW-UPS 98): the pet action bar's buttons
+        // pet control (item 98): the pet action bar's buttons
         // (CMSG_PET_ACTION carries a command, a react state or a spell), a
         // direct pet cast, the bar edits, and the queries a client fires on
         // its own (name by pet number, the bar on demand)
@@ -565,7 +766,7 @@ namespace WrathBench
         { "CMSG_ITEM_QUERY_SINGLE", CMSG_ITEM_QUERY_SINGLE },
         { "CMSG_NPC_TEXT_QUERY", CMSG_NPC_TEXT_QUERY },
         { "CMSG_PAGE_TEXT_QUERY", CMSG_PAGE_TEXT_QUERY },
-        // player-written item text — a mailed letter (FOLLOW-UPS 103; body u64 item guid)
+        // player-written item text — a mailed letter (item 103; body u64 item guid)
         { "CMSG_ITEM_TEXT_QUERY", CMSG_ITEM_TEXT_QUERY },
         { "CMSG_PLAYED_TIME", CMSG_PLAYED_TIME },
         { "CMSG_QUERY_TIME", CMSG_QUERY_TIME },
@@ -787,8 +988,8 @@ namespace WrathBench
         std::string account = req.GetString("account", DefaultAccount());
 
         // Minimal ownership gate for the current per-run account scheme
-        // (FOLLOW-UPS 14; per-character credentials are the real Phase-1 fix,
-        // FOLLOW-UPS 10). Deletes are only served for accounts on the
+        // (item 14; per-character credentials are the real Phase-1 fix,
+        // item 10). Deletes are only served for accounts on the
         // configured allowlist (WrathBench.Accounts), and never while another
         // token holds a live bench session on the account — an unauthenticated
         // caller must not be able to delete a character out from under a
@@ -1374,7 +1575,7 @@ namespace WrathBench
         return r;
     }
 
-    // The z-ladder in front of the cause ladder (FOLLOW-UPS 46 part 3). A unit
+    // The z-ladder in front of the cause ladder (item 46 part 3). A unit
     // target's z comes from the unit's own movement packets, and a patrolling or
     // sloped NPC's z can sit outside the core's default poly-search extents
     // while the ground under it is perfectly walkable ("Ironforge Mountaineer"
@@ -1478,7 +1679,7 @@ namespace WrathBench
             // A client whose run is redirected stops first: without this the
             // server's last movement word stays MOVEMENTFLAG_FORWARD when the
             // new request fails at planning, isMoving() stays true and every
-            // later cast fails SPELL_FAILED_MOVING (FOLLOW-UPS 46 part 3,
+            // later cast fails SPELL_FAILED_MOVING (item 46 part 3,
             // ~10 minutes of Hearthstone casts in nav-probe c3).
             MoveState& old = s->move;
             SendMovePacket(*s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, old.curX, old.curY, old.curZ, old.curO,
@@ -2610,7 +2811,7 @@ namespace WrathBench
         // destination itself. `transferred` rather than `interrupted`, so the
         // agent knows a portal took it (FOLLOW-UPS 38 N1); the SDK then waits
         // for SMSG_NEW_WORLD and resolves on the new map. A same-map teleport
-        // (Hearthstone, graveyard port) is `teleported` (FOLLOW-UPS 46): no
+        // (Hearthstone, graveyard port) is `teleported` (item 46): no
         // map change is coming. The 15y desync guard
         // below must not run here: the far-teleport position jump would race it.
         if (s.pendingTransferMap.load() != 0 || player->IsBeingTeleportedFar())
@@ -2949,7 +3150,7 @@ namespace WrathBench
     // teleport lands), and draws the answer as the corpse marker on its map.
     // The parked client has no map, so the module issues the same one-shot
     // query and the tapped MSG_CORPSE_QUERY reply is served as an event
-    // (PROTOCOL.md "Death"; FOLLOW-UPS 53). Client behaviour, not an agent
+    // (PROTOCOL.md "Death"; item 53). Client behaviour, not an agent
     // action: nothing here resurrects or moves anyone, and the handler answers
     // from the corpse the player already owns. Waiting for the teleport to be
     // acked matters: the handler compares the corpse map to the player's map,
@@ -3486,7 +3687,7 @@ namespace WrathBench
     // is not served (caller has already consumed the value).
     // A u64 update field arrives as two u32 halves under consecutive
     // indices; the halves are collected here and joined into one guid
-    // string after the block (targetGuid and, since FOLLOW-UPS 98, the
+    // string after the block (targetGuid and, since item 98, the
     // owner fields a client reads a pet's master off).
     struct GuidHalves
     {
@@ -3575,7 +3776,7 @@ namespace WrathBench
                 // the number on the talent frame; SMSG_TALENTS_INFO carries the
                 // same figure.
                 if (index == PLAYER_CHARACTER_POINTS1) { f.Add("talentPoints", v); return true; }
-                // Skills (FOLLOW-UPS 95): 128 lines x 3 packed u32s, PRIVATE
+                // Skills (item 95): 128 lines x 3 packed u32s, PRIVATE
                 // to self. Served raw per field the way the quest log is, plus
                 // the client's SkillLine.dbc name beside each id so the SDK
                 // needs no table. The SDK's fold keeps only numbers in
@@ -3617,7 +3818,7 @@ namespace WrathBench
                 // keyed by inventory slot (0-22 equipment+bags, 23-38 backpack,
                 // 39-66 bank, 67-73 bank bags — the core's slot numbering, the
                 // fields are contiguous). Halves stay u32 JSON numbers; the
-                // SDK joins them into guids. Bank slots since FOLLOW-UPS 100.
+                // SDK joins them into guids. Bank slots since item 100.
                 if (index >= PLAYER_FIELD_INV_SLOT_HEAD && index < PLAYER_FIELD_BANKBAG_SLOT_1 + 14)
                 {
                     uint32 rel = index - PLAYER_FIELD_INV_SLOT_HEAD;
@@ -3640,7 +3841,7 @@ namespace WrathBench
             if (index == ITEM_FIELD_OWNER + 1)     { f.Add("ownerHi", v); return true; }
             if (index == ITEM_FIELD_CONTAINED)     { f.Add("containedLo", v); return true; }
             if (index == ITEM_FIELD_CONTAINED + 1) { f.Add("containedHi", v); return true; }
-            // Worn-bag contents (FOLLOW-UPS 50): a container's slot guids as
+            // Worn-bag contents (item 50): a container's slot guids as
             // lo/hi u32 halves keyed by bag slot 0-35, plus its slot count.
             // PUBLIC fields every client in range receives; same idiom as
             // the player's invSlot<n>. The SDK joins halves into guids.
@@ -3717,7 +3918,7 @@ namespace WrathBench
         std::vector<uint64_t> nameQueries;
         std::vector<uint32_t> itemQueries;
         // (petNumber, guid): a client asks a pet's given name once per pet
-        // number it sees (FOLLOW-UPS 98); the answer is SMSG_PET_NAME_QUERY_RESPONSE.
+        // number it sees (item 98); the answer is SMSG_PET_NAME_QUERY_RESPONSE.
         std::vector<std::pair<uint32, uint64_t>> petNameQueries;
 
         Json::Writer top;
@@ -4133,7 +4334,7 @@ namespace WrathBench
                 // the arrival point, which the server relocated to before
                 // building the MovementInfo. One u32 movement-order counter
                 // sits between the packGUID and the MovementInfo; otherwise the
-                // shape is the observed-movement one (FOLLOW-UPS 46).
+                // shape is the observed-movement one (item 46).
                 case MSG_MOVE_TELEPORT_ACK:
                 {
                     name = MoveOpcodeName(opcode);
@@ -4648,7 +4849,7 @@ namespace WrathBench
                     break;
                 }
                 // ------------------------------------------------- pets
-                // (FOLLOW-UPS 98). Everything below is what the client's pet
+                // (item 98). Everything below is what the client's pet
                 // frame is drawn from; spell ids carry their Spell.dbc name
                 // the way the spellbook rows do.
                 case SMSG_PET_SPELLS:
@@ -4779,7 +4980,7 @@ namespace WrathBench
                     break;
                 }
                 // ------------------------------------------------ group
-                // (FOLLOW-UPS 100). Group::SendUpdateToPlayer and the
+                // (item 100). Group::SendUpdateToPlayer and the
                 // GroupHandler replies; codes are the core's PartyResult /
                 // PartyOperation, named by the SDK.
                 case SMSG_GROUP_INVITE:
@@ -4873,7 +5074,7 @@ namespace WrathBench
                     break;
                 }
                 // ------------------------------------------------- mail
-                // (FOLLOW-UPS 100). MailHandler / Player::SendMailResult.
+                // (item 100). MailHandler / Player::SendMailResult.
                 case SMSG_SHOW_MAILBOX:
                 {
                     // WorldSession::SendShowMailBox: u64 mailbox guid — the
@@ -4964,7 +5165,7 @@ namespace WrathBench
                     break;
                 }
                 // ------------------------------------------------- bank
-                // (FOLLOW-UPS 100). The slots themselves are the PLAYER_FIELD_
+                // (item 100). The slots themselves are the PLAYER_FIELD_
                 // BANK_SLOT_1 / BANKBAG_SLOT_1 update fields (invSlot39-73).
                 case SMSG_SHOW_BANK:
                 {
@@ -4986,7 +5187,7 @@ namespace WrathBench
                     break;
                 }
                 // ------------------------------------------------ trade
-                // (FOLLOW-UPS 100). TradeHandler.
+                // (item 100). TradeHandler.
                 case SMSG_TRADE_STATUS:
                 {
                     // WorldSession::SendTradeStatus: u32 TradeStatus, then per
@@ -5493,7 +5694,7 @@ namespace WrathBench
                     break;
                 }
                 // ------------------------------------------- group loot rolls
-                // (FOLLOW-UPS 102). Group::SendLootStartRoll and friends: a
+                // (item 102). Group::SendLootStartRoll and friends: a
                 // roll is keyed by a fresh item guid the core mints for it
                 // (`rollGuid`), not by the loot slot alone.
                 case SMSG_LOOT_START_ROLL:
@@ -5569,7 +5770,7 @@ namespace WrathBench
                     break;
                 }
                 // ------------------------------------------------ item text
-                // (FOLLOW-UPS 103). Two reading paths a client has: a book or
+                // (item 103). Two reading paths a client has: a book or
                 // letter with a PageText id (CMSG_READ_ITEM -> SMSG_READ_ITEM_OK
                 // -> the client's CMSG_PAGE_TEXT_QUERY on the template's page
                 // id -> one SMSG_PAGE_TEXT_QUERY_RESPONSE per page, the core
@@ -5796,7 +5997,7 @@ namespace WrathBench
                      .Add("buyPrice", buyPrice).Add("sellPrice", sellPrice)
                      .Add("itemLevel", itemLevel).Add("requiredLevel", reqLevel)
                      .Add("class", itemClass).Add("subClass", subClass);
-                    // The rest of the tooltip (FOLLOW-UPS 97), in the order
+                    // The rest of the tooltip (item 97), in the order
                     // WorldSession::HandleItemQuerySingleOpcode writes it:
                     // requirements, stack/bag sizes, the stat list, two damage
                     // ranges, armor and six resistances, speed, five spell
@@ -5881,7 +6082,7 @@ namespace WrathBench
                     if (!description.empty()) w.Add("description", description);
                     if (startQuest) w.Add("startQuest", startQuest);
                     // PageText.dbc-shaped id of the item's first page: a book
-                    // or letter the client can read (FOLLOW-UPS 103). 0 is
+                    // or letter the client can read (item 103). 0 is
                     // "nothing to read" and is not served.
                     if (pageText) w.Add("pageText", pageText);
                     if (block) w.Add("block", block);
