@@ -2183,7 +2183,21 @@ export interface RawActionResponse extends ActionResponse {
  */
 export async function connect(options: ConnectOptions): Promise<WrathClient> {
   const client = new WrathClient(options);
-  if (options.subscribeEvents ?? true) await client.events.connect();
+  if (options.subscribeEvents ?? true) {
+    try {
+      await client.events.connect();
+    } catch (err) {
+      // The client the caller never receives is the client nobody can close.
+      // `events.connect()` rejects on a whole failed climb of the ladder
+      // (FOLLOW-UPS 113) while the stream itself keeps retrying, so without
+      // this every failed `connect()` leaks a reconnect ladder for the life of
+      // the process. `close()` is the client's own cleanup for everything the
+      // constructor started — the stream and the coalescing timers — so the
+      // next thing the constructor starts is covered here for free.
+      client.close();
+      throw err;
+    }
+  }
   return client;
 }
 

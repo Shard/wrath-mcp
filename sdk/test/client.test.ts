@@ -3986,3 +3986,64 @@ describe("client: quest-start items and the questgiver marker pre-check (2026-08
     await stub.stop();
   });
 });
+
+describe("connect() closes the stream it fails to open (FOLLOW-UPS 114)", () => {
+  /**
+   * A socket that always refuses, the way a refused TCP connect or a rejected
+   * upgrade arrives. Every instance is one attempt of the reconnect ladder, so
+   * counting instances counts the ladder's climbs.
+   */
+  class RefusedSocket {
+    static instances: RefusedSocket[] = [];
+    readyState = 0;
+    private readonly handlers = new Map<string, ((ev: unknown) => void)[]>();
+
+    constructor(readonly url: string) {
+      RefusedSocket.instances.push(this);
+      setTimeout(() => {
+        this.readyState = 3;
+        this.dispatch("error");
+        this.dispatch("close");
+      }, 0);
+    }
+
+    addEventListener(type: string, handler: (ev: unknown) => void): void {
+      const list = this.handlers.get(type) ?? [];
+      list.push(handler);
+      this.handlers.set(type, list);
+    }
+
+    close(): void {
+      this.readyState = 3;
+    }
+
+    private dispatch(type: string): void {
+      for (const h of this.handlers.get(type) ?? []) h({ type });
+    }
+  }
+
+  test("a rejected events.connect() leaves no ladder still climbing", async () => {
+    RefusedSocket.instances = [];
+    await expect(
+      connect({
+        token: "t",
+        baseUrl: "http://refused",
+        events: {
+          connectTimeoutMs: 20,
+          reconnectMinDelayMs: 5,
+          reconnectMaxDelayMs: 10,
+          webSocketImpl: RefusedSocket as unknown as typeof WebSocket,
+        },
+      }),
+    ).rejects.toThrow(/failed to connect to ws:\/\/refused/);
+
+    // The discriminating assertion: not "the client says it is disconnected"
+    // — it would say that either way — but that the socket count stops moving.
+    // Before the fix the discarded client's stream kept retrying forever with
+    // nobody holding a reference able to close it.
+    const atRejection = RefusedSocket.instances.length;
+    expect(atRejection).toBeGreaterThan(0);
+    await Bun.sleep(80);
+    expect(RefusedSocket.instances.length).toBe(atRejection);
+  });
+});
