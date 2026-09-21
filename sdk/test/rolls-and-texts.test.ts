@@ -1,5 +1,5 @@
 /**
- * Group loot rolls (item 102) and item text (item 103): the state folds and
+ * Group loot rolls and item text: the state folds and
  * the two helpers, against the stub module. Kept in its own file so the
  * shared client/state suites stay untouched.
  */
@@ -75,7 +75,7 @@ async function untilAction(stub: StubServer, action: string, from = 0): Promise<
 
 const SEED = { guid: SELF_GUID, name: "Fenwick" };
 
-describe("state: group loot rolls (item 102)", () => {
+describe("state: group loot rolls", () => {
   test("a start-roll opens a frame named from the item query, with the buttons the mask allows and a deadline", () => {
     const cache = StateCache.replay(toEvents([...loginSequence, startRoll(10), lionfur(11)]), { seed: SEED });
     const rolls = cache.pendingRolls(TS + 11);
@@ -160,7 +160,7 @@ describe("state: group loot rolls (item 102)", () => {
   });
 });
 
-describe("state: item text (item 103)", () => {
+describe("state: item text", () => {
   const withPages = [
     ...loginSequence,
     selfCreate,

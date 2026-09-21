@@ -1,6 +1,6 @@
 /**
  * The state cache's shared social surface: pets, group, mail, bank, trade,
- * group loot rolls and item text (items 98, 100, 102, 103).
+ * group loot rolls and item text.
  *
  * The read shapes the model sees for that surface, plus the client's own text
  * for the result codes those packets carry. Split out of `state.ts` along the
@@ -18,7 +18,7 @@ import type { PetActionBarButton } from "./protocol";
 import type { GuidKey } from "./guid";
 import type { BagSlotItem, WornBag } from "./state";
 
-// ------------------------------------------------------------------ pets (item 98)
+// ------------------------------------------------------------------ pets
 
 /** The pet's react state, as the pet frame labels it. */
 export type PetReaction = "passive" | "defensive" | "aggressive";
@@ -36,7 +36,7 @@ export interface PetSpellEntry {
 }
 
 /**
- * The pet as the pet frame shows it (item 98): the control bar from the last
+ * The pet as the pet frame shows it: the control bar from the last
  * `SMSG_PET_SPELLS`, joined at read time to the pet's own unit in view (level,
  * health, power, the creature template's name) and to the given name the
  * server answered for its pet number (`SMSG_PET_NAME_QUERY_RESPONSE`).
@@ -75,7 +75,7 @@ export interface PetState {
 }
 
 
-// ---------------------------------------------------------------- group (item 100)
+// ---------------------------------------------------------------- group
 
 /** One other member of the party, as `SMSG_GROUP_LIST` lists them (self is never in the list). */
 export interface GroupMember {
@@ -88,7 +88,7 @@ export interface GroupMember {
 }
 
 /**
- * The party (item 100): the last `SMSG_GROUP_LIST` plus the invitation and
+ * The party: the last `SMSG_GROUP_LIST` plus the invitation and
  * verdict packets around it. `inGroup` false with a `pendingInvite` is the
  * "X invites you to a group" dialog; `lastResult` is the server's word on the
  * last invite / uninvite / leave (`partyResultText` names it).
@@ -115,7 +115,7 @@ export interface GroupState {
 }
 
 
-// ----------------------------------------------------------------- mail (item 100)
+// ----------------------------------------------------------------- mail
 
 /** One attached item of a mail, with the template name joined when the item query has answered. */
 export interface MailItem {
@@ -146,7 +146,7 @@ export interface MailEntry {
 }
 
 /**
- * The mailbox (item 100): the frame last opened (`openMailbox`, or an
+ * The mailbox: the frame last opened (`openMailbox`, or an
  * `SMSG_SHOW_MAILBOX` when the core does send one), the
  * inbox as last listed (`SMSG_MAIL_LIST_RESULT`), whether new mail has
  * arrived since (`SMSG_RECEIVED_MAIL`), and the last verdict
@@ -169,10 +169,10 @@ export interface MailboxState {
 }
 
 
-// ----------------------------------------------------------------- bank (item 100)
+// ----------------------------------------------------------------- bank
 
 /**
- * The bank (item 100): the banker the frame was last opened at
+ * The bank: the banker the frame was last opened at
  * (`SMSG_SHOW_BANK`) and the bank slots, addressed the way the bank opcodes
  * want them — `bag` 255 with `slot` 39-66 for the main bank, a bank bag's own
  * slot (67-73) with `slot` 0..numSlots-1 for its contents. The slots come
@@ -190,10 +190,10 @@ export interface BankContents {
 }
 
 
-// ---------------------------------------------------------------- trade (item 100)
+// ---------------------------------------------------------------- trade
 
 /**
- * The trade window (item 100): the last `SMSG_TRADE_STATUS`
+ * The trade window: the last `SMSG_TRADE_STATUS`
  * (`tradeStatusText` names it) and both sides of the window from
  * `SMSG_TRADE_STATUS_EXTENDED`. `open` is true from the window opening until
  * a cancel, a completion or a close. `undefined` until any trade packet.
@@ -216,7 +216,7 @@ export interface TradeSide {
 }
 
 
-// ---------------------------- pets, group, mail, trade result text (items 98, 100)
+// ---------------------------- pets, group, mail, trade result text
 
 const PARTY_RESULT_TEXT: Readonly<Record<number, string>> = {
   0: "ok",
@@ -304,7 +304,7 @@ const PET_FEEDBACK_TEXT: Readonly<Record<number, string>> = {
   3: "your pet cannot attack that target",
 };
 
-// ----------------------------------------------------- group loot rolls (item 102)
+// ----------------------------------------------------- group loot rolls
 
 /** A vote on a group loot roll, as the roll frame's buttons name them. */
 export type RollChoice = "need" | "greed" | "pass" | "disenchant";
@@ -312,13 +312,8 @@ export type RollChoice = "need" | "greed" | "pass" | "disenchant";
 /** The wire `RollVote` for each button (`CMSG_LOOT_ROLL`, `SMSG_LOOT_ROLL.rollType`). */
 export const ROLL_VOTE: Readonly<Record<RollChoice, number>> = { pass: 0, need: 1, greed: 2, disenchant: 3 };
 
-/** The button name for a wire `rollType`, or the number when it is none of them. */
-export function rollChoiceName(rollType: number): RollChoice | undefined {
-  return (["pass", "need", "greed", "disenchant"] as const)[rollType];
-}
-
 /**
- * One open roll frame (item 102): an over-threshold item on a group-looted
+ * One open roll frame: an over-threshold item on a group-looted
  * corpse the server asked this character to vote on (`SMSG_LOOT_START_ROLL`).
  * `rollGuid` is what the vote names; `deadline` is when the frame closes
  * (arrival plus the countdown, on the local clock); `allowed` lists the
@@ -339,10 +334,10 @@ export interface PendingRoll {
 }
 
 
-// ------------------------------------------------------------ item text (item 103)
+// ------------------------------------------------------------ item text
 
 /**
- * The text of a carried item the character has read (item 103): a book's or
+ * The text of a carried item the character has read: a book's or
  * letter's pages (`SMSG_PAGE_TEXT_QUERY_RESPONSE`, in chain order) or the
  * player-written text on a mailed letter (`SMSG_ITEM_TEXT_QUERY_RESPONSE`).
  */
@@ -356,7 +351,7 @@ export interface ItemText {
 }
 
 
-// ---------------------------- pets, group, mail, trade result text (items 98, 100)
+// ---------------------------- pets, group, mail, trade result text
 
 /** The client's text for a `SMSG_PARTY_COMMAND_RESULT` code; the code itself when the SDK does not name it. */
 export function partyResultText(result: number): string {

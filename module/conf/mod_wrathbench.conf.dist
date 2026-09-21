@@ -63,11 +63,14 @@ WrathBench.Account = "RUNNER"
 #                     serves (case-insensitive). Every surface that takes an
 #                     "account" parameter (/session, /characters,
 #                     /character-delete) refuses accounts not on this list with
-#                     403 account_not_permitted (item 14).
+#                     403 account_not_permitted.
+#                     A deployment that runs several accounts sets its own list
+#                     here; the fleet's lives in the deployment, not in this
+#                     file, so what ships is the single-account default.
 #        Default:     the WrathBench.Account value (single-account behaviour)
 #
 
-WrathBench.Accounts = "RUNNER,RUNNER2,SHAKEOUT,PROBE"
+WrathBench.Accounts = "RUNNER"
 
 #
 #    WrathBench.Secret

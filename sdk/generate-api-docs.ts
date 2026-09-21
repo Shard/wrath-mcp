@@ -58,7 +58,7 @@ const CLIENT_ENDPOINTS: readonly Row[] = [
   { name: "logout", sig: "logout(): Promise<DeleteSessionResponse>", purpose: "Alias for deleteSession()." },
   { name: "deleteCharacter", sig: "deleteCharacter(character, options?): Promise<CharacterDeleteResponse>", purpose: "Delete a character by name through the real delete path, with the module's required retries." },
   { name: "health", sig: "health(): Promise<HealthResponse>", purpose: "Module and world status; no auth, not session-scoped." },
-  { name: "close", sig: "close(): void", purpose: "Close the event stream; does not log the character out." },
+  { name: "close", sig: "close(): void", purpose: "Stop observing: closes the event stream and settles the waits it was serving; does not log the character out. connect() reopens it." },
   { name: "selfKey", sig: "get selfKey: string | undefined", purpose: "Our own guid once the session response has seeded it." },
 ];
 
@@ -285,6 +285,8 @@ const STATE_INTERNAL = new Set([
   "applyCreate",
   "applySelfPosition",
   "applyUpdateBlock",
+  "bagRow",
+  "walkContainer",
   "deriveGauges",
   "evictOnMapChange",
   "forget",
@@ -427,9 +429,14 @@ you carry. Guids and opcode names are never fuzzed.
 ## Session & connection
 
 In a snippet, \`await connect()\` (no arguments) opens the event stream on the
-pre-constructed \`sdk\` client; call it once before \`createSession\`. (The library
-form \`connect(options): Promise<WrathClient>\` is for host code that builds its
-own client — not for snippets, where \`sdk\` already exists.) Then, on the client:
+pre-constructed \`sdk\` client; call it once before \`createSession\`. It is a
+no-op while the stream is open, and reopens it once it is not — after a drop the
+reconnect ladder gave up on, or after something called \`close()\` — so the events
+missed in between arrive as one \`stream_gap\` and \`state\` is current again from
+the next packets on. A session the module no longer has is a refusal, not a
+reopen. (The library form \`connect(options): Promise<WrathClient>\` is for host
+code that builds its own client — not for snippets, where \`sdk\` already
+exists.) Then, on the client:
 
 ${table(CLIENT_ENDPOINTS)}
 

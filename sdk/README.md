@@ -42,6 +42,9 @@ first is what makes the state cache complete.
 
 ### Client
 
+A slice of the surface, not the whole of it: `sdk/API.md` is the generated,
+exhaustive reference and is what the model is given.
+
 ```ts
 connect(options: ConnectOptions): Promise<WrathClient>
 
@@ -159,7 +162,7 @@ throws `EventTimeoutError`.
 it returns whatever the NPC offers right now, `{ ok: true, quests: [...] }`,
 and an empty list is an answer rather than an error. It exists because models
 kept rebuilding it by hand over `questList` plus event scraping and getting
-confused by their own nulls (closed item 9a, `docs/worklogs/2026-08-22.md`).
+confused by their own nulls.
 
 `acceptQuestFrom` reads the quest log *first*, because a turn-in chain may
 already have added the quest (the core auto-advances, so an explicit accept can
@@ -202,13 +205,23 @@ released yet" and are retried with a fresh throwaway token each time; anything
 else the module says (`character_not_found`, a `char_delete_failed_code_<N>`)
 is a real answer and is thrown.
 
-`ConnectOptions`: `baseUrl`, `token`, and optionally `eventsUrl`,
-`subscribeEvents` (default true), `requestTimeoutMs` (default 30000 — the
-session call blocks up to 20s server-side), `fetchImpl`, `events` (stream
-options), `state` (`chatTail`, `notificationTail`).
+`ConnectOptions`: `baseUrl`, `token`, and optionally `secret` (the bearer
+credential every route requires — the port secret for operator tooling, the
+run's lease secret for a snippet child; the SDK reads no environment, the caller
+passes it), `account` (the game account the run occupies; when set it fills an
+omitted `createSession`/`deleteCharacter` account and overrides any the caller
+named), `eventsUrl`, `subscribeEvents` (default true), `requestTimeoutMs`
+(default 30000 — the session call blocks up to 20s server-side), `fetchImpl`,
+`events` (stream options), `state` (`chatTail`, `notificationTail`), `signal`
+(an `AbortSignal`, or a function consulted per wait, that every wait the client
+performs defaults to) and `deadline` (the epoch-ms instant the caller's budget
+runs out; it caps nothing, it only lets a `moveTo` hint say the walk was always
+longer than the snippet had left).
 
-Helpers stop here because this is what the probes and `infra/smoke/one-quest.ts`
-have actually needed. Nothing is added in anticipation.
+The list above is a slice; `sdk/API.md` is generated from the live surface and
+holds all of it. Helpers stop where they stop because this is what the probes
+and `infra/smoke/one-quest.ts` have actually needed. Nothing is added in
+anticipation.
 
 ### Movement
 
@@ -302,6 +315,13 @@ class EventStream implements AsyncIterable<StreamEvent> {
 Every event carries `seq`, `opcode`, `opcodeId`, `ts`, `data`, exactly as
 PROTOCOL.md defines them.
 
+`connect()` resolves at once while the socket is open, joins the attempt or
+pending retry the reconnect ladder already owns, and reopens the stream after a
+`close()` — a consumer that hung up can dial again, and the gap accounting
+carries across, so the events emitted while it was down arrive as one
+`stream_gap`. What `close()` really ended stays ended: the waits it rejected and
+the async iterators it finished belong to the caller that closed them.
+
 `waitFor` searches the retained buffer (default 500 events) *before* waiting,
 so a wait issued after an action was acked can still find an event that arrived
 during the call. `{ sinceSeq }` bounds how far back it looks;
@@ -342,7 +362,7 @@ state.nearby        // Map<guidKey, NearbyObject>                (from SMSG_UPDA
 state.questLog      // QuestLogEntry[]   — derived from the raw quest<slot><Off> fields
 state.quest(id)     // one quest log slot, or undefined
 state.inventory     // InventoryItem[]   — invSlot halves joined to items and names
-state.bag()         // { items: [{ bag, slot, itemId, name, count, guid }], freeSlots }
+state.bag()         // { items: [{ bag, slot, itemId, name, count, guid }], bags, freeSlots, totalSlots }
 state.questCompletions, state.questsCompleted  // turn-ins seen (SMSG_QUESTGIVER_QUEST_COMPLETE)
 state.money, state.xp, state.nextLevelXp   // Observed<number> | undefined (self only)
 state.target        // the NearbyObject our own targetGuid points at, when in view
@@ -382,10 +402,13 @@ fields and this is where they are folded.
   (bag 255, slots 23-38), `count` is the observed stack count, and `freeSlots`
   counts the backpack slots holding nothing. Earned surface:
   morning-opus-1 rebuilt this from push-result listeners, invSlot regexes and a
-  full relog when it was already in the cache. Two caveats: empty slots are
-  zero fields the wire compresses away, so before our own create block arrives
-  `freeSlots` reads 16; and equipped bags' contents (slots 19-22) are container
-  fields no whitelisted opcode serves — only the backpack is reported.
+  full relog when it was already in the cache. Worn bags (equipment slots 19-22)
+  are reported too: a container's contents are the bag item's own `bagSlot<n>`
+  update fields, so each is walked and its rows carry the equipment slot as
+  their `bag`. `bags` lists what is worn and how big each is, and `totalSlots`
+  is the backpack plus all of them, which is what `freeSlots` counts against.
+  One caveat: empty slots are zero fields the wire compresses away, so before
+  our own create block arrives `freeSlots` reads 16.
 - `pointOf(obj)` answers "where do I walk to reach it" from the freshest of the
   two independent sources: an oriented position (update blocks, `MSG_MOVE_*`)
   or `SMSG_MONSTER_MOVE`'s destination, which is what a player reads off a
@@ -451,8 +474,8 @@ through `upsertNearby()`. Landing a new event means: add the schema in
 `src/protocol.ts`, add one `case` in `src/state.ts`, and derive rather than
 duplicate if it belongs to `self`. The pets, group, mail, bank, trade, loot-roll
 and item-text families live in `src/protocol-social.ts` and
-`src/state-social.ts` instead — the same two steps, one file over in each case
-(item 108). `src/guid.ts` is the leaf both halves of the protocol import for
+`src/state-social.ts` instead — the same two steps, one file over in each
+case. `src/guid.ts` is the leaf both halves of the protocol import for
 `guidSchema`; it exists so `protocol-social.ts` never reaches back into
 `protocol.ts` at value level, which is a module-eval cycle `tsc` cannot see. Unknown opcodes,
 unknown update-block kinds and unknown `data` fields all already pass through
@@ -465,7 +488,9 @@ when the module's widens.
 bun test sdk                 # the whole suite, no game stack needed
 bunx tsc --noEmit -p sdk     # strict typecheck of src, test and examples
 
-# live checks, need the stack up; not part of bun test
+# live checks, need the stack up; not part of bun test. Both read
+# WRATHBENCH_MODULE_SECRET from the environment and send it as the bearer
+# credential — without it the module answers 401 unauthorized.
 docker compose -f infra/compose.yml exec runner bun sdk/examples/live-slice.ts
 docker compose -f infra/compose.yml exec runner bun sdk/examples/live-move.ts
 ```

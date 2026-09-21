@@ -46,9 +46,14 @@ you carry. Guids and opcode names are never fuzzed.
 ## Session & connection
 
 In a snippet, `await connect()` (no arguments) opens the event stream on the
-pre-constructed `sdk` client; call it once before `createSession`. (The library
-form `connect(options): Promise<WrathClient>` is for host code that builds its
-own client — not for snippets, where `sdk` already exists.) Then, on the client:
+pre-constructed `sdk` client; call it once before `createSession`. It is a
+no-op while the stream is open, and reopens it once it is not — after a drop the
+reconnect ladder gave up on, or after something called `close()` — so the events
+missed in between arrive as one `stream_gap` and `state` is current again from
+the next packets on. A session the module no longer has is a refusal, not a
+reopen. (The library form `connect(options): Promise<WrathClient>` is for host
+code that builds its own client — not for snippets, where `sdk` already
+exists.) Then, on the client:
 
 | Method | Signature | Purpose |
 | --- | --- | --- |
@@ -57,7 +62,7 @@ own client — not for snippets, where `sdk` already exists.) Then, on the clien
 | `logout` | `logout(): Promise<DeleteSessionResponse>` | Alias for deleteSession(). |
 | `deleteCharacter` | `deleteCharacter(character, options?): Promise<CharacterDeleteResponse>` | Delete a character by name through the real delete path, with the module's required retries. |
 | `health` | `health(): Promise<HealthResponse>` | Module and world status; no auth, not session-scoped. |
-| `close` | `close(): void` | Close the event stream; does not log the character out. |
+| `close` | `close(): void` | Stop observing: closes the event stream and settles the waits it was serving; does not log the character out. connect() reopens it. |
 | `selfKey` | `get selfKey: string | undefined` | Our own guid once the session response has seeded it. |
 
 ## Helpers (wait for a game verdict)

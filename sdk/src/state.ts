@@ -150,7 +150,7 @@ const UNIT_FLAG_TAXI_FLIGHT = 0x0010_0000;
  */
 const PLAYER_FLAGS_RESTING = 0x0000_0020;
 
-// The wire's react/command state byte, as the pet frame names it (item 98); the
+// The wire's react/command state byte, as the pet frame names it; the
 // pair the `pet()` fold reads. The names themselves live in `./state-social`.
 const PET_REACTIONS: readonly PetReaction[] = ["passive", "defensive", "aggressive"];
 const PET_COMMANDS: readonly PetCommand[] = ["stay", "follow", "attack", "abandon"];
@@ -527,7 +527,7 @@ export interface QuestCompletion {
 
 /**
  * One occupied inventory slot: equipment and bags are 0-22, the backpack 23-38,
- * the bank 39-66 and the bank bags 67-73 (bank slots since item 100; an older
+ * the bank 39-66 and the bank bags 67-73 (bank slots since; an older
  * module serves none).
  *
  * A three-way join, and each leg can be missing: the `invSlot<n>Lo`/`Hi` halves
@@ -542,6 +542,12 @@ export interface InventoryItem {
   readonly itemId: number | undefined;
   readonly name: string | undefined;
   readonly stackCount: number | undefined;
+  /**
+   * Item quality (0 poor .. 5 legendary) from the item query, when answered —
+   * the same leg of the join `name` comes off, and the same field `bag()` rows
+   * already carry. Undefined while the query is outstanding, as `name` is.
+   */
+  readonly quality?: number | undefined;
   readonly seq: number;
   readonly ts: number;
 }
@@ -585,7 +591,7 @@ export interface BagContents {
 
 /**
  * What an item query answered about one item entry: the tooltip. The fields
- * past `buyPrice` (item 97) are `undefined` on events from a module older
+ * past `buyPrice` are `undefined` on events from a module older
  * than 2026-08-29 and on items that simply have none (no stats, no damage).
  * `inventoryType` is the equip slot class (1 head, 13 one-hand, 17 two-hand,
  * 21 main hand, 22 off hand, 15 ranged, 18 bag, ...); `class` 2 weapon, 4
@@ -617,14 +623,14 @@ export interface ItemInfo {
   readonly bonding: number | undefined;
   readonly description: string | undefined;
   readonly startQuest: number | undefined;
-  /** PageText id of the first page when the item can be read (a book, a letter); undefined otherwise. Item 103. */
+  /** PageText id of the first page when the item can be read (a book, a letter); undefined otherwise. */
   readonly pageText: number | undefined;
   readonly block: number | undefined;
   readonly maxDurability: number | undefined;
 }
 
 /**
- * One line of the character's skill pane (item 95), folded from the
+ * One line of the character's skill pane, folded from the
  * `PLAYER_SKILL_INFO` update fields. `value`/`max` are the pane's "150/225";
  * `tempBonus`/`permBonus` the green modifier. `name` is the client's
  * SkillLine.dbc text (`undefined` when the module could not read it).
@@ -660,7 +666,7 @@ export function reputationRank(reputation: number): ReputationRank {
 }
 
 /**
- * One faction of the reputation pane (item 99): the fold of the login list
+ * One faction of the reputation pane: the fold of the login list
  * (`SMSG_INITIALIZE_FACTIONS`) and every change since
  * (`SMSG_SET_FACTION_STANDING`). `standing` is the wire's value, `base` the
  * client's Faction.dbc base for this race/class, `reputation` their sum and
@@ -711,7 +717,7 @@ export interface TalentTreeTab {
 }
 
 /**
- * The class talent frame (item 96): the last `WB_TALENT_TREE` (the answer to
+ * The class talent frame: the last `WB_TALENT_TREE` (the answer to
  * `queryTalentTree`) with the learned ranks from the last `SMSG_TALENTS_INFO`
  * merged in at read time. `unspentPoints` follows the talents packet when
  * one has arrived since.
@@ -969,7 +975,7 @@ export interface NearbyObject extends UnitFieldsState {
   /**
    * The master of a summoned or created unit (`UNIT_FIELD_SUMMONEDBY`, else
    * `UNIT_FIELD_CREATEDBY`): a pet's owner, a totem's shaman. `"0"` reads as
-   * undefined. Item 98.
+   * undefined.
    */
   ownerGuid: Observed<GuidKey> | undefined;
   /** Who mind-controls this unit (`UNIT_FIELD_CHARMEDBY`), when observed. */
@@ -1403,7 +1409,7 @@ export class StateCache {
 
   // -------------------------------- pets, group, mail, bank, trade, rolls, item text
 
-  /** The last `SMSG_PET_SPELLS` with a pet in it; cleared by the guid-0 removal (item 98). */
+  /** The last `SMSG_PET_SPELLS` with a pet in it; cleared by the guid-0 removal. */
   private petBar: (PetSpellsData & { readonly seq: number; readonly ts: number }) | undefined;
 
   /** petNumber -> given name, from `SMSG_PET_NAME_QUERY_RESPONSE`. Never pruned: the module asks once per number. */
@@ -1411,10 +1417,10 @@ export class StateCache {
 
   private groupState: GroupState | undefined;
 
-  /** rollGuid -> the open roll frame (item 102). Closed by the won / all-passed verdict, by our own counted vote, or by its deadline. */
+  /** rollGuid -> the open roll frame. Closed by the won / all-passed verdict, by our own counted vote, or by its deadline. */
   private readonly rolls = new Map<GuidKey, PendingRoll>();
 
-  /** pageId -> one page of a book (item 103). A client-cache mirror: pages never change, so never pruned. */
+  /** pageId -> one page of a book. A client-cache mirror: pages never change, so never pruned. */
   private readonly pageTexts = new Map<number, { readonly text: string; readonly nextPageId: number }>();
 
   /** item guid -> the player-written text on it, from `SMSG_ITEM_TEXT_QUERY_RESPONSE`. */
@@ -1670,11 +1676,13 @@ export class StateCache {
       if (guid === "0") continue;
       const item = this.nearby.get(guid);
       const itemId = item?.entry?.value;
+      const info = itemId === undefined ? undefined : this.items.get(itemId)?.value;
       out.push({
         slot,
         guid,
         itemId,
-        name: itemId === undefined ? undefined : this.items.get(itemId)?.value.name,
+        name: info?.name,
+        quality: info?.quality,
         stackCount: item?.fields.get("stackCount")?.value,
         seq: Math.max(lo?.seq ?? -1, hi?.seq ?? -1),
         ts: Math.max(lo?.ts ?? 0, hi?.ts ?? 0),
@@ -1697,7 +1705,7 @@ export class StateCache {
    * invSlot regexes over raw updates, and a full relog to force a resend; the
    * worn-bag span came from `inventory_full` turn-ins (quests 33, 183) and a
    * model hand-rolling destroyItem loops against a 16-slot ceiling while a
-   * worn bag had room (item 50).
+   * worn bag had room.
    *
    * One honest caveat. Empty slots are zero-valued update fields and the wire
    * compresses zeros out of create blocks, so "no field observed" reads as
@@ -1706,45 +1714,65 @@ export class StateCache {
   bag(): BagContents {
     const items: BagSlotItem[] = [];
     const bags: WornBag[] = [];
-    const rowOf = (bag: number, slot: number, guid: GuidKey): BagSlotItem => {
-      const item = this.nearby.get(guid);
-      const itemId = item?.entry?.value;
-      const info = itemId === undefined ? undefined : this.items.get(itemId)?.value;
-      return {
-        bag,
-        slot,
-        guid,
-        itemId,
-        name: info?.name,
-        count: item?.fields.get("stackCount")?.value,
-        quality: info?.quality,
-      };
-    };
     let totalSlots = BACKPACK_SIZE;
     const inventory = this.inventory;
     // Backpack first, then each worn bag in slot order.
     for (const i of inventory) {
-      if (i.slot >= BACKPACK_FIRST_SLOT && i.slot <= BACKPACK_LAST_SLOT) items.push(rowOf(BACKPACK_BAG, i.slot, i.guid));
+      if (i.slot >= BACKPACK_FIRST_SLOT && i.slot <= BACKPACK_LAST_SLOT) items.push(this.bagRow(BACKPACK_BAG, i.slot, i.guid));
     }
     for (const i of inventory) {
       if (i.slot < BAG_FIRST_SLOT || i.slot > BAG_LAST_SLOT) continue;
-      // A worn bag: its contents are the container's own `bagSlot<n>Lo/Hi`
-      // fields, addressed by the equipment slot the bag sits in.
-      const container = this.nearby.get(i.guid);
-      const numSlots = container?.fields.get("numSlots")?.value ?? 0;
+      const { numSlots, contents } = this.walkContainer(i.guid);
       bags.push({ slot: i.slot, numSlots, name: i.name });
       totalSlots += numSlots;
-      if (!container) continue;
-      for (let n = 0; n < numSlots; n++) {
-        const lo = container.fields.get(`bagSlot${n}Lo`);
-        const hi = container.fields.get(`bagSlot${n}Hi`);
-        if (!lo && !hi) continue;
-        const guid = formatGuid((BigInt(hi?.value ?? 0) << 32n) | BigInt((lo?.value ?? 0) >>> 0));
-        if (guid === "0") continue;
-        items.push(rowOf(i.slot, n, guid));
-      }
+      for (const c of contents) items.push(this.bagRow(i.slot, c.slot, c.guid));
     }
     return { items, freeSlots: totalSlots - items.length, totalSlots, bags };
+  }
+
+  /**
+   * One slot's row: the guid joined to the item's entry (its create block) and
+   * to the item template the query answered with, which is where the name and
+   * quality come from. An unqueried item is a row with a guid and no name.
+   */
+  private bagRow(bag: number, slot: number, guid: GuidKey): BagSlotItem {
+    const item = this.nearby.get(guid);
+    const itemId = item?.entry?.value;
+    const info = itemId === undefined ? undefined : this.items.get(itemId)?.value;
+    return {
+      bag,
+      slot,
+      guid,
+      itemId,
+      name: info?.name,
+      count: item?.fields.get("stackCount")?.value,
+      quality: info?.quality,
+    };
+  }
+
+  /**
+   * What a worn bag holds: its size, and the guid in each occupied slot.
+   *
+   * A container's contents are the container item's own `bagSlot<n>Lo/Hi`
+   * update fields, so reading a bag means reading the item that *is* the bag.
+   * Bank bags work exactly the same way, which is why this walk lives once.
+   * A container whose create block has not arrived reads as zero slots and
+   * nothing in them rather than as an error.
+   */
+  private walkContainer(guid: GuidKey): { numSlots: number; contents: readonly { slot: number; guid: GuidKey }[] } {
+    const container = this.nearby.get(guid);
+    const numSlots = container?.fields.get("numSlots")?.value ?? 0;
+    const contents: { slot: number; guid: GuidKey }[] = [];
+    if (container === undefined) return { numSlots, contents };
+    for (let n = 0; n < numSlots; n++) {
+      const lo = container.fields.get(`bagSlot${n}Lo`);
+      const hi = container.fields.get(`bagSlot${n}Hi`);
+      if (!lo && !hi) continue;
+      const inner = formatGuid((BigInt(hi?.value ?? 0) << 32n) | BigInt((lo?.value ?? 0) >>> 0));
+      if (inner === "0") continue;
+      contents.push({ slot: n, guid: inner });
+    }
+    return { numSlots, contents };
   }
 
   /** The object our own `targetGuid` points at, when it is also in view. */
@@ -1932,10 +1960,10 @@ export class StateCache {
     return only(resolveName(key, all, (r) => r.name));
   }
 
-  // ------------------------------------------------------------------ pets (item 98)
+  // ------------------------------------------------------------------ pets
 
   /**
-   * The pet frame (item 98): the control bar the server last sent
+   * The pet frame: the control bar the server last sent
    * (`SMSG_PET_SPELLS`) joined to the pet's unit in view and its given name.
    * `undefined` when there is no pet — none summoned, or the server removed
    * the bar (death, dismiss, abandon).
@@ -1992,10 +2020,10 @@ export class StateCache {
     return only(resolveName(key, all, (s) => s.name));
   }
 
-  // ----------------------------------------------------- group loot rolls (item 102)
+  // ----------------------------------------------------- group loot rolls
 
   /**
-   * The roll frames open right now (item 102), oldest first, named from the
+   * The roll frames open right now, oldest first, named from the
    * item query where it has answered. A frame whose deadline has passed is
    * gone: the server decided it without us. `now` defaults to the stream's
    * own clock (`lastTs`), the clock the deadline was set on.
@@ -2013,10 +2041,10 @@ export class StateCache {
     return out;
   }
 
-  // ------------------------------------------------------------ item text (item 103)
+  // ------------------------------------------------------------ item text
 
   /**
-   * The text of every carried item this character has read (item 103): a
+   * The text of every carried item this character has read: a
    * book's pages walked from the template's `pageText` through the cached
    * chain, or the player-written text on a mailed letter. Items that were
    * never read are absent; `complete` is false while a chain's later pages
@@ -2047,17 +2075,17 @@ export class StateCache {
     return out;
   }
 
-  // ---------------------------------------------------------------- group (item 100)
+  // ---------------------------------------------------------------- group
 
-  /** The party (item 100), or `undefined` until any group packet has been observed. */
+  /** The party, or `undefined` until any group packet has been observed. */
   group(): GroupState | undefined {
     return this.groupState;
   }
 
-  // ----------------------------------------------------------------- mail (item 100)
+  // ----------------------------------------------------------------- mail
 
   /**
-   * The mailbox (item 100): the inbox as last listed, with item names and
+   * The mailbox: the inbox as last listed, with item names and
    * sender names joined at read time. `undefined` until any mail packet.
    */
   mailbox(): MailboxState | undefined {
@@ -2071,10 +2099,10 @@ export class StateCache {
     return { ...m, mails };
   }
 
-  // ----------------------------------------------------------------- bank (item 100)
+  // ----------------------------------------------------------------- bank
 
   /**
-   * The bank (item 100): the main bank slots (bag 255, slots 39-66) and each
+   * The bank: the main bank slots (bag 255, slots 39-66) and each
    * bank bag's contents (bag = the bank bag's slot 67-73), addressed the way
    * `bankWithdraw(bag, slot)` takes them. The same three-way join as `bag()`.
    * `guid` is the banker the frame was last opened at, or undefined.
@@ -2082,42 +2110,27 @@ export class StateCache {
   bank(): BankContents {
     const items: BagSlotItem[] = [];
     const bags: WornBag[] = [];
-    const rowOf = (bag: number, slot: number, guid: GuidKey): BagSlotItem => {
-      const item = this.nearby.get(guid);
-      const itemId = item?.entry?.value;
-      const info = itemId === undefined ? undefined : this.items.get(itemId)?.value;
-      return { bag, slot, guid, itemId, name: info?.name, count: item?.fields.get("stackCount")?.value, quality: info?.quality };
-    };
     const inventory = this.inventory;
     // The main bank: a character starts with 28 slots and buys none (3.3.5
     // bank *bag* slots are bought; the 28 item slots are free), so every
     // slot in the range counts toward totalSlots.
     let totalSlots = BANK_LAST_SLOT - BANK_FIRST_SLOT + 1;
     for (const i of inventory) {
-      if (i.slot >= BANK_FIRST_SLOT && i.slot <= BANK_LAST_SLOT) items.push(rowOf(BACKPACK_BAG, i.slot, i.guid));
+      if (i.slot >= BANK_FIRST_SLOT && i.slot <= BANK_LAST_SLOT) items.push(this.bagRow(BACKPACK_BAG, i.slot, i.guid));
     }
     for (const i of inventory) {
       if (i.slot < BANK_BAG_FIRST_SLOT || i.slot > BANK_BAG_LAST_SLOT) continue;
-      const container = this.nearby.get(i.guid);
-      const numSlots = container?.fields.get("numSlots")?.value ?? 0;
+      const { numSlots, contents } = this.walkContainer(i.guid);
       bags.push({ slot: i.slot, numSlots, name: i.name });
       totalSlots += numSlots;
-      if (!container) continue;
-      for (let n = 0; n < numSlots; n++) {
-        const lo = container.fields.get(`bagSlot${n}Lo`);
-        const hi = container.fields.get(`bagSlot${n}Hi`);
-        if (!lo && !hi) continue;
-        const guid = formatGuid((BigInt(hi?.value ?? 0) << 32n) | BigInt((lo?.value ?? 0) >>> 0));
-        if (guid === "0") continue;
-        items.push(rowOf(i.slot, n, guid));
-      }
+      for (const c of contents) items.push(this.bagRow(i.slot, c.slot, c.guid));
     }
     return { guid: this.bankGuid?.value, items, bags, freeSlots: totalSlots - items.length, totalSlots };
   }
 
-  // ---------------------------------------------------------------- trade (item 100)
+  // ---------------------------------------------------------------- trade
 
-  /** The trade window (item 100), or `undefined` until any trade packet. */
+  /** The trade window, or `undefined` until any trade packet. */
   trade(): TradeState | undefined {
     const t = this.tradeState;
     if (t === undefined) return undefined;
@@ -2126,7 +2139,7 @@ export class StateCache {
     return { ...t, mine: side(t.mine), theirs: side(t.theirs) };
   }
 
-  // ---------------------- group, mail, pets, loot rolls folders (items 98, 100, 102)
+  // ---------------------- group, mail, pets, loot rolls folders
 
   private foldGroupList(d: GroupListData, seq: number, ts: number): void {
     const prev = this.groupState;
@@ -3541,14 +3554,14 @@ export class StateCache {
         }
         continue;
       }
-      // The skill pane's names ride beside the ids as strings (item 95);
+      // The skill pane's names ride beside the ids as strings;
       // they live in their own map because `fields` holds numbers only.
       if (target === this.self && typeof raw === "string") {
         const m = /^skill(\d+)Name$/.exec(key);
         if (m !== null) this.skillNames.set(Number(m[1]), raw);
         continue;
       }
-      // Owner guids (item 98): joined u64 halves the module serves as guid
+      // Owner guids: joined u64 halves the module serves as guid
       // strings. SUMMONEDBY is the pet's master; CREATEDBY is the fallback
       // the client draws the same conclusion from.
       if (typeof raw === "string" && target !== this.self && "ownerGuid" in target) {
@@ -4124,7 +4137,7 @@ const QUEST_LOG_SLOTS = 25;
 /** The quest log's completion bit, the one the probe verified live. */
 const QUEST_STATE_COMPLETE = 1;
 /** Equipment + bags are 0-22, backpack 23-38 (PROTOCOL.md). */
-/** The last `invSlot<n>` the module serves: the bank bags (item 100). Older modules stop at 38. */
+/** The last `invSlot<n>` the module serves: the bank bags. Older modules stop at 38. */
 const INVENTORY_LAST_SLOT = 73;
 /** `PLAYER_SKILL_INFO_1_1` holds 128 skill slots of three packed u32s each. */
 const SKILL_SLOTS = 128;

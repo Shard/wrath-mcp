@@ -1,5 +1,5 @@
 /**
- * Filesystem confinement for the sandbox child (FOLLOW-UPS 19, part 3).
+ * Filesystem confinement for the sandbox child (part 3).
  *
  * The host spawns THIS file, not `entry.ts`:
  *

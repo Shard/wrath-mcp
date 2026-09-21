@@ -26,10 +26,18 @@ const BASE = `http://${HOST}:${PORT}`;
 // with `weak_token`, so it is random hex, not a timestamp. The *character* is
 // deliberately stable — `POST /session` is create-or-reuse, so a fixed name
 // makes re-runs idempotent instead of leaving a new saved character on the
-// account every time (the realm caps them, and Phase 0 has no delete-character
-// action). It also exercises the reuse branch.
+// account every time (the realm caps them; `deleteCharacter` can clear one, but
+// a stable name means nothing has to). It also exercises the reuse branch.
 const TOKEN = `sdk-slice-${randomBytes(16).toString("hex")}`;
 const CHARACTER = process.env.SLICE_CHARACTER ?? "Benchslice";
+/**
+ * The operator credential (`module/PROTOCOL.md`, "Authentication"): the port
+ * secret, which every route requires. Read from the environment the way the
+ * runner reads it. Left unset it is sent as nothing, which a module that
+ * predates authentication accepts and any current one answers `401
+ * unauthorized`.
+ */
+const SECRET = process.env.WRATHBENCH_MODULE_SECRET;
 const SAY_TEXT = "hello from the sdk";
 
 function log(msg: string): void {
@@ -44,7 +52,7 @@ function fail(msg: string): never {
 async function main(): Promise<void> {
   // 1. Connect. This opens the event subscription before any session exists,
   //    which is what lets the cache see the login handshake.
-  const client = await connect({ baseUrl: BASE, token: TOKEN });
+  const client = await connect({ baseUrl: BASE, token: TOKEN, secret: SECRET });
   log(`subscribed to events for token ${TOKEN}`);
 
   const health = await client.health();

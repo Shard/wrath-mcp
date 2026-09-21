@@ -1,11 +1,11 @@
 /**
  * The runner's side of the module's authentication (module/PROTOCOL.md,
- * "Authentication"; FOLLOW-UPS 19).
+ * "Authentication").
  *
  * Two credentials exist and this file keeps them apart:
  *
  *  - The **port secret**, `WRATHBENCH_MODULE_SECRET`, read from the
- *    environment (Bun loads it from the repo-root `.env`; docs/OPERATIONS.md
+ *    environment (Bun loads it from the repo-root `.env`; docs/RUNBOOK.md
  *    "Secrets"). It is the operator class: the host process presents it on
  *    hygiene, `/health`, and to lease. It never reaches the snippet child —
  *    `sandboxChildEnv` drops it — because a snippet holding it could list and

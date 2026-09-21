@@ -747,7 +747,7 @@ export interface ConnectOptions {
   secret?: string;
   /**
    * The game account this run occupies, bound operator-side exactly like
-   * `token` (decided 2026-08-22). When set it is authoritative: it
+   * `token`. When set it is authoritative: it
    * fills an omitted `createSession`/`deleteCharacter` account and overrides any
    * account the model typed, so a snippet can never land on — or delete on —
    * the wrong account (the RUNNER6→RUNNER cross-account corruption this closes).
@@ -935,7 +935,7 @@ export type MoveResult =
 /**
  * Per-status recovery recipes (what happened, what it means,
  * the next step), in the result rather than in a trajectory nobody reads twice.
- * Before the module split `no_path` into causes (FOLLOW-UPS 38 N1) one hint
+ * Before the module split `no_path` into causes one hint
  * covered four failures and qwen (2026-08-22 roster) spent 8 turns discovering
  * which one it had; the cause is now the module's word and the hint is only the
  * recovery that follows from it.
@@ -1030,6 +1030,41 @@ const MOVE_LEAVES_NO_STOP: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * How long the server's refusal of a `moveTo` stands for.
+ *
+ * A refusal in `MOVE_LEAVES_NO_STOP` is a planning answer about two fixed
+ * things — where the character is standing and where it asked to go — so
+ * re-asking the same question from the same spot inside a quarter second cannot
+ * get a different answer. It can get a great deal of traffic: one 25-second
+ * snippet re-issued one refused destination 4014 times (~160/s), which is 4014
+ * requests through the module's bridge for a verdict the SDK already had. The
+ * repeat is answered from the remembered one instead. Nothing new appears on
+ * the model surface: the result is the verdict the server gave, in the same
+ * shape with the same hint, and the hint tally counts the call as the failure it
+ * is. The window is short on purpose — it bounds a loop without ever standing in
+ * for an answer the world could have changed, and the world is not observed from
+ * here to decide that.
+ */
+const MOVE_REJECTION_MEMO_MS = 250;
+
+/**
+ * How close two points must be to be the same point, in yards: the destination
+ * asked for, and where the character is standing. Tight, because "has not moved"
+ * has to mean it — a character that walked even a step is asking a different
+ * question, and server positions are exact, not jittery.
+ */
+const MOVE_REJECTION_MEMO_EPSILON = 0.1;
+
+/** Same point within `MOVE_REJECTION_MEMO_EPSILON` on all three axes. */
+function samePointish(a: Point3, b: Point3): boolean {
+  return (
+    Math.abs(a.x - b.x) <= MOVE_REJECTION_MEMO_EPSILON &&
+    Math.abs(a.y - b.y) <= MOVE_REJECTION_MEMO_EPSILON &&
+    Math.abs(a.z - b.z) <= MOVE_REJECTION_MEMO_EPSILON
+  );
+}
+
+/**
  * What an `arrived` with `meshZ` means. Within 3y the mesh corrected a stale
  * z and the agent should quote the mesh's value. Beyond that the module's
  * drop guard should have refused the walk, so the honest reading is that the
@@ -1110,7 +1145,7 @@ export interface WaitForTransferOptions {
 /**
  * The outcome of waiting for a map transfer — returned, never thrown, for the
  * same reason as `MoveResult`: every arm is the game answering, and
- * the bounded-wait statuses FOLLOW-UPS 38 N1 asks for (`waiting`, `wrong_map`)
+ * the bounded-wait statuses the navigation plan asks for (`waiting`, `wrong_map`)
  * are answers too, not absences.
  */
 export type TransferResult =
@@ -1624,7 +1659,7 @@ const TAXI_REPLY_HINTS: Record<number, string> = {
  *
  * Every inventory refusal the game makes arrives as one of these numbers and
  * nothing else, and a run was observed reverse-engineering "reason 60" into
- * "in combat" from context (FOLLOW-UPS item 101a). The number stays the
+ * "in combat" from context. The number stays the
  * server's word and is always reported alongside; this table only names it.
  * Naming is not softening game semantics — the client shows this text too —
  * and it says nothing about what to do next.
@@ -1641,12 +1676,12 @@ const INVENTORY_RESULT_TEXT: Record<number, string> = {
   5: "a bag with things in it cannot go inside another bag",
   6: "bags with things in them cannot be traded",
   7: "only ammo can go there",
-  8: "your class has no proficiency for that weapon or armour type — a weapon master can teach some of them",
+  8: "your class has no proficiency for that weapon or armour type",
   9: "no equipment slot is free for it",
   10: "this character can never use that item",
   11: "this character can never use that item",
   12: "no equipment slot is free for it",
-  13: "a two-handed weapon is equipped — that blocks an off-hand or shield until you equip a one-hander instead",
+  13: "a two-handed weapon is equipped — that blocks an off-hand or shield",
   14: "you cannot dual wield",
   15: "that item does not go into a bag",
   16: "that item does not go into a bag",
@@ -1730,6 +1765,20 @@ const INVENTORY_RESULT_TEXT: Record<number, string> = {
  */
 export function inventoryResultText(result: number): string | undefined {
   return INVENTORY_RESULT_TEXT[result];
+}
+
+/**
+ * Is this `SMSG_INVENTORY_CHANGE_FAILURE` the verdict on the move we just sent?
+ *
+ * `result` 0 is `EQUIP_ERR_OK` and not a refusal at all, and a refusal that
+ * names a different item — a background loot's bag-full landing mid-wait — is
+ * somebody else's answer. A failure that carries no guid, or a wait that knows
+ * none, cannot be told apart from ours and is taken as ours. Shared so equip
+ * and the bank moves read the same event the same way.
+ */
+function isOwnInventoryFailure(d: InventoryChangeFailureData, guid: string | undefined): boolean {
+  if (d.result === 0) return false;
+  return d.itemGuid === undefined || guid === undefined || guidKey(d.itemGuid) === guid;
 }
 
 /** Inventory slots below this are equipment and bag slots; 23-38 are backpack. */
@@ -1821,7 +1870,7 @@ export interface MailOptions {
 export type LootRollRefusalStatus = "no_pending_roll" | "ambiguous_roll" | "roll_not_allowed";
 
 /**
- * The outcome of `lootRoll` (item 102). `rolled` is the server's echo of the
+ * The outcome of `lootRoll`. `rolled` is the server's echo of the
  * counted vote (`SMSG_LOOT_ROLL` for this character). That first echo is only
  * an acknowledgement of the button — `Group::CountRollVote` sends it with
  * rollNumber 0 for need and 128 for pass / greed / disenchant, and with
@@ -1851,7 +1900,7 @@ export interface LootRollOptions {
 }
 
 /**
- * The outcome of `readItem` (item 103). `read` carries the pages in order and
+ * The outcome of `readItem`. `read` carries the pages in order and
  * `text` as one string. `no_item` is a bag address or name that holds
  * nothing; `not_readable` is the server's (or the template's) word that there
  * is nothing to read on it.
@@ -2189,7 +2238,7 @@ export async function connect(options: ConnectOptions): Promise<WrathClient> {
     } catch (err) {
       // The client the caller never receives is the client nobody can close.
       // `events.connect()` rejects on a whole failed climb of the ladder
-      // (FOLLOW-UPS 113) while the stream itself keeps retrying, so without
+      // while the stream itself keeps retrying, so without
       // this every failed `connect()` leaks a reconnect ladder for the life of
       // the process. `close()` is the client's own cleanup for everything the
       // constructor started — the stream and the coalescing timers — so the
@@ -2217,6 +2266,28 @@ export class WrathClient {
 
   /** Hint-bearing failures since the last drain, by `action:status`. See `ActionHint`. */
   private readonly actionHints = new Map<string, ActionHint>();
+
+  /**
+   * The last `moveTo` the server refused without moving anything, kept for
+   * `MOVE_REJECTION_MEMO_MS` so an identical repeat from the same spot is
+   * answered rather than re-sent. One slot: a loop re-asks its own last
+   * question, and anything else replaces this one.
+   */
+  private lastMoveRejection:
+    | {
+        /** Where the refused move was headed. */
+        readonly point: MovePoint;
+        /** Where the character was standing when it was refused. */
+        readonly from: Point3;
+        /** When the refusal came back (epoch ms). */
+        readonly at: number;
+        /** The status and recipe, so a short-circuited repeat tallies exactly as the call it repeats. */
+        readonly status: string;
+        readonly recipe: string | undefined;
+        /** The verdict itself, returned again verbatim — it is the same verdict. */
+        readonly result: MoveResult;
+      }
+    | null = null;
 
   constructor(options: ConnectOptions) {
     this.token = options.token;
@@ -2525,6 +2596,9 @@ export class WrathClient {
 
   /** The `move_to` POST itself; `guid` is the planning hint `resolveMoveTarget` attaches to unit targets. */
   private postMoveTo(point: MovePoint, guid?: string): Promise<MoveToResponse> {
+    // Any dispatch supersedes a remembered refusal, whichever call made it:
+    // what comes back is the verdict now.
+    this.lastMoveRejection = null;
     return this.request(
       "POST",
       "/action",
@@ -2898,11 +2972,7 @@ export class WrathClient {
               (sinceSeq === undefined || e.seq > sinceSeq)
             ) {
               const d = e.data as InventoryChangeFailureData;
-              // result 0 is EQUIP_ERR_OK, and a refusal that names a different
-              // item (a background loot's bag-full) is not this equip's answer.
-              const mine =
-                d.itemGuid === undefined || guid === undefined || guidKey(d.itemGuid) === guid;
-              if (d.result !== 0 && mine) {
+              if (isOwnInventoryFailure(d, guid)) {
                 failure = d;
                 return true;
               }
@@ -3006,7 +3076,7 @@ export class WrathClient {
         err.message += item === undefined
           ? ` — local state sees nothing at bag ${bag} slot ${slot}; slots shift after looting/selling, re-read state.bag()`
           : startQuest !== undefined
-            ? ` — local state sees ${label} at bag ${bag} slot ${slot}, and its tooltip says it starts quest ${startQuest}: this module build predates quest-start items (it needs the 2026-08-30 build); until then the quest cannot be started from the item`
+            ? ` — local state sees ${label} at bag ${bag} slot ${slot}, and its tooltip says it starts quest ${startQuest}: this module build predates quest-start items and must be rebuilt; until then the quest cannot be started from the item`
             : ` — local state sees ${label} at bag ${bag} slot ${slot}: that item has no on-use spell and no quest to start (per its tooltip, state.items)`;
       }
       throw err;
@@ -3445,7 +3515,7 @@ export class WrathClient {
     });
   }
 
-  // ------------------------------------------------------------------ pets (item 98)
+  // ------------------------------------------------------------------ pets
 
   /**
    * The pet the control bar is for, or the refusal to send anything. "There is
@@ -3590,7 +3660,7 @@ export class WrathClient {
     return this.petAction(pet.guid, 3, 0x07);
   }
 
-  // ---------------------------------------------------------------- group (item 100)
+  // ---------------------------------------------------------------- group
 
   /**
    * Invite a player by name (`CMSG_GROUP_INVITE`) and return the server's
@@ -3659,7 +3729,7 @@ export class WrathClient {
     return this.state.group()!;
   }
 
-  // ----------------------------------------------------------------- mail (item 100)
+  // ----------------------------------------------------------------- mail
 
   /**
    * The sentence every mail call says when no frame is open. One text, whether
@@ -3823,7 +3893,7 @@ export class WrathClient {
     return this.waitMailResult("deleteMail", 4, sinceSeq, options.timeout ?? 10_000, `deleteMail(${mailId})`);
   }
 
-  // ----------------------------------------------------------------- bank (item 100)
+  // ----------------------------------------------------------------- bank
 
   /** Open the bank at a banker (`CMSG_BANKER_ACTIVATE`) and return it once the frame opens (`SMSG_SHOW_BANK`; also `state.bank()`). */
   async openBank(npcGuid: GuidOrUnit, options: BankOptions = {}): Promise<WithResolved<BankContents>> {
@@ -3878,8 +3948,13 @@ export class WrathClient {
       (e) => {
         if (sinceSeq !== undefined && e.seq <= sinceSeq) return false;
         if (isEvent(e, "SMSG_INVENTORY_CHANGE_FAILURE") && !isDecodeError(e.data)) {
-          failure = e.data as InventoryChangeFailureData;
-          return true;
+          const d = e.data as InventoryChangeFailureData;
+          // Not every refusal on the stream is this move's: one that names
+          // another item falls through to the arrival check below.
+          if (isOwnInventoryFailure(d, guid)) {
+            failure = d;
+            return true;
+          }
         }
         place = landed();
         return place !== undefined;
@@ -3977,7 +4052,7 @@ export class WrathClient {
     return this.action({ action: "learn_talent", talentId, rank });
   }
 
-  // ------------------------------------------- group loot rolls (item 102)
+  // ------------------------------------------- group loot rolls
 
   /**
    * Vote on an open roll frame (`CMSG_LOOT_ROLL`): the need / greed / pass /
@@ -4063,7 +4138,7 @@ export class WrathClient {
     return { ok: false, status, hint };
   }
 
-  // ------------------------------------------------------ item text (item 103)
+  // ------------------------------------------------------ item text
 
   /**
    * Read a carried book or letter and return its text. The item is the
@@ -4392,6 +4467,15 @@ export class WrathClient {
       return { ok: false, status: "unknown_target", hint: resolved.unknown };
     }
     const point = resolved.point;
+    const repeat = this.recallMoveRejection(point);
+    if (repeat !== null) {
+      // The same refusal, tallied like the call it is, and no request. The
+      // `stop()` the status would otherwise send is skipped with it: the
+      // remembered refusal already sent one and the character has not moved
+      // since, so a second is a second packet for the same repair.
+      this.noteActionHint("moveTo", repeat.status, repeat.recipe, point);
+      return repeat.result;
+    }
     // Notes that belong on whatever verdict comes back: a stale-position
     // fallback, and the budget estimate below. They explain the call, so they
     // ride the `hint` rather than changing the module's status (the status
@@ -4529,7 +4613,7 @@ export class WrathClient {
     }
     if (status === "transferred") {
       // Postcondition, not dispatch: resolve only once the server has named
-      // the new map (FOLLOW-UPS 38 N1). A transfer that never completes is a
+      // the new map. A transfer that never completes is a
       // typed `ok: false` from waitForTransfer, surfaced with the move status
       // intact so the caller sees both facts.
       const transfer = await this.waitForTransfer({ timeout: options.timeout ?? 90_000, sinceSeq, epoch });
@@ -4551,7 +4635,7 @@ export class WrathClient {
     if (status === "teleported") {
       // A same-map port: no SMSG_NEW_WORLD is coming, so waiting for one
       // (what `transferred` does) would be a full-timeout hang ending in a
-      // false "still pending" (item 46). The arrival point is the
+      // false "still pending". The arrival point is the
       // server's own MSG_MOVE_TELEPORT_ACK, sent before the result — so this
       // is a buffer lookup from before the move, and the short timeout only
       // covers a module that did not serve it.
@@ -4609,7 +4693,7 @@ export class WrathClient {
     this.noteActionHint("moveTo", status, recipe, point);
     const hint = withNotes(recipe);
     const reachedPos = data.reachedPos ? { x: data.reachedPos.x, y: data.reachedPos.y, z: data.reachedPos.z } : undefined;
-    return {
+    const result: MoveResult = {
       ok: false,
       status,
       ...common,
@@ -4617,6 +4701,44 @@ export class WrathClient {
       ...(data.dz !== undefined ? { dz: data.dz } : {}),
       ...(hint !== undefined ? { hint } : {}),
     };
+    if (MOVE_LEAVES_NO_STOP.has(status)) {
+      // Nothing moved, so this verdict is about a position and a destination
+      // that both still hold: remember it for the repeat (see
+      // `MOVE_REJECTION_MEMO_MS`). The refusal's own `pos` is already folded
+      // into the cache, so `recallMoveRejection` compares like with like.
+      const here = this.state.self.position?.value;
+      if (here !== undefined) {
+        this.lastMoveRejection = { point, from: here, at: Date.now(), status, recipe, result };
+      }
+    }
+    return result;
+  }
+
+  /**
+   * The remembered refusal, when this `moveTo` is the same question again: the
+   * same destination, from the same spot, inside `MOVE_REJECTION_MEMO_MS`. Null
+   * whenever any of the three fails — and a memory that fails on time or on
+   * position is dropped, because neither can come back.
+   *
+   * Only `moveTo` reads this. `moveToAsync` acks with a `moveId` the module
+   * mints, and there is no honest way to answer one without dispatching: an
+   * invented id is precisely the class of value the SDK never returns.
+   */
+  private recallMoveRejection(point: MovePoint): typeof this.lastMoveRejection {
+    const memo = this.lastMoveRejection;
+    if (memo === null) return null;
+    if (Date.now() - memo.at > MOVE_REJECTION_MEMO_MS) {
+      this.lastMoveRejection = null;
+      return null;
+    }
+    const here = this.state.self.position?.value;
+    // No position to compare is no claim that the character stood still.
+    if (here === undefined) return null;
+    if (!samePointish(here, memo.from)) {
+      this.lastMoveRejection = null;
+      return null;
+    }
+    return samePointish(point, memo.point) ? memo : null;
   }
 
   /**
@@ -4653,7 +4775,7 @@ export class WrathClient {
    * a deadline with no transfer announced at all is `no_transfer`, and an
    * arrival on a map other than `expectMap` is `wrong_map`. Never sleeps.
    *
-   * Earned by the travel probe (`infra/smoke/travel.ts`, FOLLOW-UPS item 18):
+   * Earned by the travel probe (`infra/smoke/travel.ts`):
    * every version of it before this helper creep-walked into the tram portal
    * and slept 1.5s per step to see whether a teleport had landed.
    */
@@ -5150,7 +5272,7 @@ export class WrathClient {
    * with `SMSG_GOSSIP_MESSAGE` carrying the quests instead of
    * `SMSG_QUESTGIVER_QUEST_LIST` — with none of the accepting. Models kept
    * rebuilding exactly this by hand over `questList` plus event scraping and
-   * getting confused by their own nulls (item 9a).
+   * getting confused by their own nulls.
    *
    * An empty `quests` is an answer: the NPC has nothing for this character
    * right now. Silence is not, so it still throws `EventTimeoutError`.

@@ -29,6 +29,14 @@ const BASE = `http://${HOST}:${PORT}`;
 // `weak_token`, and a per-session token must be unique anyway.
 const TOKEN = `sdk-move-${randomBytes(16).toString("hex")}`;
 const CHARACTER = process.env.MOVE_CHARACTER ?? "Benchmove";
+/**
+ * The operator credential (`module/PROTOCOL.md`, "Authentication"): the port
+ * secret, which every route requires. Read from the environment the way the
+ * runner reads it. Left unset it is sent as nothing, which a module that
+ * predates authentication accepts and any current one answers `401
+ * unauthorized`.
+ */
+const SECRET = process.env.WRATHBENCH_MODULE_SECRET;
 /** How far to walk, in yards, when the geometry allows it. */
 const TARGET_DISTANCE = 30;
 /** How long to keep retrying while the module is being rebuilt under us. */
@@ -87,11 +95,11 @@ async function waitForModule(client: WrathClient): Promise<void> {
 async function main(): Promise<void> {
   // Health first, without a subscription: the WS would only reconnect-loop
   // while the worldserver is down.
-  const probe = await connect({ baseUrl: BASE, token: TOKEN, subscribeEvents: false, requestTimeoutMs: 10_000 });
+  const probe = await connect({ baseUrl: BASE, token: TOKEN, secret: SECRET, subscribeEvents: false, requestTimeoutMs: 10_000 });
   await waitForModule(probe);
   probe.close();
 
-  const client = await connect({ baseUrl: BASE, token: TOKEN });
+  const client = await connect({ baseUrl: BASE, token: TOKEN, secret: SECRET });
   log(`subscribed to events for token ${TOKEN}`);
 
   try {

@@ -195,7 +195,7 @@ describe("client: operator-bound account", () => {
 });
 
 describe("client: movement", () => {
-  test("the default signal aborts a pending moveTo, issues one stop, and leaves later waits alive (item 44)", async () => {
+  test("the default signal aborts a pending moveTo, issues one stop, and leaves later waits alive", async () => {
     const stub = startStub({ onConnect: () => frames(loginSequence) });
     // A provider, as the runner passes it: consulted at the start of each wait.
     let current: AbortSignal | undefined;
@@ -357,6 +357,116 @@ describe("client: movement", () => {
     }
   });
 
+  describe("a refusal already given is not re-asked on the wire", () => {
+    /**
+     * One 25-second snippet re-issued a refused `moveTo` 4014 times — ~160
+     * requests a second through the module's bridge for a planning verdict about
+     * a destination and a position that had not changed. The repeat inside the
+     * memo window is answered from the refusal the server already gave.
+     */
+    const dispatches = (stub: { actions: { action: string }[] }): number =>
+      stub.actions.filter((a) => a.action === "move_to").length;
+
+    /** Where the state cache says the character is; a walk moves it. */
+    const walked = (seq: number): string =>
+      JSON.stringify({ ...moveProgress, seq, data: { moveId: 9, pos: { x: -1190, y: 981, z: 42, o: 1.2 } } });
+
+    async function refused(
+      client: Awaited<ReturnType<typeof connect>>,
+      stub: ReturnType<typeof startStub>,
+      point: { x: number; y: number; z: number },
+      status: string,
+      moveId: number,
+      seq: number,
+    ) {
+      const pending = client.moveTo(point, { timeout: 2000 });
+      stub.push(JSON.stringify(moveResult(status, moveId, seq)));
+      return pending;
+    }
+
+    async function session() {
+      const stub = startStub({ onConnect: () => frames(loginSequence) });
+      const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+      await client.createSession({ character: "Fenwick" });
+      return { stub, client, done: async () => { client.close(); await stub.stop(); } };
+    }
+
+    test("the same refused destination, repeated at once, is one request and the same verdict", async () => {
+      const { stub, client, done } = await session();
+      const point = { x: 1, y: 2, z: 3 };
+      const first = await refused(client, stub, point, "drop", 1, 30);
+      expect(first.status).toBe("drop");
+
+      // What the loop did: the same call again, and again, with nothing to
+      // answer it on the stream.
+      const repeats = [await client.moveTo(point), await client.moveTo({ ...point })];
+      for (const r of repeats) expect(r).toEqual(first);
+      expect(dispatches(stub)).toBe(1);
+
+      // The hint tally still counts calls, not dispatches: the model is told
+      // about every refusal it asked for, exactly as before.
+      const drained = client.drainActionHints();
+      expect(drained).toHaveLength(1);
+      expect(drained[0]?.status).toBe("drop");
+      expect(drained[0]?.count).toBe(3);
+      await done();
+    });
+
+    test("every status where nothing moved is remembered; one where something did is not", async () => {
+      for (const status of ["too_far", "no_mesh", "target_off_mesh", "start_off_mesh", "path_incomplete", "drop"] as const) {
+        const { stub, client, done } = await session();
+        await refused(client, stub, { x: 1, y: 2, z: 3 }, status, 1, 30);
+        await client.moveTo({ x: 1, y: 2, z: 3 });
+        expect(dispatches(stub)).toBe(1);
+        await done();
+      }
+      // `interrupted` is a move that started and stopped, not a refusal: the
+      // character is somewhere new and the question is open again.
+      for (const status of ["interrupted", "stopped", "superseded", "arrived"] as const) {
+        const { stub, client, done } = await session();
+        await refused(client, stub, { x: 1, y: 2, z: 3 }, status, 1, 30);
+        const again = refused(client, stub, { x: 1, y: 2, z: 3 }, status, 2, 31);
+        expect((await again).status).toBe(status);
+        expect(dispatches(stub)).toBe(2);
+        await done();
+      }
+    });
+
+    test("a different destination, a character that moved, or a later retry all go to the wire", async () => {
+      const { stub, client, done } = await session();
+      await refused(client, stub, { x: 1, y: 2, z: 3 }, "drop", 1, 30);
+
+      // A destination a yard away is a different question.
+      expect((await refused(client, stub, { x: 2, y: 2, z: 3 }, "drop", 2, 31)).status).toBe("drop");
+      expect(dispatches(stub)).toBe(2);
+
+      // The character walked: the refusal was about where it was standing.
+      stub.push(walked(32));
+      await client.events.waitForOpcode("WB_MOVE_PROGRESS", { timeout: 2000 });
+      expect((await refused(client, stub, { x: 2, y: 2, z: 3 }, "drop", 3, 33)).status).toBe("drop");
+      expect(dispatches(stub)).toBe(3);
+
+      // And the window is short: after it, the question is asked again.
+      await Bun.sleep(300);
+      expect((await refused(client, stub, { x: 2, y: 2, z: 3 }, "drop", 4, 34)).status).toBe("drop");
+      expect(dispatches(stub)).toBe(4);
+      await done();
+    });
+
+    test("a dispatched move by any route clears the memory", async () => {
+      const { stub, client, done } = await session();
+      const point = { x: 1, y: 2, z: 3 };
+      await refused(client, stub, point, "start_off_mesh", 1, 30);
+      // The async sibling cannot be answered from memory — its `moveId` is the
+      // module's to mint — so it dispatches, and what it dispatched is now the
+      // live move.
+      await client.moveToAsync(point);
+      expect((await refused(client, stub, point, "start_off_mesh", 3, 31)).status).toBe("start_off_mesh");
+      expect(dispatches(stub)).toBe(3);
+      await done();
+    });
+  });
+
   test("hint-bearing failures are tallied per status on the client's own channel and drained once", async () => {
     // The hint rides inside the result object, so a snippet that keeps only
     // `.status` never shows it to the model (run a11: 41 `too_far`, hint read 0
@@ -426,7 +536,7 @@ describe("client: movement", () => {
   });
 
   test("each typed failure carries its own recovery hint; path_incomplete carries reachedPos", async () => {
-    // FOLLOW-UPS 38 N1: the module now names the cause, so the hint is only
+    // The module now names the cause, so the hint is only
     // the recovery that follows from it.
     const stub = startStub({ onConnect: () => frames(loginSequence) });
     const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
@@ -441,7 +551,9 @@ describe("client: movement", () => {
     expect(r1.hint).toContain("not on walkable ground");
     expect(r1.reachedPos).toBeUndefined();
 
-    const p2 = client.moveTo({ x: 10, y: 20, z: 30 }, { timeout: 2000 });
+    // A destination of its own per status: a repeat of a refused one inside the
+    // memo window is answered from the refusal already given, not the wire.
+    const p2 = client.moveTo({ x: 11, y: 20, z: 30 }, { timeout: 2000 });
     const partial = moveResult("path_incomplete", 2, 31) as { data: Record<string, unknown> };
     partial.data.reachedPos = { x: 5, y: 6, z: 7 };
     stub.push(JSON.stringify(partial));
@@ -451,13 +563,13 @@ describe("client: movement", () => {
     expect(r2.reachedPos).toEqual({ x: 5, y: 6, z: 7 });
     expect(r2.hint).toContain("ends at (5.0, 6.0)");
 
-    const p3 = client.moveTo({ x: 10, y: 20, z: 30 }, { timeout: 2000 });
+    const p3 = client.moveTo({ x: 12, y: 20, z: 30 }, { timeout: 2000 });
     stub.push(JSON.stringify(moveResult("no_mesh", 3, 32)));
     const r3 = await p3;
     if (r3.ok) throw new Error("unreachable");
     expect(r3.hint).toContain("harness data limitation");
 
-    const p4 = client.moveTo({ x: 10, y: 20, z: 30 }, { timeout: 2000 });
+    const p4 = client.moveTo({ x: 13, y: 20, z: 30 }, { timeout: 2000 });
     stub.push(JSON.stringify(moveResult("start_off_mesh", 4, 33)));
     const r4 = await p4;
     if (r4.ok) throw new Error("unreachable");
@@ -627,7 +739,7 @@ describe("client: movement", () => {
   });
 
   test("transferred resolves on SMSG_NEW_WORLD, even one that landed before the move result", async () => {
-    // FOLLOW-UPS 38 N1: the postcondition is the server naming the new map,
+    // The postcondition is the server naming the new map,
     // never the dispatch. The server sends NEW_WORLD in the tick the portal
     // fires; the module's `transferred` result follows on the next world tick.
     const stub = startStub({ onConnect: () => frames(loginSequence) });
@@ -652,7 +764,7 @@ describe("client: movement", () => {
   });
 
   test("teleported (same-map port) resolves on the own-guid MSG_MOVE_TELEPORT_ACK, never waits for NEW_WORLD", async () => {
-    // item 46: a Hearthstone mid-move used to answer `transferred`, and
+    // a Hearthstone mid-move used to answer `transferred`, and
     // moveTo then waited 90s for an SMSG_NEW_WORLD that never comes on a
     // same-map port. The module now says `teleported`, and the arrival point
     // is the server's own teleport ack, sent before the result.
@@ -816,7 +928,7 @@ describe("client: movement", () => {
   test("a relog cannot resolve a moveTo against the previous session's stale result", async () => {
     // The module's moveId generator is per-session and restarts when the
     // session is recreated, so after a relog a fresh ack can reuse a moveId
-    // that a stale buffered result still carries (FOLLOW-UPS item 14: probes
+    // that a stale buffered result still carries (probes
     // with 8s timeouts "resolved" in 59ms against pre-relog payloads). The
     // stub pins moveId 1 on every ack to force exactly that collision.
     const stub = startStub({
@@ -1211,7 +1323,7 @@ describe("client: killTarget", () => {
     await stub.stop();
   });
 
-  test("a UnitView from state.units(...) can be passed straight in (item 3b)", async () => {
+  test("a UnitView from state.units(...) can be passed straight in", async () => {
     const stub = startStub({ onConnect: () => combatWorld() });
     const client = await inWorld(stub);
     const unit = client.state.units().find((u) => u.guid === CREATURE_GUID)!;
@@ -2145,7 +2257,7 @@ describe("client: equipItem", () => {
     const pending = client.equipItem(255, BACKPACK_SLOT, { timeout: 2000 });
     await untilAction(stub, "equip_item");
     // 60 is EQUIP_ERR_NOT_IN_COMBAT — the code a run reverse-engineered from
-    // context because nothing ever named it (item 101a).
+    // context because nothing ever named it.
     stub.push(JSON.stringify(inventoryChangeFailure(78, 60)));
     const result = await pending;
     if (result.ok || result.status !== "not_equipped") throw new Error("unreachable");
@@ -2290,7 +2402,7 @@ describe("guids are opaque decimal strings: guid arguments at the client surface
   });
 });
 
-describe("client: flight master window and activateTaxi (item 38 N3)", () => {
+describe("client: flight master window and activateTaxi", () => {
   const TS = 1_700_000_000_000;
   const menu = (seq: number, withTaxi = true): string =>
     JSON.stringify({
@@ -2430,7 +2542,7 @@ describe("client: flight master window and activateTaxi (item 38 N3)", () => {
   });
 });
 
-describe("client: bindAtInnkeeper (item 38 N2)", () => {
+describe("client: bindAtInnkeeper", () => {
   const TS = 1_700_000_000_000;
   const menu = (seq: number): string =>
     JSON.stringify({
@@ -2501,7 +2613,7 @@ describe("client: bindAtInnkeeper (item 38 N2)", () => {
   });
 });
 
-describe("client: gossipSelect by observed option text (item 3c)", () => {
+describe("client: gossipSelect by observed option text", () => {
   const gossipMenu = (seq: number): string =>
     JSON.stringify({
       seq,
@@ -2777,7 +2889,7 @@ describe("client: questgiver status and quest query, issued the way a client doe
   });
 });
 
-describe("client: talents and the raw escape hatch (item 39)", () => {
+describe("client: talents and the raw escape hatch", () => {
   const talentsInfo = (seq: number, talents: { talentId: number; rank: number }[], unspent = 0) =>
     JSON.stringify({
       seq,
@@ -3257,7 +3369,7 @@ describe("client: moveTo target resolution", () => {
   });
 });
 
-describe("client: queryTalentTree and resetTalents (item 96)", () => {
+describe("client: queryTalentTree and resetTalents", () => {
   const TS = 1_700_000_000_000;
   const tree = (seq: number): string =>
     JSON.stringify({
@@ -3368,7 +3480,7 @@ describe("client: queryTalentTree and resetTalents (item 96)", () => {
   });
 });
 
-describe("client: pet, group, mail and bank helpers (items 98 and 100)", () => {
+describe("client: pet, group, mail and bank helpers", () => {
   const TS = 1_700_000_000_000;
   const PET_GUID = "17365880163140632999";
   const frame = (seq: number, opcode: string, data: unknown): string => JSON.stringify({ seq, opcode, opcodeId: 0x100, ts: TS + seq, data });
@@ -3526,6 +3638,32 @@ describe("client: pet, group, mail and bank helpers (items 98 and 100)", () => {
     expect(stub.actions[at]).toMatchObject({ opcode: "CMSG_AUTOSTORE_BANK_ITEM", payload: "ff27" });
     stub.push(frame(532, "SMSG_INVENTORY_CHANGE_FAILURE", { result: 4 }));
     expect(await withdraw).toMatchObject({ ok: false, status: "refused", result: 4 });
+    client.close();
+    await stub.stop();
+  });
+
+  test("another item's refusal does not settle a bank move", async () => {
+    const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate, creatureCreate, creatureQuery, inventorySlot, itemCreate, itemQuery]) });
+    const client = await inWorld(stub);
+    await client.events.waitForOpcode("SMSG_ITEM_QUERY_SINGLE_RESPONSE", { timeout: 2000 });
+    const open = client.openBank(CREATURE_GUID, { timeout: 2000 });
+    let at = await untilAction(stub, "raw");
+    stub.push(frame(540, "SMSG_SHOW_BANK", { guid: CREATURE_GUID }));
+    await open;
+
+    const deposit = client.bankDeposit(255, BACKPACK_SLOT, { timeout: 2000 });
+    at = await untilAction(stub, "raw", at + 1);
+    expect(stub.actions[at]).toMatchObject({ opcode: "CMSG_AUTOBANK_ITEM" });
+    // A background loot's bag-full names a different item guid: not our answer,
+    // so the wait falls through to where the item actually landed.
+    stub.push(frame(541, "SMSG_INVENTORY_CHANGE_FAILURE", { result: 50, itemGuid: "12345" }));
+    stub.push(
+      frame(542, "SMSG_UPDATE_OBJECT", {
+        blocks: 1,
+        objects: [{ update: "values", guid: SELF_GUID, fields: { [`invSlot${BACKPACK_SLOT}Lo`]: 0, [`invSlot${BACKPACK_SLOT}Hi`]: 0, invSlot39Lo: ITEM_GUID_LO, invSlot39Hi: ITEM_GUID_HI } }],
+      }),
+    );
+    expect(await deposit).toMatchObject({ ok: true, status: "moved", bag: 255, slot: 39, guid: ITEM_GUID });
     client.close();
     await stub.stop();
   });
@@ -3987,7 +4125,7 @@ describe("client: quest-start items and the questgiver marker pre-check (2026-08
   });
 });
 
-describe("connect() closes the stream it fails to open (FOLLOW-UPS 114)", () => {
+describe("connect() closes the stream it fails to open", () => {
   /**
    * A socket that always refuses, the way a refused TCP connect or a rejected
    * upgrade arrives. Every instance is one attempt of the reconnect ladder, so

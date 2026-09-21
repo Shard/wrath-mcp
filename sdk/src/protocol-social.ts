@@ -1,6 +1,6 @@
 /**
  * Wire protocol of the shared social surface: pets, group, mail, bank, trade,
- * group loot rolls and item text (items 98, 100, 102, 103).
+ * group loot rolls and item text.
  *
  * Split out of `protocol.ts` along the banners the two files already shared;
  * the same seam splits `state.ts` / `state-social.ts` and the two stay paired.
@@ -17,7 +17,7 @@ import { z } from "zod";
 
 import { guidSchema } from "./guid";
 
-// ------------------------------------------------------------------ pets (item 98)
+// ------------------------------------------------------------------ pets
 
 /** One button of the pet action bar as `SMSG_PET_SPELLS` carries it. */
 export const petActionBarButtonSchema = z.looseObject({
@@ -95,7 +95,7 @@ export type PetNameQueryResponseData = z.infer<typeof petNameQueryResponseDataSc
 export const petNameInvalidDataSchema = z.looseObject({ reason: z.number(), name: z.string() });
 export type PetNameInvalidData = z.infer<typeof petNameInvalidDataSchema>;
 
-// ----------------------------------------------------------------- group (item 100)
+// ----------------------------------------------------------------- group
 
 /** `SMSG_GROUP_INVITE`: `canAccept` true is an invitation from `inviterName`; false is the "already grouped" notice. */
 export const groupInviteDataSchema = z.looseObject({ canAccept: z.boolean(), inviterName: z.string() });
@@ -149,7 +149,7 @@ export const groupListDataSchema = z.looseObject({
 });
 export type GroupListData = z.infer<typeof groupListDataSchema>;
 
-// ------------------------------------------------------------------ mail (item 100)
+// ------------------------------------------------------------------ mail
 
 /** `SMSG_SHOW_MAILBOX` / `SMSG_SHOW_BANK`: the frame opened for this guid. */
 export const showFrameDataSchema = z.looseObject({ guid: guidSchema });
@@ -211,7 +211,7 @@ export type MailListResultData = z.infer<typeof mailListResultDataSchema>;
 export const buyBankSlotResultDataSchema = z.looseObject({ result: z.number() });
 export type BuyBankSlotResultData = z.infer<typeof buyBankSlotResultDataSchema>;
 
-// ----------------------------------------------------------------- trade (item 100)
+// ----------------------------------------------------------------- trade
 
 /** `SMSG_TRADE_STATUS`: a `TradeStatus` code (`tradeStatusText` names them) with the fields that status carries. */
 export const tradeStatusDataSchema = z.looseObject({
@@ -268,8 +268,7 @@ export type ItemSpell = z.infer<typeof itemSpellSchema>;
 
 /**
  * `SMSG_ITEM_QUERY_SINGLE_RESPONSE`: the item template as the tooltip shows
- * it. Everything past `subClass` was added 2026-08-29 (item 97) and is
- * absent from older modules' events.
+ * it. Everything past `subClass` is absent from older modules' events.
  */
 export const itemQueryResponseDataSchema = z.looseObject({
   itemId: z.number(),
@@ -302,14 +301,14 @@ export const itemQueryResponseDataSchema = z.looseObject({
   bonding: z.number().optional(),
   description: z.string().optional(),
   startQuest: z.number().optional(),
-  /** The item's first page (PageText id) when it can be read; absent otherwise. Item 103. */
+  /** The item's first page (PageText id) when it can be read; absent otherwise. */
   pageText: z.number().optional(),
   block: z.number().optional(),
   maxDurability: z.number().optional(),
 });
 export type ItemQueryResponseData = z.infer<typeof itemQueryResponseDataSchema>;
 
-// ------------------------------------------------------ group loot rolls (item 102)
+// ------------------------------------------------------ group loot rolls
 
 /**
  * `SMSG_LOOT_START_ROLL`: a roll frame opened for one over-threshold item on
@@ -367,7 +366,7 @@ export const lootMasterListDataSchema = z.looseObject({
 });
 export type LootMasterListData = z.infer<typeof lootMasterListDataSchema>;
 
-// ------------------------------------------------------------ item text (item 103)
+// ------------------------------------------------------------ item text
 
 /** `SMSG_READ_ITEM_OK` / `SMSG_READ_ITEM_FAILED`: the item a `CMSG_READ_ITEM` named. */
 export const readItemDataSchema = z.looseObject({ guid: guidSchema });

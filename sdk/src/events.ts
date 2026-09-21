@@ -276,10 +276,10 @@ export class EventStream implements AsyncIterable<StreamEvent> {
 
   /**
    * Resolves once the socket is open. Rejects only when the stream cannot get
-   * there on its own: `close()` was called, reconnect is disabled and the
-   * attempt failed, or the server stayed unreachable through a whole climb of
-   * the backoff ladder (every growing rung, so ~8s of immediate refusals or up
-   * to ~38s of stalled handshakes with the defaults).
+   * there on its own: reconnect is disabled and the attempt failed, or the
+   * server stayed unreachable through a whole climb of the backoff ladder
+   * (every growing rung, so ~8s of immediate refusals or up to ~38s of stalled
+   * handshakes with the defaults).
    *
    * The promise tracks the *stream*, not one attempt: a first handshake that
    * stalls in a loaded container fails its attempt, the ladder retries, and the
@@ -287,9 +287,25 @@ export class EventStream implements AsyncIterable<StreamEvent> {
    * `connect()` joins an attempt or pending retry rather than opening a second
    * socket — so calling it again after a rejection is safe and, if the ladder
    * has since brought the stream back, resolves at once.
+   *
+   * A `connect()` after `close()` reopens the stream. A real client that hangs
+   * up can dial again, and the alternative was worse: a snippet that closed
+   * this stream (a cleanup loop calling `.close()` on everything closable) left
+   * a stream whose `connect()` could only ever reject, so the caller's only
+   * honest option was to stop observing for the rest of the run. The reopen
+   * carries the ladder's own continuity: `expectedSeq` survives the close, so
+   * whatever the module emitted while the socket was down shows up as one
+   * `stream_gap` — never a replay, never a silent skip. Two things the close
+   * really did end stay ended, because they were the caller's to end: the
+   * `waitFor`s it rejected, and the async iterators it finished.
    */
   connect(): Promise<void> {
-    if (this.closedByUser) return Promise.reject(new EventStreamClosedError());
+    // The deliberate reopen: the close is no longer in force, and the next
+    // failure ladder starts from its first rung rather than the cap.
+    if (this.closedByUser) {
+      this.closedByUser = false;
+      this.attempt = 0;
+    }
     if (this.connected) return Promise.resolve();
     return new Promise<void>((resolve, reject) => {
       this.connectWaiters.add({ resolve, reject, failures: 0 });
@@ -331,6 +347,11 @@ export class EventStream implements AsyncIterable<StreamEvent> {
     this.epochCounter++;
   }
 
+  /**
+   * Stop observing: the socket goes, the ladder stops, and the waits and
+   * iterators this stream was serving are settled. Not terminal — `connect()`
+   * reopens it, keeping the gap accounting (see `connect`).
+   */
   close(): void {
     this.closedByUser = true;
     // Before the socket goes: a fake that dispatches `close` synchronously would
@@ -413,8 +434,14 @@ export class EventStream implements AsyncIterable<StreamEvent> {
     ws.addEventListener("message", (ev: MessageEvent) => {
       this.ingest(typeof ev.data === "string" ? ev.data : String(ev.data));
     });
+    // A socket this stream has already let go of — `close()` dropped it, and a
+    // reopen may since have started a fresh attempt. Its error and its close
+    // are not news: counting them would fail somebody else's attempt, and
+    // clearing the open deadline would clear the live socket's.
+    const abandoned = (): boolean => this.socket !== ws && !timedOut;
+
     ws.addEventListener("error", () => {
-      if (timedOut) return;
+      if (timedOut || abandoned()) return;
       this.clearOpenTimer();
       if (!settled) {
         settled = true;
@@ -422,9 +449,9 @@ export class EventStream implements AsyncIterable<StreamEvent> {
       }
     });
     ws.addEventListener("close", () => {
-      if (timedOut) return;
+      if (timedOut || abandoned()) return;
       this.clearOpenTimer();
-      if (this.socket === ws) this.socket = undefined;
+      this.socket = undefined;
       if (!settled) {
         settled = true;
         this.attemptFailed(new EventStreamClosedError(`connection to ${this.url} closed before open`));

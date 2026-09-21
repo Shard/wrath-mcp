@@ -215,7 +215,7 @@ namespace WrathBench
         if (PortSecret().size() < 32)
         {
             LOG_ERROR("module", "wrathbench: WrathBench.Secret (AC_WRATH_BENCH_SECRET) is unset or shorter than 32 characters; "
-                "the HTTP/WS control surface is NOT listening. Set WRATHBENCH_MODULE_SECRET in .env (docs/OPERATIONS.md, Secrets).");
+                "the HTTP/WS control surface is NOT listening. Set WRATHBENCH_MODULE_SECRET in .env (docs/RUNBOOK.md, Secrets).");
             return;
         }
 
@@ -587,7 +587,7 @@ namespace WrathBench
         if (token.empty())
             return {400, Json::Writer().Add("ok", false).Add("error", "missing_token").Str()};
 
-        // Minimum-length gate (FOLLOW-UPS 19). The token is no longer the
+        // Minimum-length gate. The token is no longer the
         // credential — the lease secret is (PROTOCOL.md, "Authentication") —
         // but it is still the key every session, audit file and event stream
         // is addressed by, so a guessable one still lets an operator-class
@@ -730,7 +730,7 @@ namespace WrathBench
         { "CMSG_GROUP_DISBAND", CMSG_GROUP_DISBAND },
         { "CMSG_GROUP_SET_LEADER", CMSG_GROUP_SET_LEADER },
         { "CMSG_LOOT_METHOD", CMSG_LOOT_METHOD },
-        // group loot roll (item 102): the need/greed/pass/disenchant
+        // group loot roll: the need/greed/pass/disenchant
         // button on the roll frame SMSG_LOOT_START_ROLL opened (body u64 roll
         // guid, u32 slot, u8 vote); the SDK's lootRoll builds it
         { "CMSG_LOOT_ROLL", CMSG_LOOT_ROLL },
@@ -745,7 +745,7 @@ namespace WrathBench
         { "CMSG_SET_TRADE_ITEM", CMSG_SET_TRADE_ITEM },
         { "CMSG_CLEAR_TRADE_ITEM", CMSG_CLEAR_TRADE_ITEM },
         { "CMSG_SET_TRADE_GOLD", CMSG_SET_TRADE_GOLD },
-        // pet control (item 98): the pet action bar's buttons
+        // pet control: the pet action bar's buttons
         // (CMSG_PET_ACTION carries a command, a react state or a spell), a
         // direct pet cast, the bar edits, and the queries a client fires on
         // its own (name by pet number, the bar on demand)
@@ -766,7 +766,7 @@ namespace WrathBench
         { "CMSG_ITEM_QUERY_SINGLE", CMSG_ITEM_QUERY_SINGLE },
         { "CMSG_NPC_TEXT_QUERY", CMSG_NPC_TEXT_QUERY },
         { "CMSG_PAGE_TEXT_QUERY", CMSG_PAGE_TEXT_QUERY },
-        // player-written item text — a mailed letter (item 103; body u64 item guid)
+        // player-written item text — a mailed letter (body u64 item guid)
         { "CMSG_ITEM_TEXT_QUERY", CMSG_ITEM_TEXT_QUERY },
         { "CMSG_PLAYED_TIME", CMSG_PLAYED_TIME },
         { "CMSG_QUERY_TIME", CMSG_QUERY_TIME },
@@ -988,8 +988,8 @@ namespace WrathBench
         std::string account = req.GetString("account", DefaultAccount());
 
         // Minimal ownership gate for the current per-run account scheme
-        // (item 14; per-character credentials are the real Phase-1 fix,
-        // item 10). Deletes are only served for accounts on the
+        // (per-character credentials are the real Phase-1 fix,
+        // . Deletes are only served for accounts on the
         // configured allowlist (WrathBench.Accounts), and never while another
         // token holds a live bench session on the account — an unauthenticated
         // caller must not be able to delete a character out from under a
@@ -1360,7 +1360,7 @@ namespace WrathBench
     // clock doubles as the "client" clock; CMSG_TIME_SYNC_RESP below keeps the
     // session's clock delta near zero so these timestamps are accepted. When
     // the point is on a transport the packet says so the way a client's would:
-    // the server then carries the character as a passenger (FOLLOW-UPS 38 N1).
+    // the server then carries the character as a passenger.
     static void SendMovePacket(BenchSession& s, Player* player, uint16 opcode, uint32 moveFlags,
         float x, float y, float z, float o, Transport* transport = nullptr)
     {
@@ -1575,7 +1575,7 @@ namespace WrathBench
         return r;
     }
 
-    // The z-ladder in front of the cause ladder (item 46 part 3). A unit
+    // The z-ladder in front of the cause ladder (part 3). A unit
     // target's z comes from the unit's own movement packets, and a patrolling or
     // sloped NPC's z can sit outside the core's default poly-search extents
     // while the ground under it is perfectly walkable ("Ironforge Mountaineer"
@@ -1679,8 +1679,8 @@ namespace WrathBench
             // A client whose run is redirected stops first: without this the
             // server's last movement word stays MOVEMENTFLAG_FORWARD when the
             // new request fails at planning, isMoving() stays true and every
-            // later cast fails SPELL_FAILED_MOVING (item 46 part 3,
-            // ~10 minutes of Hearthstone casts in nav-probe c3).
+            // later cast fails SPELL_FAILED_MOVING (~10 minutes of
+            // Hearthstone casts in nav-probe c3).
             MoveState& old = s->move;
             SendMovePacket(*s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, old.curX, old.curY, old.curZ, old.curO,
                 FindTransportAt(player->GetMap(), old.curX, old.curY, old.curZ));
@@ -1715,7 +1715,7 @@ namespace WrathBench
 
         // Resolve the request against the server's mmaps (the one sanctioned
         // navmesh use, docs/CONTRACTS.md "Pathing") into either a walkable
-        // polyline or one typed cause. FOLLOW-UPS item 38 N1: the old single
+        // polyline or one typed cause: the old single
         // `no_path` hid four different failures, and one of them (a 3D endpoint
         // check against a request whose z was merely stale) was self-inflicted.
         // Transports have no navmesh: a client walks straight onto (or off) a
@@ -2809,9 +2809,9 @@ namespace WrathBench
         // A map transfer or a teleport ends the move: the server discards
         // every movement opcode until the ack (TickTeleportAcks) and applies the
         // destination itself. `transferred` rather than `interrupted`, so the
-        // agent knows a portal took it (FOLLOW-UPS 38 N1); the SDK then waits
+        // agent knows a portal took it; the SDK then waits
         // for SMSG_NEW_WORLD and resolves on the new map. A same-map teleport
-        // (Hearthstone, graveyard port) is `teleported` (item 46): no
+        // (Hearthstone, graveyard port) is `teleported`: no
         // map change is coming. The 15y desync guard
         // below must not run here: the far-teleport position jump would race it.
         if (s.pendingTransferMap.load() != 0 || player->IsBeingTeleportedFar())
@@ -2848,7 +2848,7 @@ namespace WrathBench
         // Dying mid-run stops the move — but only while the body is still on
         // the ground. A released spirit (ghost flag) can and must move: the
         // corpse run is the normal 3.3.5a death recovery. Conflating the two
-        // death states made every corpse run impossible (FOLLOW-UPS item 14).
+        // death states made every corpse run impossible.
         if (!player->IsAlive() && !player->HasPlayerFlag(PLAYER_FLAGS_GHOST))
         {
             SendMovePacket(s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE,
@@ -2878,8 +2878,8 @@ namespace WrathBench
             // this loop without ever advancing `seg` — so the geometric-end
             // check below never fired, no MSG_MOVE_STOP was sent, and the
             // move heartbeated in place forever with no WB_MOVE_RESULT
-            // (module-navigation step 5 on the harness-0.4 smoke shape,
-            // 2026-08-23: walk home, off-mesh, too_far, then "walk home" again).
+            // (module-navigation step 5 of the smoke shape: walk home,
+            // off-mesh, too_far, then "walk home" again).
             if (segLen <= 0.0001f)
             {
                 ++m.seg;
@@ -3092,7 +3092,7 @@ namespace WrathBench
     // opcodes (HandleMovementOpcodes: IsBeingTeleported -> ignore) and the
     // destination is never applied, so a session that never acks is wedged at
     // its pre-teleport position forever — repop's graveyard teleport was the
-    // observed case (docs/FOLLOW-UPS.md item 14). The parked client has no
+    // observed case. The parked client has no
     // loading screen, so the module acks on the next world tick, through the
     // same handlers a real client's packets would hit. Like the
     // CMSG_TIME_SYNC_RESP answer in the tap, this is module-internal client
@@ -3150,7 +3150,7 @@ namespace WrathBench
     // teleport lands), and draws the answer as the corpse marker on its map.
     // The parked client has no map, so the module issues the same one-shot
     // query and the tapped MSG_CORPSE_QUERY reply is served as an event
-    // (PROTOCOL.md "Death"; item 53). Client behaviour, not an agent
+    // (PROTOCOL.md "Death"). Client behaviour, not an agent
     // action: nothing here resurrects or moves anyone, and the handler answers
     // from the corpse the player already owns. Waiting for the teleport to be
     // acked matters: the handler compares the corpse map to the player's map,
@@ -3318,7 +3318,7 @@ namespace WrathBench
                     {
                         uint64_t matchGuid = FindCharInEnum(packet, s->charName);
                         if (matchGuid == 0)
-                            FailAck(*s, "character_not_found");
+                            FailAck(*s, "character_not_found", 400);
                         else
                         {
                             s->targetGuidRaw = matchGuid;
@@ -3440,7 +3440,7 @@ namespace WrathBench
             s->dropCount.fetch_add(1);
             _totalDrops.fetch_add(1);
             // Per-opcode histogram for the whitelist-expansion census
-            // (PHASE-0). Relaxed atomic add: this is the hot path, fired for
+            // Relaxed atomic add: this is the hot path, fired for
             // every non-whitelisted packet on world and map threads.
             if (opcode < kOpcodeSpace)
                 _dropsByOpcode[opcode].fetch_add(1, std::memory_order_relaxed);
@@ -3687,7 +3687,7 @@ namespace WrathBench
     // is not served (caller has already consumed the value).
     // A u64 update field arrives as two u32 halves under consecutive
     // indices; the halves are collected here and joined into one guid
-    // string after the block (targetGuid and, since item 98, the
+    // string after the block (targetGuid and, since, the
     // owner fields a client reads a pet's master off).
     struct GuidHalves
     {
@@ -3776,7 +3776,7 @@ namespace WrathBench
                 // the number on the talent frame; SMSG_TALENTS_INFO carries the
                 // same figure.
                 if (index == PLAYER_CHARACTER_POINTS1) { f.Add("talentPoints", v); return true; }
-                // Skills (item 95): 128 lines x 3 packed u32s, PRIVATE
+                // Skills: 128 lines x 3 packed u32s, PRIVATE
                 // to self. Served raw per field the way the quest log is, plus
                 // the client's SkillLine.dbc name beside each id so the SDK
                 // needs no table. The SDK's fold keeps only numbers in
@@ -3818,7 +3818,7 @@ namespace WrathBench
                 // keyed by inventory slot (0-22 equipment+bags, 23-38 backpack,
                 // 39-66 bank, 67-73 bank bags — the core's slot numbering, the
                 // fields are contiguous). Halves stay u32 JSON numbers; the
-                // SDK joins them into guids. Bank slots since item 100.
+                // SDK joins them into guids. Bank slots since.
                 if (index >= PLAYER_FIELD_INV_SLOT_HEAD && index < PLAYER_FIELD_BANKBAG_SLOT_1 + 14)
                 {
                     uint32 rel = index - PLAYER_FIELD_INV_SLOT_HEAD;
@@ -3841,7 +3841,7 @@ namespace WrathBench
             if (index == ITEM_FIELD_OWNER + 1)     { f.Add("ownerHi", v); return true; }
             if (index == ITEM_FIELD_CONTAINED)     { f.Add("containedLo", v); return true; }
             if (index == ITEM_FIELD_CONTAINED + 1) { f.Add("containedHi", v); return true; }
-            // Worn-bag contents (item 50): a container's slot guids as
+            // Worn-bag contents: a container's slot guids as
             // lo/hi u32 halves keyed by bag slot 0-35, plus its slot count.
             // PUBLIC fields every client in range receives; same idiom as
             // the player's invSlot<n>. The SDK joins halves into guids.
@@ -3918,7 +3918,7 @@ namespace WrathBench
         std::vector<uint64_t> nameQueries;
         std::vector<uint32_t> itemQueries;
         // (petNumber, guid): a client asks a pet's given name once per pet
-        // number it sees (item 98); the answer is SMSG_PET_NAME_QUERY_RESPONSE.
+        // number it sees; the answer is SMSG_PET_NAME_QUERY_RESPONSE.
         std::vector<std::pair<uint32, uint64_t>> petNameQueries;
 
         Json::Writer top;
@@ -4334,7 +4334,7 @@ namespace WrathBench
                 // the arrival point, which the server relocated to before
                 // building the MovementInfo. One u32 movement-order counter
                 // sits between the packGUID and the MovementInfo; otherwise the
-                // shape is the observed-movement one (item 46).
+                // shape is the observed-movement one.
                 case MSG_MOVE_TELEPORT_ACK:
                 {
                     name = MoveOpcodeName(opcode);
@@ -4849,7 +4849,7 @@ namespace WrathBench
                     break;
                 }
                 // ------------------------------------------------- pets
-                // (item 98). Everything below is what the client's pet
+                //. Everything below is what the client's pet
                 // frame is drawn from; spell ids carry their Spell.dbc name
                 // the way the spellbook rows do.
                 case SMSG_PET_SPELLS:
@@ -4980,7 +4980,7 @@ namespace WrathBench
                     break;
                 }
                 // ------------------------------------------------ group
-                // (item 100). Group::SendUpdateToPlayer and the
+                //. Group::SendUpdateToPlayer and the
                 // GroupHandler replies; codes are the core's PartyResult /
                 // PartyOperation, named by the SDK.
                 case SMSG_GROUP_INVITE:
@@ -5074,7 +5074,7 @@ namespace WrathBench
                     break;
                 }
                 // ------------------------------------------------- mail
-                // (item 100). MailHandler / Player::SendMailResult.
+                //. MailHandler / Player::SendMailResult.
                 case SMSG_SHOW_MAILBOX:
                 {
                     // WorldSession::SendShowMailBox: u64 mailbox guid — the
@@ -5165,7 +5165,7 @@ namespace WrathBench
                     break;
                 }
                 // ------------------------------------------------- bank
-                // (item 100). The slots themselves are the PLAYER_FIELD_
+                //. The slots themselves are the PLAYER_FIELD_
                 // BANK_SLOT_1 / BANKBAG_SLOT_1 update fields (invSlot39-73).
                 case SMSG_SHOW_BANK:
                 {
@@ -5187,7 +5187,7 @@ namespace WrathBench
                     break;
                 }
                 // ------------------------------------------------ trade
-                // (item 100). TradeHandler.
+                //. TradeHandler.
                 case SMSG_TRADE_STATUS:
                 {
                     // WorldSession::SendTradeStatus: u32 TradeStatus, then per
@@ -5694,7 +5694,7 @@ namespace WrathBench
                     break;
                 }
                 // ------------------------------------------- group loot rolls
-                // (item 102). Group::SendLootStartRoll and friends: a
+                //. Group::SendLootStartRoll and friends: a
                 // roll is keyed by a fresh item guid the core mints for it
                 // (`rollGuid`), not by the loot slot alone.
                 case SMSG_LOOT_START_ROLL:
@@ -5770,7 +5770,7 @@ namespace WrathBench
                     break;
                 }
                 // ------------------------------------------------ item text
-                // (item 103). Two reading paths a client has: a book or
+                //. Two reading paths a client has: a book or
                 // letter with a PageText id (CMSG_READ_ITEM -> SMSG_READ_ITEM_OK
                 // -> the client's CMSG_PAGE_TEXT_QUERY on the template's page
                 // id -> one SMSG_PAGE_TEXT_QUERY_RESPONSE per page, the core
@@ -5997,7 +5997,7 @@ namespace WrathBench
                      .Add("buyPrice", buyPrice).Add("sellPrice", sellPrice)
                      .Add("itemLevel", itemLevel).Add("requiredLevel", reqLevel)
                      .Add("class", itemClass).Add("subClass", subClass);
-                    // The rest of the tooltip (item 97), in the order
+                    // The rest of the tooltip, in the order
                     // WorldSession::HandleItemQuerySingleOpcode writes it:
                     // requirements, stack/bag sizes, the stat list, two damage
                     // ranges, armor and six resistances, speed, five spell
@@ -6082,7 +6082,7 @@ namespace WrathBench
                     if (!description.empty()) w.Add("description", description);
                     if (startQuest) w.Add("startQuest", startQuest);
                     // PageText.dbc-shaped id of the item's first page: a book
-                    // or letter the client can read (item 103). 0 is
+                    // or letter the client can read. 0 is
                     // "nothing to read" and is not served.
                     if (pageText) w.Add("pageText", pageText);
                     if (block) w.Add("block", block);

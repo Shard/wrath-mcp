@@ -96,7 +96,6 @@ export {
   npcRolesOf,
   partyResultText,
   petFeedbackText,
-  rollChoiceName,
   ROLL_VOTE,
   petTameFailureText,
   pointOf,
@@ -193,7 +192,6 @@ export {
   MOVE_OPCODES,
   MOVE_STATUSES,
   parseEventFrame,
-  PROTOCOL_REVISION,
 } from "./protocol";
 export type {
   ActionRequest,

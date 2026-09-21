@@ -340,7 +340,7 @@ describe("state cache: self, from the wire", () => {
   });
 
   test("SMSG_NEW_WORLD moves self to the new map and evicts the old map's objects", () => {
-    // FOLLOW-UPS 38 N1: SMSG_LOGIN_VERIFY_WORLD is login-only, so before this
+    // SMSG_LOGIN_VERIFY_WORLD is login-only, so before this
     // a tram ride left self.position.map at the login map forever and the
     // Ironforge crowd lingered in `nearby` on map 369.
     const cache = StateCache.replay(
@@ -390,7 +390,7 @@ describe("state cache: self, from the wire", () => {
   });
 
   test("an own-guid MSG_MOVE_TELEPORT_ACK moves self, and the `teleported` result after it does not", () => {
-    // item 46: a same-map port sends no SMSG_NEW_WORLD; the server's
+    // a same-map port sends no SMSG_NEW_WORLD; the server's
     // teleport ack under our guid is the arrival point. The `teleported` move
     // result that follows carries the pre-teleport position and must not win.
     const cache = StateCache.replay(toEvents([...loginSequence, selfCreate, teleportAck(40)]), { seed: SEED });
@@ -701,6 +701,9 @@ describe("state cache: self progress, target and inventory", () => {
     expect(item?.itemId).toBe(ITEM_ENTRY);
     expect(item?.name).toBe("Gritstone Charm");
     expect(item?.stackCount).toBe(5);
+    // Quality rides the same leg of the join `name` does, as bag() rows already
+    // carry it: a paperdoll tints a slot by it.
+    expect(item?.quality).toBe(1);
     expect(cache.items.get(ITEM_ENTRY)?.value.sellPrice).toBe(40);
   });
 
@@ -710,6 +713,15 @@ describe("state cache: self progress, target and inventory", () => {
     expect(cache.inventory[0]?.guid).toBe(ITEM_GUID);
     expect(cache.inventory[0]?.itemId).toBeUndefined();
     expect(cache.inventory[0]?.name).toBeUndefined();
+    // Unanswered, not poor: quality 0 is a real quality.
+    expect(cache.inventory[0]?.quality).toBeUndefined();
+  });
+
+  test("an item whose create block arrived but whose query has not has no quality", () => {
+    const cache = withWorld([inventorySlot, itemCreate]);
+    expect(cache.inventory[0]?.itemId).toBe(ITEM_ENTRY);
+    expect(cache.inventory[0]?.name).toBeUndefined();
+    expect(cache.inventory[0]?.quality).toBeUndefined();
   });
 
   test("a map change evicts old-map objects but keeps own items", () => {
@@ -1364,7 +1376,7 @@ describe("state.closest(): criteria object or predicate", () => {
   });
 });
 
-describe("state cache: the gossip menu fold (item 3c)", () => {
+describe("state cache: the gossip menu fold", () => {
   const gossipMsg = (guid: string, seq: number) => ({
     seq,
     opcode: "SMSG_GOSSIP_MESSAGE",
@@ -1417,7 +1429,7 @@ describe("state cache: the gossip menu fold (item 3c)", () => {
   });
 });
 
-describe("state cache: vendor, trainer and loot windows (item 101b)", () => {
+describe("state cache: vendor, trainer and loot windows", () => {
   const ts = (seq: number) => 1_700_000_000_000 + seq;
   const vendorList = (guid: string, seq: number, items = [{ slot: 1, itemId: 117, price: 25, buyCount: 1, leftInStock: -1, extendedCost: 0 }]) => ({
     seq,
@@ -1555,7 +1567,7 @@ describe("state cache: vendor, trainer and loot windows (item 101b)", () => {
   });
 });
 
-describe("state cache: questgiver markers (item 27)", () => {
+describe("state cache: questgiver markers", () => {
   const withWorld = (extra: readonly unknown[]) =>
     StateCache.replay(toEvents([...worldStream, ...extra]), { seed: SEED });
 
@@ -1658,7 +1670,7 @@ describe("state cache: questgiver markers (item 27)", () => {
   });
 });
 
-describe("state cache: quest objectives from the quest query (item 28)", () => {
+describe("state cache: quest objectives from the quest query", () => {
   const withWorld = (extra: readonly unknown[]) =>
     StateCache.replay(toEvents([...worldStream, ...extra]), { seed: SEED });
 
@@ -1709,7 +1721,7 @@ describe("state cache: quest objectives from the quest query (item 28)", () => {
   });
 });
 
-describe("state cache: spellbook, cooldowns and talents (item 39)", () => {
+describe("state cache: spellbook, cooldowns and talents", () => {
   const at = (seq: number, opcode: string, opcodeId: number, data: unknown) => ({
     seq,
     opcode,
@@ -2162,7 +2174,7 @@ describe("achievements and flight paths", () => {
   });
 });
 
-describe("skills, talent tree, item stats, reputation (items 95-99)", () => {
+describe("skills, talent tree, item stats, reputation", () => {
   const TS = 1_700_000_000_000;
   const selfValues = (seq: number, fields: Record<string, number | string>) => ({
     seq,
@@ -2353,7 +2365,7 @@ describe("skills, talent tree, item stats, reputation (items 95-99)", () => {
   });
 });
 
-describe("pets, group, mail, bank, trade (items 98 and 100)", () => {
+describe("pets, group, mail, bank, trade", () => {
   const TS = 1_700_000_000_000;
   const PET_GUID = "17365880163140632999";
   const frame = (seq: number, opcode: string, data: unknown) => ({ seq, opcode, opcodeId: 0x100, ts: TS + seq, data });

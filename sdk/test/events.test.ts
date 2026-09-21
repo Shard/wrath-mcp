@@ -238,6 +238,41 @@ describe("event stream: over a real socket", () => {
     stream.close();
     await stub.stop();
   });
+
+  test("a stream closed by its consumer reopens, and the events it missed are one gap", async () => {
+    // The freeplay failure this exists for: a snippet's cleanup loop closed the
+    // client's own stream, and a `connect()` that could only reject left the
+    // run reading a frozen cache. The reopen keeps the ladder's continuity —
+    // seq 4..19 were emitted while the socket was down, and that is a gap, not
+    // a replay and not silence.
+    const stub = startStub({
+      onConnect: (i) => (i === 0 ? frames(loginSequence) : frames([{ ...chatEcho, seq: 20 }])),
+    });
+    const stream = new EventStream({ url: `${stub.wsUrl}/events`, token: "t", reconnect: false });
+    await stream.connect();
+    await stream.waitForOpcode("SMSG_LOGIN_VERIFY_WORLD", { timeout: 2000 });
+    const epoch = stream.epoch;
+
+    stream.close();
+    expect(stream.connected).toBe(false);
+
+    // Registered before the reopen: the missed-events gap rides the first frame
+    // of the new socket, which can land before a wait started afterwards.
+    const gapSeen = stream.waitForOpcode(STREAM_GAP, { timeout: 2000, includeBuffered: false });
+    await stream.connect();
+    expect(stream.connected).toBe(true);
+    const gap = await gapSeen;
+    expect(gap.data).toEqual({ fromSeq: 4, toSeq: 19, missing: 16 });
+    expect(stream.gaps).toBe(1);
+    // Same session, so no session boundary: a reopen is a reconnect, and the
+    // per-session correlation ids are still this session's.
+    expect(stream.epoch).toBe(epoch);
+    // And observation is arriving again.
+    const chat = await stream.waitForOpcode("SMSG_MESSAGECHAT", { timeout: 2000 });
+    expect(chat.seq).toBe(20);
+    stream.close();
+    await stub.stop();
+  });
 });
 
 describe("events.off (2026-08-23 softening: EventEmitter-shaped removal)", () => {
@@ -379,7 +414,7 @@ describe("event stream: per-attempt connect deadline (issue #34)", () => {
     // Without the deadline this promise never settles: the stalled socket fires
     // neither close nor error, so nothing reschedules. With it, the stalled
     // attempt fails, the ladder retries, and the caller sees that retry open
-    // (FOLLOW-UPS 113: one attempt's failure is not the caller's verdict).
+    // (one attempt's failure is not the caller's verdict).
     await stream.connect();
     // The stalled socket is closed, not leaked half-open.
     expect(StallingSocket.instances[0]?.closeCalls).toBe(1);
@@ -399,7 +434,7 @@ describe("event stream: per-attempt connect deadline (issue #34)", () => {
   });
 });
 
-describe("event stream: connect() rides the ladder (FOLLOW-UPS 113)", () => {
+describe("event stream: connect() rides the ladder", () => {
   type Plan = "open" | "stall" | "refuse";
 
   /**
@@ -501,10 +536,42 @@ describe("event stream: connect() rides the ladder (FOLLOW-UPS 113)", () => {
     const pending = stream.connect();
     stream.close();
     await expect(pending).rejects.toThrow(/^event stream closed$/);
-    // No ladder after a user close, and nothing to connect to afterwards.
+    // No ladder after a user close: nothing retries on its own.
     await settle(40);
     expect(ScriptedSocket.instances.length).toBe(1);
-    await expect(stream.connect()).rejects.toBeInstanceOf(EventStreamClosedError);
+    stream.close();
+  });
+
+  test("connect() after close() is a fresh attempt, not a standing refusal", async () => {
+    const stream = scripted(() => "open");
+    await stream.connect();
+    stream.close();
+    expect(stream.connected).toBe(false);
+    await stream.connect();
+    expect(stream.connected).toBe(true);
+    expect(ScriptedSocket.instances.length).toBe(2);
+    // And still cheap while it is open.
+    await stream.connect();
+    expect(ScriptedSocket.instances.length).toBe(2);
+    stream.close();
+  });
+
+  test("a reopen against a server that refuses the upgrade rejects, and says so", async () => {
+    // What a session the module no longer has looks like from here: the
+    // handshake is refused. The reopen must report that, not resolve.
+    ScriptedSocket.instances = [];
+    ScriptedSocket.plan = () => "refuse";
+    const stream = new EventStream({
+      url: "ws://scripted",
+      token: "t",
+      reconnect: false,
+      connectTimeoutMs: 20,
+      webSocketImpl: ScriptedSocket as unknown as typeof WebSocket,
+    });
+    stream.close();
+    await expect(stream.connect()).rejects.toThrow(/^failed to connect to ws:\/\/scripted/);
+    expect(stream.connected).toBe(false);
+    stream.close();
   });
 
   test("an unreachable server rejects after a whole climb of the ladder while the stream keeps trying", async () => {
