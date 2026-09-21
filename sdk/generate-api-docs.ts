@@ -168,6 +168,7 @@ const CLIENT_INTERNAL = new Set([
   "drainActionHints",
   "request",
   "postMoveTo",
+  "recallMoveRejection",
   "waitOwnTeleportAck",
   "reclaimRefusal",
   "latestReclaimDelay",
