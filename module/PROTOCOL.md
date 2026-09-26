@@ -1037,6 +1037,24 @@ knowledge, like item-template fields:
 | `MSG_TALENT_WIPE_CONFIRM` | 0x2AA | `{ "guid", "cost": <u32 copper>, "nothingToReset": <bool> }` — the trainer's "unlearn all talents?" dialog (`Player::SendTalentWipeConfirm`) after its unlearn gossip option; a client answers yes by echoing the opcode with the guid (raw). `nothingToReset` is the guid-0/cost-0 form `HandleTalentWipeConfirmOpcode` sends back when there are no talents to reset or the money is short; a successful reset has no packet of its own — `SMSG_TALENTS_INFO` follows with every rank gone |
 | `WB_TALENT_TREE` | 0xFF08 | `{ "class": <u8>, "unspentPoints": <u32>, "tabs": [{ "tabId", "name"?, "page", "talents": [{ "talentId", "name"?, "row", "col", "maxRank", "ranks": [<spellId> × maxRank], "dependsOn"?, "dependsOnRank"? }] }] }` — the answer to the `talent_tree` action: every TalentTab.dbc tab whose class mask holds the character's class, in page order, and every Talent.dbc row in it sorted by row then column. `name` on a tab is the client's TalentTab.dbc text (the module reads the file: `dbc/TalentTab.dbc`, 24 fields, record size 96, refused otherwise), on a talent the first rank spell's Spell.dbc name; `dependsOnRank` is 0-based. What the talent frame draws, nothing more — no icons, no tooltips, and no server-side state (the ranks learned are `SMSG_TALENTS_INFO`'s, joined by the SDK) |
 
+The cooldown opcodes rarely fire. A client derives a cooldown from its own
+Spell.dbc, so the core sends only what it cannot derive. For a player's own
+cast, `Player::AddSpellAndCategoryCooldowns` sends `SMSG_SPELL_COOLDOWN` only
+when a `SPELL_AURA_MOD_COOLDOWN` aura changed the recovery of a spell the
+player knows, plus the category siblings of the few spells the core
+force-flags (Aimed Shot). Neither level nor item changes that: a Hearthstone
+use is answered with `SMSG_SPELL_START`, `SMSG_SPELL_GO` and
+`MSG_MOVE_TELEPORT_ACK` and no cooldown opcode, though the server holds its
+30-minute cooldown. The packet's other senders are pets and vehicles, the
+school lockout after an interrupt, and a GCD-only marker for a weapon swap in
+combat. `SMSG_COOLDOWN_EVENT` is for a cooldown that starts when an effect
+ends: a potion, whose timer waits for the end of combat, and a
+cooldown-on-event spell such as Stealth, when its aura is removed (read from
+the core, not yet observed). A cooldown started without a packet still
+persists through a logout and comes back at the next login in
+`SMSG_INITIAL_SPELLS.cooldowns[]`, which is where a relog after a Hearthstone
+reads its remaining time.
+
 Reputation. The wire keys factions by their
 `Faction.dbc` reputation index (`repListId`), not the faction id; the module
 makes the same join a client does and adds the client's base standing for

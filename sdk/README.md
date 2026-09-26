@@ -42,64 +42,13 @@ first is what makes the state cache complete.
 
 ### Client
 
-A slice of the surface, not the whole of it: `sdk/API.md` is the generated,
-exhaustive reference and is what the model is given.
+`sdk/API.md` is the generated, exhaustive reference and is what the model is
+given.
 
-```ts
-connect(options: ConnectOptions): Promise<WrathClient>
-
-class WrathClient {
-  readonly token: string
-  readonly baseUrl: string
-  readonly events: EventStream
-  readonly state: StateCache
-
-  health(): Promise<HealthResponse>                                   // GET /health
-  createSession(req: Omit<CreateSessionRequest, "token">): Promise<SessionResponse>  // POST /session
-  say(text: string): Promise<ActionResponse>                          // POST /action
-  moveToAsync(target: MoveTarget): Promise<MoveToResponse>            // POST /action, ack only
-  stop(): Promise<ActionResponse>                                     // POST /action
-  face(orientationOrPoint: number | { x, y }): Promise<FaceResponse>  // POST /action
-  deleteSession(): Promise<DeleteSessionResponse>                     // DELETE /session
-  logout(): Promise<DeleteSessionResponse>                            // alias
-  close(): void                                                       // closes the stream only
-
-  // quest/combat extension: one method per single-opcode action
-  setTarget(guid) / clearTarget()
-  attackStart(guid) / attackStop()
-  castSpell(spellId, targetGuid?) / cancelCast(spellId)
-  interact(guid) / gossipHello(guid) / gossipSelect(guid, menuId, optionId)
-  questList(guid) / questDetails(guid, questId) / questAccept(guid, questId)
-  questComplete(guid, questId) / questChooseReward(guid, questId, rewardIndex?) / questAbandon(questId)
-  loot(guid) / lootAll(guid) / lootItem(slot) / lootMoney() / lootRelease(guid)
-  vendorList(guid) / buyItem(guid, itemId, slot, count?) / sellItem(guid, itemGuid, count?) / repairAll(guid)
-  useItem(bag, slot, targetGuid?) / destroyItem(bag, slot, count?)
-  trainerListAsync(guid) / trainerBuySpellAsync(guid, spellId)
-  repop() / reclaimCorpse(guid?, options?) → { status: reclaimed | not_reclaimed | unconfirmed, reason: too_far | delay_not_elapsed | wrong_map | no_corpse | still_ghost … } (waits out SMSG_CORPSE_RECLAIM_DELAY itself; state.self.corpse / graveyard say where to walk) / spiritHealerActivate(guid)
-  deleteCharacter(name, o?: DeleteCharacterOptions): Promise<CharacterDeleteResponse>  // POST /character-delete
-
-  // composed helpers — each waits for the game's verdict
-  waitForChat(match: string | ((e: ChatEntry) => boolean), o?: WaitForChatOptions): Promise<ChatEntry>
-  moveTo(target: MoveTarget, o?: MoveToOptions): Promise<MoveResult>
-  waitForNearby(p: (o: NearbyObject) => boolean, o?: WaitForNearbyOptions): Promise<NearbyObject>
-  killTarget(guid, o?: KillTargetOptions): Promise<KillResult>
-  lootCorpse(guid, o?: LootOptions): Promise<LootResult>              // corpses and chests alike
-  questsAvailableFrom(npcGuid, o?: QuestOptions): Promise<{ ok: true; quests: readonly OfferedQuest[] }>
-  acceptQuestFrom(npcGuid, questId, o?: QuestOptions): Promise<QuestAcceptResult>
-  turnInQuest(npcGuid, questId, rewardIndex?, o?: QuestOptions): Promise<QuestTurnInResult>
-  waitForQuestObjective(questId, o?: QuestOptions): Promise<QuestLogEntry>
-  trainerList(npcGuid, o?: TrainerOptions): Promise<TrainerListResult>
-  buySpell(npcGuid, spellId, o?: TrainerOptions): Promise<BuySpellResult>
-  equipItem(bag, slot, o?: EquipOptions): Promise<EquipItemResult>
-  get selfKey(): string | undefined
-}
-```
-
-Not in that list, because it is not a helper: `raw()` queues one allowlisted
-client opcode with a caller-built body. It is the escape hatch the surface
-philosophy promises (`docs/METHODOLOGY.md`, "The model surface") — the way a
-trajectory shows a surface is needed before one is built, not a second path to
-anything above. The allowlist is `module/PROTOCOL.md` ("raw").
+`raw()` is not a helper: it queues one allowlisted client opcode with a
+caller-built body. It is the escape hatch the surface philosophy promises
+(`docs/METHODOLOGY.md`, "The model surface") — the way a trajectory shows a
+surface is needed before one is built, not a second path to any helper. The allowlist is `module/PROTOCOL.md` ("raw").
 
 Every guid — state fields, helper returns, and every guid argument — is an
 opaque decimal string, which is also exactly what the wire carries:
@@ -109,18 +58,11 @@ for you.
 
 ### Combat, loot and quests
 
-```ts
-// { ok, status, guid, swings, healthPct, attacking, detail }
-const fight = await client.killTarget(kobold.guid, { abortBelowHealthPct: 35 });
-if (fight.ok) await client.lootCorpse(kobold.guid);      // { ok, status, gold, items, window }
-if (fight.attacking) await client.attackStop();          // it left us swinging
-```
-
 `killTarget` owns the whole melee loop, and each part of it is there because a
 live run needed it: a synthesized character never auto-faces the way a client
 does and the server drops a swing that is not facing its victim, so the target
-is faced before the first swing and re-faced every ~1.5s; the character walks
-into melee range before that first swing and is walked back whenever the target
+is faced before the first swing and re-faced during the fight; the character
+walks into melee range before that first swing and is walked back whenever the target
 drifts out of it; our own death ends it at once. Statuses are `killed` (the
 target's observed health reached zero), `player_died`, `lost` (it left view
 alive), `timeout`, and `aborted_low_health` when `abortBelowHealthPct` was given
@@ -141,19 +83,17 @@ snippet cap; longer fights belong in a background routine.
 
 `lootCorpse` sends `loot_all` — the module replaying the client's auto-loot
 sequence — and returns once the window has been emptied and released. A
-chest-type game object goes the way a client opens one: the core ignores
-`CMSG_GAMEOBJ_USE` on a chest and drops `CMSG_LOOT` on a game object guid, so
-the helper casts the lock's Opening spell at it (6478, 3365, 6247, 6477 — one
-per open-hand lock type, tried in order until the server accepts one) and
+chest-type game object goes the way a client opens one (`docs/CONTRACTS.md`,
+the action contract): the helper casts the lock's Opening spell at it and
 sends the store/money/release sequence itself once the window arrives; a
-chest none of them fits is `{ ok: false, status: "not_opened", reason, hint }`.
-`interact(guid)` on a chest is refused with `{ status: "chest" }` and a hint,
-because the ack it would return means nothing. Its
-`items` are what `SMSG_ITEM_PUSH_RESULT` confirmed *stored*, not what the
-window displayed (the window is an offer; the pushes are the receipt — a
-possible no-op is never reported as success). The window contents ride along
-as `window`. A corpse with nothing on it releases without ever opening a
-window, which is `{ ok: false, status: "empty" }`: an answer, not a failure.
+chest none of the Opening spells fits is
+`{ ok: false, status: "not_opened", reason, hint }`. `interact(guid)` on a
+chest is refused with `{ status: "chest" }` and a hint, because the ack it
+would return means nothing. Its `items` are what `SMSG_ITEM_PUSH_RESULT`
+confirmed *stored*, not what the window displayed (the window is an offer; the
+pushes are the receipt — a possible no-op is never reported as success). A
+corpse with nothing on it releases without ever opening a window, which is
+`{ ok: false, status: "empty" }`: an answer, not a failure.
 A window that showed items of which not one entered a bag — bags full, or a
 broken store path — is `{ ok: false, status: "none_stored" }`. Silence still
 throws `EventTimeoutError`.
@@ -176,6 +116,17 @@ wait races `SMSG_INVENTORY_CHANGE_FAILURE`: a reward that does not fit is
 answered with that failure and no completion at all, so a full bag comes back
 as `{ ok: false, status: "inventory_full", hint }` instead of burning the
 whole timeout (the quest stays in the log; free a slot and turn in again).
+`acceptQuestFrom` races the same failure after its accept: a quest that hands
+over an item is refused with it when the item does not fit, and never enters
+the log, so that is `inventory_full` too.
+
+The core answers an out-of-range quest call with silence, so `questsAvailableFrom`,
+`acceptQuestFrom` and `turnInQuest` refuse locally with `too_far` and the
+distance when the cached positions put the NPC beyond any questgiver's reach.
+That reach is 5.5y plus both combat reaches, and the module does not serve the
+NPC's, so the ceiling is set by the largest questgiver in the pinned world
+rather than a typical one; nearer than that the call still goes out, and a
+silence is explained by the distance afterwards.
 
 `waitForQuestObjective` waits on the **quest log**, not on an event, because at
 the pinned commit the core sends no `SMSG_QUESTUPDATE_COMPLETE` for a kill
@@ -205,50 +156,23 @@ released yet" and are retried with a fresh throwaway token each time; anything
 else the module says (`character_not_found`, a `char_delete_failed_code_<N>`)
 is a real answer and is thrown.
 
-`ConnectOptions`: `baseUrl`, `token`, and optionally `secret` (the bearer
-credential every route requires — the port secret for operator tooling, the
-run's lease secret for a snippet child; the SDK reads no environment, the caller
-passes it), `account` (the game account the run occupies; when set it fills an
-omitted `createSession`/`deleteCharacter` account and overrides any the caller
-named), `eventsUrl`, `subscribeEvents` (default true), `requestTimeoutMs`
-(default 30000 — the session call blocks up to 20s server-side), `fetchImpl`,
-`events` (stream options), `state` (`chatTail`, `notificationTail`), `signal`
-(an `AbortSignal`, or a function consulted per wait, that every wait the client
-performs defaults to) and `deadline` (the epoch-ms instant the caller's budget
-runs out; it caps nothing, it only lets a `moveTo` hint say the walk was always
-longer than the snippet had left).
+The SDK reads no environment: the bearer credential every route requires —
+the port secret for operator tooling, the run's lease secret for a snippet
+child — is passed in by the caller (`ConnectOptions.secret`).
 
-The list above is a slice; `sdk/API.md` is generated from the live surface and
-holds all of it. Helpers stop where they stop because this is what the probes
-and `infra/smoke/one-quest.ts` have actually needed. Nothing is added in
+Helpers stop where they stop because this is what the probes and
+`infra/smoke/one-quest.ts` have actually needed. Nothing is added in
 anticipation.
 
 ### Movement
 
-```ts
-const result = await client.moveTo({ x, y, z }, { timeout: 90_000 });
-if (result.ok) console.log("arrived at", result.position);
-else console.log("did not get there:", result.status, "stopped at", result.position);
-```
-
-`moveTo` takes a point, a unit from `state.units(...)`/`state.closest(...)`, or
-a guid — the unit forms resolve to that unit's position in the state cache at
-call time, and a guid nothing in view answers to comes back as `ok: false,
-status: "unknown_target"` with a hint, the one arm with no move (and so no
-`moveId`/`position`) behind it. `moveToAsync` takes the same targets and is the
-call for a walk longer than your own time budget: dispatch, then watch
-`WB_MOVE_RESULT`.
-
 `moveTo` issues `move_to`, then resolves on the `WB_MOVE_RESULT` carrying the
-same `moveId`. **Game outcomes are returned, not thrown** (`docs/METHODOLOGY.md`, "The model surface"):
-`arrived` is `ok: true` (with `meshZ` when the mesh walked to a different z
-than asked); `too_far`, `no_mesh`, `target_off_mesh`, `start_off_mesh`,
-`path_incomplete` (with `reachedPos`), `interrupted`, `stopped` and
-`superseded` are `ok: false` with the status intact and a per-status `hint`,
-and *every* one of them carries the server-confirmed position the character
-actually ended at. A
-snippet that forgets a `try` should not lose a run to a wall, and "there is no
-path there" is an answer, not an error.
+same `moveId`. **Game outcomes are returned, not thrown**
+(`docs/METHODOLOGY.md`, "The model surface"): `arrived` is `ok: true`; every
+failure status is `ok: false` with the status intact and a per-status `hint`,
+and *every* move result carries the server-confirmed position the character
+actually ended at. A snippet that forgets a `try` should not lose a run to a
+wall, and "there is no path there" is an answer, not an error.
 
 Two things still throw:
 
@@ -265,8 +189,6 @@ queued the `MSG_MOVE_STOP` — it does *not* wait for the character to halt; it 
 the in-flight `moveTo` that resolves, with `status: "stopped"`, once the stop
 has landed. Read the position off that result rather than off the cache right
 after `await client.stop()`.
-`face()` takes an absolute orientation in radians or a point, and is refused
-with code `moving` while a move is running.
 
 `waitForNearby` waits on the *cache*, not on one event: a named creature takes a
 create block plus the creature-query answer the module fired on first sight, so
@@ -294,39 +216,14 @@ module code costs autocompletion, not correctness.
 
 ### Event stream
 
-```ts
-class EventStream implements AsyncIterable<StreamEvent> {
-  connect(): Promise<void>
-  close(): void
-  get connected(): boolean
-  get gaps(): number
-
-  on(opcode, handler): Unsubscribe        // typed per opcode
-  once(opcode, handler): Unsubscribe
-  onAny(handler): Unsubscribe
-  waitFor(predicate, o?: WaitForOptions): Promise<StreamEvent>
-  waitForOpcode(opcode, o?: WaitForOptions): Promise<EventByOpcode[K]>
-  recent(limit?: number): StreamEvent[]
-  ingest(frame: string): void             // feed a raw frame (replay / tests)
-  [Symbol.asyncIterator]()                // from subscription forward
-}
-```
-
-Every event carries `seq`, `opcode`, `opcodeId`, `ts`, `data`, exactly as
-PROTOCOL.md defines them.
-
-`connect()` resolves at once while the socket is open, joins the attempt or
-pending retry the reconnect ladder already owns, and reopens the stream after a
-`close()` — a consumer that hung up can dial again, and the gap accounting
-carries across, so the events emitted while it was down arrive as one
-`stream_gap`. What `close()` really ended stays ended: the waits it rejected and
+`client.events.connect()` reopens the stream after a `close()` — a consumer
+that hung up can dial again, and the gap accounting carries across, so the
+events emitted while it was down arrive as one `stream_gap`. What `close()` really ended stays ended: the waits it rejected and
 the async iterators it finished belong to the caller that closed them.
 
-`waitFor` searches the retained buffer (default 500 events) *before* waiting,
-so a wait issued after an action was acked can still find an event that arrived
-during the call. `{ sinceSeq }` bounds how far back it looks;
-`{ includeBuffered: false }` turns history off; `{ timeout }` (default 10s)
-rejects with `EventTimeoutError`; `{ signal }` accepts an `AbortSignal`.
+`waitFor` searches the retained buffer *before* waiting, so a wait issued
+after an action was acked can still find an event that arrived during the
+call.
 
 Three ways an event can be less than fully typed, none of which drop it:
 
@@ -352,35 +249,6 @@ Two synthetic opcodes, lowercase so they can never collide with an `SMSG_*`:
 
 `client.state` is a `StateCache`: a pure fold over the stream.
 
-```ts
-state.self          // { guid, name, level?, position?, health?, power?, fields }
-state.characters    // Observed<CharacterSummary[]> | undefined  (from SMSG_CHAR_ENUM)
-state.names         // Map<guidKey, Observed<string>>            (from SMSG_NAME_QUERY_RESPONSE)
-state.creatures     // Map<entry, Observed<CreatureInfo>>        (from SMSG_CREATURE_QUERY_RESPONSE)
-state.items         // Map<itemId, Observed<ItemInfo>>          (from SMSG_ITEM_QUERY_SINGLE_RESPONSE)
-state.nearby        // Map<guidKey, NearbyObject>                (from SMSG_UPDATE_OBJECT, MSG_MOVE_*, SMSG_MONSTER_MOVE)
-state.questLog      // QuestLogEntry[]   — derived from the raw quest<slot><Off> fields
-state.quest(id)     // one quest log slot, or undefined
-state.inventory     // InventoryItem[]   — invSlot halves joined to items and names
-state.bag()         // { items: [{ bag, slot, itemId, name, count, guid }], bags, freeSlots, totalSlots }
-state.questCompletions, state.questsCompleted  // turn-ins seen (SMSG_QUESTGIVER_QUEST_COMPLETE)
-state.money, state.xp, state.nextLevelXp   // Observed<number> | undefined (self only)
-state.target        // the NearbyObject our own targetGuid points at, when in view
-state.aurasOf(guid) // AuraEntry[]       (from SMSG_AURA_UPDATE / _ALL)
-state.chat          // readonly ChatEntry[]  (bounded tail)
-state.notifications // readonly NotificationEntry[]
-state.motd          // Observed<string[]> | undefined
-state.gaps          // readonly GapRecord[]  — non-empty means incomplete
-state.anomalies     // readonly Anomaly[]    — non-empty means contradictory
-state.lastSeq, state.eventCount
-state.nameOf(guid), state.snapshot()
-
-state.nearbyUnits()          // objects a create block typed unit or player
-state.creaturesByEntry(id)   // units whose observed template entry is `id`
-state.closest(filter?)       // nearest object with a position, from ours
-StateCache.replay(events, { seed })
-```
-
 `questLog`, `inventory`, `money`, `xp`, `nextLevelXp` and `target` are *derived
 on read* from `self.fields` rather than kept as a second copy written by a
 second path. There is one write seam (the field merge), so replay-equals-live
@@ -398,15 +266,10 @@ fields and this is where they are folded.
   can be missing, and a slot whose item has not been created for us yet is
   still reported — it *is* occupied — with `itemId` and `name` undefined.
 - `bag()` is the backpack view of `inventory`, shaped for acting on it:
-  `bag`/`slot` are exactly what `equipItem`, `useItem` and `destroyItem` take
-  (bag 255, slots 23-38), `count` is the observed stack count, and `freeSlots`
-  counts the backpack slots holding nothing. Earned surface:
-  morning-opus-1 rebuilt this from push-result listeners, invSlot regexes and a
-  full relog when it was already in the cache. Worn bags (equipment slots 19-22)
-  are reported too: a container's contents are the bag item's own `bagSlot<n>`
-  update fields, so each is walked and its rows carry the equipment slot as
-  their `bag`. `bags` lists what is worn and how big each is, and `totalSlots`
-  is the backpack plus all of them, which is what `freeSlots` counts against.
+  `bag`/`slot` are exactly what `equipItem`, `useItem` and `destroyItem` take,
+  `count` is the observed stack count, and `freeSlots` counts the slots holding
+  nothing. Earned surface: morning-opus-1 rebuilt this from push-result
+  listeners, invSlot regexes and a full relog when it was already in the cache.
   One caveat: empty slots are zero fields the wire compresses away, so before
   our own create block arrives `freeSlots` reads 16.
 - `pointOf(obj)` answers "where do I walk to reach it" from the freshest of the
@@ -421,17 +284,16 @@ by every `WB_MOVE_PROGRESS` while we walk and by the server-confirmed
 `WB_MOVE_RESULT` at the end — and between events it is stale, which the `seq`
 says out loud.
 
-The three queries are pure reads. `closest` returns `undefined` when we have no
-position of our own, rather than guessing one. They hand back the live cache
-entries; `snapshot()` is the frozen copy.
+The queries (`nearbyUnits`, `creaturesByEntry`, `closest`) are pure reads.
+`closest` returns `undefined` when we have no position of our own, rather than
+guessing one. They hand back the live cache entries; `snapshot()` is the frozen
+copy.
 
 #### How an object in view is built
 
-`create` blocks populate a `NearbyObject`, `values` deltas merge **per field**
-(each field keeps the `seq`/`ts` of the block that carried it, so a health
-number and the max it is out of can be minutes apart and say so), `movement`
-blocks and `MSG_MOVE_*` update positions, `outOfRange` lists and
-`SMSG_DESTROY_OBJECT` prune. A `near` block is *not* a removal and does not
+`values` deltas merge **per field** (each field keeps the `seq`/`ts` of the
+block that carried it, so a health number and the max it is out of can be
+minutes apart and say so). A `near` block is *not* a removal and does not
 prune. `names` and `creatures` are never pruned: the module will not re-issue a
 query for an entry it already asked about, so a creature that walks away and
 comes back would otherwise be permanently nameless.
@@ -472,15 +334,12 @@ Two rules the tests enforce:
 **Extension point.** `apply()` is a switch on opcode and every world write goes
 through `upsertNearby()`. Landing a new event means: add the schema in
 `src/protocol.ts`, add one `case` in `src/state.ts`, and derive rather than
-duplicate if it belongs to `self`. The pets, group, mail, bank, trade, loot-roll
-and item-text families live in `src/protocol-social.ts` and
-`src/state-social.ts` instead — the same two steps, one file over in each
-case. `src/guid.ts` is the leaf both halves of the protocol import for
-`guidSchema`; it exists so `protocol-social.ts` never reaches back into
-`protocol.ts` at value level, which is a module-eval cycle `tsc` cannot see. Unknown opcodes,
-unknown update-block kinds and unknown `data` fields all already pass through
-rather than failing, so an SDK built against today's whitelist keeps streaming
-when the module's widens.
+duplicate if it belongs to `self`. The social families live in
+`src/protocol-social.ts` and `src/state-social.ts` instead — the same two
+steps, one file over in each case. `src/guid.ts` is the leaf both halves of the
+protocol import for `guidSchema`; it exists so `protocol-social.ts` never
+reaches back into `protocol.ts` at value level, which is a module-eval cycle
+`tsc` cannot see.
 
 ## Running things
 
@@ -494,11 +353,6 @@ bunx tsc --noEmit -p sdk     # strict typecheck of src, test and examples
 docker compose -f infra/compose.yml exec runner bun sdk/examples/live-slice.ts
 docker compose -f infra/compose.yml exec runner bun sdk/examples/live-move.ts
 ```
-
-`live-move.ts` is the movement/observation slice end to end: session, wait for a
-named creature to arrive on the update stream, walk ~30y toward it, print the
-server-confirmed arrival and the closest creature, log out. It retries patiently
-while the worldserver is restarting.
 
 Tests run against an in-process `Bun.serve` stub (`test/server.ts`) that speaks
 the same HTTP and WebSocket shapes and replays fixture frames. All fixtures are

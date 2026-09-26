@@ -43,7 +43,6 @@ import {
   type ActivateTaxiReplyData,
   type BindPointUpdateData,
   type CharacterDeleteResponse,
-  type CorpseReclaimDelayData,
   type CorpseQueryData,
   type CreateSessionRequest,
   type DeathReleaseLocData,
@@ -1295,6 +1294,35 @@ function distanceToUnit(state: StateCache, guid: GuidArg): number | undefined {
 
 /** What the core treats as interaction range for a questgiver/trainer, in yards. */
 const INTERACT_RANGE = 5;
+
+/**
+ * The farthest a questgiver can be, by the cached positions, and still be in
+ * reach — past it a quest call is refused locally as `too_far` instead of
+ * being sent into the server's silence. The core's reach is 5.5y plus the
+ * player's 1.5y combat reach plus the NPC's own, which the module does not
+ * serve; the largest questgiver's in the pinned world is 20y (27y in all), and
+ * the rest absorbs rounding and a position that moved since its last report.
+ * A refusal this ceiling gets wrong still points the right way: moveTo the
+ * NPC lands on the same cached point, and the call then goes out.
+ */
+const QUESTGIVER_REACH_CEILING = 30;
+
+/**
+ * The yards to a questgiver when the cache proves it is out of reach, else
+ * undefined. A player is exempt: the core puts no range on a player sharing a
+ * quest.
+ */
+function questgiverOutOfReach(state: StateCache, guid: GuidArg): number | undefined {
+  if (state.nearby.get(guidKey(guid))?.objectType?.value === "player") return undefined;
+  const distance = distanceToUnit(state, guid);
+  return distance !== undefined && distance > QUESTGIVER_REACH_CEILING ? Math.round(distance) : undefined;
+}
+
+/** The `too_far` hint every quest call gives, nothing having been sent. */
+function questgiverTooFarHint(distance: number): string {
+  return `the questgiver is ${distance}y away — interact range is ~${INTERACT_RANGE}y; moveTo it first`;
+}
+
 /** `UNIT_NPC_FLAG_QUESTGIVER`. */
 const NPC_FLAG_QUESTGIVER = 0x2;
 /** `GAMEOBJECT_TYPE_QUESTGIVER`. */
@@ -1519,6 +1547,26 @@ export type QuestAcceptResult =
       readonly questId: number;
       readonly offered: readonly OfferedQuest[];
       readonly hint: string;
+    }
+  | {
+      readonly ok: false;
+      /**
+       * The quest hands over an item on accept and the server could not store
+       * it, so the quest was not added — accept again once a bag slot is free.
+       */
+      readonly status: "inventory_full";
+      readonly questId: number;
+      /** Raw `InventoryResult` code from `SMSG_INVENTORY_CHANGE_FAILURE`. */
+      readonly result: number;
+      readonly hint: string;
+    }
+  | {
+      readonly ok: false;
+      /** The cached positions put the questgiver out of reach; nothing was sent. */
+      readonly status: "too_far";
+      readonly questId: number;
+      readonly distance: number;
+      readonly hint: string;
     };
 
 /**
@@ -1537,13 +1585,26 @@ function questStartedBy(state: StateCache, item: BagSlotItem | undefined): numbe
   return startQuest === undefined || startQuest === 0 ? undefined : startQuest;
 }
 
-/** `questsAvailableFrom`'s answer; `nothing_on_offer` is the marker pre-check, with nothing sent. */
+/**
+ * `questsAvailableFrom`'s answer; `nothing_on_offer` is the marker pre-check
+ * and `too_far` the range pre-check, each with nothing sent.
+ */
 export type QuestsAvailableResult =
   | { readonly ok: true; readonly quests: readonly OfferedQuest[] }
-  | { readonly ok: false; readonly status: "nothing_on_offer"; readonly quests: readonly OfferedQuest[]; readonly hint: string };
+  | { readonly ok: false; readonly status: "nothing_on_offer"; readonly quests: readonly OfferedQuest[]; readonly hint: string }
+  | {
+      readonly ok: false;
+      readonly status: "too_far";
+      readonly quests: readonly OfferedQuest[];
+      readonly distance: number;
+      readonly hint: string;
+    };
 
-/** What `questOffer` learned: the list, or the marker that made asking pointless. */
-type QuestOfferOutcome = { readonly quests: readonly OfferedQuest[] } | { readonly nothing: QuestGiverMarker; readonly hint: string };
+/** What `questOffer` learned: the list, or the marker or the distance that made asking pointless. */
+type QuestOfferOutcome =
+  | { readonly quests: readonly OfferedQuest[] }
+  | { readonly nothing: QuestGiverMarker; readonly hint: string }
+  | { readonly tooFar: number; readonly hint: string };
 
 /** The questgiver markers that say "nothing to offer" before a quest list is even asked for. */
 const OFFERS_NOTHING: ReadonlySet<QuestGiverStatusName> = new Set([
@@ -2194,6 +2255,14 @@ export type ReclaimCorpseReason =
 
 /** `CORPSE_RECLAIM_RADIUS` in the core: a reclaim further than this is dropped silently. */
 export const CORPSE_RECLAIM_RADIUS = 39;
+
+/**
+ * Yards past `CORPSE_RECLAIM_RADIUS` before `reclaimCorpse` refuses without
+ * sending. The core measures in 3D and adds both objects' sizes (the corpse's
+ * ~0.4y and the player's 1.5y combat reach) to the radius, so a straight-line
+ * 2D distance only proves the refusal once it clears those too.
+ */
+const CORPSE_RECLAIM_SLACK = 3;
 
 /**
  * The Spirit Healer's price, as a rule rather than a table: every equipped
@@ -3156,16 +3225,22 @@ export class WrathClient {
    *
    * The delay is the server's own word, not a constant: `BuildPlayerRepop`
    * sends `SMSG_CORPSE_RECLAIM_DELAY { delayMs }` immediately before it resets
-   * the corpse's ghost time, so the most recent one on the stream plus its
-   * timestamp is when the reclaim becomes legal. When no such event is in the
-   * retained buffer — none was owed (the core sends nothing when the delay has
-   * already expired), or it aged out of the 500-event window — the call
-   * dispatches *immediately* rather than inventing a 30s wait, and lets the
-   * retry absorb a too-early refusal.
+   * the corpse's ghost time, and the state cache keeps the latest one as
+   * `state.self.reclaimDelay` — when the reclaim becomes legal — until the
+   * resurrect clears it. It is read from there rather than from the event
+   * buffer, which a busy stream turns over in well under the delay. When none
+   * has been observed — none was owed (the core sends nothing when the delay
+   * has already expired) — the call dispatches *immediately* rather than
+   * inventing a 30s wait, and lets the retry absorb a too-early refusal. A
+   * delay that runs past the call's budget is answered at once as
+   * `delay_not_elapsed` with the seconds left, since waiting out the budget
+   * would only end in that same answer.
    *
    * Refusals are silent (see `ReclaimCorpseResult`), so the loop re-sends
    * every `attemptTimeout` until the budget runs out, and the verdict is read
    * off `SMSG_DEATH_RELEASE_LOC { map: -1 }` and the character's own health.
+   * The one refusal no wait can cure — a ghost observed standing well outside
+   * the reclaim radius — is answered as `too_far` before anything is sent.
    * The ambient snippet signal aborts every wait here, as everywhere.
    *
    * Every game outcome is a value; the one throw is a refused request — a
@@ -3181,9 +3256,7 @@ export class WrathClient {
 
     /** Own health as the cache last saw it: 0 = dead, 1 = a released ghost, >1 = alive. */
     const health = (): number | undefined => this.state.self.health?.value.current;
-    const delayEvent = (): { delayMs: number; ts: number } | undefined => this.latestReclaimDelay();
-    const announced = delayEvent();
-    const delayMs = announced?.delayMs;
+    const delayMs = this.state.self.reclaimDelay?.value.delayMs;
 
     // Pre-flight, so the two states that can never work are named rather than
     // burning the whole budget on a packet the core drops on sight.
@@ -3213,6 +3286,20 @@ export class WrathClient {
         hint: `state.self.health is ${before}, so you are alive and there is nothing to reclaim`,
       };
     }
+    // A ghost observed out of reclaim range cannot close the distance by
+    // waiting: the reclaim delay and the re-sends both assume it is standing
+    // at the corpse. Nothing is sent, and the refusal is the one the loop would
+    // have ended on — after its whole budget — with the distance and the way back.
+    const corpseAt = this.state.self.corpse?.value;
+    const here = this.state.self.position?.value;
+    if (
+      corpseAt !== undefined &&
+      here !== undefined &&
+      corpseAt.map === here.map &&
+      distance2d(here, corpseAt) > CORPSE_RECLAIM_RADIUS + CORPSE_RECLAIM_SLACK
+    ) {
+      return { ok: false, status: "not_reclaimed", ...facts(0), ...this.reclaimRefusal(0, options) };
+    }
 
     // The resurrect is announced by SMSG_DEATH_RELEASE_LOC clearing the marker
     // (map -1). Latched from a subscription rather than a wait, so an answer
@@ -3229,10 +3316,11 @@ export class WrathClient {
       for (;;) {
         this.throwIfAborted("the corpse reclaim delay");
         // Recomputed each pass: a second death mid-call moves the clock.
-        const latest = delayEvent();
-        const readyAt =
-          latest === undefined ? Date.now() : Math.min(latest.ts + latest.delayMs, Date.now() + latest.delayMs);
-        const wait = Math.min(Math.max(0, readyAt - Date.now()), Math.max(0, deadline - Date.now()));
+        const readyAt = this.reclaimReadyAt() ?? Date.now();
+        const wait = Math.max(0, readyAt - Date.now());
+        // A delay that outlasts the budget cannot be waited into a reclaim:
+        // answer now with what is left instead of sleeping to the same refusal.
+        if (wait > 0 && readyAt >= deadline) break;
         if (wait > 0) await this.sleepAborting(wait);
         if (Date.now() >= deadline) break;
 
@@ -3342,8 +3430,8 @@ export class WrathClient {
         };
       }
     }
-    const latest = this.latestReclaimDelay();
-    const left = latest === undefined ? 0 : Math.max(0, latest.ts + latest.delayMs - Date.now());
+    const readyAt = this.reclaimReadyAt();
+    const left = readyAt === undefined ? 0 : Math.max(0, readyAt - Date.now());
     if (left > 0) {
       const secondsLeft = Math.ceil(left / 1000);
       return {
@@ -3368,16 +3456,15 @@ export class WrathClient {
     };
   }
 
-  /** The most recent `SMSG_CORPSE_RECLAIM_DELAY` in the buffer: the server's word on when a reclaim becomes legal. */
-  private latestReclaimDelay(): { delayMs: number; ts: number } | undefined {
-    const events = this.events.recent();
-    for (let i = events.length - 1; i >= 0; i--) {
-      const e = events[i] as StreamEvent;
-      if (isEvent(e, "SMSG_CORPSE_RECLAIM_DELAY") && !isDecodeError(e.data)) {
-        return { delayMs: (e.data as CorpseReclaimDelayData).delayMs, ts: e.ts };
-      }
-    }
-    return undefined;
+  /**
+   * When a reclaim becomes legal (epoch ms), from the server's latest delay
+   * as the cache holds it (`state.self.reclaimDelay`); undefined when none has
+   * been observed since the last resurrect. Never later than a full delay from
+   * now, so a stamp from a clock running ahead cannot stretch the wait.
+   */
+  private reclaimReadyAt(): number | undefined {
+    const delay = this.state.self.reclaimDelay?.value;
+    return delay === undefined ? undefined : Math.min(delay.readyAt, Date.now() + delay.delayMs);
   }
 
   /** `sleep`, bounded by the ambient signal: rejects with `EventAbortedError` when the snippet is abandoned. */
@@ -5250,17 +5337,54 @@ export class WrathClient {
           this.noteActionHint("acceptQuestFrom", "nothing_on_offer", offered.hint);
           return { ok: false, status: "nothing_on_offer", questId, offered: [], hint: offered.hint };
         }
+        if ("tooFar" in offered) {
+          this.noteActionHint("acceptQuestFrom", "too_far", offered.hint);
+          return { ok: false, status: "too_far", questId, distance: offered.tooFar, hint: offered.hint };
+        }
         wanted = offered.quests.find((q) => q.questId === questId);
         if (!wanted) return { ok: false, status: "not_offered", questId, offered: offered.quests };
       }
 
+      // Raced against the quest landing in the log: a quest that gives an item
+      // on accept is refused with SMSG_INVENTORY_CHANGE_FAILURE when the item
+      // does not fit, and the quest is never added — the same answer
+      // turnInQuest reads for a reward that does not fit. Only a failure after
+      // this accept counts.
+      const sinceSeq = this.events.recent(1)[0]?.seq;
       await this.questAccept(npc, questId);
-      const quest = await this.waitForState(
-        () => this.state.quest(questId),
-        timeout,
-        `quest ${questId} to appear in the quest log after accept`,
-      );
-      return { ok: true, status: "accepted", questId, quest, title: wanted.title };
+      let quest = this.state.quest(questId);
+      let refused: InventoryChangeFailureData | undefined;
+      if (quest === undefined) {
+        await this.waitEvent(
+          (e) => {
+            quest = this.state.quest(questId);
+            if (quest !== undefined) return true;
+            if (
+              isEvent(e, "SMSG_INVENTORY_CHANGE_FAILURE") &&
+              !isDecodeError(e.data) &&
+              (sinceSeq === undefined || e.seq > sinceSeq)
+            ) {
+              refused = e.data as InventoryChangeFailureData;
+              return true;
+            }
+            return false;
+          },
+          {
+            timeout,
+            ...(sinceSeq === undefined ? {} : { sinceSeq: sinceSeq + 1 }),
+            description: `quest ${questId} to appear in the quest log after accept (or SMSG_INVENTORY_CHANGE_FAILURE)`,
+          },
+        );
+      }
+      if (quest === undefined && refused !== undefined) {
+        const named = inventoryResultText(refused.result);
+        const hint =
+          `the item this quest hands over on accept could not be stored (InventoryResult ${refused.result}` +
+          `${named ? `: ${named}` : ""}) — free a bag slot (sell or destroyItem), then accept again`;
+        this.noteActionHint("acceptQuestFrom", "inventory_full", hint);
+        return { ok: false, status: "inventory_full", questId, result: refused.result, hint };
+      }
+      return { ok: true, status: "accepted", questId, quest: quest as QuestLogEntry, title: wanted.title };
     });
   }
 
@@ -5286,6 +5410,10 @@ export class WrathClient {
       if ("nothing" in offered) {
         this.noteActionHint("questsAvailableFrom", "nothing_on_offer", offered.hint);
         return { ok: false, status: "nothing_on_offer", quests: [], hint: offered.hint };
+      }
+      if ("tooFar" in offered) {
+        this.noteActionHint("questsAvailableFrom", "too_far", offered.hint);
+        return { ok: false, status: "too_far", quests: [], distance: offered.tooFar, hint: offered.hint };
       }
       return { ok: true, quests: offered.quests };
     });
@@ -5643,18 +5771,15 @@ export class WrathClient {
 
       // Out-of-range quest_complete is silently ignored by the server and burns
       // the whole timeout (roster-opus-20260822 turn ~28). Fail fast only when
-      // the cache can prove the NPC is *grossly* far away — the 40y threshold
-      // leaves cached-position staleness no room to reject a legitimate call;
-      // borderline cases still get the honest timeout.
+      // the cache proves the NPC is out of reach (QUESTGIVER_REACH_CEILING);
+      // closer than that, a large NPC may still be in reach, so the call goes
+      // out and a silence gets the honest timeout.
       const distance = distanceToUnit(this.state, npcId);
-      if (distance !== undefined && distance > 40) {
-        return {
-          ok: false,
-          status: "too_far",
-          questId,
-          distance: Math.round(distance),
-          hint: `the questgiver is ${Math.round(distance)}y away — interact range is ~${INTERACT_RANGE}y; moveTo it first`,
-        };
+      const tooFar = questgiverOutOfReach(this.state, npcId);
+      if (tooFar !== undefined) {
+        const hint = questgiverTooFarHint(tooFar);
+        this.noteActionHint("turnInQuest", "too_far", hint);
+        return { ok: false, status: "too_far", questId, distance: tooFar, hint };
       }
 
       {
@@ -5844,6 +5969,10 @@ export class WrathClient {
           'Use the search_reference tool for who offers the quest you are after; state.units({ questGiver: "available" }) lists every NPC in view with a quest on offer.',
       };
     }
+    // Checked after the marker, which is the more specific answer: an NPC
+    // with nothing on offer has nothing to walk over for.
+    const tooFar = questgiverOutOfReach(this.state, npcGuid);
+    if (tooFar !== undefined) return { tooFar, hint: questgiverTooFarHint(tooFar) };
     await this.questList(npcGuid);
     const menu = await this
       .waitEvent(

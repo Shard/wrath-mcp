@@ -150,6 +150,14 @@ const UNIT_FLAG_TAXI_FLIGHT = 0x0010_0000;
  */
 const PLAYER_FLAGS_RESTING = 0x0000_0020;
 
+/**
+ * `PLAYER_FLAGS_GHOST` on 3.3.5a — set from the release of the spirit until
+ * the resurrect, the bit a client reads to draw the ghost world. Decoded from
+ * the same `playerFlags` integer; a ghost's health is 1, so health alone
+ * cannot tell one from the living.
+ */
+const PLAYER_FLAGS_GHOST = 0x0000_0010;
+
 // The wire's react/command state byte, as the pet frame names it; the
 // pair the `pet()` fold reads. The names themselves live in `./state-social`.
 const PET_REACTIONS: readonly PetReaction[] = ["passive", "defensive", "aggressive"];
@@ -383,6 +391,14 @@ export interface SelfState extends UnitFieldsState {
    * `undefined` until a block has carried `playerFlags` at all.
    */
   resting: Observed<boolean> | undefined;
+  /**
+   * `PLAYER_FLAGS_GHOST` on our own `playerFlags`: true while the released
+   * spirit walks as a ghost, from the release until the resurrect. A ghost's
+   * health reads 1, not 0, so this is the reading that says dead once the
+   * spirit is released. Guarded like `resting`; `undefined` until a block has
+   * carried `playerFlags` at all.
+   */
+  ghost: Observed<boolean> | undefined;
   /**
    * The last `SMSG_ACTIVATETAXIREPLY` (the answer to a raw `CMSG_ACTIVATETAXI`).
    * Kept because it is the only thing that says a flight was *accepted*; the
@@ -1308,6 +1324,7 @@ export class StateCache {
     achievements: undefined,
     taxiFlight: undefined,
     resting: undefined,
+    ghost: undefined,
     taxiReply: undefined,
     bindPoint: undefined,
     health: undefined,
@@ -3281,7 +3298,8 @@ export class StateCache {
   /**
    * The nearest object in view that passes `filter`, by straight-line distance
    * from our own last observed position. `undefined` when we have no position,
-   * or nothing in view has one — never a guess.
+   * or nothing in view has one — never a guess. The answer is the raw
+   * `NearbyObject` (wrapped fields, no `distance`), not a `units()` row.
    *
    * `filter` is either a `units()` criteria object — `closest({ entry: 196 })`,
    * `closest({ name: "Deputy Willem", npc: true })` — with exactly the meaning
@@ -3598,6 +3616,7 @@ export class StateCache {
       // must not be read as "not resting".
       if (typeof fields.playerFlags === "number") {
         this.self.resting = { value: (fields.playerFlags & PLAYER_FLAGS_RESTING) !== 0, seq, ts };
+        this.self.ghost = { value: (fields.playerFlags & PLAYER_FLAGS_GHOST) !== 0, seq, ts };
       }
       const healthAfter = target.fields.get("health")?.value;
       const pos = this.self.position?.value;

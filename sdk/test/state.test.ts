@@ -2172,6 +2172,26 @@ describe("achievements and flight paths", () => {
     const cache = StateCache.replay(toEvents([playerFlags(1, 0x20), selfProgress]), { seed: SEED });
     expect(cache.self.resting).toEqual({ value: true, seq: 1, ts: 2001 });
   });
+
+  test("ghost is the PLAYER_FLAGS_GHOST bit on self, and unobserved until a block carries it", () => {
+    expect(StateCache.replay([], { seed: SEED }).self.ghost).toBeUndefined();
+    // 0x10 is PLAYER_FLAGS_GHOST; 0x20 (resting) alone is not a ghost.
+    expect(StateCache.replay(toEvents([playerFlags(1, 0x20)]), { seed: SEED }).self.ghost).toEqual({
+      value: false,
+      seq: 1,
+      ts: 2001,
+    });
+    expect(StateCache.replay(toEvents([playerFlags(1, 0x30)]), { seed: SEED }).self.ghost).toEqual({
+      value: true,
+      seq: 1,
+      ts: 2001,
+    });
+    // The resurrect clears the bit, and a block without playerFlags leaves it alone.
+    const back = StateCache.replay(toEvents([playerFlags(1, 0x10), selfProgress, playerFlags(40, 0)]), { seed: SEED });
+    expect(back.self.ghost).toEqual({ value: false, seq: 40, ts: 2040 });
+    const held = StateCache.replay(toEvents([playerFlags(1, 0x10), selfProgress]), { seed: SEED });
+    expect(held.self.ghost).toEqual({ value: true, seq: 1, ts: 2001 });
+  });
 });
 
 describe("skills, talent tree, item stats, reputation", () => {

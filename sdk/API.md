@@ -69,7 +69,7 @@ exists.) Then, on the client:
 
 | Method | Signature | Purpose |
 | --- | --- | --- |
-| `moveTo` | `moveTo(target, options?): Promise<MoveResult>` | Walk to a point { x, y, z }, a unit, a guid, or the name of something in view (its cached position; the guid rides along so the module resolves z to the ground under the unit) and wait for the server's arrive/target_off_mesh/transferred/teleported/… verdict; a target nothing in view answers to comes back as status "unknown_target". An arrival aboard a tram car or boat carries onTransport { guid, entry }, and state.self.position then follows the ride (WB_RIDE_PROGRESS). |
+| `moveTo` | `moveTo(target, options?): Promise<MoveResult>` | Walk to a point { x, y, z }, a unit, a guid, or the name of something in view (its cached position; the guid rides along so the module resolves z to the ground under the unit) and wait for the server's arrive/target_off_mesh/transferred/teleported/… verdict; a target nothing in view answers to comes back as status "unknown_target". One move reaches at most 250y in a straight line (x/y) from where you stand: a farther target is refused as status "too_far" with nothing moved, so a longer trip is several moves. An arrival aboard a tram car or boat carries onTransport { guid, entry }, and state.self.position then follows the ride (WB_RIDE_PROGRESS). |
 | `killTarget` | `killTarget(target: GuidOrUnit, options?): Promise<KillResult>` | Approach and auto-attack until the target or we drop; returns how the fight ended. |
 | `lootCorpse` | `lootCorpse(target: GuidOrUnit, options?): Promise<LootResult>` | Empty a corpse and report what actually entered the bags (confirmed pushes, not the window). |
 | `acceptQuestFrom` | `acceptQuestFrom(npcGuid: GuidOrUnit, questId, options?): Promise<QuestAcceptResult>` | Take a quest from an NPC and confirm it landed in the quest log. |
@@ -108,7 +108,7 @@ exists.) Then, on the client:
 | Method | Signature | Purpose |
 | --- | --- | --- |
 | `say` | `say(text): Promise<ActionResponse>` | Say something in local chat. |
-| `moveToAsync` | `moveToAsync(target): Promise<MoveToResponse>` | Queue a move without waiting — the call for a walk longer than your own time budget; same targets as moveTo. |
+| `moveToAsync` | `moveToAsync(target): Promise<MoveToResponse>` | Queue a move without waiting — the call for a walk longer than your own time budget; same targets and the same 250y single-move cap as moveTo. |
 | `stop` | `stop(): Promise<ActionResponse>` | Queue a movement stop; the in-flight moveTo resolves with status 'stopped'. |
 | `face` | `face(orientationOrPoint: number | { x, y }): Promise<FaceResponse>` | Turn in place toward an orientation (radians) or a point. |
 | `setTarget` | `setTarget(target: GuidOrUnit): Promise<ActionResponse>` | Set the current target. |
@@ -161,16 +161,18 @@ exists.) Then, on the client:
 `state` (alias for `sdk.state`) is a cache folded from events. `state.self`
 (guid, name, level, position, zone and area — `{ id, name }`, the game's own
 zone/subzone as the client names them on screen, e.g. "Elwynn Forest" /
-"Northshire Valley" — health, targetGuid) and `state.nearby` (a Map
-keyed by guid) are plain properties; the members below are getters and methods.
+"Northshire Valley" — health, targetGuid, and ghost: `state.self.ghost.value`
+is true while your released spirit walks as a ghost, whose health reads 1, not
+0) and `state.nearby` (a Map keyed by guid) are plain properties; the members
+below are getters and methods.
 Observed fields are wrapped as `{ value, seq, ts }` — read `.value`. Every field
 is `undefined` until an event carried it; `undefined` means unobserved, never
 zero.
 
 | Method | Signature | Purpose |
 | --- | --- | --- |
-| `units` | `state.units(filter?: UnitFilter): UnitView[]` | Scan nearby objects, nearest first; filter by entry, name (string | RegExp), type, alive, maxDistance, npc, role (an NPC role word or a list: "questGiver", "vendor", "repair", "trainer", "flightMaster", "innkeeper", "spiritHealer", "banker", "auctioneer", …), questGiver (the observed marker name: "available" offers a quest, "reward" takes a turn-in now, "incomplete" ends a quest not yet done; true means any marker but "none"). Rows carry roles (the NPC's role words from its npc flags — what it is for, never what to do; empty for non-NPCs) and questGiver / questGiverStatus; game objects are named ("Mailbox", "Subway") and carry goType (door, chest, mailbox, transport, …), and a transport carries docked (true while the car sits at a platform). |
-| `closest` | `state.closest(filter?): NearbyObject | undefined` | The nearest object by distance. `filter` is a units() criteria object ({ entry, name, type, alive, maxDistance, npc, role, questGiver }) or a predicate over the raw object. |
+| `units` | `state.units(filter?: UnitFilter): UnitView[]` | Scan nearby objects, nearest first; filter by entry, name (string | RegExp), type, alive, maxDistance, npc (true keeps NPCs with any npc flag, false drops them — a filter key only: rows carry roles, never an npc field), role (an NPC role word or a list: "questGiver", "vendor", "repair", "trainer", "flightMaster", "innkeeper", "spiritHealer", "banker", "auctioneer", …), questGiver (the observed marker name: "available" offers a quest, "reward" takes a turn-in now, "incomplete" ends a quest not yet done; true means any marker but "none"). Rows carry roles (the NPC's role words from its npc flags — what it is for, never what to do; empty for non-NPCs) and questGiver / questGiverStatus; game objects are named ("Mailbox", "Subway") and carry goType (door, chest, mailbox, transport, …), and a transport carries docked (true while the car sits at a platform). |
+| `closest` | `state.closest(filter?): NearbyObject | undefined` | The nearest object by distance, returned as the raw object nearbyUnits() gives — not a units() row: fields are wrapped (.name.value, .entry.value, .position.value; only .guid is plain) and there is no .distance; state.units(filter) gives flat rows with distance, nearest first. `filter` is a units() criteria object ({ entry, name, type, alive, maxDistance, npc, role, questGiver }) or a predicate over the raw object. |
 | `nearbyUnits` | `state.nearbyUnits(): NearbyObject[]` | The raw nearby objects (state.units gives flat plain objects instead). |
 | `creaturesByEntry` | `state.creaturesByEntry(entry): NearbyObject[]` | Nearby creatures with a given template entry id. |
 | `bag` | `state.bag(): BagContents` | The whole carried inventory — backpack plus worn bags — as { items: [{ bag, slot, guid, itemId, name, count, quality? }], freeSlots, totalSlots, bags: [{ slot, numSlots, name }] }; each item's bag/slot is what the item actions take. |
@@ -222,8 +224,8 @@ the zone or subzone changes, by foot, teleport or transfer — what `state.self.
 / `state.self.area` are folded from),
 `WB_RIDE_PROGRESS` (own position while a transport carries you, ≤1/s) and
 `WB_TRANSPORT_PROGRESS` (`{ guid, entry, pos, docked, progressMs, periodMs }`
-per transport in view, ≤1/s — the same facts as the `docked` column of
-`state.units()`).
+for every transport on your map, near or not, each ≤1/s — the same facts as
+the `docked` column of `state.units()`).
 
 | Method | Signature | Purpose |
 | --- | --- | --- |

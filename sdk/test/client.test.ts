@@ -1183,6 +1183,13 @@ async function untilAction(stub: StubServer, action: string, from = 0): Promise<
 }
 
 const combatWorld = () => frames([...loginSequence, selfCreate, creatureCreate, creatureQuery]);
+/**
+ * The combat world with ourselves walked up to the creature: quest calls are
+ * refused locally past the questgiver reach ceiling, and the fixture creature
+ * stands ~35y from the login position.
+ */
+const questWorld = () =>
+  frames([...loginSequence, selfCreate, creatureCreate, creatureQuery, selfArrived(20, { x: -1202, y: 980, z: 42 })]);
 const chestWorld = () => frames([...loginSequence, selfCreate, chestCreate]);
 
 describe("client: killTarget", () => {
@@ -1717,7 +1724,7 @@ describe("client: lootCorpse", () => {
 
 describe("client: quests", () => {
   test("acceptQuestFrom reads the quest list out of a gossip menu", async () => {
-    const stub = startStub({ onConnect: () => combatWorld() });
+    const stub = startStub({ onConnect: () => questWorld() });
     const client = await inWorld(stub);
     const pending = client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 2000 });
     await untilAction(stub, "quest_list");
@@ -1735,7 +1742,7 @@ describe("client: quests", () => {
   });
 
   test("acceptQuestFrom reads the plain questgiver list too", async () => {
-    const stub = startStub({ onConnect: () => combatWorld() });
+    const stub = startStub({ onConnect: () => questWorld() });
     const client = await inWorld(stub);
     const pending = client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 2000 });
     await untilAction(stub, "quest_list");
@@ -1759,22 +1766,57 @@ describe("client: quests", () => {
   });
 
   test("a questgiver that does not offer it says what it did offer", async () => {
-    const stub = startStub({ onConnect: () => combatWorld() });
+    const stub = startStub({ onConnect: () => questWorld() });
     const client = await inWorld(stub);
     const pending = client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 2000 });
     await untilAction(stub, "quest_list");
     stub.push(JSON.stringify(gossipWithQuests([OTHER_QUEST_ID], 77)));
     const result = await pending;
     expect(result.ok).toBe(false);
-    if (result.ok) throw new Error("unreachable");
-    expect(result.status).toBe("not_offered");
+    if (result.ok || result.status !== "not_offered") throw new Error(`unexpected ${result.status}`);
     expect(result.offered.map((q) => q.questId)).toEqual([OTHER_QUEST_ID]);
     client.close();
     await stub.stop();
   });
 
+  test("an accept whose item does not fit is inventory_full at once, not a timeout", async () => {
+    // The core adds nothing to the log and answers with the InventoryResult
+    // for the item the quest hands over on accept (50: bags full).
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    const started = Date.now();
+    const pending = client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 5000 });
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify(questGiverList([QUEST_ID], 86)));
+    await untilAction(stub, "quest_accept");
+    stub.push(JSON.stringify(inventoryChangeFailure(87, 50)));
+    const result = await pending;
+    expect(Date.now() - started).toBeLessThan(2000);
+    if (result.ok || result.status !== "inventory_full") throw new Error(`unexpected ${result.status}`);
+    expect(result).toMatchObject({ questId: QUEST_ID, result: 50 });
+    expect(result.hint).toContain("free a bag slot");
+    expect(client.state.quest(QUEST_ID)).toBeUndefined();
+    expect(client.drainActionHints()[0]).toMatchObject({ action: "acceptQuestFrom", status: "inventory_full" });
+    client.close();
+    await stub.stop();
+  });
+
+  test("an inventory failure from before the accept is not read as its answer", async () => {
+    const stub = startStub({ onConnect: () => [...questWorld(), JSON.stringify(inventoryChangeFailure(31, 50))] });
+    const client = await inWorld(stub);
+    await client.events.waitFor((e) => e.seq === 31, { timeout: 2000 });
+    const pending = client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 2000 });
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify(questGiverList([QUEST_ID], 88)));
+    await untilAction(stub, "quest_accept");
+    stub.push(JSON.stringify({ ...(questAccepted as object), seq: 89 }));
+    expect(await pending).toMatchObject({ ok: true, status: "accepted", questId: QUEST_ID });
+    client.close();
+    await stub.stop();
+  });
+
   test("turnInQuest chooses a reward and reports the XP the server granted", async () => {
-    const stub = startStub({ onConnect: () => combatWorld() });
+    const stub = startStub({ onConnect: () => questWorld() });
     const client = await inWorld(stub);
     const pending = client.turnInQuest(CREATURE_GUID, QUEST_ID, 0, { timeout: 2000 });
     await untilAction(stub, "quest_complete");
@@ -1791,7 +1833,7 @@ describe("client: quests", () => {
     // Re-asking with quest_complete gets REQUEST_ITEMS again forever on
     // item-delivery quests (roster-opus-20260822): the reward is chosen
     // directly from the completable answer.
-    const stub = startStub({ onConnect: () => combatWorld() });
+    const stub = startStub({ onConnect: () => questWorld() });
     const client = await inWorld(stub);
     const pending = client.turnInQuest(CREATURE_GUID, QUEST_ID, 0, { timeout: 2000 });
     await untilAction(stub, "quest_complete");
@@ -1804,7 +1846,7 @@ describe("client: quests", () => {
   });
 
   test("a reward that does not fit is inventory_full, not a timeout", async () => {
-    const stub = startStub({ onConnect: () => combatWorld() });
+    const stub = startStub({ onConnect: () => questWorld() });
     const client = await inWorld(stub);
     const pending = client.turnInQuest(CREATURE_GUID, QUEST_ID, 0, { timeout: 2000 });
     await untilAction(stub, "quest_complete");
@@ -1822,7 +1864,7 @@ describe("client: quests", () => {
   });
 
   test("a questgiver refusing an unfinished quest is a value", async () => {
-    const stub = startStub({ onConnect: () => combatWorld() });
+    const stub = startStub({ onConnect: () => questWorld() });
     const client = await inWorld(stub);
     const pending = client.turnInQuest(CREATURE_GUID, QUEST_ID, 0, { timeout: 2000 });
     await untilAction(stub, "quest_complete");
@@ -1838,7 +1880,7 @@ describe("client: quests", () => {
   test("a grossly out-of-range questgiver fails fast as too_far", async () => {
     // The server silently ignores an out-of-range quest_complete; without the
     // pre-check the call burns its whole timeout (roster-opus-20260822).
-    const stub = startStub({ onConnect: () => combatWorld() });
+    const stub = startStub({ onConnect: () => questWorld() });
     const client = await inWorld(stub);
     const FAR_GUID = "17365880163140632599";
     const far = structuredClone(creatureCreate);
@@ -1861,7 +1903,7 @@ describe("client: quests", () => {
     // and re-read "the NPC may be out of interact range" for 135 turns. The
     // SDK knows the distance locally, so the message stops offering range as a
     // live possibility when it is not one.
-    const stub = startStub({ onConnect: () => combatWorld() });
+    const stub = startStub({ onConnect: () => questWorld() });
     const client = await inWorld(stub);
     const NEAR_GUID = "17365880163140632777";
     const self = client.state.self.position?.value;
@@ -1892,18 +1934,49 @@ describe("client: quests", () => {
   });
 
   test("a quest-list timeout quotes the distance and says to close it when it is far", async () => {
-    const stub = startStub({ onConnect: () => combatWorld() });
+    // 20y: out of a small NPC's reach, but within a large one's, so the call
+    // still goes out and the silence is explained afterwards.
+    const stub = startStub({
+      onConnect: () => [...combatWorld(), JSON.stringify(selfArrived(20, { x: -1220, y: 980, z: 42 }))],
+    });
     const client = await inWorld(stub);
     await Bun.sleep(20);
     const err = (await client
       .questsAvailableFrom(CREATURE_GUID, { timeout: 150 })
       .catch((e: unknown) => e)) as Error & { distance?: number };
     expect(err).toBeInstanceOf(EventTimeoutError);
-    // creatureCreate stands ~35y from the login position.
-    expect(err.message).toMatch(/distance: 3\d(\.\d+)?y/);
+    expect(err.message).toContain("distance: 20y");
     expect(err.message).toContain("interact range is ~5y");
     expect(err.message).toContain("move to the NPC first");
-    expect(err.distance).toBeGreaterThan(30);
+    expect(err.distance).toBe(20);
+    expect(stub.actions.some((a) => a.action === "quest_list")).toBe(true);
+    client.close();
+    await stub.stop();
+  });
+
+  test("past the reach ceiling every quest call is too_far at once, with nothing sent", async () => {
+    // creatureCreate stands ~35y from the login position: farther than any
+    // questgiver reaches, so the server's silence is not waited for.
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    await Bun.sleep(20);
+    const started = Date.now();
+    const offer = await client.questsAvailableFrom(CREATURE_GUID, { timeout: 5000 });
+    const accept = await client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 5000 });
+    const turnIn = await client.turnInQuest(CREATURE_GUID, QUEST_ID, 0, { timeout: 5000 });
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(offer).toMatchObject({ ok: false, status: "too_far", quests: [], distance: 35 });
+    expect(accept).toMatchObject({ ok: false, status: "too_far", questId: QUEST_ID, distance: 35 });
+    expect(turnIn).toMatchObject({ ok: false, status: "too_far", questId: QUEST_ID, distance: 35 });
+    if (offer.ok || offer.status !== "too_far") throw new Error("unreachable");
+    expect(offer.hint).toBe("the questgiver is 35y away — interact range is ~5y; moveTo it first");
+    const sent = stub.actions.map((a) => a.action);
+    for (const action of ["quest_list", "quest_accept", "quest_complete"]) expect(sent).not.toContain(action);
+    expect(client.drainActionHints().map((h) => `${h.action}:${h.status}`)).toEqual([
+      "questsAvailableFrom:too_far",
+      "acceptQuestFrom:too_far",
+      "turnInQuest:too_far",
+    ]);
     client.close();
     await stub.stop();
   });
@@ -1911,7 +1984,7 @@ describe("client: quests", () => {
   test("a refusal while the log says complete names the wrong questgiver", async () => {
     // roster-sonnet-20260822: three not_completes against a log that said
     // complete:true — the honest status is that another NPC ends this quest.
-    const stub = startStub({ onConnect: () => combatWorld() });
+    const stub = startStub({ onConnect: () => questWorld() });
     const client = await inWorld(stub);
     stub.push(JSON.stringify(questAccepted));
     stub.push(JSON.stringify(questComplete));
@@ -1928,7 +2001,7 @@ describe("client: quests", () => {
   });
 
   test("waitForQuestObjective settles on the quest log's own completion bit", async () => {
-    const stub = startStub({ onConnect: () => combatWorld() });
+    const stub = startStub({ onConnect: () => questWorld() });
     const client = await inWorld(stub);
     stub.push(JSON.stringify(questAccepted));
     const pending = client.waitForQuestObjective(QUEST_ID, { timeout: 2000 });
@@ -1946,7 +2019,7 @@ describe("client: quests", () => {
   });
 
   test("an objective that never completes throws rather than inventing a status", async () => {
-    const stub = startStub({ onConnect: () => combatWorld() });
+    const stub = startStub({ onConnect: () => questWorld() });
     const client = await inWorld(stub);
     stub.push(JSON.stringify(questAccepted));
     await expect(client.waitForQuestObjective(QUEST_ID, { timeout: 40 })).rejects.toBeInstanceOf(
@@ -1959,7 +2032,7 @@ describe("client: quests", () => {
 
 describe("client: questsAvailableFrom", () => {
   test("reads the offer out of a gossip menu", async () => {
-    const stub = startStub({ onConnect: () => combatWorld() });
+    const stub = startStub({ onConnect: () => questWorld() });
     const client = await inWorld(stub);
     const pending = client.questsAvailableFrom(CREATURE_GUID, { timeout: 2000 });
     await untilAction(stub, "quest_list");
@@ -1974,7 +2047,7 @@ describe("client: questsAvailableFrom", () => {
   });
 
   test("reads the plain questgiver list too", async () => {
-    const stub = startStub({ onConnect: () => combatWorld() });
+    const stub = startStub({ onConnect: () => questWorld() });
     const client = await inWorld(stub);
     const pending = client.questsAvailableFrom(CREATURE_GUID, { timeout: 2000 });
     await untilAction(stub, "quest_list");
@@ -1986,7 +2059,7 @@ describe("client: questsAvailableFrom", () => {
   });
 
   test("an empty offer is an answer, not an error", async () => {
-    const stub = startStub({ onConnect: () => combatWorld() });
+    const stub = startStub({ onConnect: () => questWorld() });
     const client = await inWorld(stub);
     const pending = client.questsAvailableFrom(CREATURE_GUID, { timeout: 2000 });
     await untilAction(stub, "quest_list");
@@ -1998,7 +2071,7 @@ describe("client: questsAvailableFrom", () => {
   });
 
   test("silence throws rather than reporting an empty offer", async () => {
-    const stub = startStub({ onConnect: () => combatWorld() });
+    const stub = startStub({ onConnect: () => questWorld() });
     const client = await inWorld(stub);
     await expect(
       client.questsAvailableFrom(CREATURE_GUID, { timeout: 40 }),
@@ -3064,10 +3137,16 @@ describe("client: reclaimCorpse owns the delay and answers with a verdict", () =
         ]),
     });
     const client = await inWorld(stub);
-    const result = await client.reclaimCorpse(undefined, { timeout: 500, attemptTimeout: 120 });
+    // A distance waiting cannot close is answered at once, with nothing sent,
+    // rather than after the whole default budget.
+    const started = Date.now();
+    const result = await client.reclaimCorpse();
+    expect(Date.now() - started).toBeLessThan(1000);
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("unreachable");
     expect(result.reason).toBe("too_far");
+    expect(result.attempts).toBe(0);
+    expect(stub.actions.filter((a) => a.action === "reclaim_corpse")).toHaveLength(0);
     expect(result.distance).toBe(387);
     expect(result.radius).toBe(39);
     expect(result.corpse?.source).toBe("corpse_query");
@@ -3075,6 +3154,23 @@ describe("client: reclaimCorpse owns the delay and answers with a verdict", () =
     expect(result.hint).toContain("moveTo(state.self.corpse.value)");
     expect(result.hint).toContain("25% durability");
     expect(result.hint).toContain("no resurrection sickness at your level");
+    client.close();
+    await stub.stop();
+  });
+
+  test("a ghost just past the radius is still sent the reclaim, since the core's reach adds both sizes", async () => {
+    const stub = startStub({
+      onConnect: () =>
+        deadWorld(1, [
+          corpseQuery(91, { map: 0, x: -1234.5, y: 987.25, z: 42.125 }),
+          selfArrived(92, { x: -1234.5 + 40, y: 987.25, z: 42.125 }),
+        ]),
+    });
+    const client = await inWorld(stub);
+    const pending = client.reclaimCorpse(undefined, { timeout: 4000, attemptTimeout: 1500 });
+    await untilAction(stub, "reclaim_corpse");
+    stub.push(JSON.stringify(deathReleaseCleared(93)));
+    expect((await pending).status).toBe("reclaimed");
     client.close();
     await stub.stop();
   });
@@ -3153,6 +3249,37 @@ describe("client: reclaimCorpse owns the delay and answers with a verdict", () =
     expect(result.reason).toBe("delay_not_elapsed");
     expect(result.attempts).toBe(0);
     expect(result.hint).toContain("still to run");
+    expect(stub.actions.filter((a) => a.action === "reclaim_corpse")).toHaveLength(0);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a delay announced before the event buffer turned over still holds, and past the budget is answered at once", async () => {
+    // The delay was announced 10s ago and has 110s to run; 520 later events
+    // have pushed it out of the 500-event buffer, so only the state cache
+    // still knows it. Nothing is sent, and the default 25s budget is not spent.
+    const filler = Array.from({ length: 520 }, (_, i) => ({
+      seq: 92 + i,
+      opcode: "SMSG_NOTIFICATION",
+      opcodeId: 0x1cb,
+      ts: Date.now(),
+      data: { text: `filler ${i}` },
+    }));
+    const stub = startStub({
+      onConnect: () => deadWorld(1, [corpseReclaimDelay(120_000, 91, Date.now() - 10_000)]),
+    });
+    const client = await inWorld(stub);
+    for (const f of filler) stub.push(JSON.stringify(f));
+    await client.events.waitFor((e) => e.seq === 92 + 519, { timeout: 2000 });
+    expect(client.events.recent().some((e) => e.opcode === "SMSG_CORPSE_RECLAIM_DELAY")).toBe(false);
+    const started = Date.now();
+    const result = await client.reclaimCorpse();
+    expect(Date.now() - started).toBeLessThan(1000);
+    if (result.ok) throw new Error("unreachable");
+    expect(result).toMatchObject({ status: "not_reclaimed", reason: "delay_not_elapsed", attempts: 0, delayMs: 120_000 });
+    expect(result.secondsLeft).toBeGreaterThanOrEqual(109);
+    expect(result.secondsLeft).toBeLessThanOrEqual(110);
+    expect(result.hint).toContain("nothing was sent");
     expect(stub.actions.filter((a) => a.action === "reclaim_corpse")).toHaveLength(0);
     client.close();
     await stub.stop();
@@ -4100,7 +4227,7 @@ describe("client: quest-start items and the questgiver marker pre-check (2026-08
   });
 
   test("acceptQuestFrom on a turn-in-only NPC is nothing_on_offer at once, with the marker's hint and nothing sent", async () => {
-    const stub = startStub({ onConnect: () => combatWorld() });
+    const stub = startStub({ onConnect: () => questWorld() });
     const client = await inWorld(stub);
     stub.push(JSON.stringify(questGiverStatus(CREATURE_GUID, 6, 91))); // reward_rep
     await Bun.sleep(20);
