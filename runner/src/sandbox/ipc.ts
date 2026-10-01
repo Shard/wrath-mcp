@@ -93,12 +93,27 @@ export type HostToChild =
    * into the SDK client, which uses it for explanation only (a `moveTo` result
    * whose walk was always longer than the budget says so in its `hint`); no
    * wait is ever shortened or refused because of it.
+   *
+   * `timeoutMs` is the ceiling that deadline was set from, carried the same way
+   * and for the same purpose: an awaited `sleep` asked for at least the time
+   * its snippet had left names the ceiling in the abandon note. Explanation
+   * only; the sleep still runs for what it was asked.
    */
-  | { t: "eval"; id: number; code: string; deadline?: number }
+  | { t: "eval"; id: number; code: string; deadline?: number; timeoutMs?: number }
   | { t: "ping"; id: number }
   /** Abort the eval with this id: fires its `signal`, so SDK waits it left behind settle. */
   | { t: "abort"; id: number }
-  | { t: "rpc"; id: number; method: "recent_events" | "state_summary" | "death_signals"; params: { limit?: number } }
+  /**
+   * `action_hints` drains the SDK's hint tally for a tool result that is not a
+   * snippet's (`SandboxHost.drainActionHints`); a snippet's own result and
+   * pong drain it themselves.
+   */
+  | {
+      t: "rpc";
+      id: number;
+      method: "recent_events" | "state_summary" | "death_signals" | "action_hints";
+      params: { limit?: number };
+    }
   | { t: "shutdown" };
 
 export interface EvalResultMsg {
@@ -140,9 +155,11 @@ export type ChildToHost =
   | { t: "ready" }
   | EvalResultMsg
   /**
-   * `note` carries what the abandoned eval learned on its way out — today, the
-   * distance an in-flight `moveTo` had covered and had left — so the host's
-   * abandon message can state it. Absent when the abort taught us nothing.
+   * `note` carries what the abandoned eval learned on its way out — the
+   * distance an in-flight `moveTo` had covered and had left, or that an awaited
+   * `sleep` was asked for at least the time the snippet had left — so the
+   * host's abandon message can state it. Absent when the abort taught us
+   * nothing.
    */
   | { t: "pong"; id: number; logs?: LogEntry[]; note?: string; hints?: ActionHintNote[] }
   | { t: "rpc_result"; id: number; ok: boolean; value?: unknown; error?: string }
