@@ -30,6 +30,7 @@ import {
   malformedChat,
   moveResult,
   sessionResponseFixture,
+  swingError,
   undecodableChat,
 } from "./fixtures";
 
@@ -112,6 +113,8 @@ describe("event frames", () => {
       "SMSG_ATTACKSTART",
       "SMSG_ATTACKSTOP",
       "SMSG_ATTACKERSTATEUPDATE",
+      "SMSG_ATTACKSWING_NOTINRANGE",
+      "SMSG_ATTACKSWING_BADFACING",
       "SMSG_SPELL_START",
       "SMSG_SPELL_GO",
       "SMSG_CAST_FAILED",
@@ -291,6 +294,39 @@ describe("event frames", () => {
     if (!result.ok) throw new Error("unknown opcodes must not fail");
     expect(result.event.opcode).toBe("SMSG_TRAINER_LIST");
     expect((result.event.data as { count: number }).count).toBe(1);
+  });
+
+  test("the two melee swing errors decode as known, bodiless events", () => {
+    // PROTOCOL.md "Swing errors": the wire carries no body, so the typed event
+    // is the opcode and an empty payload — no victim, no distance.
+    for (const [kind, opcode, id] of [
+      ["NOTINRANGE", "SMSG_ATTACKSWING_NOTINRANGE", 0x145],
+      ["BADFACING", "SMSG_ATTACKSWING_BADFACING", 0x146],
+    ] as const) {
+      expect(isKnownOpcode(opcode)).toBe(true);
+      const result = parseEventFrame(JSON.stringify(swingError(kind, 70)));
+      if (!result.ok) throw new Error("a swing-error frame must parse");
+      expect(isEvent(result.event, opcode)).toBe(true);
+      expect((result.event as { schemaError?: string }).schemaError).toBeUndefined();
+      expect(result.event.opcode).toBe(opcode);
+      expect(result.event.opcodeId).toBe(id);
+      expect(result.event.seq).toBe(70);
+      expect(isDecodeError(result.event.data)).toBe(false);
+      expect(result.event.data).toEqual({});
+    }
+    // The siblings the core never sends at the pinned commit are not on the
+    // whitelist; were one to arrive it would still stream, as an UnknownEvent.
+    expect(isKnownOpcode("SMSG_ATTACKSWING_DEADTARGET")).toBe(false);
+    expect(isKnownOpcode("SMSG_ATTACKSWING_CANT_ATTACK")).toBe(false);
+  });
+
+  test("a swing error whose payload is not an object keeps the event, flagged", () => {
+    const frame = { ...(swingError("BADFACING", 71) as object), data: "nope" };
+    const result = parseEventFrame(JSON.stringify(frame));
+    if (!result.ok) throw new Error("frame should still parse");
+    expect(result.event.opcode).toBe("SMSG_ATTACKSWING_BADFACING");
+    expect((result.event as { schemaError?: string }).schemaError).toBeDefined();
+    expect(isEvent(result.event, "SMSG_ATTACKSWING_BADFACING")).toBe(false);
   });
 
   test("a creature guid above 2^63 survives the frame as an exact string", () => {

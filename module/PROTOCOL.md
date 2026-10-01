@@ -369,7 +369,7 @@ them: `{ "ok": true, "action": "<name>", "token": ... }`.
 |---|---|---|---|
 | `set_target` | `guid` | `CMSG_SET_SELECTION` | |
 | `clear_target` | — | `CMSG_SET_SELECTION` | guid 0 |
-| `attack_start` | `guid` | `CMSG_ATTACKSWING` | melee auto-attack; server swings while in range |
+| `attack_start` | `guid` | `CMSG_ATTACKSWING` | melee auto-attack; server swings while in range and facing. A swing it refuses is reported once as `SMSG_ATTACKSWING_NOTINRANGE` / `SMSG_ATTACKSWING_BADFACING` (latched: see "Swing errors" under the combat table) |
 | `attack_stop` | — | `CMSG_ATTACKSTOP` | |
 | `cast_spell` | `spellId`, `targetGuid?` | `CMSG_CAST_SPELL` | no `targetGuid` = self/auto target (mask 0); with it, TARGET_FLAG_UNIT + packed guid. A game object guid works too (the core resolves the packed guid by its type), which is how chests open; a client would set TARGET_FLAG_GAMEOBJECT for it |
 | `cancel_cast` | `spellId` | `CMSG_CANCEL_CAST` | |
@@ -953,6 +953,8 @@ Combat:
 | `SMSG_ATTACKSTART` | 0x143 | `{ "attackerGuid", "victimGuid" }` |
 | `SMSG_ATTACKSTOP` | 0x144 | `{ "attackerGuid", "victimGuid", "attackerDead": <bool> }` |
 | `SMSG_ATTACKERSTATEUPDATE` | 0x14A | compact: `{ "attackerGuid", "victimGuid", "hitInfo": <u32>, "damage", "overkill", "absorb", "resist", "blocked", "victimState": <u8>, "miss": <bool>, "crit": <bool> }` — per-school sub-damages are summed, not itemized |
+| `SMSG_ATTACKSWING_NOTINRANGE` | 0x145 | `{}` — a ready melee swing was refused: the victim is out of melee range (see the latch note below) |
+| `SMSG_ATTACKSWING_BADFACING` | 0x146 | `{}` — a ready melee swing was refused: the victim is outside the attacker's front arc |
 | `SMSG_SPELL_START` | 0x131 | compact: `{ "casterGuid", "spellId", "castTimeMs", "targetGuid"? }` |
 | `SMSG_SPELL_GO` | 0x132 | compact: `{ "casterGuid", "spellId", "hitGuids": [<guid-string>], "misses": [{ "guid", "reason": <u8> }] }` |
 | `SMSG_CAST_FAILED` | 0x130 | `{ "spellId", "result": <u8> }` (SpellCastResult code) |
@@ -965,6 +967,38 @@ Combat:
 "casterGuid"?, "maxDuration"?, "duration"? }`; `spellId` 0 means the slot was
 cleared and the entry carries `"removed": true` instead of the optional fields.
 Durations are in ms and present only when the aura shows one (`flags & 0x20`).
+
+Swing errors. `SMSG_ATTACKSWING_NOTINRANGE` and `SMSG_ATTACKSWING_BADFACING`
+are the two packets a client shows as on-screen errors while auto-attack is
+armed and no swing can land. Both are bodiless on the wire
+(`Player::SendAttackSwingNotInRange`, `Player::SendAttackSwingBadFacingAttack`),
+so `data` is `{}`: the packet names no victim and no distance, and the module
+adds none. They go to the attacking player only, raised in `Player::Update`
+when the main-hand swing comes ready and fails a check: range first
+(`IsWithinMeleeRange`), then facing (the victim outside the 120° front arc,
+and only when the attacker is not standing inside the victim's boundary
+radius, where facing is not checked at all). The refused swing is retried
+every 100 ms; melee stays armed and no `SMSG_ATTACKSTOP` follows.
+
+The core latches them (`m_swingErrorMsg`), and a consumer has to know how:
+
+- One event per change of error state, not one per refused swing. Out of
+  range for ten seconds is one `SMSG_ATTACKSWING_NOTINRANGE`; moving into
+  range with the back turned is then one `SMSG_ATTACKSWING_BADFACING`.
+- Nothing is sent when the error clears. The latch resets only when a swing
+  passes both checks (the swing itself then arrives as
+  `SMSG_ATTACKERSTATEUPDATE`, hit or miss) or at login. `attack_stop` and a
+  change of target do not reset it.
+- So silence proves nothing. A second out-of-range attack after an earlier one
+  that never swung sends no packet at all, and the absence of either event
+  does not mean the character is in range or facing its target. Only a swing
+  does.
+
+The module forwards what the wire carries and synthesizes no "cleared" event.
+The siblings `SMSG_ATTACKSWING_DEADTARGET` (0x148) and
+`SMSG_ATTACKSWING_CANT_ATTACK` (0x149) are not whitelisted: at the pinned
+commit their senders have no callers, so there is nothing to forward. An
+attack on an invalid target is answered with `SMSG_ATTACKSTOP`, above.
 
 Progress:
 

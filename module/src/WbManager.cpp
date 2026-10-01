@@ -4397,6 +4397,21 @@ namespace WrathBench
                      .Add("crit", (hitInfo & HITINFO_CRITICALHIT) != 0);
                     break;
                 }
+                // The two melee swing errors a client shows on screen. Both are
+                // bodiless (Player::SendAttackSwingNotInRange /
+                // SendAttackSwingBadFacingAttack), so the event is the fact and
+                // nothing else: no victim, no distance. The core latches them
+                // (Player::Update, m_swingErrorMsg): one packet per change of
+                // error state and none when the state clears, so this tap is
+                // exactly as sparse as the wire. SMSG_ATTACKSWING_DEADTARGET and
+                // SMSG_ATTACKSWING_CANT_ATTACK have no caller at the pinned
+                // commit and are left to the drop census until one does.
+                case SMSG_ATTACKSWING_NOTINRANGE:
+                    name = "SMSG_ATTACKSWING_NOTINRANGE";
+                    break;
+                case SMSG_ATTACKSWING_BADFACING:
+                    name = "SMSG_ATTACKSWING_BADFACING";
+                    break;
                 case SMSG_SPELL_START:
                 {
                     name = "SMSG_SPELL_START";

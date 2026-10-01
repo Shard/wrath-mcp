@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import { EventStream, EventStreamClosedError, EventTimeoutError, STREAM_ERROR, STREAM_GAP } from "../src/events";
 import type { StreamEvent } from "../src/events";
-import { chatEcho, frames, fullStream, loginSequence } from "./fixtures";
+import { chatEcho, CREATURE_GUID, frames, fullStream, loginSequence, SELF_GUID, swing, swingError } from "./fixtures";
 import { startStub } from "./server";
 
 /** A stream with no socket, driven by `ingest`. Ordering/gap logic only. */
@@ -38,6 +38,28 @@ describe("event stream: ordering and delivery", () => {
     // seq 4 decodes, seq 8 is a module decode error, seq 9 fails our schema.
     expect(chats).toBe(3);
     expect(onceFired).toBe(1);
+  });
+
+  test("the melee swing errors reach typed handlers, waiters and the retained buffer", async () => {
+    const stream = offlineStream();
+    const seen: string[] = [];
+    // Typed registration: both names are keys of EventByOpcode, and `data` is
+    // the empty payload (or the module's decode-error marker), nothing else.
+    stream.on("SMSG_ATTACKSWING_NOTINRANGE", (e) => seen.push(`${e.opcode}:${JSON.stringify(e.data)}`));
+    stream.on("SMSG_ATTACKSWING_BADFACING", (e) => seen.push(`${e.opcode}:${JSON.stringify(e.data)}`));
+    stream.ingest(JSON.stringify(swingError("NOTINRANGE", 0)));
+    stream.ingest(JSON.stringify(swing(SELF_GUID, CREATURE_GUID, 1)));
+    stream.ingest(JSON.stringify(swingError("BADFACING", 2)));
+    expect(seen).toEqual(["SMSG_ATTACKSWING_NOTINRANGE:{}", "SMSG_ATTACKSWING_BADFACING:{}"]);
+    // What a snippet reads back (`events.recent()`), and what the runner's
+    // event window is built from: the opcode name and `{}`.
+    expect(stream.recent().map((e) => [e.seq, e.opcode, e.data])).toEqual([
+      [0, "SMSG_ATTACKSWING_NOTINRANGE", {}],
+      [1, "SMSG_ATTACKERSTATEUPDATE", expect.anything()],
+      [2, "SMSG_ATTACKSWING_BADFACING", {}],
+    ]);
+    const facing = await stream.waitForOpcode("SMSG_ATTACKSWING_BADFACING", { timeout: 50 });
+    expect(facing.seq).toBe(2);
   });
 
   test("unsubscribing stops delivery", () => {

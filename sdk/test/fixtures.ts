@@ -782,6 +782,21 @@ export function attackStopped(
   };
 }
 
+/**
+ * A melee swing error as the module forwards it: the packet is bodiless on the
+ * wire, so `{}` is the whole payload. The ids are the pinned core's
+ * (`Opcodes.h`): 0x145 out of range, 0x146 facing away.
+ */
+export function swingError(kind: "NOTINRANGE" | "BADFACING", seq: number): unknown {
+  return {
+    seq,
+    opcode: `SMSG_ATTACKSWING_${kind}`,
+    opcodeId: kind === "NOTINRANGE" ? 0x145 : 0x146,
+    ts: 1_700_000_000_000 + seq,
+    data: {},
+  };
+}
+
 /** The whole quest/combat fold in one stream, for the replay property. */
 export const questCombatStream: unknown[] = [
   ...worldStream,

@@ -95,6 +95,16 @@ mid-fight (`SMSG_ATTACKSTOP` with the target still alive), the loop swings
 again. The default `timeout` is 25s, deliberately under the runner's 30s
 snippet cap; longer fights belong in a background routine.
 
+A swing the server refuses is on the event stream as
+`SMSG_ATTACKSWING_NOTINRANGE` or `SMSG_ATTACKSWING_BADFACING`, both with an
+empty payload: the two errors a client shows while auto-attack is armed and
+nothing lands. They are typed events and nothing more — `killTarget` does not
+read them, and its result is unchanged. Whoever does read them has to respect
+the core's latch (module/PROTOCOL.md, "Swing errors"): one event per change of
+error state, none when the error clears, and the latch survives `attackStop`
+and a new target, so a second out-of-range attack is silent. Seeing one is
+evidence; seeing none is not evidence of being in range or facing.
+
 `lootCorpse` sends `loot_all` — the module replaying the client's auto-loot
 sequence — and returns once the window has been emptied and released. A
 chest-type game object goes the way a client opens one (`docs/CONTRACTS.md`,

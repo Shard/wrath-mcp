@@ -1559,6 +1559,14 @@ export const eventDataSchemas = {
   SMSG_ATTACKSTART: attackStartDataSchema,
   SMSG_ATTACKSTOP: attackStopDataSchema,
   SMSG_ATTACKERSTATEUPDATE: attackerStateUpdateDataSchema,
+  // The two melee swing errors a client shows on screen, bodiless on the wire:
+  // armed auto-attack, and the ready swing was refused for range or for facing.
+  // The core latches them — one event per CHANGE of error state, none when the
+  // error clears, and the latch resets only on a swing that lands or misses (or
+  // at login), not on attackStop or a new target. So never read their absence
+  // as "in range and facing": a second out-of-range attack sends nothing.
+  SMSG_ATTACKSWING_NOTINRANGE: emptyDataSchema,
+  SMSG_ATTACKSWING_BADFACING: emptyDataSchema,
   SMSG_SPELL_START: spellStartDataSchema,
   SMSG_SPELL_GO: spellGoDataSchema,
   SMSG_CAST_FAILED: castFailedDataSchema,
