@@ -54,7 +54,21 @@ Every guid — state fields, helper returns, and every guid argument — is an
 opaque decimal string, which is also exactly what the wire carries:
 compare with `===`, use as Map keys, `JSON.stringify` freely. A `number` guid
 is rejected loudly (precision loss); a bigint you conjure yourself is converted
-for you.
+for you. Why strings: BigInt was the top error class of the first measured
+night and never load-bearing at the model surface, so the SDK may use bigint
+internally and never lets one escape. Session-scoped short aliases were
+rejected: they die on reconnect, so a stale alias silently names the wrong
+unit — the forbidden class. Representation is fair game to optimize;
+referents are not.
+
+Wherever a helper or raw action takes a guid, it also takes the name of a
+unit, item, spell, talent, faction or taxi node the model can currently
+observe (`docs/METHODOLOGY.md`, "A name in view is a valid referent, with
+bounded fuzz"; `src/resolve.ts` is the shared resolver). Resolution is
+deterministic and narrow: normalise case, whitespace and apostrophes; exact
+match, else a unique substring, else a unique match within a small edit
+distance. One candidate acts; none refuses with what is in view; two or more
+refuse and list them. Opcode names and guids themselves are never fuzzed.
 
 ### Combat, loot and quests
 
@@ -181,7 +195,11 @@ Two things still throw:
 - `EventTimeoutError` — no result arrived within `timeout` (default 90s: the
   ~250yd single-move cap is ~36s of running, plus the module's server-confirmation
   deadline). That is the *absence* of an outcome — the character may still be
-  walking — so it is not dressed up as a `status`.
+  walking — so it is not dressed up as a `status`. Inventing a
+  `status: "timeout"` would put an SDK fabrication in a field that otherwise
+  only holds the module's words. The corollary: an SDK-side status is legal
+  only when it describes the SDK declining to act (`unknown_target`, `lost`)
+  — never a renamed or inferred server outcome.
 
 A `moveTo` issued while another is running supersedes it, and the older call
 returns `status: "superseded"`. `stop()` returns as soon as the module has
