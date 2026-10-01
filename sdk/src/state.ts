@@ -3298,31 +3298,36 @@ export class StateCache {
   /**
    * The nearest object in view that passes `filter`, by straight-line distance
    * from our own last observed position. `undefined` when we have no position,
-   * or nothing in view has one — never a guess. The answer is the raw
-   * `NearbyObject` (wrapped fields, no `distance`), not a `units()` row.
+   * or nothing in view has one — never a guess. The answer is that object's
+   * `units()` row, built by the same `toUnitView` — flat, `distance` included —
+   * because a caller who has used `units()` reads its sibling the same way:
+   * while it returned the raw `NearbyObject`, three 0.5 probes each raised
+   * 5–18 TypeErrors reading `closest(...).distance`, documented or not
+   * (operator decision, 2026-10-01).
    *
    * `filter` is either a `units()` criteria object — `closest({ entry: 196 })`,
    * `closest({ name: "Deputy Willem", npc: true })` — with exactly the meaning
    * and the rejection messages it has there, or a predicate over the raw
-   * object. Four of five models in the 2026-08-22 roster reached for the
-   * criteria object by analogy with `units(filter)` and got a bare V8
-   * `TypeError: filter is not a function`, which cost one of them a 15-turn
-   * detour; the analogy was right, so the surface now matches it (earned by
-   * observed need).
+   * object, which is still what a predicate is handed. Four of five models in
+   * the 2026-08-22 roster reached for the criteria object by analogy with
+   * `units(filter)` and got a bare V8 `TypeError: filter is not a function`,
+   * which cost one of them a 15-turn detour; the analogy was right, so the
+   * surface now matches it (earned by observed need).
    *
    * Ordering is by distance in both forms. `units({ name: "tree" })` ranks its
    * name matches by tier first; `closest` does not, because "nearest" is the
    * whole question it answers.
    *
-   * Distances mix the freshness of two observations (ours and theirs); both
-   * carry their own `seq`, so a caller that cares can check.
+   * Distances mix the freshness of two observations (ours and theirs); the
+   * raw object (`state.nearby.get(row.guid)`) carries each one's `seq`, so a
+   * caller that cares can check.
    *
    * Returns `undefined` on no match, and also when our own position has not
    * been observed yet — so read a field off it only after checking, or the
    * miss arrives as a bare `TypeError` from your own code rather than as an
    * answer. (`units()` answers the same question with `[]`.)
    */
-  closest(filter?: UnitFilter | ((obj: NearbyObject) => boolean)): NearbyObject | undefined {
+  closest(filter?: UnitFilter | ((obj: NearbyObject) => boolean)): UnitView | undefined {
     const from = this.self.position?.value;
     if (!from) return undefined;
 
@@ -3336,22 +3341,21 @@ export class StateCache {
       filter !== undefined && typeof filter !== "function" ? normalizeUnitFilter(filter) : undefined;
     const predicate = typeof filter === "function" ? filter : undefined;
 
-    let best: NearbyObject | undefined;
+    let best: UnitView | undefined;
     let bestD2 = Infinity;
     for (const obj of this.nearby.values()) {
       const p = pointOf(obj)?.value;
       if (!p) continue;
       if (predicate && !predicate(obj)) continue;
-      if (criteria) {
-        // Items and containers (our own inventory) are not in view for
-        // `units()`, so a criteria query must not find them here either.
-        const view = toUnitView(obj, from);
-        if (view === undefined || !passesUnitFilter(view, obj, criteria)) continue;
-      }
+      // The answer is a `units()` row, so what `units()` leaves out — items
+      // and containers, our own inventory — is never an answer here either.
+      const view = toUnitView(obj, from);
+      if (view === undefined) continue;
+      if (criteria && !passesUnitFilter(view, obj, criteria)) continue;
       const d2 = (p.x - from.x) ** 2 + (p.y - from.y) ** 2 + (p.z - from.z) ** 2;
       if (d2 < bestD2) {
         bestD2 = d2;
-        best = obj;
+        best = view;
       }
     }
     return best;

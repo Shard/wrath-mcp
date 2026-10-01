@@ -110,10 +110,10 @@ exists.) Then, on the client:
 | `say` | `say(text): Promise<ActionResponse>` | Say something in local chat. |
 | `moveToAsync` | `moveToAsync(target): Promise<MoveToResponse>` | Queue a move without waiting — the call for a walk longer than your own time budget; same targets and the same 250y single-move cap as moveTo. |
 | `stop` | `stop(): Promise<ActionResponse>` | Queue a movement stop; the in-flight moveTo resolves with status 'stopped'. |
-| `face` | `face(orientationOrPoint: number | { x, y }): Promise<FaceResponse>` | Turn in place toward an orientation (radians) or a point. |
+| `face` | `face(orientationOrPoint: number | { x, y }): Promise<FaceResponse>` | Turn in place toward an orientation (radians, 0 = east, counter-clockwise) or a point { x, y }. Refused with code moving while a move is running. |
 | `setTarget` | `setTarget(target: GuidOrUnit): Promise<ActionResponse>` | Set the current target. |
 | `clearTarget` | `clearTarget(): Promise<ActionResponse>` | Clear the current target. |
-| `attackStart` | `attackStart(target: GuidOrUnit): Promise<ActionResponse>` | Start melee auto-attack. |
+| `attackStart` | `attackStart(target: GuidOrUnit): Promise<ActionResponse>` | Start melee auto-attack. The server swings only while you are in melee range and facing the target, and nothing turns you automatically: face() it first. killTarget does both. |
 | `attackStop` | `attackStop(): Promise<ActionResponse>` | Stop melee auto-attack. |
 | `castSpell` | `castSpell(spellId, targetGuid?: GuidOrUnit): Promise<ActionResponse>` | Cast a spell; no target means self/auto-target. |
 | `cancelCast` | `cancelCast(spellId): Promise<ActionResponse>` | Cancel a cast in progress. |
@@ -172,7 +172,7 @@ zero.
 | Method | Signature | Purpose |
 | --- | --- | --- |
 | `units` | `state.units(filter?: UnitFilter): UnitView[]` | Scan nearby objects, nearest first; filter by entry, name (string | RegExp), type, alive, maxDistance, npc (true keeps NPCs with any npc flag, false drops them — a filter key only: rows carry roles, never an npc field), role (an NPC role word or a list: "questGiver", "vendor", "repair", "trainer", "flightMaster", "innkeeper", "spiritHealer", "banker", "auctioneer", …), questGiver (the observed marker name: "available" offers a quest, "reward" takes a turn-in now, "incomplete" ends a quest not yet done; true means any marker but "none"). Rows carry roles (the NPC's role words from its npc flags — what it is for, never what to do; empty for non-NPCs) and questGiver / questGiverStatus; game objects are named ("Mailbox", "Subway") and carry goType (door, chest, mailbox, transport, …), and a transport carries docked (true while the car sits at a platform). |
-| `closest` | `state.closest(filter?): NearbyObject | undefined` | The nearest object by distance, returned as the raw object nearbyUnits() gives — not a units() row: fields are wrapped (.name.value, .entry.value, .position.value; only .guid is plain) and there is no .distance; state.units(filter) gives flat rows with distance, nearest first. `filter` is a units() criteria object ({ entry, name, type, alive, maxDistance, npc, role, questGiver }) or a predicate over the raw object. |
+| `closest` | `state.closest(filter?): UnitView | undefined` | The nearest object by distance, as its units() row — the same flat object state.units(filter) returns, distance included (.name, .distance, .x; npc is a filter key, never a field) — or undefined when nothing matches or your own position is unobserved. `filter` is a units() criteria object ({ entry, name, type, alive, maxDistance, npc, role, questGiver }) or a predicate over the raw object nearbyUnits() gives. |
 | `nearbyUnits` | `state.nearbyUnits(): NearbyObject[]` | The raw nearby objects (state.units gives flat plain objects instead). |
 | `creaturesByEntry` | `state.creaturesByEntry(entry): NearbyObject[]` | Nearby creatures with a given template entry id. |
 | `bag` | `state.bag(): BagContents` | The whole carried inventory — backpack plus worn bags — as { items: [{ bag, slot, guid, itemId, name, count, quality? }], freeSlots, totalSlots, bags: [{ slot, numSlots, name }] }; each item's bag/slot is what the item actions take. |

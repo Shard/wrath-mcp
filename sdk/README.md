@@ -93,7 +93,11 @@ half-fought mob is how a character dies standing still. `attacking` says which
 happened and `detail` says it in words. If the server cancels our auto-attack
 mid-fight (`SMSG_ATTACKSTOP` with the target still alive), the loop swings
 again. The default `timeout` is 25s, deliberately under the runner's 30s
-snippet cap; longer fights belong in a background routine.
+snippet cap; longer fights belong in a background routine. The walk into melee
+range draws on the same timeout, so every result also says whether melee range
+was ever reached (`reached`) and how far the target was at the end
+(`distance`), and a `timeout` that never got there leads `detail` with "never
+reached melee range" and how far the walk got, rather than reading as a fight.
 
 A swing the server refuses is on the event stream as
 `SMSG_ATTACKSWING_NOTINRANGE` or `SMSG_ATTACKSWING_BADFACING`, both with an
@@ -151,6 +155,15 @@ That reach is 5.5y plus both combat reaches, and the module does not serve the
 NPC's, so the ceiling is set by the largest questgiver in the pinned world
 rather than a typical one; nearer than that the call still goes out, and a
 silence is explained by the distance afterwards.
+
+The questgiver marker answers before the wire too. `acceptQuestFrom` and
+`questsAvailableFrom` refuse with `nothing_on_offer` when the NPC's marker says
+it offers nothing, and `turnInQuest` refuses with `not_ready` and the `marker`
+when it says nothing the NPC ends is ready (`none` or `incomplete`). The
+turn-in check trusts only a marker newer than the last change to the quest log
+or the character's level, because the client re-asks for every marker when the
+log changes and a quest just completed still reads `incomplete` until that
+answer lands; an older marker, or none, still sends.
 
 `waitForQuestObjective` waits on the **quest log**, not on an event, because at
 the pinned commit the core sends no `SMSG_QUESTUPDATE_COMPLETE` for a kill
@@ -314,8 +327,10 @@ says out loud.
 
 The queries (`nearbyUnits`, `creaturesByEntry`, `closest`) are pure reads.
 `closest` returns `undefined` when we have no position of our own, rather than
-guessing one. They hand back the live cache entries; `snapshot()` is the frozen
-copy.
+guessing one, and otherwise the nearest object's `units()` row — the same flat
+shape, `distance` included, because models reading its sibling's rows kept
+reading `.distance` off it. `nearbyUnits` and `creaturesByEntry` hand back the
+live cache entries; `snapshot()` is the frozen copy.
 
 #### How an object in view is built
 

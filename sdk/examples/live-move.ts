@@ -192,8 +192,9 @@ async function main(): Promise<void> {
     const here = client.state.self.position?.value;
     const closest = client.state.closest((o) => o.objectType?.value === "unit" && o.name !== undefined);
     if (!closest) fail("no named creature in view after the move");
-    log(`closest creature: ${describe(closest, here)}`);
-    log(`face it: ${JSON.stringify(await client.face({ x: closest.position!.value.x, y: closest.position!.value.y }))}`);
+    // closest() answers with the units() row; describe() reads the raw object behind it.
+    log(`closest creature: ${describe(client.state.nearby.get(closest.guid)!, here)}`);
+    log(`face it: ${JSON.stringify(await client.face({ x: closest.x!, y: closest.y! }))}`);
 
     if (client.state.gaps.length > 0) fail(`stream had gaps: ${JSON.stringify(client.state.gaps)}`);
     if (client.state.anomalies.length > 0) {

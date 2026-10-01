@@ -972,6 +972,10 @@ export const MOVE_HINTS: Readonly<Record<string, (point: MovePoint, data: MoveRe
   interrupted: () =>
     `the move stopped early (death, root, stun, or the server rejected the movement). Check state.self, ` +
     `then retry from where you are.`,
+  superseded: () =>
+    `a newer moveTo replaced this one and is the move walking now. It came from this run's own code: another ` +
+    `routine, a snippet, or a helper's walk (killTarget's approach). Retrying on superseded cancels that newer ` +
+    `move in turn, so two callers that both retry cancel each other forever. Let one caller own movement.`,
 };
 
 /**
@@ -1043,6 +1047,13 @@ const MOVE_LEAVES_NO_STOP: ReadonlySet<string> = new Set([
  * is. The window is short on purpose — it bounds a loop without ever standing in
  * for an answer the world could have changed, and the world is not observed from
  * here to decide that.
+ *
+ * The remembered answer is given when the window runs out, not at once: an
+ * instant answer turned the same loop into a hot loop inside the sandbox — a
+ * background routine re-asked a `drop` some 2.07M times in 35 s, ~60,000 calls
+ * a second, taking the CPU the other snippets and runs share. Answered at the
+ * window's end, a loop that re-asks runs at most once per window, and the call
+ * after it is a fresh question that goes to the wire.
  */
 const MOVE_REJECTION_MEMO_MS = 250;
 
@@ -1126,6 +1137,19 @@ function fmtXY(p: { x: number; y: number }): string {
   return `${p.x.toFixed(1)}, ${p.y.toFixed(1)}`;
 }
 
+/**
+ * How far a walk toward `point` got, from `from` to `at`: the words a timed-out
+ * or abandoned `moveTo` uses, and the ones `killTarget` keeps for an approach
+ * that ran out its clock.
+ */
+function walkProgress(from: Point3 | undefined, at: Point3 | undefined, point: { x: number; y: number }): string {
+  const covered = at !== undefined && from !== undefined ? distance2d(from, at) : undefined;
+  const remaining = at !== undefined ? distance2d(at, point) : undefined;
+  return covered !== undefined && remaining !== undefined
+    ? `~${Math.round(covered)}y covered, ~${Math.round(remaining)}y still to go to (${fmtXY(point)})`
+    : `no position was observed for it (target (${fmtXY(point)}))`;
+}
+
 export interface WaitForTransferOptions {
   /** How long to wait for `SMSG_NEW_WORLD`. Default 15000: a far teleport is a few server ticks. */
   timeout?: number;
@@ -1206,8 +1230,10 @@ export interface DeleteCharacterOptions {
 
 export interface KillTargetOptions {
   /**
-   * Give up after this long and return `status: "timeout"`. Default 25000,
-   * chosen to sit under the runner's 30s snippet cap: a call that outlives the
+   * Give up after this long and return `status: "timeout"`. The walk into
+   * melee range counts against it as well as the fight, so a far target can
+   * spend all of it walking (`reached: false` says so). Default 25000, chosen
+   * to sit under the runner's 30s snippet cap: a call that outlives the
    * snippet is abandoned mid-fight and its verdict is never seen. Raise it only
    * from a background routine, which outlives the snippet that started it.
    */
@@ -1249,6 +1275,17 @@ interface KillResultFacts {
    * for. Call `attackStop()` when you actually want to break off.
    */
   readonly attacking: boolean;
+  /**
+   * Whether the character was within `meleeRange` of the target at any point
+   * in this call, by the cached positions. `false` when it never was, and when
+   * the positions were never both observed.
+   */
+  readonly reached: boolean;
+  /**
+   * Yards to the target at exit, in x/y as `meleeRange` is measured, to 0.1y;
+   * `undefined` when either position is unobserved.
+   */
+  readonly distance: number | undefined;
   /** One line about how it ended and what state the character was left in. */
   readonly detail: string;
 }
@@ -1401,6 +1438,33 @@ function questgiverMarkerOf(state: StateCache, guid: GuidArg, wanted: "reward" |
   if (raw === undefined) return undefined;
   return { name: questGiverStatusName(raw), wanted, questId };
 }
+
+/**
+ * The observed questgiver marker of a unit, only when it is newer than every
+ * change the cache has seen to what the server computes a marker from: the
+ * quest log's slots (a quest entering or leaving it, or its state changing)
+ * and our own level. The client re-asks for every marker when the log
+ * changes, so an older marker may be about to change — finishing the last
+ * objective and turning in at once is the common case. Undefined when no
+ * marker was observed or it is older than such a change.
+ */
+function freshQuestgiverMarkerOf(state: StateCache, guid: GuidArg, wanted: "reward" | "available", questId?: number): QuestGiverMarker | undefined {
+  const observed = state.nearby.get(guidKey(guid))?.questGiver;
+  if (observed === undefined) return undefined;
+  let changed = -1;
+  for (const [key, field] of state.self.fields) {
+    if (key === "level" || /^quest\d+(Id|State)$/.test(key)) changed = Math.max(changed, field.seq);
+  }
+  return observed.seq > changed ? { name: questGiverStatusName(observed.value), wanted, questId } : undefined;
+}
+
+/**
+ * The markers that say no quest this NPC ends is ready to turn in: `none`
+ * (it ends nothing in the log) and `incomplete` (it ends a quest whose
+ * objectives are not done). A `reward` from any quest it ends would outrank
+ * either one.
+ */
+const TURN_IN_NOT_READY: ReadonlySet<QuestGiverStatusName> = new Set(["none", "incomplete"]);
 
 /**
  * Record the measured distance on a timeout so a caller can branch on it
@@ -1621,9 +1685,10 @@ const OFFERS_NOTHING: ReadonlySet<QuestGiverStatusName> = new Set([
  * The outcome of a turn-in. `not_complete` is the questgiver refusing while
  * the quest log agrees the objectives are unfinished; `wrong_questgiver` is
  * the refusal when the log says complete — another NPC ends this quest;
- * `too_far` is a local pre-check, nothing was sent; `inventory_full` is the
- * server refusing to hand over the reward — the quest is still in the log and
- * can be turned in again once a bag slot is free.
+ * `not_ready` (the NPC's marker) and `too_far` (the distance) are local
+ * pre-checks, nothing was sent; `inventory_full` is the server refusing to
+ * hand over the reward — the quest is still in the log and can be turned in
+ * again once a bag slot is free.
  */
 export type QuestTurnInResult =
   | {
@@ -1643,6 +1708,19 @@ export type QuestTurnInResult =
       readonly ok: false;
       readonly status: "wrong_questgiver";
       readonly questId: number;
+      readonly hint: string;
+    }
+  | {
+      readonly ok: false;
+      /**
+       * The NPC's questgiver marker, newer than the last change to the quest
+       * log or our level, already says nothing it ends is ready to turn in;
+       * nothing was sent.
+       */
+      readonly status: "not_ready";
+      readonly questId: number;
+      /** That marker, as `state.units()` names it: `none` or `incomplete`. */
+      readonly marker: QuestGiverStatusName;
       readonly hint: string;
     }
   | {
@@ -2339,8 +2417,8 @@ export class WrathClient {
   /**
    * The last `moveTo` the server refused without moving anything, kept for
    * `MOVE_REJECTION_MEMO_MS` so an identical repeat from the same spot is
-   * answered rather than re-sent. One slot: a loop re-asks its own last
-   * question, and anything else replaces this one.
+   * answered (when the window runs out) rather than re-sent. One slot: a loop
+   * re-asks its own last question, and anything else replaces this one.
    */
   private lastMoveRejection:
     | {
@@ -3321,7 +3399,7 @@ export class WrathClient {
         // A delay that outlasts the budget cannot be waited into a reclaim:
         // answer now with what is left instead of sleeping to the same refusal.
         if (wait > 0 && readyAt >= deadline) break;
-        if (wait > 0) await this.sleepAborting(wait);
+        if (wait > 0) await this.sleepAborting(wait, "a corpse reclaim delay");
         if (Date.now() >= deadline) break;
 
         attempts++;
@@ -3467,13 +3545,16 @@ export class WrathClient {
     return delay === undefined ? undefined : Math.min(delay.readyAt, Date.now() + delay.delayMs);
   }
 
-  /** `sleep`, bounded by the ambient signal: rejects with `EventAbortedError` when the snippet is abandoned. */
-  private sleepAborting(ms: number): Promise<void> {
+  /**
+   * `sleep`, bounded by the ambient signal: rejects with `EventAbortedError`
+   * (saying it was `waitingFor` this) when the snippet is abandoned.
+   */
+  private sleepAborting(ms: number, waitingFor: string): Promise<void> {
     const signal = this.currentSignal();
     if (signal === undefined) return sleep(ms);
     return new Promise<void>((resolve, reject) => {
       if (signal.aborted) {
-        reject(new EventAbortedError(signal.reason, "a corpse reclaim delay"));
+        reject(new EventAbortedError(signal.reason, waitingFor));
         return;
       }
       const timer = setTimeout(() => {
@@ -3482,7 +3563,7 @@ export class WrathClient {
       }, ms);
       function onAbort(): void {
         clearTimeout(timer);
-        reject(new EventAbortedError(signal?.reason, "a corpse reclaim delay"));
+        reject(new EventAbortedError(signal?.reason, waitingFor));
       }
       signal.addEventListener("abort", onAbort, { once: true });
     });
@@ -4559,7 +4640,12 @@ export class WrathClient {
       // The same refusal, tallied like the call it is, and no request. The
       // `stop()` the status would otherwise send is skipped with it: the
       // remembered refusal already sent one and the character has not moved
-      // since, so a second is a second packet for the same repair.
+      // since, so a second is a second packet for the same repair. Answered
+      // when the window runs out rather than at once, so a loop that re-asks
+      // waits instead of spinning (see `MOVE_REJECTION_MEMO_MS`); the ambient
+      // signal ends the wait, and nothing is walking to stop.
+      const windowLeft = repeat.at + MOVE_REJECTION_MEMO_MS - Date.now();
+      await this.sleepAborting(windowLeft, "a repeated moveTo's remembered refusal");
       this.noteActionHint("moveTo", repeat.status, repeat.recipe, point);
       return repeat.result;
     }
@@ -4637,13 +4723,7 @@ export class WrathClient {
       // How far this walk got, shared by both branches below: an abort and a
       // timeout are both the absence of a verdict, and the caller needs the
       // same two facts either way.
-      const at = this.state.self.position?.value;
-      const covered = at !== undefined && from !== undefined ? distance2d(from, at) : undefined;
-      const remaining = at !== undefined ? distance2d(at, point) : undefined;
-      const progress =
-        covered !== undefined && remaining !== undefined
-          ? `~${Math.round(covered)}y covered, ~${Math.round(remaining)}y still to go to (${fmtXY(point)})`
-          : `no position was observed for it (target (${fmtXY(point)}))`;
+      const progress = walkProgress(from, this.state.self.position?.value, point);
       if (err instanceof EventTimeoutError) {
         // The timeout is not "the move failed": the character is still walking
         // and the verdict is still coming. Saying so stops the model from
@@ -4814,7 +4894,9 @@ export class WrathClient {
   private recallMoveRejection(point: MovePoint): typeof this.lastMoveRejection {
     const memo = this.lastMoveRejection;
     if (memo === null) return null;
-    if (Date.now() - memo.at > MOVE_REJECTION_MEMO_MS) {
+    // `>=`, so a remembered answer always has at least a millisecond of its
+    // window left to wait out — never an instant one.
+    if (Date.now() - memo.at >= MOVE_REJECTION_MEMO_MS) {
       this.lastMoveRejection = null;
       return null;
     }
@@ -5008,10 +5090,13 @@ export class WrathClient {
    *
    * The default `timeout` (25s) is deliberately under the runner's 30s snippet
    * cap so an in-snippet call returns its verdict rather than being abandoned
-   * mid-fight; a longer fight belongs in a background routine. An approach walk
-   * that outlasts the deadline — before the first swing or after it — is folded
-   * into `detail` and reported as `timeout` rather than thrown, so the outcome
-   * stays a value.
+   * mid-fight; a longer fight belongs in a background routine. The walks draw on
+   * the same deadline as the fight. An approach walk that outlasts it — before
+   * the first swing or after it — is folded into `detail`, with how far it got,
+   * and reported as `timeout` rather than thrown, so the outcome stays a value.
+   * `reached` says whether melee range was ever reached and `distance` how far
+   * the target was at the end; a `timeout` that never reached it leads `detail`
+   * with "never reached melee range" rather than describing a fight.
    *
    * Returns a value for every game outcome and throws only for a refused
    * request. The caller is expected to loot afterwards: `killTarget` does not,
@@ -5076,38 +5161,69 @@ export class WrathClient {
 
       let outcome: KillResult["status"] | undefined;
       let note = "";
+      // Whether we have been within melee range at any point in this call.
+      let reached = false;
+      /** Yards to the target now, in x/y as `meleeRange` is; records reaching it. */
+      const measure = (): number | undefined => {
+        const self = this.state.self.position?.value;
+        const at = aimAt();
+        if (self === undefined || at === undefined) return undefined;
+        const yards = distance2d(self, at);
+        if (yards <= meleeRange) reached = true;
+        return yards;
+      };
+      // How far the last walk got when it ran out the clock; cleared by a
+      // walk that ends with a verdict.
+      let unfinished: string | undefined;
       /**
        * Walk to the target, recording what the walk did. A walk that never
        * finishes is the clock running out, which the loop reports as `timeout` on
-       * its next tick — so it is folded into `note` rather than thrown out of a
-       * helper whose whole contract is a value per outcome.
+       * its next tick — so it is kept for `detail`, with how far it got, rather
+       * than thrown out of a helper whose whole contract is a value per outcome.
+       * A walk that arrives clears what an earlier one said.
        */
       const walkTo = async (at: Point3): Promise<void> => {
+        const before = this.state.self.position?.value;
         try {
           const walk = await this.moveTo(at, { timeout: Math.max(1000, deadline - Date.now()) });
-          if (!walk.ok) note = ` (approach: ${walk.status})`;
+          note = walk.ok ? "" : ` (approach: ${walk.status})`;
+          unfinished = undefined;
         } catch (e) {
           if (!(e instanceof EventTimeoutError)) throw e;
-          note = " (approach never finished)";
+          note = "";
+          unfinished = walkProgress(before, this.state.self.position?.value, at);
         }
+        measure();
       };
       const done = (status: KillResult["status"]): KillResult => {
         outcome = status;
         const armed = leavingArmed(status, options.disengage === true);
+        const distance = measure();
+        // A timeout that never came within melee range is an approach that did
+        // not finish, not a fight that did: that leads, with how far the walk
+        // got. Only when the distance is observed — unknown is not "never".
+        const neverReached = status === "timeout" && !reached && distance !== undefined;
+        const walking =
+          unfinished === undefined ? undefined : `${unfinished} when the timeout ran out; the character is still walking`;
         // A "lost" verdict on a guid the cache never held is not a target that
         // left view — it is a guid that named nothing observable. Say so.
         const base =
           status === "lost" && !sawTarget
             ? `target ${key} was never in view — a stale or mistyped guid, or a missed view update; ` +
               `get guids from state.nearbyUnits() or state.closest(...)`
-            : KILL_DETAIL[status];
+            : neverReached
+              ? `never reached melee range${walking === undefined ? "" : `: ${walking}`}`
+              : KILL_DETAIL[status];
+        const approach = walking !== undefined && !neverReached ? ` (approach never finished: ${walking})` : "";
         const facts: KillResultFacts = {
           guid: id,
           swings,
           healthPct: healthPct(),
           attacking: armed,
+          reached,
+          distance: distance === undefined ? undefined : Math.round(distance * 10) / 10,
           detail:
-            `${base}${note}; ` +
+            `${base}${approach}${note}; ` +
             (armed
               ? "still auto-attacking — call attackStop() or pass { disengage: true } to break off"
               : "auto-attack stopped"),
@@ -5122,8 +5238,8 @@ export class WrathClient {
         // Close the distance before the first swing, so it is a swing and not a
         // 25-second stare. A walk that runs out the clock is an answer too.
         const opening = aimAt();
-        const from = this.state.self.position?.value;
-        if (opening && from && distance2d(from, opening) > meleeRange) await walkTo(opening);
+        const gap = measure();
+        if (opening && gap !== undefined && gap > meleeRange) await walkTo(opening);
         const facing = aimAt();
         if (facing) await this.faceQuietly(facing);
         await this.attackStart(id);
@@ -5145,6 +5261,7 @@ export class WrathClient {
               return done("aborted_low_health");
             }
           }
+          measure();
           if (Date.now() > deadline) return done("timeout");
 
           const at = aimAt();
@@ -5754,7 +5871,9 @@ export class WrathClient {
    * (roster-opus-20260822), so the reward is chosen directly from there. A
    * `completable: false` is the questgiver saying no: `not_complete` when the
    * quest log agrees, `wrong_questgiver` when the log says the objectives are
-   * done — that refusal means another NPC ends this quest.
+   * done — that refusal means another NPC ends this quest. Nothing is sent when
+   * the NPC's current marker already says no turn-in is ready there
+   * (`not_ready`) or the cached positions put it out of reach (`too_far`).
    */
   async turnInQuest(
     npcGuid: GuidOrUnit,
@@ -5768,6 +5887,24 @@ export class WrathClient {
         isEvent(e, opcode) &&
         !isDecodeError(e.data) &&
         (e.data as { questId: number }).questId === questId;
+
+      // The server already said what this NPC has for us (its questgiver
+      // marker, received before the call), and nothing it ends is ready: a
+      // turn-in there cannot succeed, and the core mostly answers it with
+      // silence, so waiting the timeout out would only confirm what is
+      // already known (three 0.5 probes lost 20–40s a run to it). Only a
+      // marker newer than the last quest-log or level change counts; an
+      // unobserved or older one sends, as before. Ahead of the range check, as
+      // in `questOffer`: an NPC with nothing to hand in has nothing to walk
+      // over for.
+      const marker = freshQuestgiverMarkerOf(this.state, npcId, "reward", questId);
+      if (marker !== undefined && TURN_IN_NOT_READY.has(marker.name)) {
+        const hint =
+          `${questgiverMarkerClause(marker)} Nothing was sent. ` +
+          'state.units({ questGiver: "reward" }) lists every NPC in view ready to take a turn-in.';
+        this.noteActionHint("turnInQuest", "not_ready", hint);
+        return { ok: false, status: "not_ready", questId, marker: marker.name, hint };
+      }
 
       // Out-of-range quest_complete is silently ignored by the server and burns
       // the whole timeout (roster-opus-20260822 turn ~28). Fail fast only when

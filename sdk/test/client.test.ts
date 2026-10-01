@@ -398,8 +398,10 @@ describe("client: movement", () => {
       expect(first.status).toBe("drop");
 
       // What the loop did: the same call again, and again, with nothing to
-      // answer it on the stream.
-      const repeats = [await client.moveTo(point), await client.moveTo({ ...point })];
+      // answer it on the stream. Both are asked inside the window (each is
+      // answered only when it runs out, so asked in sequence the second would
+      // be a fresh question).
+      const repeats = await Promise.all([client.moveTo(point), client.moveTo({ ...point })]);
       for (const r of repeats) expect(r).toEqual(first);
       expect(dispatches(stub)).toBe(1);
 
@@ -465,6 +467,77 @@ describe("client: movement", () => {
       expect(dispatches(stub)).toBe(3);
       await done();
     });
+
+    test("the remembered refusal is answered when its window runs out, not at once", async () => {
+      // A 0.5 probe's background routine looped `await sdk.moveTo(point)` on a
+      // refused `drop`: answered at once from memory, it ran ~60,000 calls a
+      // second inside the sandbox. Only the timing changed: same verdict, no
+      // request, tallied as before.
+      const { stub, client, done } = await session();
+      const point = { x: 1, y: 2, z: 3 };
+      const first = await refused(client, stub, point, "drop", 1, 30);
+      const refusedAt = Date.now();
+      const repeat = await client.moveTo(point);
+      expect(Date.now() - refusedAt).toBeGreaterThanOrEqual(200);
+      expect(repeat).toEqual(first);
+      expect(dispatches(stub)).toBe(1);
+      expect(client.drainActionHints()[0]).toMatchObject({ status: "drop", count: 2 });
+      await done();
+    });
+
+    test("a naive retry loop runs at most once per window", async () => {
+      const { stub, client, done } = await session();
+      const point = { x: 1, y: 2, z: 3 };
+      // The server refuses every dispatched move the same way, as it would.
+      let answered = 0;
+      const responder = setInterval(() => {
+        while (answered < dispatches(stub)) {
+          answered++;
+          stub.push(JSON.stringify(moveResult("drop", answered, 100 + answered)));
+        }
+      }, 2);
+      try {
+        let calls = 0;
+        const until = Date.now() + 600;
+        while (Date.now() < until) {
+          const r = await client.moveTo(point, { timeout: 2000 });
+          expect(r.status).toBe("drop");
+          calls++;
+        }
+        // About one dispatch and one remembered answer per 250ms window: a
+        // handful of calls in 600ms, where the instant answer made millions.
+        expect(calls).toBeLessThanOrEqual(8);
+        expect(dispatches(stub)).toBeLessThanOrEqual(4);
+        expect(calls).toBeGreaterThan(dispatches(stub));
+      } finally {
+        clearInterval(responder);
+      }
+      await done();
+    });
+
+    test("the snippet's signal ends the wait for a remembered refusal, and nothing is sent", async () => {
+      const stub = startStub({ onConnect: () => frames(loginSequence) });
+      let current: AbortSignal | undefined;
+      const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false }, signal: () => current });
+      await client.createSession({ character: "Fenwick" });
+      const point = { x: 1, y: 2, z: 3 };
+      await refused(client, stub, point, "drop", 1, 30);
+      const sent = stub.actions.length;
+
+      const ac = new AbortController();
+      current = ac.signal;
+      const repeat = client.moveTo(point);
+      const started = Date.now();
+      setTimeout(() => ac.abort(new Error("snippet abandoned")), 20);
+      await expect(repeat).rejects.toBeInstanceOf(EventAbortedError);
+      await expect(repeat).rejects.toThrow(/remembered refusal.*snippet abandoned/);
+      expect(Date.now() - started).toBeLessThan(200);
+      await Bun.sleep(20);
+      // Nothing is walking, so there is nothing to stop.
+      expect(stub.actions.length).toBe(sent);
+      client.close();
+      await stub.stop();
+    });
   });
 
   test("hint-bearing failures are tallied per status on the client's own channel and drained once", async () => {
@@ -501,6 +574,34 @@ describe("client: movement", () => {
     // Drained exactly once.
     expect(client.drainActionHints()).toEqual([]);
 
+    client.close();
+    await stub.stop();
+  });
+
+  test("a superseded moveTo carries a hint and is tallied with it", async () => {
+    // Two callers that both retry on `superseded` cancel each other's moves
+    // and spin (a DeepSeek probe, ~450 requests a second); with no hint on
+    // either channel nothing told the model its own code was doing it.
+    const stub = startStub({ onConnect: () => frames(loginSequence) });
+    const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+    await client.createSession({ character: "Fenwick" });
+    // A few yards from the login position, so no per-call note joins the hint.
+    const point = { x: -1230, y: 987, z: 42 };
+    const pending = client.moveTo(point, { timeout: 2000 });
+    stub.push(JSON.stringify(moveResult("superseded", 1, 30)));
+    const result = await pending;
+    if (result.ok) throw new Error("unreachable");
+    expect(result.status).toBe("superseded");
+    expect(result.hint).toContain("a newer moveTo replaced this one");
+    expect(result.hint).toContain("Let one caller own movement.");
+    const drained = client.drainActionHints();
+    expect(drained).toHaveLength(1);
+    expect(drained[0]).toMatchObject({ action: "moveTo", status: "superseded", count: 1, point, hint: result.hint });
+    // Whole on the harness channel: under the runner's render cap
+    // (ACTION_HINT_RENDER.MAX_HINT_CHARS, 320), so it is never cut short.
+    expect(result.hint!.length).toBeLessThan(320);
+    // Still no stop and no memory: a newer move is walking.
+    expect(stub.actions.map((a) => a.action)).toEqual(["move_to"]);
     client.close();
     await stub.stop();
   });
@@ -1439,6 +1540,61 @@ describe("client: killTarget", () => {
     expect(result.attacking).toBe(true);
     expect(result.detail).toContain("still auto-attacking");
     expect(stub.actions.map((a) => a.action)).not.toContain("attack_stop");
+    // In range the whole time (meleeRange 100 against ~35y): a fight, and the
+    // detail says so.
+    expect(result.reached).toBe(true);
+    expect(result.distance).toBeCloseTo(35.3, 1);
+    expect(result.detail).toStartWith("timed out with both alive; ");
+    client.close();
+    await stub.stop();
+  });
+
+  test("an approach that runs out the timeout reads as never reaching melee range, with how far the walk got", async () => {
+    // A DeepSeek probe read "timed out with both alive (approach never
+    // finished); still auto-attacking" as a fight it had lost: the walk had
+    // used the whole deadline and no swing was ever possible.
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    // The walk's own floor is 1s, so this waits that long for a verdict that
+    // never comes, part of the way there.
+    const fight = client.killTarget(CREATURE_GUID, { timeout: 50, pollIntervalMs: 10, meleeRange: 5 });
+    await untilAction(stub, "move_to");
+    stub.push(JSON.stringify({ ...moveProgress, seq: 70 })); // ~15y walked, ~21y to go
+    const result = await fight;
+    expect(result).toMatchObject({ ok: false, status: "timeout", swings: 0, attacking: true, reached: false });
+    expect(result.distance).toBeCloseTo(20.6, 1);
+    expect(result.detail).toMatch(
+      /^never reached melee range: ~1[45]y covered, ~21y still to go to \(-1200\.0, 980\.0\) when the timeout ran out; the character is still walking; still auto-attacking/,
+    );
+    expect(result.detail).not.toContain("both alive");
+    client.close();
+    await stub.stop();
+  });
+
+  test("a walk that arrives clears what an earlier walk said, and reaching melee range is recorded", async () => {
+    // The opening walk is superseded (another caller's moveTo); the re-approach
+    // arrives and the fight is won. The old detail still said "(approach:
+    // superseded)" on the kill.
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const fight = client.killTarget(CREATURE_GUID, {
+      timeout: 5000,
+      pollIntervalMs: 10,
+      reapproachIntervalMs: 20,
+      meleeRange: 5,
+    });
+    const first = await untilAction(stub, "move_to");
+    // The superseded verdict leaves us 5.1y off: just outside melee range.
+    stub.push(JSON.stringify(moveResult("superseded", 1, 70)));
+    const second = await untilAction(stub, "move_to", first + 1);
+    const close = moveResult("arrived", 2, 71) as { data: { pos: Record<string, number> } };
+    close.data.pos = { x: -1201, y: 980, z: 42, o: 0 };
+    stub.push(JSON.stringify(close));
+    await untilAction(stub, "attack_start", second);
+    stub.push(JSON.stringify(creatureHealth(0, 72)));
+    const result = await fight;
+    expect(result).toMatchObject({ ok: true, status: "killed", reached: true, distance: 1 });
+    expect(result.detail).toBe("target died; auto-attack stopped");
     client.close();
     await stub.stop();
   });
@@ -4247,6 +4403,70 @@ describe("client: quest-start items and the questgiver marker pre-check (2026-08
     await untilAction(stub, "quest_list");
     stub.push(JSON.stringify(questGiverList([QUEST_ID], 93)));
     expect((await pending).quests.map((q) => q.questId)).toEqual([QUEST_ID]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("turnInQuest at an NPC whose current marker says incomplete or none is not_ready at once, with nothing sent", async () => {
+    // Three 0.5 probes waited out the 10s timeout 4+ times a run on a turn-in
+    // the marker had already ruled out.
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    stub.push(JSON.stringify(questAccepted)); // seq 30: in the log, not done
+    stub.push(JSON.stringify(questGiverStatus(CREATURE_GUID, 5, 91))); // incomplete
+    await Bun.sleep(20);
+    const before = Date.now();
+    const incomplete = await client.turnInQuest(CREATURE_GUID, QUEST_ID, 0, { timeout: 10_000 });
+    expect(Date.now() - before).toBeLessThan(1000);
+    expect(incomplete).toMatchObject({ ok: false, status: "not_ready", questId: QUEST_ID, marker: "incomplete" });
+    if (incomplete.ok || incomplete.status !== "not_ready") throw new Error("unreachable");
+    expect(incomplete.hint).toContain("questgiver status is `incomplete`, not `reward`");
+    expect(incomplete.hint).toContain("Nothing was sent.");
+
+    stub.push(JSON.stringify(questGiverStatus(CREATURE_GUID, 0, 92))); // none
+    await Bun.sleep(20);
+    const none = await client.turnInQuest(CREATURE_GUID, QUEST_ID, 0, { timeout: 10_000 });
+    expect(none).toMatchObject({ ok: false, status: "not_ready", questId: QUEST_ID, marker: "none" });
+    if (none.ok || none.status !== "not_ready") throw new Error("unreachable");
+    expect(none.hint).toContain(`not quest ${QUEST_ID}'s ender`);
+    // Whole on the harness channel (the runner renders 320 characters).
+    for (const r of [incomplete, none]) expect(r.hint.length).toBeLessThan(320);
+
+    expect(stub.actions.map((a) => a.action)).not.toContain("quest_complete");
+    const drained = client.drainActionHints();
+    expect(drained).toHaveLength(1);
+    expect(drained[0]).toMatchObject({ action: "turnInQuest", status: "not_ready", count: 2, hint: none.hint });
+    client.close();
+    await stub.stop();
+  });
+
+  test("a marker older than the last quest-log or level change still sends the turn-in", async () => {
+    // Completing the last objective and turning in at once is the common
+    // case: the complete bit lands before the marker refresh does, so the
+    // cached marker still reads `incomplete` for a quest that is done.
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    stub.push(JSON.stringify(questAccepted)); // seq 30
+    stub.push(JSON.stringify(questGiverStatus(CREATURE_GUID, 5, 91))); // incomplete
+    stub.push(JSON.stringify({ ...(questComplete as object), seq: 92 }));
+    await Bun.sleep(20);
+    expect(client.state.quest(QUEST_ID)?.complete).toBe(true);
+    const pending = client.turnInQuest(CREATURE_GUID, QUEST_ID, 0, { timeout: 2000 });
+    await untilAction(stub, "quest_complete");
+    stub.push(JSON.stringify(offerReward(QUEST_ID, 93)));
+    await untilAction(stub, "quest_choose_reward");
+    stub.push(JSON.stringify(questRewarded(QUEST_ID, 94)));
+    expect(await pending).toMatchObject({ ok: true, status: "complete", questId: QUEST_ID });
+
+    // A level change dates a `none` the same way: the server computes markers
+    // from what the character can take, and the level is part of that.
+    stub.push(JSON.stringify(questGiverStatus(CREATURE_GUID, 0, 95))); // none
+    stub.push(JSON.stringify({ ...(selfProgress as object), seq: 96 })); // level 4
+    await Bun.sleep(20);
+    const after = stub.actions.length;
+    const sent = client.turnInQuest(CREATURE_GUID, QUEST_ID, 0, { timeout: 150 }).catch((e: unknown) => e);
+    await untilAction(stub, "quest_complete", after);
+    expect(await sent).toBeInstanceOf(EventTimeoutError);
     client.close();
     await stub.stop();
   });

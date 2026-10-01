@@ -491,8 +491,8 @@ describe("state cache: world queries", () => {
     const cache = StateCache.replay(events, { seed: SEED });
     // self is at x=-1234.5: the creature at -1200 is ~35y away, the player at
     // -1240 is ~6y away.
-    expect(cache.closest()?.name?.value).toBe("Quilby");
-    expect(cache.closest((o) => o.objectType?.value === "unit")?.name?.value).toBe("Thistlebore");
+    expect(cache.closest()?.name).toBe("Quilby");
+    expect(cache.closest((o) => o.objectType?.value === "unit")?.name).toBe("Thistlebore");
   });
 
   test("closest claims nothing when we have no position of our own", () => {
@@ -1360,6 +1360,26 @@ describe("state.closest(): criteria object or predicate", () => {
     const c = cache();
     expect(c.closest((o) => o.objectType?.value === "gameObject")?.guid).toBe(OBJECT_GUID);
     expect(c.closest()?.guid).toBeDefined();
+  });
+
+  test("the answer is that unit's units() row, distance included", () => {
+    // Operator decision, 2026-10-01: three 0.5 probes each raised 5–18
+    // TypeErrors reading closest(...).distance off the raw object it returned.
+    const c = cache();
+    const row = c.closest({ entry: VENDOR_ENTRY });
+    expect(row?.guid).toBe(VENDOR_GUID);
+    expect(row).toEqual(c.units({ entry: VENDOR_ENTRY })[0]);
+    expect(typeof row?.distance).toBe("number");
+    // No wrappers, and npc stays a filter key the rows never carry.
+    expect(row).not.toHaveProperty("position");
+    expect(row).not.toHaveProperty("npc");
+    // The predicate form answers in the same shape.
+    const byPredicate = c.closest((o) => o.guid === OBJECT_GUID);
+    expect(byPredicate?.guid).toBe(OBJECT_GUID);
+    expect(byPredicate).toEqual(c.units().find((u) => u.guid === OBJECT_GUID));
+    // A miss is undefined, as it always was.
+    expect(c.closest({ entry: 999_999 })).toBeUndefined();
+    expect(c.closest(() => false)).toBeUndefined();
   });
 
   test("a bad key is rejected with the same message units() gives", () => {
