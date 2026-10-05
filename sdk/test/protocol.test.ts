@@ -17,6 +17,7 @@ import {
   moveToResponseSchema,
   parseEventFrame,
   sessionResponseSchema,
+  spellCastResultName,
   updateObjectDataSchema,
 } from "../src/protocol";
 import {
@@ -516,5 +517,48 @@ describe("the social seam decodes across the protocol / protocol-social split", 
   test("bank: SMSG_SHOW_BANK carries the banker's guid", () => {
     const data = decode("SMSG_SHOW_BANK", 0x01b7, { guid: "007" });
     expect(data.guid).toBe("7");
+  });
+});
+
+describe("SpellCastResult names", () => {
+  test("the table follows the pinned enum, checked against its explicit values", () => {
+    // SharedDefines.h `enum SpellCastResult`: every value is spelled out there.
+    const pinned: Record<number, string> = {
+      0: "success",
+      12: "bad_targets",
+      22: "caster_aurastate",
+      23: "caster_dead",
+      27: "dont_report",
+      40: "interrupted",
+      51: "moving",
+      64: "not_mounted",
+      67: "not_ready",
+      97: "out_of_range",
+      100: "reagents",
+      187: "unknown",
+    };
+    for (const [code, name] of Object.entries(pinned)) expect(spellCastResultName(Number(code))).toBe(name);
+    expect(spellCastResultName(188)).toBeUndefined();
+    expect(spellCastResultName(255)).toBeUndefined();
+    expect(spellCastResultName(1.5)).toBeUndefined();
+  });
+
+  test("the three cast-failure packets keep the number and gain the name", () => {
+    const cases: readonly [string, { result: number } & Record<string, unknown>][] = [
+      ["SMSG_CAST_FAILED", { spellId: 20271, result: 67 }],
+      ["SMSG_SPELL_FAILURE", { casterGuid: "7", spellId: 635, result: 40 }],
+      ["SMSG_PET_CAST_FAILED", { spellId: 3110, result: 97 }],
+    ];
+    for (const [opcode, data] of cases) {
+      const parsed = parseEventFrame(JSON.stringify({ seq: 1, opcode, opcodeId: 1, ts: 1, data }));
+      if (!parsed.ok) throw new Error(parsed.error);
+      expect(parsed.event).not.toHaveProperty("schemaError");
+      expect(parsed.event.data).toMatchObject({ ...data, reason: spellCastResultName(data.result) });
+    }
+    const unknown = parseEventFrame(
+      JSON.stringify({ seq: 2, opcode: "SMSG_CAST_FAILED", opcodeId: 1, ts: 1, data: { spellId: 1, result: 200 } }),
+    );
+    if (!unknown.ok) throw new Error(unknown.error);
+    expect(unknown.event.data).toMatchObject({ result: 200, reason: undefined });
   });
 });

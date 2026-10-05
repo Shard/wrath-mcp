@@ -436,7 +436,8 @@ export interface TaxiNodeRef {
  * The flight master's window last observed for one NPC: the fold of the last
  * `SMSG_SHOWTAXINODES` for that guid. `current` is the node the master
  * stands at (what `activateTaxi` sends as the source), `known` the nodes this
- * character has visited — the only destinations the server will accept.
+ * character has visited — the only destinations the server will accept, and only one
+ * flight path from `current` (a farther one gets no reply).
  * `mask` is the taximask verbatim. Nothing here is a route or a fare.
  */
 export interface TaxiWindow {
@@ -1639,7 +1640,8 @@ export class StateCache {
   /**
    * The objectives of one quest, client-style: the template's required
    * entries and counts joined with the log's counters (creature/gameobject/
-   * event slots) or the backpack's stack totals (item slots). A join over two
+   * event slots) or the carried stack totals (item slots: equipment, backpack
+   * and worn bags, as `carriedItems` says). A join over two
    * observations, nothing invented.
    */
   private questObjectives(info: QuestInfo, counts: readonly number[]): QuestObjective[] {
@@ -1664,16 +1666,33 @@ export class StateCache {
         done: have >= req.count,
       });
     });
-    let bags: InventoryItem[] | undefined;
+    let carried: { itemId: number | undefined; count: number | undefined }[] | undefined;
     for (const item of info.requiredItems) {
       if (item.itemId === 0) continue;
-      bags ??= this.inventory;
+      carried ??= this.carriedItems();
       let have = 0;
-      for (const row of bags) {
-        if (row.itemId === item.itemId) have += row.stackCount ?? 1;
+      for (const row of carried) {
+        if (row.itemId === item.itemId) have += row.count ?? 1;
       }
       out.push({ kind: "collect", entry: item.itemId, text: undefined, required: item.count, have, done: have >= item.count });
     }
+    return out;
+  }
+
+  /**
+   * Every item the character carries, for counting a collect objective the
+   * way the server's `Player::GetItemCount(id, false)` does: the equipment
+   * slots, the backpack, and the contents of the worn bags — not the bank,
+   * whose items the turn-in refuses. Reading only the player's own inventory
+   * fields missed everything in a worn bag, so a collect objective read
+   * `have: 0` while the quest log said complete.
+   */
+  private carriedItems(): { itemId: number | undefined; count: number | undefined }[] {
+    const out: { itemId: number | undefined; count: number | undefined }[] = [];
+    for (const row of this.inventory) {
+      if (row.slot < BACKPACK_FIRST_SLOT) out.push({ itemId: row.itemId, count: row.stackCount });
+    }
+    for (const row of this.bag().items) out.push({ itemId: row.itemId, count: row.count });
     return out;
   }
 

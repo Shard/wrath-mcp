@@ -592,7 +592,35 @@ export function questGiverList(questIds: readonly number[], seq = 46): unknown {
   };
 }
 
-export function offerReward(questId: number, seq = 47): unknown {
+/**
+ * A quest's details window: what a single-quest NPC answers the hello with
+ * (`Player::SendPreparedQuest`), and what a quest-start item answers its query with.
+ */
+export function questDetails(questId: number, seq = 46, guid = CREATURE_GUID): unknown {
+  return {
+    seq,
+    opcode: "SMSG_QUESTGIVER_QUEST_DETAILS",
+    opcodeId: 0x188,
+    ts: 1_700_000_000_465,
+    data: {
+      guid,
+      questId,
+      title: `fixture quest ${questId}`,
+      details: "fixture details",
+      objectives: "fixture objectives",
+      choiceRewards: [],
+      rewards: [],
+      money: 0,
+      xp: 100,
+    },
+  };
+}
+
+export function offerReward(
+  questId: number,
+  seq = 47,
+  choiceRewards: readonly { itemId: number; count: number }[] = [{ itemId: ITEM_ENTRY, count: 1 }],
+): unknown {
   return {
     seq,
     opcode: "SMSG_QUESTGIVER_OFFER_REWARD",
@@ -603,7 +631,7 @@ export function offerReward(questId: number, seq = 47): unknown {
       questId,
       title: "fixture quest",
       text: "fixture reward text",
-      choiceRewards: [{ itemId: ITEM_ENTRY, count: 1 }],
+      choiceRewards,
       rewards: [],
       money: 250,
       xp: 400,

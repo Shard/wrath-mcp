@@ -47,6 +47,7 @@ import {
   QUEST_ID,
   questAccepted,
   questComplete,
+  questDetails,
   questGiverList,
   questGiverStatus,
   questGiverStatusMultiple,
@@ -1138,6 +1139,20 @@ describe("client: movement", () => {
     client.close();
     await stub.stop();
   });
+
+  test("face refuses a guid or a name locally and says to pass the unit's position", async () => {
+    const stub = startStub();
+    const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+    const sent = stub.actions.length;
+    // The signature takes a number or a point; a model passing a guid is the case under test.
+    const err = (await client.face(CREATURE_GUID as unknown as number).catch((e: unknown) => e)) as Error;
+    expect(err).toBeInstanceOf(TypeError);
+    expect(err.message).toContain("not a guid or a name");
+    expect(err.message).toContain("sdk.face({ x: unit.x, y: unit.y })");
+    expect(stub.actions.length).toBe(sent);
+    client.close();
+    await stub.stop();
+  });
 });
 
 describe("client: waiting on the world", () => {
@@ -1910,6 +1925,45 @@ describe("client: quests", () => {
     await stub.stop();
   });
 
+  test("acceptQuestFrom takes a quest a single-quest NPC answered with its details", async () => {
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    const pending = client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 2000 });
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify(questDetails(QUEST_ID, 73)));
+    await untilAction(stub, "quest_accept");
+    stub.push(JSON.stringify({ ...(questAccepted as object), seq: 74 }));
+    expect(await pending).toMatchObject({ ok: true, status: "accepted", questId: QUEST_ID, title: `fixture quest ${QUEST_ID}` });
+    client.close();
+    await stub.stop();
+  });
+
+  test("an auto-accept quest the hello already added is accepted with nothing more sent", async () => {
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    const pending = client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 2000 });
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify({ ...(questAccepted as object), seq: 73 }));
+    stub.push(JSON.stringify(questDetails(QUEST_ID, 74)));
+    expect(await pending).toMatchObject({ ok: true, status: "accepted", questId: QUEST_ID });
+    expect(stub.actions.map((a) => a.action)).not.toContain("quest_accept");
+    client.close();
+    await stub.stop();
+  });
+
+  test("a single-quest NPC offering another quest is not_offered, naming it", async () => {
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    const pending = client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 2000 });
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify(questDetails(OTHER_QUEST_ID, 73)));
+    const result = await pending;
+    if (result.ok || result.status !== "not_offered") throw new Error(`unexpected ${result.status}`);
+    expect(result.offered.map((q) => q.questId)).toEqual([OTHER_QUEST_ID]);
+    client.close();
+    await stub.stop();
+  });
+
   test("a quest a turn-in chain already added is not asked for again", async () => {
     const stub = startStub({ onConnect: () => [...combatWorld(), JSON.stringify(questAccepted)] });
     const client = await inWorld(stub);
@@ -1981,6 +2035,54 @@ describe("client: quests", () => {
     stub.push(JSON.stringify(questRewarded(QUEST_ID, 79)));
     const result = await pending;
     expect(result).toEqual({ ok: true, status: "complete", questId: QUEST_ID, xp: 400, money: 250 });
+    client.close();
+    await stub.stop();
+  });
+
+  test("a reward window with a choice and no index returns the choices and chooses nothing", async () => {
+    const OTHER_ITEM = ITEM_ENTRY + 1;
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    const pending = client.turnInQuest(CREATURE_GUID, QUEST_ID, undefined, { timeout: 2000 });
+    await untilAction(stub, "quest_complete");
+    stub.push(JSON.stringify(offerReward(QUEST_ID, 78, [{ itemId: ITEM_ENTRY, count: 1 }, { itemId: OTHER_ITEM, count: 2 }])));
+    // The module's item query for the first choice answers; the second's has not arrived.
+    stub.push(JSON.stringify({ ...itemQuery, seq: 79 }));
+    const result = await pending;
+    if (result.ok || result.status !== "choose_reward") throw new Error(`unexpected ${JSON.stringify(result)}`);
+    expect(result.choices.map(({ item: _item, ...rest }) => rest)).toEqual([
+      { index: 0, itemId: ITEM_ENTRY, count: 1, name: "Gritstone Charm", quality: 1 },
+      { index: 1, itemId: OTHER_ITEM, count: 2, name: undefined, quality: undefined },
+    ]);
+    expect(result.choices[0]?.item?.sellPrice).toBe(40);
+    expect(result.choices[1]?.item).toBeUndefined();
+    expect(result.hint).toContain(`turnInQuest(npc, ${QUEST_ID}, index)`);
+    expect(stub.actions.map((a) => a.action)).not.toContain("quest_choose_reward");
+    expect(client.drainActionHints()[0]).toMatchObject({ action: "turnInQuest", status: "choose_reward" });
+
+    // The second call, with the index, takes it.
+    const from = stub.actions.length;
+    const again = client.turnInQuest(CREATURE_GUID, QUEST_ID, 1, { timeout: 2000 });
+    await untilAction(stub, "quest_complete", from);
+    stub.push(JSON.stringify(offerReward(QUEST_ID, 80, [{ itemId: ITEM_ENTRY, count: 1 }, { itemId: OTHER_ITEM, count: 2 }])));
+    const at = await untilAction(stub, "quest_choose_reward", from);
+    expect(stub.actions[at]).toMatchObject({ rewardIndex: 1 });
+    stub.push(JSON.stringify(questRewarded(QUEST_ID, 81)));
+    expect(await again).toMatchObject({ ok: true, status: "complete" });
+    client.close();
+    await stub.stop();
+  });
+
+  test("a reward window with one choice and no index completes as before", async () => {
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    const pending = client.turnInQuest(CREATURE_GUID, QUEST_ID, undefined, { timeout: 2000 });
+    await untilAction(stub, "quest_complete");
+    stub.push(JSON.stringify(offerReward(QUEST_ID, 78)));
+    const at = await untilAction(stub, "quest_choose_reward");
+    expect(stub.actions[at]).toMatchObject({ rewardIndex: 0 });
+    stub.push(JSON.stringify(questRewarded(QUEST_ID, 79)));
+    expect(await pending).toMatchObject({ ok: true, status: "complete" });
     client.close();
     await stub.stop();
   });
@@ -2222,6 +2324,81 @@ describe("client: questsAvailableFrom", () => {
     stub.push(JSON.stringify(gossipWithQuests([], 93)));
     const result = await pending;
     expect(result).toEqual({ ok: true, quests: [] });
+    client.close();
+    await stub.stop();
+  });
+
+  test("a single-quest NPC answering with the quest's details is a one-row offer", async () => {
+    // Player::SendPreparedQuest skips the list when the menu holds one quest
+    // and the NPC has no gossip flag: the hello is answered with the details.
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    const pending = client.questsAvailableFrom(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify(questDetails(QUEST_ID, 94)));
+    const result = await pending;
+    expect(result).toEqual({
+      ok: true,
+      quests: [{ questId: QUEST_ID, title: `fixture quest ${QUEST_ID}`, icon: 2, level: undefined }],
+    });
+    client.close();
+    await stub.stop();
+  });
+
+  test("a single-quest window from another guid is not this NPC's answer", async () => {
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    const pending = client.questsAvailableFrom(CREATURE_GUID, { timeout: 150 }).catch((e: unknown) => e);
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify(questDetails(QUEST_ID, 95, ITEM_GUID)));
+    const err = (await pending) as Error;
+    expect(err).toBeInstanceOf(EventTimeoutError);
+    expect(err.message).toContain("SMSG_QUESTGIVER_QUEST_DETAILS");
+    client.close();
+    await stub.stop();
+  });
+
+  test("a turn-in window for a quest already in the log is nothing on offer, with the turn-in named", async () => {
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    stub.push(JSON.stringify(questAccepted));
+    await client.events.waitFor((e) => e.seq === 30, { timeout: 2000 });
+    const pending = client.questsAvailableFrom(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify(requestItems(QUEST_ID, false, 96)));
+    const result = await pending;
+    if (result.ok || result.status !== "nothing_on_offer") throw new Error(`unexpected ${JSON.stringify(result)}`);
+    expect(result.quests).toEqual([]);
+    expect(result.hint).toContain(`turnInQuest(npc, ${QUEST_ID})`);
+    expect(client.drainActionHints()[0]).toMatchObject({ action: "questsAvailableFrom", status: "nothing_on_offer" });
+    client.close();
+    await stub.stop();
+  });
+
+  test("a quest that completes on the spot, not in the log, is offered", async () => {
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    const pending = client.questsAvailableFrom(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify(offerReward(QUEST_ID, 97)));
+    const result = await pending;
+    expect(result).toEqual({
+      ok: true,
+      quests: [{ questId: QUEST_ID, title: "fixture quest", icon: undefined, level: undefined }],
+    });
+    client.close();
+    await stub.stop();
+  });
+
+  test("a silence from an NPC marked available says no quest window came back, not that it offers something unseen", async () => {
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    stub.push(JSON.stringify(questGiverStatus(CREATURE_GUID, 8, 98))); // available
+    await client.events.waitFor((e) => e.seq === 98, { timeout: 2000 });
+    const err = (await client.questsAvailableFrom(CREATURE_GUID, { timeout: 60 }).catch((e: unknown) => e)) as Error;
+    expect(err).toBeInstanceOf(EventTimeoutError);
+    expect(err.message).toContain("no quest window came back — check events.recent() for what did arrive");
+    expect(err.message).not.toContain("nothing to give");
     client.close();
     await stub.stop();
   });
@@ -2748,6 +2925,21 @@ describe("client: flight master window and activateTaxi", () => {
     const hints = client.drainActionHints();
     expect(hints).toHaveLength(1);
     expect(hints[0]).toMatchObject({ action: "activateTaxi", status: "refused", count: 1 });
+    client.close();
+    await stub.stop();
+  });
+
+  test("activateTaxi: the silence a destination two hops away gets is explained, naming both nodes", async () => {
+    // Player::ActivateTaxiPathTo returns without a reply when no single path
+    // joins the two nodes, so ERR_TAXINOSUCHPATH never names that case.
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    stub.push(window(345));
+    await client.events.waitForOpcode("SMSG_SHOWTAXINODES", { timeout: 2000 });
+    const err = (await client.activateTaxi(CREATURE_GUID, 8, { timeout: 60 }).catch((e: unknown) => e)) as Error;
+    expect(err).toBeInstanceOf(EventTimeoutError);
+    expect(err.message).toContain("no direct flight path joins Ironforge, Dun Morogh and Thelsamar, Loch Modan");
+    expect(err.message).toContain("one hop toward it");
     client.close();
     await stub.stop();
   });

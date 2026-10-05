@@ -40,6 +40,8 @@ export type {
   MoveToOptions,
   QuestAcceptResult,
   QuestOptions,
+  QuestOfferRow,
+  QuestRewardChoice,
   QuestsAvailableResult,
   QuestTurnInResult,
   UseItemResult,
@@ -192,6 +194,7 @@ export {
   MOVE_OPCODES,
   MOVE_STATUSES,
   parseEventFrame,
+  spellCastResultName,
 } from "./protocol";
 export type {
   ActionRequest,

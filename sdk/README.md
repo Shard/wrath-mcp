@@ -135,15 +135,37 @@ confused by their own nulls.
 `acceptQuestFrom` reads the quest log *first*, because a turn-in chain may
 already have added the quest (the core auto-advances, so an explicit accept can
 be a no-op) — that is `status: "already_in_log"`. Otherwise it asks, and
-accepts the list in either shape: a gossip-flagged questgiver answers
-`quest_list` with an `SMSG_GOSSIP_MESSAGE` carrying the quests, not an
-`SMSG_QUESTGIVER_QUEST_LIST`. `turnInQuest` handles the other branch of the
+accepts the answer in every shape the core sends: a gossip-flagged questgiver
+answers `quest_list` with an `SMSG_GOSSIP_MESSAGE` carrying the quests, not an
+`SMSG_QUESTGIVER_QUEST_LIST`, and an NPC without the gossip flag whose menu
+holds exactly one quest skips the list and sends that quest's own window
+(`Player::SendPreparedQuest`). Its details are a one-row offer (an auto-accept
+quest is already in the log by then, and is reported accepted); its
+request-items or offer-reward window is a quest that completes on the spot, or,
+for a quest already in the log, that quest's turn-in, which is
+`nothing_on_offer` with a hint naming `turnInQuest`. Before the single-quest
+windows were read, both helpers timed out on every such NPC although the
+server had answered. Those windows are matched on the NPC's guid as well,
+since turn-ins and quest-start items send the same opcodes.
+`turnInQuest` handles the other branch of the
 same asymmetry: `SMSG_QUESTGIVER_REQUEST_ITEMS` that says the quest *is*
 completable is the client's cue to send the completion again. The completion
 wait races `SMSG_INVENTORY_CHANGE_FAILURE`: a reward that does not fit is
 answered with that failure and no completion at all, so a full bag comes back
 as `{ ok: false, status: "inventory_full", hint }` instead of burning the
 whole timeout (the quest stays in the log; free a slot and turn in again).
+A reward window offering two or more choice items, when no `rewardIndex` was
+passed, is not answered: `turnInQuest` returns `{ ok: false, status:
+"choose_reward", choices, hint }`, each choice `{ index, itemId, count, name,
+quality, item }` with the item's tooltip from the client cache (the module
+queries every reward item it decodes; the call waits up to a second for those
+answers and leaves `item` undefined for any still missing), and a second call
+with the index takes it. Defaulting to the first choice had hidden the choice
+completely (operator decision, 2026-10-05). An explicit index, or one choice or
+none, completes as before. A completable REQUEST_ITEMS carries no reward list,
+so that path still takes `rewardIndex ?? 0` unseen: the window that would show
+the choices follows the client's "Continue" (`CMSG_QUESTGIVER_REQUEST_REWARD`),
+which the module does not send.
 `acceptQuestFrom` races the same failure after its accept: a quest that hands
 over an item is refused with it when the item does not fit, and never enters
 the log, so that is `inventory_full` too.
@@ -285,6 +307,16 @@ Two synthetic opcodes, lowercase so they can never collide with an `SMSG_*`:
   torn down and recreated under the same token) is re-baselined, not reported
   as a gap.
 - `stream_error` — a frame arrived that was not a readable event envelope.
+
+One field is added at decode time, never invented: the cast-failure packets
+(`SMSG_CAST_FAILED`, `SMSG_SPELL_FAILURE`, `SMSG_PET_CAST_FAILED`) keep their
+numeric `result` and gain `reason`, the pinned core's `SpellCastResult` name
+for it (`97` is `out_of_range`, `67` `not_ready`; `spellCastResultName`), or
+`undefined` for a code outside that enum. The number alone left runs decoding
+failures from memory; the name is the key the client's own failure text uses,
+so it is client-visible knowledge, like the `InventoryResult` sentences
+(operator decision, 2026-10-05). `castSpell` itself still acks the dispatch
+only: these events, or `SMSG_SPELL_GO`, are the outcome.
 
 ### State cache
 

@@ -73,11 +73,11 @@ import {
   type MoveToResponse,
   type NewWorldData,
   type TransferAbortedData,
-  type OfferedQuest,
   type QuestGiverQuestCompleteData,
   type QuestGiverQuestListData,
   type QuestGiverQuestDetailsData,
   type QuestGiverRequestItemsData,
+  type QuestGiverOfferRewardData,
   type QuestGiverStatusData,
   type QuestGiverStatusMultipleData,
   type RawField,
@@ -121,6 +121,7 @@ import {
   type CorpseLocation,
   type NearbyObject,
   type Point3,
+  type ItemInfo,
   type QuestGiverStatusName,
   type QuestLogEntry,
   type TalentState,
@@ -628,6 +629,14 @@ const CHAR_RESPONSE_HINTS: Record<number, string> = {
 };
 
 /**
+ * What `face` takes, said once for both of its refusals: the local one for a
+ * guid or name, and the module's `missing_face_target`.
+ */
+const FACE_TAKES =
+  "face takes an orientation in radians or an { x, y } point, not a guid or a name — " +
+  "to face a unit, pass its position: sdk.face({ x: unit.x, y: unit.y }) with the unit from state.units().";
+
+/**
  * One actionable sentence per request-error code, rendered into the
  * `WrathRequestError` message. Deterministic and model-agnostic: the same
  * pattern as `CHAR_RESPONSE_HINTS`, extended to the codes live runs actually
@@ -656,7 +665,7 @@ const ERROR_CODE_HINTS: Record<string, string> = {
   missing_guid:
     "this action needs a guid argument — get one from state.nearbyUnits() or state.closest(...)",
   missing_position: "move_to needs finite x, y and z numbers",
-  missing_face_target: "face needs either an orientation in radians or an { x, y } point",
+  missing_face_target: FACE_TAKES,
   missing_token: "the request body is missing its session token — call through the sdk client methods",
   missing_character: "createSession needs a character name",
   unknown_account:
@@ -696,8 +705,9 @@ const ERROR_CODE_HINTS: Record<string, string> = {
     "the module refused use_item for that bag/slot — the item there has no on-use spell and no quest to start, " +
     "or the slot is empty or shifted (slots move after looting/selling); check state.bag()",
   opcode_not_allowed:
-    "sdk.raw() only sends the CMSG_* names on the module's allowlist (module/PROTOCOL.md, \"raw\"); " +
-    "an opcode that already has a dedicated sdk method must go through that method",
+    "sdk.raw() sends only the CMSG_* opcodes on the module's raw allowlist, and this one is not on it — " +
+    "where an sdk method sends that opcode (castSpell, questAccept, ...) call the method, otherwise it cannot be sent; " +
+    "an aura you can cancel, a mount among them, goes with sdk.raw(\"CMSG_CANCEL_AURA\", [{ u32: spellId }])",
   invalid_payload:
     "the raw payload did not reach the module as whole hex bytes — pass a field list like " +
     "[{ u32: id }, { guid: unit.guid }] and let the SDK pack it",
@@ -1427,7 +1437,7 @@ function questgiverMarkerClause(m: QuestGiverMarker): string {
     return `Its questgiver status is \`${m.name}\`, not \`reward\` — it is not${q}'s ender (or the quest is not complete).`;
   }
   const offers = m.name === "available" || m.name === "available_rep" || m.name === "low_level_available" || m.name === "low_level_available_rep";
-  if (offers) return `Its questgiver status is \`${m.name}\`, so it is offering something — the silence is not "nothing to give".`;
+  if (offers) return `Its questgiver status is \`${m.name}\`, so it is offering something, yet no quest window came back — check events.recent() for what did arrive.`;
   if (m.name === "none") return `Its questgiver status is \`none\` — the server says it has no quest for you right now.`;
   return `Its questgiver status is \`${m.name}\`, not \`available\` — it has nothing on offer for you right now.`;
 }
@@ -1602,14 +1612,18 @@ export type QuestAcceptResult =
       readonly status: "not_offered";
       readonly questId: number;
       /** What the NPC did offer, so a caller can say what it saw. */
-      readonly offered: readonly OfferedQuest[];
+      readonly offered: readonly QuestOfferRow[];
     }
   | {
       readonly ok: false;
-      /** The NPC's observed questgiver marker already says it offers nothing; nothing was sent. */
+      /**
+       * The NPC's observed questgiver marker already says it offers nothing
+       * (nothing was sent), or the NPC answered with the turn-in window of a
+       * quest already in the log: the one quest it has for this character.
+       */
       readonly status: "nothing_on_offer";
       readonly questId: number;
-      readonly offered: readonly OfferedQuest[];
+      readonly offered: readonly QuestOfferRow[];
       readonly hint: string;
     }
   | {
@@ -1650,25 +1664,55 @@ function questStartedBy(state: StateCache, item: BagSlotItem | undefined): numbe
 }
 
 /**
- * `questsAvailableFrom`'s answer; `nothing_on_offer` is the marker pre-check
- * and `too_far` the range pre-check, each with nothing sent.
+ * One quest a questgiver offers. A list row carries the `icon` and `level`
+ * the list packet names. A quest offered on its own (the NPC answered the
+ * hello with that quest's window rather than a list) has no list row: its
+ * `level` is the cached quest template's when one was observed and
+ * `undefined` otherwise, and its `icon` is 2 for a details window and
+ * `undefined` for a quest offered straight to its completion window.
+ */
+export interface QuestOfferRow {
+  readonly questId: number;
+  readonly title: string;
+  readonly icon: number | undefined;
+  readonly level: number | undefined;
+  readonly repeatable?: boolean | undefined;
+}
+
+/**
+ * `questsAvailableFrom`'s answer. `nothing_on_offer` is the marker pre-check
+ * (nothing sent) or the NPC answering with the turn-in window of a quest
+ * already in the log; `too_far` is the range pre-check, nothing sent.
  */
 export type QuestsAvailableResult =
-  | { readonly ok: true; readonly quests: readonly OfferedQuest[] }
-  | { readonly ok: false; readonly status: "nothing_on_offer"; readonly quests: readonly OfferedQuest[]; readonly hint: string }
+  | { readonly ok: true; readonly quests: readonly QuestOfferRow[] }
+  | { readonly ok: false; readonly status: "nothing_on_offer"; readonly quests: readonly QuestOfferRow[]; readonly hint: string }
   | {
       readonly ok: false;
       readonly status: "too_far";
-      readonly quests: readonly OfferedQuest[];
+      readonly quests: readonly QuestOfferRow[];
       readonly distance: number;
       readonly hint: string;
     };
 
-/** What `questOffer` learned: the list, or the marker or the distance that made asking pointless. */
+/** What `questOffer` learned: the offer, or what made it nothing (a marker, or a turn-in window), or the distance. */
 type QuestOfferOutcome =
-  | { readonly quests: readonly OfferedQuest[] }
-  | { readonly nothing: QuestGiverMarker; readonly hint: string }
+  | { readonly quests: readonly QuestOfferRow[] }
+  | { readonly nothing: QuestGiverMarker | undefined; readonly hint: string }
   | { readonly tooFar: number; readonly hint: string };
+
+/**
+ * The windows a questgiver with exactly one quest in its menu answers the
+ * hello with instead of a list (`Player::SendPreparedQuest`, single-element
+ * case, reached for an NPC without the gossip flag): the quest's details,
+ * or — for a quest in the log that it ends, or one that completes on the
+ * spot — its request-items or offer-reward window.
+ */
+const SINGLE_OFFER_OPCODES: ReadonlySet<string> = new Set([
+  "SMSG_QUESTGIVER_QUEST_DETAILS",
+  "SMSG_QUESTGIVER_REQUEST_ITEMS",
+  "SMSG_QUESTGIVER_OFFER_REWARD",
+]);
 
 /** The questgiver markers that say "nothing to offer" before a quest list is even asked for. */
 const OFFERS_NOTHING: ReadonlySet<QuestGiverStatusName> = new Set([
@@ -1682,13 +1726,30 @@ const OFFERS_NOTHING: ReadonlySet<QuestGiverStatusName> = new Set([
 ]);
 
 /**
+ * One item on a reward window's choice list: the wire's `itemId` and `count`,
+ * joined to the item's tooltip when the client cache holds it (`item`, the
+ * same `ItemInfo` as `state.items`; the module queries every reward item it
+ * sees, so it is `undefined` only when that answer has not arrived yet).
+ */
+export interface QuestRewardChoice {
+  readonly index: number;
+  readonly itemId: number;
+  readonly count: number;
+  readonly name: string | undefined;
+  readonly quality: number | undefined;
+  readonly item: ItemInfo | undefined;
+}
+
+/**
  * The outcome of a turn-in. `not_complete` is the questgiver refusing while
  * the quest log agrees the objectives are unfinished; `wrong_questgiver` is
  * the refusal when the log says complete — another NPC ends this quest;
  * `not_ready` (the NPC's marker) and `too_far` (the distance) are local
  * pre-checks, nothing was sent; `inventory_full` is the server refusing to
  * hand over the reward — the quest is still in the log and can be turned in
- * again once a bag slot is free.
+ * again once a bag slot is free; `choose_reward` is the reward window offering
+ * a choice of items when no `rewardIndex` was passed — nothing was chosen, and
+ * the quest is still in the log.
  */
 export type QuestTurnInResult =
   | {
@@ -1697,6 +1758,14 @@ export type QuestTurnInResult =
       readonly questId: number;
       readonly xp: number;
       readonly money: number;
+    }
+  | {
+      readonly ok: false;
+      readonly status: "choose_reward";
+      readonly questId: number;
+      /** The window's choice rewards; `index` is the `rewardIndex` that takes each one. */
+      readonly choices: readonly QuestRewardChoice[];
+      readonly hint: string;
     }
   | {
       readonly ok: false;
@@ -1778,13 +1847,16 @@ const TRAINER_BUY_FAIL_HINTS: Record<number, string> = {
  */
 const TAXI_REPLY_HINTS: Record<number, string> = {
   1: "the server refused the flight without a reason (ERR_TAXIUNSPECIFIEDSERVERERROR); ask again",
-  2: "no flight path connects these two nodes for this character (ERR_TAXINOSUCHPATH); pick another destination from state.lastTaxiNodes(guid).known",
+  // At the pinned core this code is sent only for a source node the server
+  // does not know; two known nodes with no direct path get no reply at all
+  // (see activateTaxi's timeout).
+  2: "the server does not know the node this flight would start from (ERR_TAXINOSUCHPATH); reopen the window with showTaxiNodes(guid) and retry",
   3: "not enough money for the fare (ERR_TAXINOTENOUGHMONEY); state.money is what you have",
   4: "too far from the flight master, or it is not a flight master (ERR_TAXITOOFARAWAY); moveTo the NPC first, then reopen the window with showTaxiNodes(guid)",
   5: "no flight master is in interaction range (ERR_TAXINOVENDORNEARBY); moveTo the NPC and retry",
   6: "this character has not visited that node (ERR_TAXINOTVISITED) — a flight master only sells routes between nodes you have discovered on foot; the destination must be in state.lastTaxiNodes(guid).known",
   7: "you are busy (ERR_TAXIPLAYERBUSY): in combat, casting, or trading; wait and retry",
-  8: "you are already mounted (ERR_TAXIPLAYERALREADYMOUNTED); dismount first",
+  8: "you are already mounted (ERR_TAXIPLAYERALREADYMOUNTED); dismount first — sdk.raw(\"CMSG_CANCEL_AURA\", [{ u32: mountSpellId }]) cancels the mount's aura",
   9: "you are shapeshifted (ERR_TAXIPLAYERSHAPESHIFTED); cancel the form first",
   10: "you are moving (ERR_TAXIPLAYERMOVING); stop(), stand still a moment, retry",
   11: "the destination is the node you are standing at (ERR_TAXISAMENODE); pick another",
@@ -2784,8 +2856,21 @@ export class WrathClient {
    * into an orientation and echoes the one it used. Rejects with
    * `WrathRequestError` code `moving` while a move is running — stop first, or
    * supersede with `moveTo`.
+   *
+   * Unlike the calls that take a target, it takes no guid or name: facing a
+   * unit is facing its position, `face({ x: unit.x, y: unit.y })`. A string
+   * is refused here with that sentence and nothing sent (the operator kept
+   * the signature and asked for the docs and the error to say how, 2026-10-05,
+   * after runs passed a guid and lost the call).
    */
   face(orientationOrPoint: number | { x: number; y: number }): Promise<FaceResponse> {
+    if (typeof orientationOrPoint === "string") {
+      return Promise.reject(
+        new TypeError(
+          `face(${JSON.stringify(orientationOrPoint)}): ${FACE_TAKES} Nothing was sent.`,
+        ),
+      );
+    }
     const body =
       typeof orientationOrPoint === "number"
         ? { token: this.token, action: "face", orientation: orientationOrPoint }
@@ -5421,10 +5506,11 @@ export class WrathClient {
   /**
    * Take a quest from an NPC and confirm it landed in the quest log.
    *
-   * Two shapes of "here are my quests" have to be accepted, because a
-   * gossip-flagged questgiver answers `quest_list` with an
+   * Three shapes of "here are my quests" have to be accepted (`questOffer`):
+   * a gossip-flagged questgiver answers `quest_list` with an
    * `SMSG_GOSSIP_MESSAGE` carrying the quests rather than an
-   * `SMSG_QUESTGIVER_QUEST_LIST`. And the log is checked *first*, because a
+   * `SMSG_QUESTGIVER_QUEST_LIST`, and one with a single quest answers with
+   * that quest's own window. And the log is checked *first*, because a
    * turn-in chain may already have added the quest for us.
    */
   async acceptQuestFrom(
@@ -5439,7 +5525,7 @@ export class WrathClient {
         return { ok: true, status: "already_in_log", questId, quest: inLog, title: undefined };
       }
 
-      let wanted: OfferedQuest | undefined;
+      let wanted: QuestOfferRow | undefined;
       const carried = this.state.bag().items.find((i) => i.guid === npc);
       if (carried !== undefined) {
         // A quest-start item is its own questgiver: there is no quest list to
@@ -5460,6 +5546,10 @@ export class WrathClient {
         }
         wanted = offered.quests.find((q) => q.questId === questId);
         if (!wanted) return { ok: false, status: "not_offered", questId, offered: offered.quests };
+        // An auto-accept quest offered on its own is added to the log by the
+        // hello itself; there is nothing left to accept.
+        const added = this.state.quest(questId);
+        if (added !== undefined) return { ok: true, status: "accepted", questId, quest: added, title: wanted.title };
       }
 
       // Raced against the quest landing in the log: a quest that gives an item
@@ -5509,9 +5599,11 @@ export class WrathClient {
    * Ask an NPC what quests it is offering, and return the list.
    *
    * The same `quest_list` send-and-wait `acceptQuestFrom` does — including
-   * accepting *either* answer shape, since a gossip-flagged questgiver replies
-   * with `SMSG_GOSSIP_MESSAGE` carrying the quests instead of
-   * `SMSG_QUESTGIVER_QUEST_LIST` — with none of the accepting. Models kept
+   * accepting every answer shape: a gossip-flagged questgiver replies with
+   * `SMSG_GOSSIP_MESSAGE` carrying the quests instead of
+   * `SMSG_QUESTGIVER_QUEST_LIST`, and one with a single quest replies with
+   * that quest's window, reported as a one-row list — with none of the
+   * accepting. Models kept
    * rebuilding exactly this by hand over `questList` plus event scraping and
    * getting confused by their own nulls.
    *
@@ -5668,7 +5760,7 @@ export class WrathClient {
    * window straight from the hello, so the select step is skipped when the
    * window arrives first. The result is what `state.lastTaxiNodes(guid)`
    * holds: the node this master stands at and the nodes this character has
-   * visited (the only destinations the server will accept). Nothing here
+   * visited (the only destinations the server will accept, and only one flight path away). Nothing here
    * is a route or a fare; the way to learn whether two nodes connect is to
    * ask (`activateTaxi`).
    */
@@ -5743,7 +5835,13 @@ export class WrathClient {
         (e) => isEvent(e, "SMSG_ACTIVATETAXIREPLY") && !isDecodeError(e.data) && (sinceSeq === undefined || e.seq > sinceSeq),
         {
           timeout: options.timeout ?? 10_000,
-          description: `the SMSG_ACTIVATETAXIREPLY answering activateTaxi(${id}, ${JSON.stringify(dest)})`,
+          // Player::ActivateTaxiPathTo returns without a reply when no single
+          // flight path joins the two nodes; every other refusal is answered.
+          description:
+            `the SMSG_ACTIVATETAXIREPLY answering activateTaxi(${id}, ${JSON.stringify(dest)}) — the server sends ` +
+            `no reply when no direct flight path joins ${window.current.name ?? `node ${window.current.nodeId}`} and ` +
+            `${to.name ?? `node ${to.nodeId}`}: a destination two or more hops away is dropped without an answer, ` +
+            `even when you know it. Fly to a known node one hop toward it, then take the next flight from there.`,
         },
       );
       const reply = (event.data as ActivateTaxiReplyData).reply;
@@ -5874,11 +5972,20 @@ export class WrathClient {
    * done — that refusal means another NPC ends this quest. Nothing is sent when
    * the NPC's current marker already says no turn-in is ready there
    * (`not_ready`) or the cached positions put it out of reach (`too_far`).
+   *
+   * A reward window offering two or more choice items, with no `rewardIndex`
+   * passed, is not answered: the call returns `choose_reward` with the
+   * choices, as a client's window waits for the player to pick, and a second
+   * call with the index takes it. Defaulting to the first choice hid the
+   * choice entirely (operator decision, 2026-10-05). An explicit index, or a
+   * window with one choice or none, completes as before. A completable
+   * REQUEST_ITEMS carries no reward list, so that path still takes
+   * `rewardIndex ?? 0` without seeing the choices.
    */
   async turnInQuest(
     npcGuid: GuidOrUnit,
     questId: number,
-    rewardIndex = 0,
+    rewardIndex?: number,
     options: QuestOptions = {},
   ): Promise<WithResolved<QuestTurnInResult>> {
     return this.byName(npcGuid, "turnInQuest(npcGuid, questId)", async (npcId) => {
@@ -5965,7 +6072,19 @@ export class WrathClient {
           }
           // completable REQUEST_ITEMS: fall through and choose the reward.
         }
-        await this.questChooseReward(npcId, questId, rewardIndex);
+        if (answer.opcode === "SMSG_QUESTGIVER_OFFER_REWARD" && rewardIndex === undefined) {
+          const offer = answer.data as QuestGiverOfferRewardData;
+          if (offer.choiceRewards.length >= 2) {
+            const choices = await this.rewardChoices(offer, timeout);
+            const hint =
+              `the reward window offers ${choices.length} items to choose from and no rewardIndex was passed, so ` +
+              `nothing was chosen and the quest is still in your log — call turnInQuest(npc, ${questId}, index) ` +
+              `with the index of the one you want`;
+            this.noteActionHint("turnInQuest", "choose_reward", hint);
+            return { ok: false, status: "choose_reward", questId, choices, hint };
+          }
+        }
+        await this.questChooseReward(npcId, questId, rewardIndex ?? 0);
         // Raced against the completion: a reward that does not fit answers the
         // choose with SMSG_INVENTORY_CHANGE_FAILURE and *no* completion — before
         // this race, a full bag was indistinguishable from silence and burned
@@ -6081,14 +6200,23 @@ export class WrathClient {
   /**
    * Send `quest_list` and return the offer the NPC answered with.
    *
-   * The one place the two answer shapes are reconciled — a gossip-flagged
-   * questgiver replies `SMSG_GOSSIP_MESSAGE` with the quests embedded — shared
-   * by `questsAvailableFrom` and `acceptQuestFrom` so they can never drift.
+   * The one place the answer shapes are reconciled, shared by
+   * `questsAvailableFrom` and `acceptQuestFrom` so they can never drift:
+   * a gossip-flagged questgiver replies `SMSG_GOSSIP_MESSAGE` with the quests
+   * embedded, and an NPC without the gossip flag whose menu holds exactly one
+   * quest skips the list and sends that quest's window
+   * (`Player::SendPreparedQuest`): `SMSG_QUESTGIVER_QUEST_DETAILS` for an
+   * offer, or `_REQUEST_ITEMS` / `_OFFER_REWARD` for a quest in the log it
+   * ends or one that completes on the spot. Before these were read, every such
+   * NPC timed out although the server had answered, and runs fell back to
+   * the raw questDetails + questAccept.
    *
-   * The match is on opcode and a `sinceSeq` floor, not on the event's guid:
-   * that is how `acceptQuestFrom` has always behaved, and narrowing it here
-   * would change a shipped helper. Two overlapping calls against *different*
-   * NPCs can therefore cross answers; one at a time is the contract.
+   * The list shapes match on opcode and a `sinceSeq` floor, not on the
+   * event's guid: that is how `acceptQuestFrom` has always behaved, and
+   * narrowing it here would change a shipped helper. Two overlapping calls
+   * against *different* NPCs can therefore cross answers; one at a time is
+   * the contract. The single-quest windows also match on the NPC's guid,
+   * because turn-ins and quest-start items send the same opcodes.
    */
   private async questOffer(npcGuid: GuidArg, timeout: number): Promise<QuestOfferOutcome> {
     const sinceSeq = this.events.recent(1)[0]?.seq;
@@ -6110,17 +6238,29 @@ export class WrathClient {
     // with nothing on offer has nothing to walk over for.
     const tooFar = questgiverOutOfReach(this.state, npcGuid);
     if (tooFar !== undefined) return { tooFar, hint: questgiverTooFarHint(tooFar) };
+    // The log as it stood when the hello went out: a single quest's
+    // completion window for a quest already in it is a turn-in, not an offer.
+    const inLogBefore = new Set(this.state.questLog.map((q) => q.questId));
+    const npcKey = guidKey(npcGuid);
     await this.questList(npcGuid);
     const menu = await this
       .waitEvent(
         (e) =>
-          (isEvent(e, "SMSG_QUESTGIVER_QUEST_LIST") || isEvent(e, "SMSG_GOSSIP_MESSAGE")) &&
+          (isEvent(e, "SMSG_QUESTGIVER_QUEST_LIST") ||
+            isEvent(e, "SMSG_GOSSIP_MESSAGE") ||
+            // A single-quest answer is matched on the NPC's guid as well:
+            // turn-ins, quest-start items and raw calls produce the same
+            // opcodes.
+            (SINGLE_OFFER_OPCODES.has(e.opcode) &&
+              !isDecodeError(e.data) &&
+              guidKey((e.data as { guid: string }).guid) === npcKey)) &&
           !isDecodeError(e.data) &&
           (sinceSeq === undefined || e.seq > sinceSeq),
         {
           timeout,
           description:
-            "the questgiver's quest list (SMSG_QUESTGIVER_QUEST_LIST or SMSG_GOSSIP_MESSAGE) — " +
+            "the questgiver's answer (SMSG_QUESTGIVER_QUEST_LIST or SMSG_GOSSIP_MESSAGE, or for a single quest " +
+            "its SMSG_QUESTGIVER_QUEST_DETAILS, _REQUEST_ITEMS or _OFFER_REWARD) — " +
             questgiverSilence(
               distance,
               "is not a questgiver, or has nothing for this character right now",
@@ -6132,7 +6272,52 @@ export class WrathClient {
       .catch((e: unknown) => {
         throw withDistance(e, distance);
       });
-    return { quests: (menu.data as QuestGiverQuestListData | GossipMessageData).quests ?? [] };
+    if (!SINGLE_OFFER_OPCODES.has(menu.opcode)) {
+      return { quests: (menu.data as QuestGiverQuestListData | GossipMessageData).quests ?? [] };
+    }
+    // A questgiver with one quest in its menu answers with that quest's own
+    // window. Details are an offer. A completion window is the turn-in of a
+    // quest that was already in the log, or else a quest that completes on
+    // the spot (auto-complete), which is an offer too.
+    const single = menu.data as { questId: number; title: string };
+    if (menu.opcode !== "SMSG_QUESTGIVER_QUEST_DETAILS" && inLogBefore.has(single.questId)) {
+      return {
+        nothing: undefined,
+        hint:
+          `the NPC answered with the turn-in window of quest ${single.questId} "${single.title}", which is in your ` +
+          `quest log: that is the one quest it has for you, and it offers nothing new. ` +
+          `turnInQuest(npc, ${single.questId}) hands it in once its objectives are done.`,
+      };
+    }
+    const row: QuestOfferRow = {
+      questId: single.questId,
+      title: single.title,
+      icon: menu.opcode === "SMSG_QUESTGIVER_QUEST_DETAILS" ? 2 : undefined,
+      level: this.state.quests.get(single.questId)?.value.level,
+    };
+    return { quests: [row] };
+  }
+
+  /**
+   * A reward window's choice list joined to the item tooltips. The module
+   * fires the item queries as it decodes the window, so their answers trail
+   * it by a round trip: wait for them a little (at most a second, inside the
+   * caller's timeout), then report what has arrived — a missing tooltip is
+   * `item: undefined`, never a guess.
+   */
+  private async rewardChoices(offer: QuestGiverOfferRewardData, timeout: number): Promise<QuestRewardChoice[]> {
+    const ids = offer.choiceRewards.map((c) => c.itemId);
+    await this.waitForState(
+      () => (ids.every((id) => this.state.items.has(id)) ? true : undefined),
+      Math.min(1000, timeout),
+      "the reward items' tooltips",
+    ).catch((e: unknown) => {
+      if (!(e instanceof EventTimeoutError)) throw e;
+    });
+    return offer.choiceRewards.map((c, index) => {
+      const item = this.state.items.get(c.itemId)?.value;
+      return { index, itemId: c.itemId, count: c.count, name: item?.name, quality: item?.quality, item };
+    });
   }
 
   /**

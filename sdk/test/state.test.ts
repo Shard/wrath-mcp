@@ -1727,6 +1727,36 @@ describe("state cache: quest objectives from the quest query", () => {
     ]);
   });
 
+  test("a collect objective counts the worn bags too, as the server's item count does", () => {
+    // Before, only the player's own inventory fields were read: an item in a
+    // worn bag read have 0 while the quest log said complete.
+    const bagOnly = withWorld([questAccepted, questQueryResponse(), wornBagSlot, wornBagCreate]);
+    expect(bagOnly.quest(QUEST_ID)!.objectives!.at(-1)).toMatchObject({ kind: "collect", have: 2, done: false });
+    const both = withWorld([
+      questAccepted,
+      questQueryResponse(),
+      inventorySlot,
+      itemCreate,
+      wornBagSlot,
+      wornBagCreate,
+    ]);
+    // 5 in the backpack plus 2 in the worn bag.
+    expect(both.quest(QUEST_ID)!.objectives!.at(-1)).toMatchObject({ kind: "collect", have: 7, done: true });
+  });
+
+  test("a collect objective does not count the bank, which the turn-in refuses", () => {
+    const bankSlot = {
+      seq: 36,
+      opcode: "SMSG_UPDATE_OBJECT",
+      opcodeId: 0x0a9,
+      ts: 1_700_000_000_036,
+      data: { blocks: 1, objects: [{ update: "values", guid: SELF_GUID, fields: { invSlot39Lo: ITEM_GUID_LO, invSlot39Hi: ITEM_GUID_HI } }] },
+    };
+    const c = withWorld([questAccepted, questQueryResponse(), bankSlot, itemCreate]);
+    expect(c.inventory.some((i) => i.slot === 39)).toBe(true);
+    expect(c.quest(QUEST_ID)!.objectives!.at(-1)).toMatchObject({ kind: "collect", have: 0, done: false });
+  });
+
   test("the answer arriving before the log entry still joins; the template is never pruned", () => {
     const c = withWorld([questQueryResponse(), questAccepted]);
     expect(c.quest(QUEST_ID)?.title).toBe("Kobold Camp Cleanup");

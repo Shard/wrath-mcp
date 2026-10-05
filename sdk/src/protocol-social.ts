@@ -16,6 +16,7 @@
 import { z } from "zod";
 
 import { guidSchema } from "./guid";
+import { withCastReason } from "./spell-cast-result";
 
 // ------------------------------------------------------------------ pets
 
@@ -74,13 +75,18 @@ export type PetActionFeedbackData = z.infer<typeof petActionFeedbackDataSchema>;
 export const petTameFailureDataSchema = z.looseObject({ result: z.number() });
 export type PetTameFailureData = z.infer<typeof petTameFailureDataSchema>;
 
-/** `SMSG_PET_CAST_FAILED`: the `SMSG_CAST_FAILED` shape for a spell the pet was told to cast. */
-export const petCastFailedDataSchema = z.looseObject({
-  spellId: z.number(),
-  result: z.number(),
-  rank: z.number().optional(),
-  name: z.string().optional(),
-});
+/**
+ * `SMSG_PET_CAST_FAILED`: the `SMSG_CAST_FAILED` shape for a spell the pet was
+ * told to cast, with the same `reason` naming the SpellCastResult code.
+ */
+export const petCastFailedDataSchema = z
+  .looseObject({
+    spellId: z.number(),
+    result: z.number(),
+    rank: z.number().optional(),
+    name: z.string().optional(),
+  })
+  .transform(withCastReason);
 export type PetCastFailedData = z.infer<typeof petCastFailedDataSchema>;
 
 /** `SMSG_PET_NAME_QUERY_RESPONSE`: the given name for a pet number (the module asked when the pet came into view). */

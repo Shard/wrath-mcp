@@ -123,8 +123,9 @@ describe("error-code hints", () => {
     ["moving", /sdk\.stop\(\)/],
     ["missing_guid", /nearbyUnits/],
     ["missing_position", /x, y and z/],
-    ["missing_face_target", /orientation/],
+    ["missing_face_target", /orientation.*not a guid or a name.*face\(\{ x: unit\.x, y: unit\.y \}\)/],
     ["invalid_guid", /decimal u64|String\(guid\)/],
+    ["opcode_not_allowed", /not on it.*CMSG_CANCEL_AURA/],
   ];
   for (const [code, pattern] of hintCases) {
     test(`${code} renders an actionable hint`, () => {

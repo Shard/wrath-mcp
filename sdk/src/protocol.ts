@@ -18,6 +18,7 @@
 import { z } from "zod";
 
 import { guidSchema, parseGuid } from "./guid";
+import { withCastReason } from "./spell-cast-result";
 import {
   buyBankSlotResultDataSchema,
   groupInviteDataSchema,
@@ -52,6 +53,7 @@ import {
 // pets / group / mail / bank / trade / loot-roll / item-text schemas.
 export * from "./guid";
 export * from "./protocol-social";
+export { spellCastResultName } from "./spell-cast-result";
 
 // ---------------------------------------------------------------- primitives
 
@@ -856,18 +858,22 @@ export const spellGoDataSchema = z.looseObject({
 });
 export type SpellGoData = z.infer<typeof spellGoDataSchema>;
 
-/** `result` is a SpellCastResult code; the SDK does not name them. */
-export const castFailedDataSchema = z.looseObject({
-  spellId: z.number(),
-  result: z.number(),
-});
+/** `result` is a SpellCastResult code; `reason` is its name (`spellCastResultName`), undefined for an unknown code. */
+export const castFailedDataSchema = z
+  .looseObject({
+    spellId: z.number(),
+    result: z.number(),
+  })
+  .transform(withCastReason);
 export type CastFailedData = z.infer<typeof castFailedDataSchema>;
 
-export const spellFailureDataSchema = z.looseObject({
-  casterGuid: guidSchema,
-  spellId: z.number(),
-  result: z.number(),
-});
+export const spellFailureDataSchema = z
+  .looseObject({
+    casterGuid: guidSchema,
+    spellId: z.number(),
+    result: z.number(),
+  })
+  .transform(withCastReason);
 export type SpellFailureData = z.infer<typeof spellFailureDataSchema>;
 
 export const periodicAuraLogDataSchema = z.looseObject({
