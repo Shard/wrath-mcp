@@ -259,7 +259,7 @@ Dispatch one action. Supported: `say`, `move_to`, `stop`, `face` (`move_to`,
 quest/combat extension set (additive): `set_target`, `clear_target`,
 `attack_start`, `attack_stop`, `cast_spell`, `cancel_cast`, `interact`,
 `gossip_hello`, `gossip_select`, `quest_list`, `quest_details`, `quest_accept`,
-`quest_complete`, `quest_choose_reward`, `quest_abandon`, `loot`, `loot_item`,
+`quest_complete`, `quest_request_reward`, `quest_choose_reward`, `quest_abandon`, `loot`, `loot_item`,
 `loot_money`, `loot_release`, `loot_all`, `vendor_list`, `buy_item`,
 `sell_item`, `repair_all`, `equip_item`, `use_item`, `destroy_item`, `repop`,
 `reclaim_corpse`, `spirit_healer_activate` (additive), the trainer
@@ -317,6 +317,18 @@ model geometry a client has too) before pathing, and falls back to the given z.
 Without `guid` the ground z is tried only after a `target_off_mesh`. Either way
 a target the mesh rejects at both heights is still `target_off_mesh`, and
 `meshZ` is reported relative to the z asked for.
+
+Optional `force` (boolean): walk a route that steps *down* off a ledge instead
+of refusing it as `drop` (statuses below). The step is walked the way a
+client's character walks off an edge — a heartbeat at the edge, nothing
+during the fall, `MSG_MOVE_FALL_LAND` at the foot — so the server charges the
+fall through its own `Player::HandleFall`, as it would a client's. `force`
+does not apply to a step *up*: a client cannot walk up a ledge the mesh calls
+a climb, and such a route is refused as `drop` (positive `dz`) whatever the
+request says. The module never judges whether a fall is
+survivable: that is a game rule, and the SDK's `moveTo` applies it from the
+facts a `drop` carries (`dz`, `safeFall`) and the character's own health
+before deciding to re-issue with `force`.
 
 Success `200` (means "queued and pathing", not "arrived"):
 ```json
@@ -379,7 +391,8 @@ them: `{ "ok": true, "action": "<name>", "token": ... }`.
 | `quest_list` | `guid` | `CMSG_QUESTGIVER_HELLO` | `SMSG_QUESTGIVER_QUEST_LIST` or a gossip menu follows; an NPC without the gossip flag whose menu holds one quest sends that quest's `SMSG_QUESTGIVER_QUEST_DETAILS` (or `_REQUEST_ITEMS` / `_OFFER_REWARD`) instead (`Player::SendPreparedQuest`) |
 | `quest_details` | `guid`, `questId` | `CMSG_QUESTGIVER_QUERY_QUEST` | quest text via `SMSG_QUESTGIVER_QUEST_DETAILS` |
 | `quest_accept` | `guid`, `questId` | `CMSG_QUESTGIVER_ACCEPT_QUEST` | `guid` may be a quest-start item's own guid (after `use_item` on it): the handler accepts TYPEMASK_ITEM |
-| `quest_complete` | `guid`, `questId` | `CMSG_QUESTGIVER_COMPLETE_QUEST` | server answers REQUEST_ITEMS or OFFER_REWARD |
+| `quest_complete` | `guid`, `questId` | `CMSG_QUESTGIVER_COMPLETE_QUEST` | server answers REQUEST_ITEMS (a quest with required items, `completable` saying whether they are all in hand) or OFFER_REWARD |
+| `quest_request_reward` | `guid`, `questId` | `CMSG_QUESTGIVER_REQUEST_REWARD` | the client's "Continue" on a completable REQUEST_ITEMS window: the handler completes the quest and answers OFFER_REWARD (`HandleQuestgiverRequestRewardOpcode`); silence when the quest is not completable there |
 | `quest_choose_reward` | `guid`, `questId`, `rewardIndex` | `CMSG_QUESTGIVER_CHOOSE_REWARD` | `rewardIndex` 0-based into `choiceRewards`; 0 when there is no choice |
 | `quest_abandon` | `questId` | `CMSG_QUESTLOG_REMOVE_QUEST` | module maps quest id -> log slot (client-visible via quest-log fields); `400 quest_not_in_log` |
 | `quest_query` | `questId` | `CMSG_QUEST_QUERY` | the client's template fetch for a quest in its log; `SMSG_QUEST_QUERY_RESPONSE` follows (unknown id: silence) |
@@ -676,11 +689,26 @@ pinned AzerothCore commit.
 | `SMSG_MOTD` | 0x33D | `{ "lineCount": <u32>, "lines": [ <string> ] }` |
 | `SMSG_NOTIFICATION` | 0x1CB | `{ "text": <string> }` |
 | `SMSG_NAME_QUERY_RESPONSE` | 0x051 | `{ "guid": <guid-string>, "found": <bool>, "name": <string?> }` |
-| `SMSG_MESSAGECHAT` | 0x096 | `{ "type": <u8>, "language": <i32>, "senderGuid": <guid-string>, "message": <string>, "chatTag": <u8> }` |
+| `SMSG_MESSAGECHAT` | 0x096 | `{ "type": <u8>, "language": <i32>, "senderGuid": <guid-string>, "senderName": <string?>, "receiverGuid": <guid-string?>, "receiverName": <string?>, "channelName": <string?>, "message": <string>, "chatTag": <u8>, "achievementId": <u32?> }` |
 
-`SMSG_MESSAGECHAT.data` is decoded for the `CHAT_MSG_SAY`-shaped layout (the one
-the slice produces). Other chat sub-types share the opcode but vary the header;
-they will be decoded as the action set grows.
+`SMSG_MESSAGECHAT.data` is decoded per chat `type`, following the layout
+`ChatHandler::BuildChatPacket` writes for each (the core's `Chat.cpp`): the
+header (`type`, `language`, `senderGuid`, flags) is common; then creature
+speech (`CHAT_MSG_MONSTER_SAY`/`PARTY`/`YELL`/`WHISPER`/`EMOTE`, 12–16,
+`RAID_BOSS_EMOTE`/`WHISPER`, 41–42, and `BATTLENET`, 47) carries a
+length-prefixed `senderName` — a creature has no name-query path, so this is
+the only place its name rides — the receiver guid, and a `receiverName` when
+the receiver is neither a player nor a pet; `CHAT_MSG_WHISPER_FOREIGN` (8)
+carries `senderName` and the receiver guid; the battleground system types
+(36–38) the receiver guid and a `receiverName` for a non-player receiver;
+`CHAT_MSG_ACHIEVEMENT`/`GUILD_ACHIEVEMENT` (48–49) the receiver guid, and an
+`achievementId` after the chat tag; `CHAT_MSG_CHANNEL` (17) a `channelName`
+(NUL-terminated) before the receiver guid; every other type just the receiver
+guid. Then the length-prefixed `message` and `chatTag`. Optional fields are
+present only when the type's layout carried them (`receiverGuid` only when
+non-zero). The achievement broadcast's `message` is the client's raw template
+(`%s has earned the achievement $a!`); filling it is the consumer's job, as it
+is the client's.
 
 ### Movement/observation extension (additive)
 
@@ -803,7 +831,7 @@ session's own identity). Their `opcodeId`s are outside the real opcode range.
 | opcode | id | `data` fields |
 |---|---|---|
 | `WB_MOVE_PROGRESS` | 0xFF02 | `{ "moveId": <number>, "pos": { "x","y","z","o" } }` — at most 1/s while moving |
-| `WB_MOVE_RESULT` | 0xFF01 | `{ "moveId": <number>, "status": <str>, "pos": { "x","y","z","o" }, "meshZ": <f?>, "reachedPos": { "x","y","z" }? }` — `meshZ` only on `arrived` when the mesh z differed from the request; `reachedPos` on `path_incomplete` and `drop`; `"dz": <f>, "target": { "x","y","z" }` only on `drop`; `"onTransport": { "guid": <guid-string>, "entry": <u32> }` when the character ended the move aboard a transport |
+| `WB_MOVE_RESULT` | 0xFF01 | `{ "moveId": <number>, "status": <str>, "pos": { "x","y","z","o" }, "meshZ": <f?>, "reachedPos": { "x","y","z" }? }` — `meshZ` only on `arrived` when the mesh z differed from the request; `reachedPos` on `path_incomplete` and `drop`; `"dz": <f>, "target": { "x","y","z" }` only on `drop`, plus `"safeFall": <u32>` when the character's own fall-height reduction (`SPELL_AURA_SAFE_FALL`, the client's buff frame) is non-zero; `"nearest": { "x","y","z" } | null` only on `target_off_mesh` (the walkable mesh point nearest the request within 20y, or `null` when none is); `"onTransport": { "guid": <guid-string>, "entry": <u32> }` when the character ended the move aboard a transport |
 | `WB_RIDE_PROGRESS` | 0xFF05 | `{ "transportGuid": <guid-string>, "transportEntry": <u32>, "pos": { "x","y","z","o" } }` — at most 1/s while the character rides a transport and is not walking; the server-side position the transport carried it to |
 | `WB_TRANSPORT_PROGRESS` | 0xFF06 | `{ "guid": <guid-string>, "entry": <u32>, "pos": { "x","y","z","o" }, "progressMs": <u32>, "periodMs": <u32?>, "docked": <bool?> }` — at most 1/s per session, one per transport on the character's map whose create block the session has received: the car's current position on its `TransportAnimation.dbc` path (what a client animates locally from `pathProgress`), the clock and period, and `docked` when the keyframe segment the clock is on has no displacement (the car is dwelling at a platform; absent for transports without an animation path) |
 | `WB_AREATRIGGER` | 0xFF04 | `{ "triggerId": <u32>, "moveId": <number>, "pos": { "x","y","z","o" } }` — the mover entered an `AreaTrigger.dbc` volume and sent `CMSG_AREATRIGGER` for it (see below) |
@@ -828,11 +856,23 @@ at the top of this document.
   retry from the agent's side.
 - `target_off_mesh` — the destination has no walkable polygon within the
   mesh's search box (4y in 2D; z is searched ±50y, so a stale z alone never
-  produces this), or it sits inside geometry. Pick a point on a road, a floor,
-  or where an NPC stands.
-- `start_off_mesh` — the character itself is standing somewhere the mesh does
-  not cover (a transport deck, a bad landing). Recovery is different from
-  `target_off_mesh`: a few yards of movement, or a disembark, fixes the start.
+  produces this), or it sits inside geometry. The result carries `nearest`:
+  the walkable mesh point closest to the request within 20y in 2D (Detour's
+  nearest-polygon query, at most 128 polygons considered, so in a dense
+  interior it is a walkable point near the request rather than provably the
+  nearest), or `null` when the box holds none. It is a statement about the
+  agent's own requested point in a failure, not a map query (operator
+  decision, 2026-10-05, docs/CONTRACTS.md "Map knowledge"). Pick a point on
+  a road, a floor, or where an NPC stands.
+- `start_off_mesh` — the character is standing off the mesh and no walkable
+  mesh lies within 10y of it (a transport deck, a bad landing). A start off
+  the mesh with mesh within 10y is not a failure: the module paths from the
+  nearest mesh point and prepends the straight walk onto it from the true
+  position — what a client's character does, since only the pathfinder is
+  mesh-bound — and the walk is dispatched (audited as `op: "move_start_snap"`
+  with the point and distance); the drop guard judges that first leg like
+  any other. Recovery from the failure is different from `target_off_mesh`:
+  more than a few yards of movement, or a disembark, fixes the start.
 - `path_incomplete` — the mesh has no continuous walkable route to the
   destination. The module already tried once to subdivide (path to where the
   mesh got, then onward); `reachedPos` is how far the mesh could get, so the
@@ -840,13 +880,22 @@ at the top of this document.
 - `drop` — the mesh's route steps off a ledge: some segment of the resolved
   polyline falls (or climbs) more than 2.0y and steeper than 1.2x its 2D
   length — a cliff, not a ramp (stairs and ramps pass; a stale z within the
-  `meshZ` band passes). A mesh path that falls is a ledge, not a route, so the
-  walk is not dispatched: `reachedPos` is the last point before the step
-  (the edge, on the character's level), `dz` is the signed vertical step the
-  route would have taken there, and `target` echoes the requested point. Pick
-  a destination on this level, or find the ramp/stairs. The same guard runs
-  per segment while walking; a ledge that slips past planning stops the
-  character at the edge with the same status and `pos` at the edge.
+  `meshZ` band passes). Without `force` the walk is not dispatched:
+  `reachedPos` is the last point before the step (the edge, on the
+  character's level), `dz` is the signed vertical step the route would have
+  taken there, `target` echoes the requested point, and `safeFall` rides when
+  non-zero. The module reports the ledge and leaves the verdict to the
+  caller: the server's fall rule (free under 13.48y, then a share of max
+  health rising with height, `Player::HandleFall`) is a game rule, so the
+  SDK estimates the fall from `dz` and `safeFall` against the character's own
+  health and re-issues with `force` unless it would take about four fifths
+  of current health or more (a ghost takes no fall damage, so a corpse run is
+  never refused). With `force` a downward route is walked and the fall is the
+  server's. A step *up* (positive `dz`) is refused forced or not: no client
+  walks up a ledge. The same guard runs per segment while walking; a ledge
+  that slips past planning stops the character at the edge with the same
+  status and `pos` at the edge, or, on a forced downward one, is walked with
+  the client's fall packets.
 - `transferred` — a map transfer took the character mid-move (an areatrigger
   portal, a cross-map port); the server applies the destination itself. `pos`
   is the last old-map position; the new map and arrival point follow on
@@ -876,8 +925,15 @@ the mover's interpolated point lies inside a transport's model bounds (the
 synthesized packet carries the transport block. Transports have no navmesh,
 so a `move_to` within 30y whose start or destination is on one is a straight
 line (boarding or disembarking, as a client walks it); anything longer goes
-through the mesh and answers `start_off_mesh` / `target_off_mesh`. A move
-that ends aboard reports `onTransport`; while aboard and idle, the server
+through the mesh and answers `start_off_mesh` / `target_off_mesh`. A
+disembarking leg ends at the ground height under the requested x,y (terrain,
+vmap and model geometry a client has too), not at the z asked for: a
+client's character drops from the deck to the platform, and a leg left to
+end at the deck height put the character in the air over the platform and
+off the mesh for its next move. When that height differs from the request
+by more than 1y the arrival carries `meshZ`, as a mesh-corrected arrival
+does, and the `move_transport_leg` audit record carries `z` and `groundZ`. A
+move that ends aboard reports `onTransport`; while aboard and idle, the server
 moves the character and the module reports where it is as
 `WB_RIDE_PROGRESS`. No "activate transport" action exists: boarding is
 walking onto the car.
@@ -1336,9 +1392,13 @@ dispatched and every event served is appended as:
 ground truth and the evidence the contracts held (docs/CONTRACTS.md).
 
 Synthesized movement logs one `action` record per `move_to`/`stop`/`face`
-request plus one per dispatched movement packet (`op: "move_pkt"` with the
-opcode and position), so the packet sequence the "client" sent is fully
-reconstructable from the audit log.
+request (`force: true` on the record when the request said so) plus one per
+dispatched movement packet (`op: "move_pkt"` with the opcode and position;
+`cause: "drop"` on the stop at a refused ledge, `cause: "drop_forced"` on the
+edge heartbeat and the `MSG_MOVE_FALL_LAND` of a forced one), so the packet
+sequence the "client" sent is fully reconstructable from the audit log.
+A move whose start the mesh does not cover logs `op: "move_start_snap"` with
+`from` (the true position), `to` (the nearest mesh point) and `distance`.
 Each `move_to` that reaches the mesh also logs one `op: "move_path"` record at
 dispatch — `moveId`, `status` (`"ok"` when the walk was dispatched, else the
 `WB_MOVE_RESULT` status), `pointCount`, and `points` (the resolved polyline,

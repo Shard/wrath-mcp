@@ -47,6 +47,61 @@ export const chatEcho = {
   data: { type: 1, language: 7, senderGuid: 7, message: "ping from the fixture", chatTag: 0 },
 };
 
+/**
+ * The per-type chat layouts PROTOCOL.md decodes (ChatHandler::BuildChatPacket):
+ * what the module serves for each, with invented names and text.
+ */
+export const chatLayouts = {
+  /** CHAT_MSG_MONSTER_SAY (12): the speaker's name rides the packet; the receiver here is a player, so no receiverName. */
+  monsterSay: {
+    seq: 40,
+    opcode: "SMSG_MESSAGECHAT",
+    opcodeId: 0x096,
+    ts: 1_700_000_000_400,
+    data: { type: 12, language: 0, senderGuid: "17365880163140632581", senderName: "Grizzled Sentry", receiverGuid: "7", message: "Halt, traveller.", chatTag: 0 },
+  },
+  /** CHAT_MSG_MONSTER_YELL (14), no receiver. */
+  monsterYell: {
+    seq: 41,
+    opcode: "SMSG_MESSAGECHAT",
+    opcodeId: 0x096,
+    ts: 1_700_000_000_410,
+    data: { type: 14, language: 0, senderGuid: "17365880163140632582", senderName: "Marrowgrim", message: "Flee, little ones!", chatTag: 0 },
+  },
+  /** CHAT_MSG_MONSTER_EMOTE (16), addressed to a creature: receiverName rides too. */
+  monsterEmote: {
+    seq: 42,
+    opcode: "SMSG_MESSAGECHAT",
+    opcodeId: 0x096,
+    ts: 1_700_000_000_420,
+    data: { type: 16, language: 0, senderGuid: "17365880163140632581", senderName: "Grizzled Sentry", receiverGuid: "17365880163140632582", receiverName: "Marrowgrim", message: "glares at Marrowgrim.", chatTag: 0 },
+  },
+  /** CHAT_MSG_CHANNEL (17): the channel name precedes the receiver guid. */
+  channel: {
+    seq: 43,
+    opcode: "SMSG_MESSAGECHAT",
+    opcodeId: 0x096,
+    ts: 1_700_000_000_430,
+    data: { type: 17, language: 7, senderGuid: "8", channelName: "General", message: "anyone selling linen", chatTag: 0 },
+  },
+  /** CHAT_MSG_ACHIEVEMENT (48): the client's raw template plus the id after the chat tag. */
+  achievement: {
+    seq: 44,
+    opcode: "SMSG_MESSAGECHAT",
+    opcodeId: 0x096,
+    ts: 1_700_000_000_440,
+    data: { type: 48, language: 0, senderGuid: "8", receiverGuid: "8", message: "%s has earned the achievement $a!", chatTag: 0, achievementId: 6 },
+  },
+  /** CHAT_MSG_WHISPER_FOREIGN (8): sender name and receiver guid. */
+  whisperForeign: {
+    seq: 45,
+    opcode: "SMSG_MESSAGECHAT",
+    opcodeId: 0x096,
+    ts: 1_700_000_000_450,
+    data: { type: 8, language: 1, senderGuid: "9", senderName: "Ordrick", receiverGuid: "7", message: "kthx", chatTag: 0 },
+  },
+} as const;
+
 export const nameQuery = {
   seq: 5,
   opcode: "SMSG_NAME_QUERY_RESPONSE",

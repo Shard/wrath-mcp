@@ -230,6 +230,7 @@ export type ActionRequest =
   | { token: string; action: "quest_details"; guid: string; questId: number }
   | { token: string; action: "quest_accept"; guid: string; questId: number }
   | { token: string; action: "quest_complete"; guid: string; questId: number }
+  | { token: string; action: "quest_request_reward"; guid: string; questId: number }
   | { token: string; action: "quest_choose_reward"; guid: string; questId: number; rewardIndex: number }
   | { token: string; action: "quest_abandon"; questId: number }
   | { token: string; action: "quest_query"; questId: number }
@@ -458,12 +459,29 @@ export const nameQueryResponseDataSchema = z.looseObject({
 });
 export type NameQueryResponseData = z.infer<typeof nameQueryResponseDataSchema>;
 
+/**
+ * `SMSG_MESSAGECHAT`, decoded per chat type the way the core builds it
+ * (PROTOCOL.md). The header is shared; the optional fields are what the type's
+ * layout carried: creature speech (`CHAT_MSG_MONSTER_*`, raid boss lines) names
+ * its speaker in the packet, a channel line names its channel, and the
+ * achievement broadcast trails an achievement id.
+ */
 export const messageChatDataSchema = z.looseObject({
   type: z.number(),
   language: z.number(),
   senderGuid: guidSchema,
+  /** The speaker's name, when the layout carries one (creature speech, foreign whispers). */
+  senderName: z.string().optional(),
+  /** The addressed unit, when the packet named one (non-zero). */
+  receiverGuid: guidSchema.optional(),
+  /** The addressed unit's name, when the layout carries one (a non-player receiver). */
+  receiverName: z.string().optional(),
+  /** `CHAT_MSG_CHANNEL` only. */
+  channelName: z.string().optional(),
   message: z.string(),
   chatTag: z.number(),
+  /** `CHAT_MSG_ACHIEVEMENT` / `CHAT_MSG_GUILD_ACHIEVEMENT` only. */
+  achievementId: z.number().optional(),
 });
 export type MessageChatData = z.infer<typeof messageChatDataSchema>;
 
@@ -745,6 +763,13 @@ export const moveResultDataSchema = z.looseObject({
   dz: z.number().optional(),
   /** `drop` only: the requested point, echoed. */
   target: z.looseObject({ x: z.number(), y: z.number(), z: z.number() }).optional(),
+  /** `drop` only, when non-zero: the character's own fall-height reduction (Safe Fall), in yards. */
+  safeFall: z.number().optional(),
+  /**
+   * `target_off_mesh` only: the walkable mesh point nearest the request within
+   * 20y, or `null` when none is. Absent from a module that predates it.
+   */
+  nearest: z.looseObject({ x: z.number(), y: z.number(), z: z.number() }).nullable().optional(),
   /** Present when the character ended the move aboard a transport the server is carrying it on. */
   onTransport: z.looseObject({ guid: guidSchema, entry: z.number() }).optional(),
 });

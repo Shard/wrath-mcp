@@ -22,6 +22,7 @@ import {
 } from "../src/protocol";
 import {
   chatEcho,
+  chatLayouts,
   creatureCreate,
   CREATURE_GUID,
   fullStream,
@@ -275,6 +276,33 @@ describe("event frames", () => {
     expect(data.senderGuid).toBe("7");
     expect(guidKey(data.senderGuid)).toBe("7");
     expect(data.message).toBe("ping from the fixture");
+  });
+
+  test("every chat layout parses, keeping only the fields its type carries", () => {
+    const parsed = Object.fromEntries(
+      Object.entries(chatLayouts).map(([k, frame]) => {
+        const result = parseEventFrame(JSON.stringify(frame));
+        if (!result.ok || !isEvent(result.event, "SMSG_MESSAGECHAT")) throw new Error(`${k}: wrong opcode`);
+        if (isDecodeError(result.event.data)) throw new Error(`${k}: unexpected decode error`);
+        return [k, result.event.data];
+      }),
+    );
+    expect(parsed.monsterSay?.senderName).toBe("Grizzled Sentry");
+    expect(parsed.monsterSay?.message).toBe("Halt, traveller.");
+    expect(parsed.monsterSay?.receiverGuid).toBe("7");
+    expect(parsed.monsterSay?.receiverName).toBeUndefined();
+    expect(parsed.monsterYell?.receiverGuid).toBeUndefined();
+    expect(parsed.monsterEmote?.receiverName).toBe("Marrowgrim");
+    expect(parsed.channel?.channelName).toBe("General");
+    expect(parsed.channel?.senderName).toBeUndefined();
+    expect(parsed.achievement?.achievementId).toBe(6);
+    expect(parsed.achievement?.message).toBe("%s has earned the achievement $a!");
+    expect(parsed.whisperForeign?.senderName).toBe("Ordrick");
+    // The player layout (chatEcho) carries none of the optional fields.
+    const say = parseEventFrame(JSON.stringify(chatEcho));
+    if (!say.ok || !isEvent(say.event, "SMSG_MESSAGECHAT") || isDecodeError(say.event.data)) throw new Error("say");
+    expect(say.event.data.senderName).toBeUndefined();
+    expect(say.event.data.achievementId).toBeUndefined();
   });
 
   test("a module decode failure is preserved, not dropped", () => {

@@ -69,7 +69,7 @@ exists.) Then, on the client:
 
 | Method | Signature | Purpose |
 | --- | --- | --- |
-| `moveTo` | `moveTo(target, options?): Promise<MoveResult>` | Walk to a point { x, y, z }, a unit, a guid, or the name of something in view (its cached position; the guid rides along so the module resolves z to the ground under the unit) and wait for the server's arrive/target_off_mesh/transferred/teleported/… verdict; a target nothing in view answers to comes back as status "unknown_target". One move reaches at most 250y in a straight line (x/y) from where you stand: a farther target is refused as status "too_far" with nothing moved, so a longer trip is several moves. An arrival aboard a tram car or boat carries onTransport { guid, entry }, and state.self.position then follows the ride (WB_RIDE_PROGRESS). |
+| `moveTo` | `moveTo(target, options?): Promise<MoveResult>` | Walk to a point { x, y, z }, a unit, a guid, or the name of something in view (its cached position; the guid rides along so the module resolves z to the ground under the unit) and wait for the server's arrive/target_off_mesh/transferred/teleported/… verdict; a target nothing in view answers to comes back as status "unknown_target"; a target that is not walkable ground comes back as status "target_off_mesh" with nearest — the walkable point closest to it within 20y, or null. One move reaches at most 250y in a straight line (x/y) from where you stand: a farther target is refused as status "too_far" with nothing moved, so a longer trip is several moves. An arrival aboard a tram car or boat carries onTransport { guid, entry }, and state.self.position then follows the ride (WB_RIDE_PROGRESS). A route that steps off a ledge is taken when the estimated fall damage (the server's rule: nothing under 13.48y, then rising with height) is under 80% of current health — a ghost always — and the arrival's hint says what it cost; otherwise status "drop" with the estimate, and { force: true } takes it anyway. |
 | `killTarget` | `killTarget(target: GuidOrUnit, options?): Promise<KillResult>` | Approach and auto-attack until the target or we drop; returns how the fight ended. |
 | `lootCorpse` | `lootCorpse(target: GuidOrUnit, options?): Promise<LootResult>` | Empty a corpse and report what actually entered the bags (confirmed pushes, not the window). |
 | `acceptQuestFrom` | `acceptQuestFrom(npcGuid: GuidOrUnit, questId, options?): Promise<QuestAcceptResult>` | Take a quest from an NPC and confirm it landed in the quest log. |
@@ -108,7 +108,7 @@ exists.) Then, on the client:
 | Method | Signature | Purpose |
 | --- | --- | --- |
 | `say` | `say(text): Promise<ActionResponse>` | Say something in local chat. |
-| `moveToAsync` | `moveToAsync(target): Promise<MoveToResponse>` | Queue a move without waiting — the call for a walk longer than your own time budget; same targets and the same 250y single-move cap as moveTo. |
+| `moveToAsync` | `moveToAsync(target, { force? }?): Promise<MoveToResponse>` | Queue a move without waiting — the call for a walk longer than your own time budget; same targets and the same 250y single-move cap as moveTo. No fall estimate here: a ledge answers drop on the WB_MOVE_RESULT event, and { force: true } walks it. |
 | `stop` | `stop(): Promise<ActionResponse>` | Queue a movement stop; the in-flight moveTo resolves with status 'stopped'. |
 | `face` | `face(orientationOrPoint: number | { x, y }): Promise<FaceResponse>` | Turn in place toward an orientation (radians, 0 = east, counter-clockwise) or a point { x, y }. It takes no guid or name: to face a unit, pass its position, face({ x: unit.x, y: unit.y }). Refused with code moving while a move is running. |
 | `setTarget` | `setTarget(target: GuidOrUnit): Promise<ActionResponse>` | Set the current target. |
@@ -124,6 +124,7 @@ exists.) Then, on the client:
 | `questDetails` | `questDetails(guid: GuidOrUnit, questId): Promise<ActionResponse>` | Request a quest's text. |
 | `questAccept` | `questAccept(guid: GuidOrUnit, questId): Promise<ActionResponse>` | Accept a quest (prefer acceptQuestFrom, which confirms). |
 | `questComplete` | `questComplete(guid: GuidOrUnit, questId): Promise<ActionResponse>` | Ask to complete a quest (prefer turnInQuest, which waits). |
+| `questRequestReward` | `questRequestReward(guid: GuidOrUnit, questId): Promise<ActionResponse>` | The "Continue" on a completable request-items window: the server then completes the quest and sends the reward window (prefer turnInQuest, which does this). |
 | `questChooseReward` | `questChooseReward(guid: GuidOrUnit, questId, rewardIndex?): Promise<ActionResponse>` | Choose a quest reward by index. |
 | `questAbandon` | `questAbandon(questId): Promise<ActionResponse>` | Abandon a quest from the log. |
 | `questQuery` | `questQuery(questId): Promise<ActionResponse>` | Fetch a quest template (title, objective text, required entries/counts) into state.quests; the SDK already does this for every quest entering the log. |
@@ -154,7 +155,7 @@ exists.) Then, on the client:
 | `petCast` | `petCast(spellNameOrId, target?: GuidOrUnit): Promise<PetActionResult>` | Have the pet cast one of its own spells (state.pet().spells, by name or by id) at a unit or at nothing; the server's refusal arrives as SMSG_PET_CAST_FAILED, while unknown_spell / ambiguous_spell / passive_spell mean nothing was sent. |
 | `petDismiss` | `petDismiss(): Promise<PetActionResult>` | Send the pet away: a hunter casts Dismiss Pet (the pet can be called back), any other pet is abandoned (a demon or temporary summon just goes). state.pet() is undefined once the bar is removed. |
 | `declineGroupInvite` | `declineGroupInvite(): Promise<RawActionResponse>` | Decline the pending invitation. |
-| `raw` | `raw(opcode: string, payload?: hex | Uint8Array | RawField[]): Promise<RawActionResponse>` | Escape hatch: send one allowlisted CMSG_* opcode with a body you build — a field list like [{ u32: 5 }, { guid: unit.guid }, { cstring: "x" }] is packed little-endian for you. Allowlist and field types: module/PROTOCOL.md "raw". The answer arrives on sdk.events only if its opcode is whitelisted there. |
+| `raw` | `raw(opcode: string, payload?: hex | Uint8Array | RawField[]): Promise<RawActionResponse>` | Escape hatch: send one allowlisted CMSG_* opcode with a body you build — a field list like [{ u32: 5 }, { guid: unit.guid }, { cstring: "x" }] is packed little-endian for you; field kinds are u8, u16, u32, i32, f32, u64 (decimal string), guid, packedGuid, cstring (NUL-terminated) and bytes (hex). The allowlist is the module's — ordinary client opcodes no sdk method sends (talents, chat and emotes, item moves and buyback, cancelling an aura, channel or auto-repeat, sheathing, stand state, the resurrect answer, taxi node status); an opcode off it is refused as opcode_not_allowed with a hint, nothing sent. The answer arrives on sdk.events only if its opcode is whitelisted there. |
 
 ## State reads (`state.*`)
 
@@ -208,7 +209,7 @@ zero.
 | `nextLevelXp` | `get state.nextLevelXp: Observed<number> | undefined` | Experience needed for the next level (read .value). |
 | `money` | `get state.money: Observed<number> | undefined` | Money in copper (read .value). |
 | `inventory` | `get state.inventory: InventoryItem[]` | All observed inventory slots by raw slot id; equipment is `slot < 19` (worn bags 19-22), bag() is the carried view. |
-| `chat` | `get state.chat: readonly ChatEntry[]` | The retained chat tail. |
+| `chat` | `get state.chat: readonly ChatEntry[]` | The retained chat tail, oldest first: { type, senderGuid, senderName?, channelName?, message, achievementId?, seq, ts }. senderName is present when the packet carried one (creature speech: an NPC's say/yell/emote/whisper); a player sender is named by state.nameOf(senderGuid). |
 | `notifications` | `get state.notifications: readonly NotificationEntry[]` | The retained notification tail. |
 | `gaps` | `get state.gaps: readonly GapRecord[]` | Observed gaps in the event stream. |
 | `anomalies` | `get state.anomalies: readonly Anomaly[]` | Things the stream said that the cache could not reconcile. |

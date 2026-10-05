@@ -122,6 +122,8 @@ namespace WrathBench
         float reqX{0}, reqY{0}, reqZ{0}; // the point the agent asked for (echoed on `drop`)
         bool hasDrop{false};        // TickMover found a ledge in the polyline: FinishMove says `drop`
         float dropDz{0};
+        bool force{false};          // request said force: ledges are walked (and fallen off), not refused
+        bool inFall{false};         // walking a forced downward ledge: MSG_MOVE_FALL_LAND is owed at its foot
     };
 
     // Per-token headless session. See docs/METHODOLOGY.md ("Client fidelity")
@@ -317,7 +319,7 @@ namespace WrathBench
         void DoGameAction(std::string token, std::string action, std::string body,
             std::shared_ptr<std::promise<HttpReply>> ack);
         void DoDeleteSession(std::string token, std::shared_ptr<std::promise<HttpReply>> ack);
-        void DoMoveTo(std::string token, float x, float y, float z, std::string guid, std::shared_ptr<std::promise<HttpReply>> ack);
+        void DoMoveTo(std::string token, float x, float y, float z, std::string guid, bool force, std::shared_ptr<std::promise<HttpReply>> ack);
         void DoStop(std::string token, std::shared_ptr<std::promise<HttpReply>> ack);
         void DoFace(std::string token, bool hasO, float o, bool hasXY, float x, float y, std::shared_ptr<std::promise<HttpReply>> ack);
 
@@ -334,14 +336,19 @@ namespace WrathBench
             float reachedX{0}, reachedY{0}, reachedZ{0};
             bool hasDrop{false};        // drop: the vertical step the polyline takes past reachedPos
             float dropDz{0};
+            bool hasSnap{false};        // the start was off the mesh and was snapped to the nearest point
+            float snapX{0}, snapY{0}, snapZ{0};
+            bool nearestSearched{false}; // target_off_mesh: the bounded search for mesh near the target ran
+            bool hasNearest{false};      // ... and found a point (nearestX/Y/Z)
+            float nearestX{0}, nearestY{0}, nearestZ{0};
         };
         // One pass of the cause ladder at x,y,z; reqZ is the z the agent asked
         // for (meshZ is reported relative to it).
-        PathResolve ResolvePathAt(Player* player, float x, float y, float z, float reqZ);
+        PathResolve ResolvePathAt(Player* player, float x, float y, float z, float reqZ, bool force = false);
         // The z-ladder around it: ground height at x,y first for a unit
         // target, as a fallback after target_off_mesh otherwise.
         PathResolve ResolvePath(Player* player, float x, float y, float z, bool unitTarget,
-            bool* usedGroundZ = nullptr, float* groundZOut = nullptr);
+            bool* usedGroundZ = nullptr, float* groundZOut = nullptr, bool force = false);
 
         // AreaTrigger.dbc as the client ships it: the
         // module reads the DBC from the server data volume so the mover can

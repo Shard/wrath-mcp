@@ -1,6 +1,15 @@
 import { describe, expect, test } from "bun:test";
 
-import { connect, inventoryResultText, meshZHint, WrathRequestError, WrathTransportError } from "../src/client";
+import {
+  connect,
+  DROP_BLOCK_FRACTION,
+  estimateFallDamage,
+  FALL_MIN_DAMAGE_DIST,
+  inventoryResultText,
+  meshZHint,
+  WrathRequestError,
+  WrathTransportError,
+} from "../src/client";
 import { EventAbortedError, EventTimeoutError } from "../src/events";
 import {
   addKill,
@@ -70,6 +79,16 @@ import {
   chestLootResponse,
 } from "./fixtures";
 import { startStub, type StubServer } from "./server";
+
+/** Resolve once the stub has recorded at least `n` actions (the SDK's requests are asynchronous). */
+async function waitForActions(stub: { actions: { action: string }[] }, n: number, timeoutMs = 2000): Promise<{ action: string }[]> {
+  const deadline = Date.now() + timeoutMs;
+  while (stub.actions.length < n) {
+    if (Date.now() > deadline) throw new Error(`stub saw ${stub.actions.length} actions, wanted ${n}`);
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  return stub.actions;
+}
 
 function json(body: unknown, status: number): Response {
   return new Response(JSON.stringify(body), {
@@ -621,6 +640,36 @@ describe("client: movement", () => {
     await stub.stop();
   });
 
+  test("target_off_mesh names the nearest walkable ground within 20y, or that there is none (operator decision, 2026-10-05)", async () => {
+    const stub = startStub({ onConnect: () => frames(loginSequence) });
+    const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+    await client.createSession({ character: "Fenwick" });
+
+    const p1 = client.moveTo({ x: -5620, y: -2580, z: 369 }, { timeout: 2000 });
+    const near = moveResult("target_off_mesh", 1, 30) as { data: Record<string, unknown> };
+    near.data.nearest = { x: -5611.5, y: -2574.2, z: 366.8 };
+    stub.push(JSON.stringify(near));
+    const r1 = await p1;
+    if (r1.ok) throw new Error("unreachable");
+    expect(r1.nearest).toEqual({ x: -5611.5, y: -2574.2, z: 366.8 });
+    expect(r1.hint).toContain(
+      "(-5620.0, -2580.0) is not on walkable ground within 4y (z is searched ±50y, so a wrong z alone is not the " +
+        "cause); the nearest walkable ground within 20y is (-5611.5, -2574.2, z 366.8), 10y away. Pick a point on a " +
+        "road or floor, or where an NPC stands.",
+    );
+
+    const p2 = client.moveTo({ x: -5700, y: -2680, z: 330 }, { timeout: 2000 });
+    const none = moveResult("target_off_mesh", 2, 31) as { data: Record<string, unknown> };
+    none.data.nearest = null;
+    stub.push(JSON.stringify(none));
+    const r2 = await p2;
+    if (r2.ok) throw new Error("unreachable");
+    expect(r2.nearest).toBeNull();
+    expect(r2.hint).toContain("cause); nothing walkable lies within 20y of it. Pick a point on a road or floor");
+    client.close();
+    await stub.stop();
+  });
+
   test("a refused stop after a failed move never masks the move verdict", async () => {
     const stub = startStub({
       onConnect: () => frames(loginSequence),
@@ -651,7 +700,13 @@ describe("client: movement", () => {
     if (r1.ok) throw new Error("unreachable");
     expect(r1.hint).toContain("10.0, 20.0");
     expect(r1.hint).toContain("not on walkable ground");
+    // A module that predates `nearest` says nothing about it.
+    expect(r1.hint).toContain(
+      "(10.0, 20.0) is not on walkable ground within 4y (z is searched ±50y, so a wrong z alone is not the cause). " +
+        "Pick a point on a road or floor, or where an NPC stands.",
+    );
     expect(r1.reachedPos).toBeUndefined();
+    expect(r1.nearest).toBeUndefined();
 
     // A destination of its own per status: a repeat of a refused one inside the
     // memo window is answered from the refusal already given, not the wire.
@@ -782,6 +837,199 @@ describe("client: movement", () => {
     expect(stub.actions.map((a) => a.action)).toEqual(["move_to", "stop"]);
     client.close();
     await stub.stop();
+  });
+
+  describe("the drop guard judges the fall the way the server charges it (operator decision, 2026-10-05)", () => {
+    // codex-astra freeplay (2026-10): 295 `drop` refusals, every one a 2.8–5.3y
+    // step, and corpse runs blocked by them. The module still reports the
+    // ledge; the SDK takes it on its own unless the fall would cost
+    // DROP_BLOCK_FRACTION of current health, and `force` overrides either way.
+    const ghostFlag = (seq: number): unknown => ({
+      seq,
+      opcode: "SMSG_UPDATE_OBJECT",
+      opcodeId: 0x0a9,
+      ts: 1_700_000_000_000 + seq,
+      data: { blocks: 1, objects: [{ update: "values", guid: SELF_GUID, fields: { playerFlags: 0x10 } }] },
+    });
+    const dropAt = (moveId: number, seq: number, dz: number, extra: Record<string, unknown> = {}): unknown => {
+      const ev = moveResult("drop", moveId, seq) as { data: Record<string, unknown> };
+      ev.data.reachedPos = { x: 9.2, y: 19.5, z: 0.7 };
+      ev.data.dz = dz;
+      ev.data.target = { x: 10, y: 20, z: 0.7 + dz };
+      Object.assign(ev.data, extra);
+      return ev;
+    };
+
+    test("estimateFallDamage is Player::HandleFall's equation", () => {
+      expect(estimateFallDamage(5, 100)).toBe(0);
+      expect(estimateFallDamage(13.4, 100)).toBe(0);
+      expect(estimateFallDamage(FALL_MIN_DAMAGE_DIST, 100)).toBe(0);
+      // 0.018 * 30 - 0.2426 = 0.2974 of max health.
+      expect(estimateFallDamage(30, 100)).toBe(29);
+      expect(estimateFallDamage(30, 1000)).toBe(297);
+      // Safe Fall shortens the fall: 30 - 17 = 13 → under the free height.
+      expect(estimateFallDamage(30, 100, 17)).toBe(0);
+      // Capped at max health.
+      expect(estimateFallDamage(200, 100)).toBe(100);
+      expect(DROP_BLOCK_FRACTION).toBe(0.8);
+    });
+
+    test("a short ledge is taken on its own: the move is re-issued with force and the arrival says so", async () => {
+      const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate]) });
+      const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+      await client.createSession({ character: "Fenwick" });
+      const p = client.moveTo({ x: 10, y: 20, z: -6.9 }, { timeout: 2000 });
+      stub.push(JSON.stringify(dropAt(1, 30, -7.64)));
+      // The re-issue carries force; its verdict is the move's.
+      const forced = await waitForActions(stub, 2);
+      expect(forced[0]).toMatchObject({ action: "move_to", x: 10, y: 20, z: -6.9 });
+      expect(forced[0]).not.toHaveProperty("force");
+      expect(forced[1]).toMatchObject({ action: "move_to", x: 10, y: 20, z: -6.9, force: true });
+      stub.push(JSON.stringify(moveResult("arrived", 2, 31)));
+      const r = await p;
+      expect(r.ok).toBe(true);
+      expect(r.status).toBe("arrived");
+      expect(r.hint).toContain(`took the 7.6-yard drop at (9.2, 19.5): a fall under ${FALL_MIN_DAMAGE_DIST} yards does no damage`);
+      // No stop: something moved, and nothing was refused.
+      expect(stub.actions.map((a) => a.action)).toEqual(["move_to", "move_to"]);
+      client.close();
+      await stub.stop();
+    });
+
+    test("a fall that hurts but leaves health is taken, with its estimate in the hint", async () => {
+      // selfCreate: 80/100 health. 30y: 29 damage < 0.8 * 80.
+      const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate]) });
+      const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+      await client.createSession({ character: "Fenwick" });
+      const p = client.moveTo({ x: 10, y: 20, z: -29.3 }, { timeout: 2000 });
+      stub.push(JSON.stringify(dropAt(1, 30, -30)));
+      await waitForActions(stub, 2);
+      stub.push(JSON.stringify(moveResult("arrived", 2, 31)));
+      const r = await p;
+      expect(r.ok).toBe(true);
+      expect(r.hint).toContain("took the 30.0-yard drop at (9.2, 19.5): estimated fall damage ~29 of 80 health");
+      client.close();
+      await stub.stop();
+    });
+
+    test("a fall that would take ~80% of current health is refused, with the estimate and the override", async () => {
+      // 60y: (0.018 * 60 - 0.2426) * 100 = 83 >= 0.8 * 80.
+      const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate]) });
+      const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+      await client.createSession({ character: "Fenwick" });
+      const p = client.moveTo({ x: 10, y: 20, z: -59.3 }, { timeout: 2000 });
+      stub.push(JSON.stringify(dropAt(1, 30, -60)));
+      const r = await p;
+      expect(r.ok).toBe(false);
+      if (r.ok) throw new Error("unreachable");
+      expect(r.status).toBe("drop");
+      expect(r.reachedPos).toEqual({ x: 9.2, y: 19.5, z: 0.7 });
+      expect(r.dz).toBe(-60);
+      expect(r.hint).toContain(
+        "the route to (10.0, 20.0, z -59.3) steps off a ledge of 60.0 yards at (9.2, 19.5); a fall of 60.0 yards " +
+          "would deal about 83 damage against 80 health, so the character stopped at the edge. Pass { force: true } " +
+          "to moveTo to take the drop anyway, or find the ramp/stairs.",
+      );
+      // One request, then the stop the module left unsent — never a forced re-issue.
+      expect(stub.actions.map((a) => a.action)).toEqual(["move_to", "stop"]);
+      client.close();
+      await stub.stop();
+    });
+
+    test("Safe Fall from the module shortens the fall in the estimate", async () => {
+      // 60y minus 40y Safe Fall → 20y: (0.018 * 20 - 0.2426) * 100 = 11.
+      const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate]) });
+      const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+      await client.createSession({ character: "Fenwick" });
+      const p = client.moveTo({ x: 10, y: 20, z: -59.3 }, { timeout: 2000 });
+      stub.push(JSON.stringify(dropAt(1, 30, -60, { safeFall: 40 })));
+      await waitForActions(stub, 2);
+      stub.push(JSON.stringify(moveResult("arrived", 2, 31)));
+      const r = await p;
+      expect(r.ok).toBe(true);
+      expect(r.hint).toContain("estimated fall damage ~11 of 80 health");
+      client.close();
+      await stub.stop();
+    });
+
+    test("a ghost takes any drop: the dead take no fall damage", async () => {
+      const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate, ghostFlag(18)]) });
+      const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+      await client.createSession({ character: "Fenwick" });
+      const p = client.moveTo({ x: 10, y: 20, z: -99.3 }, { timeout: 2000 });
+      stub.push(JSON.stringify(dropAt(1, 30, -100)));
+      const forced = await waitForActions(stub, 2);
+      expect(forced[1]).toMatchObject({ force: true });
+      stub.push(JSON.stringify(moveResult("arrived", 2, 31)));
+      const r = await p;
+      expect(r.ok).toBe(true);
+      expect(r.hint).toContain("took the 100.0-yard drop at (9.2, 19.5): a ghost takes no fall damage");
+      client.close();
+      await stub.stop();
+    });
+
+    test("a step up is refused, forced or not, and the hint says force does not apply to climbs", async () => {
+      const climb =
+        "the route climbs a 5.0-yard step at (9.2, 19.5) that cannot be walked up, so the character stopped at " +
+        "the edge; force does not apply to climbs. Pick a destination on this level, or find the ramp/stairs.";
+      const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate]) });
+      const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+      await client.createSession({ character: "Fenwick" });
+      const p = client.moveTo({ x: 10, y: 20, z: 5.7 }, { timeout: 2000 });
+      stub.push(JSON.stringify(dropAt(1, 30, 5)));
+      const r = await p;
+      expect(r.ok).toBe(false);
+      expect(r.status).toBe("drop");
+      expect(r.hint).toContain(climb);
+      expect(stub.actions.map((a) => a.action)).toEqual(["move_to", "stop"]);
+      // Forced: the module refuses the climb the same way, and the SDK neither re-issues nor offers force.
+      const p2 = client.moveTo({ x: 11, y: 20, z: 5.7 }, { timeout: 2000, force: true });
+      stub.push(JSON.stringify(dropAt(2, 31, 5)));
+      const r2 = await p2;
+      expect(r2.ok).toBe(false);
+      expect(r2.hint).toContain(climb);
+      expect(r2.hint).not.toContain("force: true");
+      expect(stub.actions.filter((a) => a.action === "move_to")).toHaveLength(2);
+      client.close();
+      await stub.stop();
+    });
+
+    test("with health unobserved the ledge is left alone and the hint says why", async () => {
+      const stub = startStub({ onConnect: () => frames(loginSequence) });
+      const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+      await client.createSession({ character: "Fenwick" });
+      const p = client.moveTo({ x: 10, y: 20, z: -6.9 }, { timeout: 2000 });
+      stub.push(JSON.stringify(dropAt(1, 30, -7.64)));
+      const r = await p;
+      expect(r.ok).toBe(false);
+      expect(r.hint).toContain("the route drops 7.6 yards at (9.2, 19.5), and own health is unobserved, so the fall could not be judged");
+      expect(r.hint).toContain("Pass { force: true }");
+      client.close();
+      await stub.stop();
+    });
+
+    test("force on moveTo and moveToAsync rides the request, and a forced drop verdict is not re-issued", async () => {
+      const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate]) });
+      const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+      await client.createSession({ character: "Fenwick" });
+      const p = client.moveTo({ x: 10, y: 20, z: -6.9 }, { timeout: 2000, force: true });
+      await waitForActions(stub, 1);
+      expect(stub.actions[0]).toMatchObject({ action: "move_to", force: true });
+      // A `drop` on a forced move (a runtime refusal the module no longer gives, but the
+      // vocabulary allows) is the verdict; nothing is re-issued.
+      stub.push(JSON.stringify(dropAt(1, 30, -7.64)));
+      const r = await p;
+      expect(r.ok).toBe(false);
+      expect(r.status).toBe("drop");
+      expect(r.hint).toContain("or pass { force: true } to moveTo to take it anyway");
+      await client.moveToAsync({ x: 1, y: 2, z: 3 }, { force: true });
+      await client.moveToAsync({ x: 1, y: 2, z: 3 });
+      const moves = stub.actions.filter((a) => a.action === "move_to");
+      expect(moves[1]).toMatchObject({ force: true });
+      expect(moves[2]).not.toHaveProperty("force");
+      client.close();
+      await stub.stop();
+    });
   });
 
   test("the meshZ hint says 'quote it' within 3y and 'a different level' beyond", async () => {
@@ -2087,18 +2335,54 @@ describe("client: quests", () => {
     await stub.stop();
   });
 
-  test("a completable REQUEST_ITEMS goes straight to the reward choice", async () => {
+  test("a completable REQUEST_ITEMS is answered with the client's Continue, and the reward window that follows is chosen from", async () => {
     // Re-asking with quest_complete gets REQUEST_ITEMS again forever on
-    // item-delivery quests (roster-opus-20260822): the reward is chosen
-    // directly from the completable answer.
+    // item-delivery quests (roster-opus-20260822); a client's "Continue" is
+    // CMSG_QUESTGIVER_REQUEST_REWARD, which the core answers with OFFER_REWARD.
     const stub = startStub({ onConnect: () => questWorld() });
     const client = await inWorld(stub);
     const pending = client.turnInQuest(CREATURE_GUID, QUEST_ID, 0, { timeout: 2000 });
     await untilAction(stub, "quest_complete");
     stub.push(JSON.stringify(requestItems(QUEST_ID, true, 80)));
-    await untilAction(stub, "quest_choose_reward");
+    const at = await untilAction(stub, "quest_request_reward");
+    expect(stub.actions[at]).toMatchObject({ guid: CREATURE_GUID, questId: QUEST_ID });
+    expect(stub.actions.map((a) => a.action)).not.toContain("quest_choose_reward");
+    stub.push(JSON.stringify(offerReward(QUEST_ID, 81)));
+    const chose = await untilAction(stub, "quest_choose_reward");
+    expect(stub.actions[chose]).toMatchObject({ rewardIndex: 0 });
     stub.push(JSON.stringify(questRewarded(QUEST_ID, 82)));
     expect((await pending).ok).toBe(true);
+    expect(stub.actions.map((a) => a.action)).toEqual(["quest_complete", "quest_request_reward", "quest_choose_reward"]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a collect quest's reward choices show through the same window (operator decision B, 2026-10-05)", async () => {
+    const OTHER_ITEM = ITEM_ENTRY + 1;
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    const pending = client.turnInQuest(CREATURE_GUID, QUEST_ID, undefined, { timeout: 2000 });
+    await untilAction(stub, "quest_complete");
+    stub.push(JSON.stringify(requestItems(QUEST_ID, true, 80)));
+    await untilAction(stub, "quest_request_reward");
+    stub.push(JSON.stringify(offerReward(QUEST_ID, 81, [{ itemId: ITEM_ENTRY, count: 1 }, { itemId: OTHER_ITEM, count: 2 }])));
+    stub.push(JSON.stringify({ ...itemQuery, seq: 82 }));
+    const result = await pending;
+    if (result.ok || result.status !== "choose_reward") throw new Error(`unexpected ${JSON.stringify(result)}`);
+    expect(result.choices.map((c) => [c.index, c.itemId])).toEqual([[0, ITEM_ENTRY], [1, OTHER_ITEM]]);
+    expect(stub.actions.map((a) => a.action)).toEqual(["quest_complete", "quest_request_reward"]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a completable REQUEST_ITEMS whose Continue the server never answers times out naming the window", async () => {
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    const pending = client.turnInQuest(CREATURE_GUID, QUEST_ID, 0, { timeout: 300 });
+    await untilAction(stub, "quest_complete");
+    stub.push(JSON.stringify(requestItems(QUEST_ID, true, 80)));
+    await untilAction(stub, "quest_request_reward");
+    await expect(pending).rejects.toThrow(/reward window for quest .* after its request-items window said it was completable/);
     client.close();
     await stub.stop();
   });

@@ -842,7 +842,11 @@ namespace WrathBench
             // ground under it before pathing, see ResolvePath); never a
             // lookup, the request still walks to x,y.
             std::string guid = req.GetString("guid");
-            PushTask([this, token, x, y, z, guid, ack]() { DoMoveTo(token, x, y, z, guid, ack); });
+            // Optional: walk a route that steps off a ledge instead of
+            // refusing it (PROTOCOL.md, `drop`). The fall then happens on the
+            // server, as it would for a client that walked off the edge.
+            bool force = req.GetBool("force");
+            PushTask([this, token, x, y, z, guid, force, ack]() { DoMoveTo(token, x, y, z, guid, force, ack); });
         }
         else if (action == "stop")
         {
@@ -873,7 +877,7 @@ namespace WrathBench
             static char const* kNeedsGuid[] = {
                 "set_target", "attack_start", "interact", "gossip_hello", "gossip_select",
                 "quest_list", "quest_details", "quest_accept", "quest_complete",
-                "quest_choose_reward", "loot", "loot_all", "loot_release",
+                "quest_request_reward", "quest_choose_reward", "loot", "loot_all", "loot_release",
                 "vendor_list", "buy_item", "sell_item", "repair_all",
                 "trainer_list", "trainer_buy_spell",
                 "spirit_healer_activate", "questgiver_status_query", nullptr };
@@ -901,7 +905,8 @@ namespace WrathBench
             if (action == "gossip_select" && (!req.Has("menuId") || !req.Has("optionId")))
                 return MissingParam(action, "missing_option", !req.Has("menuId") ? "menuId" : "optionId");
             if ((action == "quest_details" || action == "quest_accept" || action == "quest_complete"
-                 || action == "quest_choose_reward" || action == "quest_abandon" || action == "quest_query")
+                 || action == "quest_request_reward" || action == "quest_choose_reward"
+                 || action == "quest_abandon" || action == "quest_query")
                 && !req.Has("questId"))
                 return MissingParam(action, "missing_quest_id", "questId");
             if (action == "quest_choose_reward" && !req.Has("rewardIndex"))
@@ -1401,6 +1406,47 @@ namespace WrathBench
         return navMesh->getTileAt(tx, ty, 0) != nullptr;
     }
 
+    // The closest point on the walkable mesh to (x, y, z) within `radius`
+    // yards in 2D (and the core's own +-50y vertically), through the map's
+    // Detour query with the filter PathGenerator gives a player
+    // (NAV_GROUND | NAV_WATER | NAV_MAGMA). Detour considers at most 128
+    // polygons in the box, so in a dense interior the point found is a
+    // walkable one near the request rather than provably the nearest. False
+    // when no polygon lies in the box. Detour's axis order is (y, z, x).
+    static bool NearestMeshPoint(Player* player, float x, float y, float z, float radius, WbVec& out)
+    {
+        dtNavMeshQuery const* query = player->GetMap()->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
+        if (!query)
+            return false;
+        dtQueryFilter filter;
+        filter.setIncludeFlags(NAV_GROUND | NAV_WATER | NAV_MAGMA);
+        filter.setExcludeFlags(0);
+        float point[3] = { y, z, x };
+        float extents[3] = { radius, 50.0f, radius };
+        float closest[3] = { 0.0f, 0.0f, 0.0f };
+        dtPolyRef ref = 0;
+        if (dtStatusFailed(query->findNearestPoly(point, extents, &filter, &ref, closest)) || ref == 0)
+            return false;
+        out = { closest[2], closest[0], closest[1] };
+        return true;
+    }
+
+    // How far from its own position the mover looks for walkable mesh when
+    // the character stands off it (a graveyard tile the mesh misses, a wedge
+    // after a fall, the air over a platform). 10y: a few yards past the 7y
+    // at which the core itself calls a start far from any polygon. One run
+    // spent 51 hours as a ghost on such a tile, every move refused.
+    static constexpr float START_SNAP_RADIUS = 10.0f;
+
+    // How far around a `target_off_mesh` point the module looks for walkable
+    // mesh to name in the result (operator decision, 2026-10-05: a bounded
+    // nearest point to the agent's own requested point, in the failure only).
+    // 20y: five times the mesh's own 4y tolerance — enough to name the road
+    // shoulder beside a guessed point, and well inside what a client sees of
+    // the ground around a click — while a sweep of such answers still only
+    // ever describes the agent's own guesses, never the map.
+    static constexpr float TARGET_NEAREST_RADIUS = 20.0f;
+
     static bool IsCompletePath(PathType type, Movement::PointsArray const& pts)
     {
         return (type & PATHFIND_NORMAL)
@@ -1426,6 +1472,18 @@ namespace WrathBench
         return std::fabs(dz) > DROP_MIN_DZ && std::fabs(dz) > DROP_SLOPE * d2;
     }
 
+    // The character's own fall-height reduction (SPELL_AURA_SAFE_FALL, the
+    // rogue's Safe Fall and the like), in yards, served on a `drop` so the
+    // caller can estimate the fall the way Player::HandleFall will charge it.
+    // An aura on self is what the client's own buff frame shows; the number
+    // is the client's Spell.dbc reading of it. Omitted when zero.
+    static void AddSafeFall(Json::Writer& w, Player* player)
+    {
+        int32 safeFall = player->GetTotalAuraModifier(SPELL_AURA_SAFE_FALL);
+        if (safeFall > 0)
+            w.Add("safeFall", (uint32)safeFall);
+    }
+
     // Audit shape of a resolved polyline (op: move_path), capped so a 200-point
     // sweep does not flood the log; `truncated` says when the cap bit.
     static std::string PathPointsJson(std::vector<WbVec> const& pts, size_t cap = 64)
@@ -1448,7 +1506,7 @@ namespace WrathBench
     // missing tile inside NORMAL|NOT_USING_PATH; the endpoint check is 2D so
     // that a stale z in the request is the mesh's problem (meshZ), not the
     // agent's.
-    Manager::PathResolve Manager::ResolvePathAt(Player* player, float x, float y, float z, float reqZ)
+    Manager::PathResolve Manager::ResolvePathAt(Player* player, float x, float y, float z, float reqZ, bool force)
     {
         PathResolve r;
         dtNavMesh const* navMesh = player->GetMap()->GetMapCollisionData().GetMMapData().GetNavMesh();
@@ -1459,19 +1517,41 @@ namespace WrathBench
             return r;
         }
 
+        // The start: the character's own position when the mesh covers it,
+        // else the nearest mesh point within START_SNAP_RADIUS, with the true
+        // position prepended to the route so the first leg is the straight
+        // walk onto the mesh a client's character would make (a client is not
+        // mesh-bound; only the pathfinder is). A path from the character to
+        // itself is NORMAL exactly when the start is on the mesh; the core
+        // does not otherwise say which end of a failed path was off it.
+        float sx = player->GetPositionX(), sy = player->GetPositionY(), sz = player->GetPositionZ();
+        {
+            PathGenerator probe(player);
+            probe.CalculatePath(sx, sy, sz, false);
+            if (probe.GetPathType() & (PATHFIND_NOT_USING_PATH | PATHFIND_FARFROMPOLY_START))
+            {
+                WbVec near;
+                if (!NearestMeshPoint(player, sx, sy, sz, START_SNAP_RADIUS, near))
+                {
+                    r.status = "start_off_mesh";
+                    return r;
+                }
+                r.hasSnap = true;
+                r.snapX = near.x; r.snapY = near.y; r.snapZ = near.z;
+                sx = near.x; sy = near.y; sz = near.z;
+            }
+        }
+
         PathGenerator gen(player);
-        bool built = gen.CalculatePath(x, y, z, false);
+        bool built = gen.CalculatePath(sx, sy, sz, x, y, z, false);
         PathType type = gen.GetPathType();
         Movement::PointsArray const& pts = gen.GetPath();
 
         if (!built || (type & PATHFIND_NOT_USING_PATH))
         {
-            // No poly under one end. The core does not say which, so ask it
-            // about the start alone: a path from the character to itself is
-            // NORMAL when the start is on the mesh.
-            PathGenerator probe(player);
-            probe.CalculatePath(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), false);
-            r.status = (probe.GetPathType() & PATHFIND_NOT_USING_PATH) ? "start_off_mesh" : "target_off_mesh";
+            // The start is on the mesh (or snapped onto it), so the poly
+            // missing is under the target.
+            r.status = "target_off_mesh";
             return r;
         }
         if (type & PATHFIND_FARFROMPOLY_START)
@@ -1550,13 +1630,20 @@ namespace WrathBench
             r.status = "path_incomplete";
             return r;
         }
+        if (r.hasSnap)
+            r.points.insert(r.points.begin(), { player->GetPositionX(), player->GetPositionY(), player->GetPositionZ() });
         // Per-segment drop guard over the whole polyline (the main path and,
         // when spliced, the leg2 continuation): the walk is not dispatched.
         // `points` is kept so the move_path audit shows the route that fell.
+        // A forced request walks a downward step: the fall is the server's
+        // to judge (TickMover sends the landing a client would). A step up is
+        // refused whatever the request says — a client's character cannot
+        // walk up a ledge the mesh calls a climb, and heartbeats that climb
+        // it are the server-side shortcut the contract forbids.
         for (size_t i = 0; i + 1 < r.points.size(); ++i)
         {
             float dz = 0.0f;
-            if (IsDropSegment(r.points[i], r.points[i + 1], &dz))
+            if (IsDropSegment(r.points[i], r.points[i + 1], &dz) && (!force || dz > 0.0f))
             {
                 r.status = "drop";
                 r.hasReached = true;
@@ -1586,7 +1673,7 @@ namespace WrathBench
     // a `target_off_mesh` for any point. A target the mesh rejects at both its
     // own z and the ground z is still `target_off_mesh`; `meshZ` is always
     // relative to the z the agent asked for.
-    Manager::PathResolve Manager::ResolvePath(Player* player, float x, float y, float z, bool unitTarget, bool* usedGroundZ, float* groundZOut)
+    Manager::PathResolve Manager::ResolvePath(Player* player, float x, float y, float z, bool unitTarget, bool* usedGroundZ, float* groundZOut, bool force)
     {
         if (usedGroundZ) *usedGroundZ = false;
         float groundZ = player->GetMap()->GetHeight(player->GetPhaseMask(), x, y, z, true);
@@ -1594,28 +1681,44 @@ namespace WrathBench
         if (groundZOut) *groundZOut = haveGround ? groundZ : z;
 
         auto isTargetOffMesh = [](PathResolve const& r) { return r.status && std::strcmp(r.status, "target_off_mesh") == 0; };
+        // A target the mesh rejected at every height it was tried: name the
+        // walkable mesh nearest to it within TARGET_NEAREST_RADIUS, or that
+        // there is none, on the result.
+        auto withNearest = [&](PathResolve r) {
+            if (isTargetOffMesh(r))
+            {
+                r.nearestSearched = true;
+                WbVec near;
+                if (NearestMeshPoint(player, x, y, haveGround ? groundZ : z, TARGET_NEAREST_RADIUS, near))
+                {
+                    r.hasNearest = true;
+                    r.nearestX = near.x; r.nearestY = near.y; r.nearestZ = near.z;
+                }
+            }
+            return r;
+        };
 
         if (unitTarget && haveGround)
         {
-            PathResolve r = ResolvePathAt(player, x, y, groundZ, z);
+            PathResolve r = ResolvePathAt(player, x, y, groundZ, z, force);
             if (!isTargetOffMesh(r))
             {
                 if (usedGroundZ) *usedGroundZ = true;
                 return r;
             }
-            return ResolvePathAt(player, x, y, z, z);
+            return withNearest(ResolvePathAt(player, x, y, z, z, force));
         }
-        PathResolve r = ResolvePathAt(player, x, y, z, z);
+        PathResolve r = ResolvePathAt(player, x, y, z, z, force);
         if (isTargetOffMesh(r) && haveGround)
         {
-            PathResolve r2 = ResolvePathAt(player, x, y, groundZ, z);
+            PathResolve r2 = ResolvePathAt(player, x, y, groundZ, z, force);
             if (!isTargetOffMesh(r2))
             {
                 if (usedGroundZ) *usedGroundZ = true;
                 return r2;
             }
         }
-        return r;
+        return withNearest(r);
     }
 
     void Manager::FinishMove(BenchSession& s, char const* status)
@@ -1654,12 +1757,14 @@ namespace WrathBench
             w.Raw("reachedPos", Json::Writer().Add("x", (double)m.curX).Add("y", (double)m.curY).Add("z", (double)m.curZ).Str());
             w.Add("dz", (double)m.dropDz);
             w.Raw("target", Json::Writer().Add("x", (double)m.reqX).Add("y", (double)m.reqY).Add("z", (double)m.reqZ).Str());
+            if (player)
+                AddSafeFall(w, player);
         }
         m.hasDrop = false;
         EmitEvent(s, "WB_MOVE_RESULT", 0xFF01, w.Str());
     }
 
-    void Manager::DoMoveTo(std::string token, float x, float y, float z, std::string guid, std::shared_ptr<std::promise<HttpReply>> ack)
+    void Manager::DoMoveTo(std::string token, float x, float y, float z, std::string guid, bool force, std::shared_ptr<std::promise<HttpReply>> ack)
     {
         auto s = FindByToken(token);
         Player* player = CheckActionSession(s, ack);
@@ -1671,6 +1776,8 @@ namespace WrathBench
             a.Add("op", "move_to").Add("x", (double)x).Add("y", (double)y).Add("z", (double)z);
             if (!guid.empty())
                 a.Add("guid", guid);
+            if (force)
+                a.Add("force", true);
             Audit(*s, "action", a.Str());
         }
 
@@ -1733,19 +1840,49 @@ namespace WrathBench
             Transport* targetT = FindTransportAt(map, x, y, z);
             if ((startT || targetT) && player->GetExactDist2d(x, y) <= 30.0f)
             {
+                bool leaving = startT != nullptr && !targetT;
+                float endZ = z;
+                // A leg that leaves the transport ends on ordinary ground, and
+                // the ground is where a client's character ends up: its physics
+                // drop it from the deck to the platform. Without this the leg
+                // ended at whatever z was asked for — a request quoting the
+                // car-deck height left the character standing in the air 10y
+                // over the Deeprun platform, `arrived`, and off the mesh for
+                // the next move. Ground height is terrain, vmap and model
+                // geometry a client has too (as ResolvePath's z-ladder); it is
+                // reported as `meshZ`, like a mesh-corrected arrival.
+                if (leaving)
+                {
+                    float groundZ = map->GetHeight(player->GetPhaseMask(), x, y, z, true);
+                    if (groundZ > INVALID_HEIGHT && std::fabs(groundZ - z) > 1.0f)
+                    {
+                        endZ = groundZ;
+                        r.hasMeshZ = true;
+                        r.meshZ = groundZ;
+                    }
+                }
                 r.points.push_back({player->GetPositionX(), player->GetPositionY(), player->GetPositionZ()});
-                r.points.push_back({x, y, z});
-                Audit(*s, "action", Json::Writer().Add("op", "move_transport_leg")
-                    .Add("moveId", moveId)
-                    .Add("boarding", targetT != nullptr).Add("leaving", startT != nullptr && !targetT).Str());
+                r.points.push_back({x, y, endZ});
+                Json::Writer a;
+                a.Add("op", "move_transport_leg").Add("moveId", moveId)
+                    .Add("boarding", targetT != nullptr).Add("leaving", leaving);
+                if (r.hasMeshZ)
+                    a.Add("z", (double)z).Add("groundZ", (double)endZ);
+                Audit(*s, "action", a.Str());
             }
             else
             {
                 bool usedGroundZ = false; float groundZ = z;
-                r = ResolvePath(player, x, y, z, !guid.empty(), &usedGroundZ, &groundZ);
+                r = ResolvePath(player, x, y, z, !guid.empty(), &usedGroundZ, &groundZ, force);
                 if (usedGroundZ)
                     Audit(*s, "action", Json::Writer().Add("op", "move_ground_z").Add("moveId", moveId)
                         .Add("unitTarget", !guid.empty()).Add("z", (double)z).Add("groundZ", (double)groundZ).Str());
+                if (r.hasSnap)
+                    Audit(*s, "action", Json::Writer().Add("op", "move_start_snap").Add("moveId", moveId)
+                        .Raw("from", PosJson(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation()))
+                        .Raw("to", Json::Writer().Add("x", (double)r.snapX).Add("y", (double)r.snapY).Add("z", (double)r.snapZ).Str())
+                        .Add("distance", (double)std::sqrt(std::pow(r.snapX - player->GetPositionX(), 2.0f) + std::pow(r.snapY - player->GetPositionY(), 2.0f) + std::pow(r.snapZ - player->GetPositionZ(), 2.0f)))
+                        .Str());
             }
         }
         // The resolved polyline, at dispatch, so a diagnosis reads the route
@@ -1769,6 +1906,14 @@ namespace WrathBench
             {
                 w.Add("dz", (double)r.dropDz);
                 w.Raw("target", Json::Writer().Add("x", (double)x).Add("y", (double)y).Add("z", (double)z).Str());
+                AddSafeFall(w, player);
+            }
+            if (r.nearestSearched)
+            {
+                if (r.hasNearest)
+                    w.Raw("nearest", Json::Writer().Add("x", (double)r.nearestX).Add("y", (double)r.nearestY).Add("z", (double)r.nearestZ).Str());
+                else
+                    w.Raw("nearest", "null");
             }
             EmitEvent(*s, "WB_MOVE_RESULT", 0xFF01, w.Str());
             return;
@@ -1778,6 +1923,8 @@ namespace WrathBench
         m.hasMeshZ = r.hasMeshZ;
         m.reqX = x; m.reqY = y; m.reqZ = z;
         m.hasDrop = false;
+        m.force = force;
+        m.inFall = false;
 
         int64_t now = NowMs();
         m.points.clear();
@@ -1958,6 +2105,16 @@ namespace WrathBench
         {
             uint32 questId = static_cast<uint32>(req.GetInt("questId"));
             p = new WorldPacket(CMSG_QUESTGIVER_COMPLETE_QUEST, 12);
+            *p << uint64(guid) << uint32(questId);
+            auditW.Add("questId", questId);
+        }
+        else if (action == "quest_request_reward")
+        {
+            // The client's "Continue" on a completable REQUEST_ITEMS window:
+            // the handler completes the quest and answers OFFER_REWARD
+            // (WorldSession::HandleQuestgiverRequestRewardOpcode).
+            uint32 questId = static_cast<uint32>(req.GetInt("questId"));
+            p = new WorldPacket(CMSG_QUESTGIVER_REQUEST_REWARD, 12);
             *p << uint64(guid) << uint32(questId);
             auditW.Add("questId", questId);
         }
@@ -2889,21 +3046,43 @@ namespace WrathBench
             // Defensive twin of ResolvePathAt's guard: a segment that would
             // step off a ledge is not walked. Stop at the segment's start (the
             // edge) and say `drop` rather than interpolate down the cliff.
+            // A forced move walks it instead, the way a client's character
+            // walks off an edge: the last packet before the fall is a
+            // heartbeat at the edge (the server records that z as the fall's
+            // start, Player::UpdateFallInformationIfNeed), nothing is sent
+            // during the fall, and the foot of the segment is reported with
+            // MSG_MOVE_FALL_LAND, on which the server charges the fall
+            // (Player::HandleFall) exactly as it would a client's. A climb is
+            // refused forced or not: no client walks up a ledge.
             if (m.segDone <= 0.0f)
             {
                 float dz = 0.0f;
                 if (IsDropSegment(a, b, &dz))
                 {
-                    m.curX = a.x; m.curY = a.y; m.curZ = a.z;
-                    SendMovePacket(s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, m.curX, m.curY, m.curZ, m.curO,
-                        FindTransportAt(player->GetMap(), m.curX, m.curY, m.curZ));
-                    Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_STOP")
-                        .Add("moveId", m.moveId).Add("cause", "drop").Add("dz", (double)dz)
-                        .Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO)).Str());
-                    m.hasDrop = true;
-                    m.dropDz = dz;
-                    FinishMove(s, "drop");
-                    return;
+                    if (!m.force || dz > 0.0f)
+                    {
+                        m.curX = a.x; m.curY = a.y; m.curZ = a.z;
+                        SendMovePacket(s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, m.curX, m.curY, m.curZ, m.curO,
+                            FindTransportAt(player->GetMap(), m.curX, m.curY, m.curZ));
+                        Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_STOP")
+                            .Add("moveId", m.moveId).Add("cause", "drop").Add("dz", (double)dz)
+                            .Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO)).Str());
+                        m.hasDrop = true;
+                        m.dropDz = dz;
+                        FinishMove(s, "drop");
+                        return;
+                    }
+                    if (dz < 0.0f && !m.inFall)
+                    {
+                        m.curO = Position::NormalizeOrientation(std::atan2(sy, sx));
+                        SendMovePacket(s, player, MSG_MOVE_HEARTBEAT, MOVEMENTFLAG_FORWARD, a.x, a.y, a.z, m.curO,
+                            FindTransportAt(player->GetMap(), a.x, a.y, a.z));
+                        m.lastPacketMs = nowMs;
+                        Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_HEARTBEAT")
+                            .Add("moveId", m.moveId).Add("cause", "drop_forced").Add("dz", (double)dz)
+                            .Raw("pos", PosJson(a.x, a.y, a.z, m.curO)).Str());
+                        m.inFall = true;
+                    }
                 }
             }
             float remain = segLen - m.segDone;
@@ -2921,6 +3100,21 @@ namespace WrathBench
             advance -= remain;
             ++m.seg;
             m.segDone = 0.0f;
+            if (m.inFall)
+            {
+                // The foot of the forced ledge: land there, as a client does.
+                m.inFall = false;
+                m.curX = b.x; m.curY = b.y; m.curZ = b.z;
+                SendMovePacket(s, player, MSG_MOVE_FALL_LAND, MOVEMENTFLAG_FORWARD, b.x, b.y, b.z, m.curO,
+                    FindTransportAt(player->GetMap(), b.x, b.y, b.z));
+                m.lastPacketMs = nowMs;
+                Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_FALL_LAND")
+                    .Add("moveId", m.moveId).Add("cause", "drop_forced")
+                    .Raw("pos", PosJson(b.x, b.y, b.z, m.curO)).Str());
+                // The server may have killed the character on landing; the
+                // next heartbeat's drift check or the death handling ends the
+                // move as `interrupted` in that case, as for any other death.
+            }
         }
 
         if (m.seg + 1 >= m.points.size())
@@ -2940,7 +3134,11 @@ namespace WrathBench
         // Heartbeat cadence, as a real client: ~500ms. Before each heartbeat,
         // verify the server actually applied the previous packets; a large gap
         // means something (root, teleport, rejection) interrupted the move.
-        if (nowMs - m.lastPacketMs >= 500)
+        // Held while a forced ledge is being fallen: the module's packets
+        // carry fallTime 0, so a heartbeat mid-fall would move the server's
+        // fall start down to the mid-air z (UpdateFallInformationIfNeed) and
+        // the landing would be charged for less than the ledge.
+        if (nowMs - m.lastPacketMs >= 500 && !m.inFall)
         {
             if (player->GetExactDist2d(m.curX, m.curY) > 15.0f)
             {
@@ -4243,22 +4441,91 @@ namespace WrathBench
                 case SMSG_MESSAGECHAT:
                 {
                     name = "SMSG_MESSAGECHAT";
+                    // Layout per chat type, exactly as ChatHandler::BuildChatPacket
+                    // writes it (deps/azerothcore src/server/game/Chat/Chat.cpp
+                    // 273-351): the header (type, language, sender, flags) is
+                    // shared; what sits between it and the length-prefixed
+                    // message depends on the type. Creature speech carries the
+                    // speaker's name (a creature has no name-query path), a
+                    // channel line its channel name, and the achievement
+                    // broadcast trails an achievement id after the chat tag.
+                    // Reading every type with the player layout put the parse
+                    // inside the name bytes for creature types, so the message
+                    // came out empty and the chat tag was a letter of the name.
                     uint8 type = 0; int32 lang = 0; uint64 sender = 0; uint32 flags = 0;
                     p >> type >> lang >> sender >> flags;
-                    // For CHAT_MSG_SAY the next field is the (unused) receiver GUID.
+                    // A length-prefixed string: u32 (length including the NUL),
+                    // then the C string. Empty when the packet is shorter.
+                    auto readLenStr = [&](std::string& out) {
+                        uint32 len = 0;
+                        if (p.rpos() + 4 > p.size()) return;
+                        p >> len;
+                        if (len == 0 || p.rpos() + len > p.size()) return;
+                        out.assign((char const*)p.contents() + p.rpos(), len);
+                        if (!out.empty() && out.back() == '\0') out.pop_back();
+                        p.rpos(p.rpos() + len);
+                    };
+                    bool hasSenderName = false, hasChannel = false;
+                    std::string senderName, receiverName, channelName;
                     uint64 receiver = 0;
-                    if (p.rpos() + 8 <= p.size()) p >> receiver;
-                    uint32 msgLen = 0; if (p.rpos() + 4 <= p.size()) p >> msgLen;
-                    std::string msg;
-                    if (msgLen > 0 && p.rpos() + msgLen <= p.size())
+                    switch (type)
                     {
-                        msg.assign((char const*)p.contents() + p.rpos(), msgLen);
-                        if (!msg.empty() && msg.back() == '\0') msg.pop_back();
-                        p.rpos(p.rpos() + msgLen);
+                        case CHAT_MSG_MONSTER_SAY: case CHAT_MSG_MONSTER_PARTY: case CHAT_MSG_MONSTER_YELL:
+                        case CHAT_MSG_MONSTER_WHISPER: case CHAT_MSG_MONSTER_EMOTE:
+                        case CHAT_MSG_RAID_BOSS_EMOTE: case CHAT_MSG_RAID_BOSS_WHISPER: case CHAT_MSG_BATTLENET:
+                        {
+                            hasSenderName = true;
+                            readLenStr(senderName);
+                            if (p.rpos() + 8 <= p.size()) p >> receiver;
+                            ObjectGuid rg(receiver);
+                            if (receiver && !rg.IsPlayer() && !rg.IsPet())
+                                readLenStr(receiverName);
+                            break;
+                        }
+                        case CHAT_MSG_WHISPER_FOREIGN:
+                            hasSenderName = true;
+                            readLenStr(senderName);
+                            if (p.rpos() + 8 <= p.size()) p >> receiver;
+                            break;
+                        case CHAT_MSG_BG_SYSTEM_NEUTRAL: case CHAT_MSG_BG_SYSTEM_ALLIANCE: case CHAT_MSG_BG_SYSTEM_HORDE:
+                        {
+                            if (p.rpos() + 8 <= p.size()) p >> receiver;
+                            if (receiver && !ObjectGuid(receiver).IsPlayer())
+                                readLenStr(receiverName);
+                            break;
+                        }
+                        case CHAT_MSG_ACHIEVEMENT: case CHAT_MSG_GUILD_ACHIEVEMENT:
+                            if (p.rpos() + 8 <= p.size()) p >> receiver;
+                            break;
+                        default:
+                            // (The GM-flagged sender-name prefix rides
+                            // SMSG_GM_MESSAGECHAT, a different opcode, never this one.)
+                            if (type == CHAT_MSG_CHANNEL)
+                            {
+                                hasChannel = true;
+                                p >> channelName; // plain C string, no length prefix
+                            }
+                            if (p.rpos() + 8 <= p.size()) p >> receiver;
+                            break;
                     }
+                    std::string msg;
+                    readLenStr(msg);
                     uint8 chatTag = 0; if (p.rpos() < p.size()) p >> chatTag;
-                    w.Add("type", (uint32)type).Add("language", lang).AddGuid("senderGuid", (uint64_t)sender)
-                     .Add("message", msg).Add("chatTag", (uint32)chatTag);
+                    uint32 achievementId = 0;
+                    if ((type == CHAT_MSG_ACHIEVEMENT || type == CHAT_MSG_GUILD_ACHIEVEMENT) && p.rpos() + 4 <= p.size())
+                        p >> achievementId;
+                    w.Add("type", (uint32)type).Add("language", lang).AddGuid("senderGuid", (uint64_t)sender);
+                    if (hasSenderName)
+                        w.Add("senderName", senderName);
+                    if (receiver)
+                        w.AddGuid("receiverGuid", (uint64_t)receiver);
+                    if (!receiverName.empty())
+                        w.Add("receiverName", receiverName);
+                    if (hasChannel)
+                        w.Add("channelName", channelName);
+                    w.Add("message", msg).Add("chatTag", (uint32)chatTag);
+                    if (achievementId)
+                        w.Add("achievementId", achievementId);
                     break;
                 }
                 case SMSG_CHAR_ENUM:

@@ -227,14 +227,28 @@ export interface CharacterSummary {
   readonly level: number;
 }
 
+/**
+ * One chat line as the module decoded it. `senderName` is present only when
+ * the packet's own layout carried a name — creature speech (`type` 12–16,
+ * 41–42: say/yell/emote/whisper from an NPC) and foreign-language whispers —
+ * since a creature has no name-query path; a player sender is named through
+ * `state.nameOf(senderGuid)` when a name query has answered. `channelName`
+ * rides channel lines (`type` 17), `achievementId` the achievement broadcast
+ * (`type` 48/49, whose `message` is the client's raw `%s`/`$a` template).
+ */
 export interface ChatEntry {
   readonly seq: number;
   readonly ts: number;
   readonly type: number;
   readonly language: number;
   readonly senderGuid: GuidKey;
+  readonly senderName?: string;
+  readonly receiverGuid?: GuidKey;
+  readonly receiverName?: string;
+  readonly channelName?: string;
   readonly message: string;
   readonly chatTag: number;
+  readonly achievementId?: number;
 }
 
 export interface NotificationEntry {
@@ -3097,8 +3111,13 @@ export class StateCache {
           type: d.type,
           language: d.language,
           senderGuid: d.senderGuid,
+          ...(d.senderName !== undefined ? { senderName: d.senderName } : {}),
+          ...(d.receiverGuid !== undefined ? { receiverGuid: d.receiverGuid } : {}),
+          ...(d.receiverName !== undefined ? { receiverName: d.receiverName } : {}),
+          ...(d.channelName !== undefined ? { channelName: d.channelName } : {}),
           message: d.message,
           chatTag: d.chatTag,
+          ...(d.achievementId !== undefined ? { achievementId: d.achievementId } : {}),
         });
         if (this.chatBuf.length > this.chatTail) {
           this.chatBuf.splice(0, this.chatBuf.length - this.chatTail);

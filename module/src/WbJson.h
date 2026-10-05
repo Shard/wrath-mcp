@@ -114,6 +114,14 @@ namespace WrathBench::Json
             try { return std::stoll(it->second); } catch (...) { return dflt; }
         }
 
+        // JSON `true` is stored verbatim by ParseRaw; anything else is false.
+        bool GetBool(std::string const& k, bool dflt = false) const
+        {
+            auto it = _obj.find(k);
+            if (it == _obj.end()) return dflt;
+            return it->second == "true";
+        }
+
         double GetDouble(std::string const& k, double dflt = 0.0) const
         {
             auto it = _obj.find(k);

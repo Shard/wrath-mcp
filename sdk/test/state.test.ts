@@ -17,6 +17,7 @@ import {
   wornBagCreate,
   wornBagQuery,
   chatEcho,
+  chatLayouts,
   inventorySlot,
   ITEM_ENTRY,
   ITEM_GUID,
@@ -111,6 +112,21 @@ describe("state cache: what it learns from events", () => {
     expect(cache.notifications).toEqual([
       { seq: 7, ts: 1_700_000_000_070, text: "fixture notification" },
     ]);
+  });
+
+  test("creature speech keeps its speaker's name; a channel line its channel; an achievement its id", () => {
+    const cache = StateCache.replay(
+      toEvents([...loginSequence, chatLayouts.monsterSay, chatLayouts.channel, chatLayouts.achievement, chatEcho]),
+      { seed: SEED },
+    );
+    expect(cache.chat).toHaveLength(4);
+    expect(cache.chat[0]).toMatchObject({ type: 12, senderName: "Grizzled Sentry", receiverGuid: "7", message: "Halt, traveller." });
+    expect(cache.chat[1]).toMatchObject({ type: 17, channelName: "General", message: "anyone selling linen" });
+    expect(cache.chat[2]).toMatchObject({ type: 48, achievementId: 6 });
+    // A player's say carries no optional field at all — nothing is invented.
+    expect(Object.keys(cache.chat[3]!).sort()).toEqual(["chatTag", "language", "message", "senderGuid", "seq", "ts", "type"]);
+    // A chat speaker is still not a nearby object, named or not.
+    expect(cache.nearby.size).toBe(0);
   });
 
   test("names come only from name-query hits", () => {

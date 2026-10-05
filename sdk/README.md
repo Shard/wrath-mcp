@@ -162,10 +162,12 @@ queries every reward item it decodes; the call waits up to a second for those
 answers and leaves `item` undefined for any still missing), and a second call
 with the index takes it. Defaulting to the first choice had hidden the choice
 completely (operator decision, 2026-10-05). An explicit index, or one choice or
-none, completes as before. A completable REQUEST_ITEMS carries no reward list,
-so that path still takes `rewardIndex ?? 0` unseen: the window that would show
-the choices follows the client's "Continue" (`CMSG_QUESTGIVER_REQUEST_REWARD`),
-which the module does not send.
+none, completes as before. A completable REQUEST_ITEMS (a collect quest with
+its items in hand) carries no reward list; `turnInQuest` sends the client's
+"Continue" there (`questRequestReward`, `CMSG_QUESTGIVER_REQUEST_REWARD`), on
+which the core completes the quest and answers with the reward window, and
+goes on from that window like any other turn-in — so a collect quest's choices
+show the same way.
 `acceptQuestFrom` races the same failure after its accept: a quest that hands
 over an item is refused with it when the item does not fit, and never enters
 the log, so that is `inventory_full` too.
@@ -245,6 +247,21 @@ Two things still throw:
   only holds the module's words. The corollary: an SDK-side status is legal
   only when it describes the SDK declining to act (`unknown_target`, `lost`)
   — never a renamed or inferred server outcome.
+
+A route that steps off a ledge comes back from the module as `drop` with the
+edge and the step. `moveTo` judges the fall before passing that on: the
+server's own fall-damage rule (free under 13.48y, then a share of max health
+rising with height, less the character's Safe Fall — `estimateFallDamage`)
+against current health. A fall that would cost less than `DROP_BLOCK_FRACTION`
+(0.8) of current health is taken — the move is re-issued with `force` and the
+arrival's `hint` says what it cost — and a ghost always is, since the dead take
+no fall damage. Otherwise the result is `drop`, the hint carries the estimate,
+and `moveTo(target, { force: true })` takes it anyway. `force` applies to drops
+only: a step the route would climb is refused forced or not, since no client
+walks up a ledge, and its hint says so. The split is deliberate: the module
+reports the ledge and walks it on request with the fall packets a client
+sends, so the server charges the fall; what a fall costs is a game rule and
+lives here.
 
 A `moveTo` issued while another is running supersedes it, and the older call
 returns `status: "superseded"`. `stop()` returns as soon as the module has
