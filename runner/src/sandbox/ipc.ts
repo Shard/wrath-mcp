@@ -79,6 +79,68 @@ export interface MoveIntentNote {
   endedAt: number | null;
 }
 
+/**
+ * One `POST /action` the session's SDK client dispatched, and the module's
+ * answer to it — the action log (CLAUDE.md: "every action dispatched").
+ *
+ * Watched at the sandbox's fetch, like `MoveIntentNote`, so it is every action
+ * the client actually put on the wire — a helper's inner `set_target`, a
+ * `raw` opcode, a routine's re-cast — and nothing the SDK refused before
+ * sending. It records the dispatch and the HTTP answer only: an ack means
+ * "queued", and how the game took it (a cast that failed, an arrival) arrives
+ * later on the event stream, where it already is. Nothing here guesses it.
+ */
+export interface ActionNote {
+  /** When the request was handed to fetch. */
+  ts: number;
+  action: string;
+  /** The request body minus `token` and `action`; long strings clipped. Absent when empty. */
+  args?: Record<string, unknown>;
+  /** The HTTP status the module answered with; 0 when no answer came (transport failure). */
+  status: number;
+  /** Request to answer, in ms. */
+  ms: number;
+  /** The module's error code (`too_far`, `opcode_not_allowed`, …), or the transport failure. */
+  error?: string;
+  /** The module's own hint on a refusal, clipped. */
+  hint?: string;
+  /** The module's move id, on a `move_to` ack — the key its `move` verdict carries. */
+  moveId?: number;
+  /**
+   * Client-cache names for the ids in `args`, read at dispatch from what the
+   * session had already observed (name and creature queries, the spellbook,
+   * item and quest queries, the bag). Never looked up anywhere else; an id the
+   * cache had no name for has no entry.
+   */
+  names?: { target?: string; spell?: string; item?: string; quest?: string };
+  /** Consecutive identical dispatches folded into this one (same action, args and answer). */
+  count?: number;
+  /** The last of those folded dispatches. */
+  lastTs?: number;
+  /**
+   * The SDK's own client-parity query (`questgiver_status_query`,
+   * `questgiver_status_multiple_query`, `quest_query` fired from the event
+   * fold, outside every snippet's async context): traffic a real client sends
+   * by itself, not something the snippet asked for.
+   */
+  auto?: true;
+}
+
+/**
+ * The actions one snippet's async context dispatched since the last flush.
+ * `evalId` is the eval that launched them — a background routine keeps the
+ * id of the snippet that started it — or null outside every snippet (an event
+ * callback, the SDK's parity queries).
+ */
+export interface ActionBatch {
+  evalId: number | null;
+  /** True when the launching snippet had already returned: a background routine's actions. */
+  routine?: true;
+  actions: ActionNote[];
+  /** Dispatches past the per-flush cap, counted by action name rather than kept. */
+  dropped?: Record<string, number>;
+}
+
 export interface LogEntry {
   level: "log" | "info" | "warn" | "error" | "debug";
   ts: number;
@@ -163,6 +225,13 @@ export type ChildToHost =
    */
   | { t: "pong"; id: number; logs?: LogEntry[]; note?: string; hints?: ActionHintNote[] }
   | { t: "rpc_result"; id: number; ok: boolean; value?: unknown; error?: string }
+  /**
+   * The action log, pushed rather than drained: sent just before a snippet's
+   * result (so the host has written it before the tool result exists), before
+   * a pong, and on an idle timer for what background routines dispatch
+   * between snippets. Record-only; nothing in it reaches the model.
+   */
+  | { t: "actions"; batches: ActionBatch[] }
   | { t: "hostcall"; id: number; method: "scratchpad_read" | "scratchpad_write" | "scratchpad_append"; params: { content?: string } }
   | { t: "fatal"; error: string };
 
