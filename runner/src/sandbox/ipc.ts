@@ -168,12 +168,14 @@ export type HostToChild =
   /**
    * `action_hints` drains the SDK's hint tally for a tool result that is not a
    * snippet's (`SandboxHost.drainActionHints`); a snippet's own result and
-   * pong drain it themselves.
+   * pong drain it themselves. `context_events` is the turn's event window: the
+   * last `limit` non-ambient events and how many ambient ones the span held
+   * (`ContextEvents`).
    */
   | {
       t: "rpc";
       id: number;
-      method: "recent_events" | "state_summary" | "death_signals" | "action_hints";
+      method: "recent_events" | "context_events" | "state_summary" | "death_signals" | "action_hints";
       params: { limit?: number };
     }
   | { t: "shutdown" };
@@ -201,6 +203,18 @@ export interface EvalResultMsg {
    */
   hints?: ActionHintNote[];
   durationMs: number;
+}
+
+/**
+ * The events a turn's context is built from: the last N events that are not
+ * ambient movement (`CONTEXT_POLICY.EVENT_WINDOW_EXCLUDE`), oldest first, and
+ * how many ambient events arrived in the span they cover — from the oldest
+ * one returned to now, or since the child started when every non-ambient
+ * event it has seen is in the list.
+ */
+export interface ContextEvents {
+  events: EventSummary[];
+  folded: number;
 }
 
 export interface EventSummary {
