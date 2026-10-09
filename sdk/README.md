@@ -92,7 +92,7 @@ makes the server swing until it is cancelled, and moving does not cancel it. So
 half-fought mob is how a character dies standing still. `attacking` says which
 happened and `detail` says it in words. If the server cancels our auto-attack
 mid-fight (`SMSG_ATTACKSTOP` with the target still alive), the loop swings
-again. The default `timeout` is 25s, deliberately under the runner's 30s
+again. The default `timeout` is 25000 ms, deliberately under the runner's 30s
 snippet cap; longer fights belong in a background routine. The walk into melee
 range draws on the same timeout, so every result also says whether melee range
 was ever reached (`reached`) and how far the target was at the end
@@ -239,7 +239,7 @@ Two things still throw:
 
 - `WrathRequestError` — the request was refused before anything moved
   (`missing_position`, `not_in_world`, …).
-- `EventTimeoutError` — no result arrived within `timeout` (default 90s: the
+- `EventTimeoutError` — no result arrived within `timeout` (default 90000 ms: the
   ~250yd single-move cap is ~36s of running, plus the module's server-confirmation
   deadline). That is the *absence* of an outcome — the character may still be
   walking — so it is not dressed up as a `status`. Inventing a

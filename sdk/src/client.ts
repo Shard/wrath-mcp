@@ -797,6 +797,7 @@ export interface ConnectOptions {
 }
 
 export interface WaitForChatOptions {
+  /** How long to wait, in ms. Default 10000. */
   timeout?: number;
   sinceSeq?: number;
   includeBuffered?: boolean;
@@ -826,7 +827,7 @@ export const TARGET_NEAREST_RADIUS = 20;
 
 export interface MoveToOptions {
   /**
-   * How long to wait for the terminal `WB_MOVE_RESULT`. Default 90000: the
+   * How long to wait for the terminal `WB_MOVE_RESULT`, in ms. Default 90000: the
    * single-move cap is ~250yd, which is ~36s at a base run speed of 7yd/s,
    * plus the module's 3s server-confirmation deadline and slack for a path
    * that is longer than the straight line.
@@ -1301,7 +1302,7 @@ function walkProgress(from: Point3 | undefined, at: Point3 | undefined, point: {
 }
 
 export interface WaitForTransferOptions {
-  /** How long to wait for `SMSG_NEW_WORLD`. Default 15000: a far teleport is a few server ticks. */
+  /** How long to wait for `SMSG_NEW_WORLD`, in ms. Default 15000: a far teleport is a few server ticks. */
   timeout?: number;
   /** When given, arriving on any other map is reported as `wrong_map` rather than success. */
   expectMap?: number;
@@ -1364,6 +1365,7 @@ export type TransferResult =
     };
 
 export interface WaitForNearbyOptions {
+  /** How long to wait, in ms. Default 10000. */
   timeout?: number;
 }
 
@@ -1380,9 +1382,9 @@ export interface DeleteCharacterOptions {
 
 export interface KillTargetOptions {
   /**
-   * Give up after this long and return `status: "timeout"`. The walk into
+   * Give up after this many ms and return `status: "timeout"`. The walk into
    * melee range counts against it as well as the fight, so a far target can
-   * spend all of it walking (`reached: false` says so). Default 25000, chosen
+   * spend all of it walking (`reached: false` says so). Default 25000 (25s), chosen
    * to sit under the runner's 30s snippet cap: a call that outlives the
    * snippet is abandoned mid-fight and its verdict is never seen. Raise it only
    * from a background routine, which outlives the snippet that started it.
@@ -1676,7 +1678,7 @@ const isStorableSlot = (i: { slotType: number }): boolean => i.slotType === 0 ||
 export type InteractResult = ActionResponse | { readonly ok: false; readonly status: "chest"; readonly hint: string };
 
 export interface LootOptions {
-  /** How long to wait for the loot window / release. Default 10000. */
+  /** How long to wait for the loot window / release, in ms. Default 10000. */
   timeout?: number;
 }
 
@@ -1728,6 +1730,7 @@ export type LootResult =
     };
 
 export interface QuestOptions {
+  /** How long to wait, in ms. Default 10000; 60000 for `waitForQuestObjective`. */
   timeout?: number;
 }
 
@@ -2171,16 +2174,17 @@ export type BuySpellResult =
     };
 
 export interface TrainerOptions {
+  /** How long to wait for the server's answer, in ms. Default 10000. */
   timeout?: number;
 }
 
 export interface TalentTreeOptions {
-  /** How long to wait for the module's WB_TALENT_TREE answer. Default 10000. */
+  /** How long to wait for the module's WB_TALENT_TREE answer, in ms. Default 10000. */
   timeout?: number;
 }
 
 export interface ResetTalentsOptions {
-  /** How long to wait for each server answer (menu, confirm, talents). Default 10000. */
+  /** How long to wait for each server answer (menu, confirm, talents), in ms. Default 10000. */
   timeout?: number;
   /**
    * Which gossip option is the respec. Default: the option whose text
@@ -2208,12 +2212,12 @@ export type PetActionResult =
 export type InviteResult = { ok: true; status: "invited"; name: string } | { ok: false; status: "refused"; name: string; result: number; hint: string };
 
 export interface GroupOptions {
-  /** How long to wait for the server's answer. Default 10000. */
+  /** How long to wait for the server's answer, in ms. Default 10000. */
   timeout?: number;
 }
 
 export interface MailOptions {
-  /** How long to wait for the server's answer. Default 10000. */
+  /** How long to wait for the server's answer, in ms. Default 10000. */
   timeout?: number;
 }
 
@@ -2246,7 +2250,7 @@ export type LootRollResult =
   | { readonly ok: false; readonly status: LootRollRefusalStatus; readonly hint: string };
 
 export interface LootRollOptions {
-  /** How long to wait for the server to echo the vote. Default 10000. */
+  /** How long to wait for the server to echo the vote, in ms. Default 10000. */
   timeout?: number;
 }
 
@@ -2267,7 +2271,7 @@ export type ReadItemResult =
   | { readonly ok: false; readonly status: "no_item" | "not_readable"; readonly hint: string };
 
 export interface ReadItemOptions {
-  /** How long to wait for each server answer (the read ack, the pages). Default 10000. */
+  /** How long to wait for each server answer (the read ack, the pages), in ms. Default 10000. */
   timeout?: number;
 }
 
@@ -2289,7 +2293,7 @@ export type MailResult =
   | { ok: false; status: "no_mailbox" | "no_item"; hint: string };
 
 export interface BankOptions {
-  /** How long to wait for the item to move (or the server to refuse). Default 10000. */
+  /** How long to wait for the item to move (or the server to refuse), in ms. Default 10000. */
   timeout?: number;
 }
 
@@ -2328,7 +2332,7 @@ export type ResetTalentsResult =
 
 export interface EquipOptions {
   /**
-   * How long to wait for the server's verdict before answering
+   * How long to wait for the server's verdict, in ms, before answering
    * `unconfirmed`. Default 3000 — the server answers `CMSG_AUTOEQUIP_ITEM`
    * within a round trip, and a loop over several items should not be able to
    * eat a snippet's whole budget.
@@ -2411,7 +2415,7 @@ export type LearnTalentResult =
     };
 
 export interface TaxiOptions {
-  /** How long to wait for the server's window or verdict. Default 10000. */
+  /** How long to wait for the server's window or verdict, in ms. Default 10000. */
   timeout?: number;
 }
 
@@ -2442,7 +2446,7 @@ export type ActivateTaxiResult =
     };
 
 export interface BindOptions {
-  /** How long to wait for each of the three server answers (menu, confirm, bind point). Default 10000. */
+  /** How long to wait for each of the three server answers (menu, confirm, bind point), in ms. Default 10000. */
   timeout?: number;
   /**
    * Which gossip option is the bind. Default: the option whose text contains
@@ -2467,7 +2471,7 @@ export type BindResult = {
 
 export interface ReclaimCorpseOptions {
   /**
-   * The whole budget for the call: waiting out the reclaim delay, dispatching,
+   * The whole budget for the call, in ms: waiting out the reclaim delay, dispatching,
    * and confirming. Default 25000 — the same shape as `killTarget`'s, and for
    * the same reason: it fits under the runner's 30s snippet cap so an
    * in-snippet call returns a verdict instead of being abandoned mid-wait. A
@@ -2475,7 +2479,7 @@ export interface ReclaimCorpseOptions {
    * larger `timeout` from a background routine, or a second call.
    */
   timeout?: number;
-  /** How long each dispatch is given to be confirmed before it is re-sent. Default 2500. */
+  /** How long each dispatch is given to be confirmed before it is re-sent, in ms. Default 2500. */
   attemptTimeout?: number;
 }
 
@@ -5350,7 +5354,7 @@ export class WrathClient {
    *     (`SMSG_ATTACKSTOP`, not because we died) while the target is still
    *     alive and still ours, the loop swings again, rate-limited and capped.
    *
-   * The default `timeout` (25s) is deliberately under the runner's 30s snippet
+   * The default `timeout` (25000 = 25s) is deliberately under the runner's 30s snippet
    * cap so an in-snippet call returns its verdict rather than being abandoned
    * mid-fight; a longer fight belongs in a background routine. The walks draw on
    * the same deadline as the fight. An approach walk that outlasts it — before

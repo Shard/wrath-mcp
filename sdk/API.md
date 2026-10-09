@@ -14,6 +14,9 @@ go through `interact`, `gossipHello`, `gossipSelect`, `useItem`, and
 and in template literals, and `JSON.stringify` them freely; get them from
 `state.units(...)`, `state.closest(...)`, or event data. Never a number.
 
+**Timeouts are milliseconds.** Every `timeout` option, on every call that
+takes one, is in ms: `{ timeout: 20000 }` is 20s.
+
 **Throw vs value.** A transport or request error always throws
 (`WrathTransportError`, `WrathRequestError`), and so does the *absence* of an
 outcome (`EventTimeoutError` — no result arrived within the timeout;
@@ -100,7 +103,7 @@ exists.) Then, on the client:
 | `bankWithdraw` | `bankWithdraw(bagOrName: number | string, slot?, options?): Promise<BankMoveResult>` | Take an item out of the bank (bag/slot as state.bank() lists it, or its name) into the bags; returns where it landed in state.bag(), refused, or no_bank / no_item. |
 | `waitForChat` | `waitForChat(match: string | (entry) => boolean, options?): Promise<ChatEntry>` | Wait for a chat line matching a string or predicate. |
 | `waitForNearby` | `waitForNearby(predicate: (obj) => boolean, options?): Promise<NearbyObject>` | Wait until an object in view satisfies the predicate. |
-| `waitForTransfer` | `waitForTransfer({ timeout?, sinceSeq?, expectMap? }): Promise<TransferResult>` | Wait for a map transfer's server verdict: transferred (SMSG_NEW_WORLD) / aborted / waiting / no_transfer / wrong_map. moveTo already does this when a portal takes the character. |
+| `waitForTransfer` | `waitForTransfer({ timeout?: ms, sinceSeq?, expectMap? }): Promise<TransferResult>` | Wait for a map transfer's server verdict: transferred (SMSG_NEW_WORLD) / aborted / waiting / no_transfer / wrong_map. moveTo already does this when a portal takes the character. |
 | `waitForQuestObjective` | `waitForQuestObjective(questId, options?): Promise<QuestLogEntry>` | Wait until the quest log marks a quest's objectives complete. |
 
 ## Raw actions (HTTP ack; outcome arrives as an event)
@@ -235,7 +238,7 @@ the `docked` column of `state.units()`).
 | `onAny` | `events.onAny(fn): Unsubscribe` | Subscribe to every event. |
 | `once` | `events.once(opcode, fn): Unsubscribe` | Subscribe to the next single event of an opcode. |
 | `waitFor` | `events.waitFor(predicate, options?): Promise<StreamEvent>` | Wait for the next event satisfying a predicate; throws EventTimeoutError on timeout, EventAbortedError if options.signal (or the client default) fires. |
-| `waitForOpcode` | `events.waitForOpcode(opcode, { timeout }): Promise<StreamEvent>` | Wait for the next event of a given opcode. |
+| `waitForOpcode` | `events.waitForOpcode(opcode, { timeout: ms }): Promise<StreamEvent>` | Wait for the next event of a given opcode. |
 | `recent` | `events.recent(n?): StreamEvent[]` | The most recent buffered events, newest last. |
 | `connected` | `get events.connected: boolean` | Whether the event socket is open. |
 

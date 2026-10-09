@@ -95,7 +95,7 @@ const CLIENT_HELPERS: readonly Row[] = [
   { name: "bankWithdraw", sig: "bankWithdraw(bagOrName: number | string, slot?, options?): Promise<BankMoveResult>", purpose: "Take an item out of the bank (bag/slot as state.bank() lists it, or its name) into the bags; returns where it landed in state.bag(), refused, or no_bank / no_item." },
   { name: "waitForChat", sig: "waitForChat(match: string | (entry) => boolean, options?): Promise<ChatEntry>", purpose: "Wait for a chat line matching a string or predicate." },
   { name: "waitForNearby", sig: "waitForNearby(predicate: (obj) => boolean, options?): Promise<NearbyObject>", purpose: "Wait until an object in view satisfies the predicate." },
-  { name: "waitForTransfer", sig: "waitForTransfer({ timeout?, sinceSeq?, expectMap? }): Promise<TransferResult>", purpose: "Wait for a map transfer's server verdict: transferred (SMSG_NEW_WORLD) / aborted / waiting / no_transfer / wrong_map. moveTo already does this when a portal takes the character." },
+  { name: "waitForTransfer", sig: "waitForTransfer({ timeout?: ms, sinceSeq?, expectMap? }): Promise<TransferResult>", purpose: "Wait for a map transfer's server verdict: transferred (SMSG_NEW_WORLD) / aborted / waiting / no_transfer / wrong_map. moveTo already does this when a portal takes the character." },
   { name: "waitForQuestObjective", sig: "waitForQuestObjective(questId, options?): Promise<QuestLogEntry>", purpose: "Wait until the quest log marks a quest's objectives complete." },
 ];
 
@@ -314,7 +314,7 @@ const EVENT_ROWS: readonly Row[] = [
   { name: "onAny", sig: "events.onAny(fn): Unsubscribe", purpose: "Subscribe to every event." },
   { name: "once", sig: "events.once(opcode, fn): Unsubscribe", purpose: "Subscribe to the next single event of an opcode." },
   { name: "waitFor", sig: "events.waitFor(predicate, options?): Promise<StreamEvent>", purpose: "Wait for the next event satisfying a predicate; throws EventTimeoutError on timeout, EventAbortedError if options.signal (or the client default) fires." },
-  { name: "waitForOpcode", sig: "events.waitForOpcode(opcode, { timeout }): Promise<StreamEvent>", purpose: "Wait for the next event of a given opcode." },
+  { name: "waitForOpcode", sig: "events.waitForOpcode(opcode, { timeout: ms }): Promise<StreamEvent>", purpose: "Wait for the next event of a given opcode." },
   { name: "recent", sig: "events.recent(n?): StreamEvent[]", purpose: "The most recent buffered events, newest last." },
   { name: "connected", sig: "get events.connected: boolean", purpose: "Whether the event socket is open." },
 ];
@@ -400,6 +400,9 @@ go through \`interact\`, \`gossipHello\`, \`gossipSelect\`, \`useItem\`, and
 **Guids** are opaque decimal strings. Compare with \`===\`, use them as Map keys
 and in template literals, and \`JSON.stringify\` them freely; get them from
 \`state.units(...)\`, \`state.closest(...)\`, or event data. Never a number.
+
+**Timeouts are milliseconds.** Every \`timeout\` option, on every call that
+takes one, is in ms: \`{ timeout: 20000 }\` is 20s.
 
 **Throw vs value.** A transport or request error always throws
 (\`WrathTransportError\`, \`WrathRequestError\`), and so does the *absence* of an
