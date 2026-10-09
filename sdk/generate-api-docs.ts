@@ -197,6 +197,7 @@ const CLIENT_INTERNAL = new Set([
   "waitMailResult",
   "bankMove",
   "questOffer",
+  "questTakenByItsOwnOffer",
   "faceQuietly",
   "waitForState",
   "waitEvent",

@@ -140,13 +140,24 @@ answers `quest_list` with an `SMSG_GOSSIP_MESSAGE` carrying the quests, not an
 `SMSG_QUESTGIVER_QUEST_LIST`, and an NPC without the gossip flag whose menu
 holds exactly one quest skips the list and sends that quest's own window
 (`Player::SendPreparedQuest`). Its details are a one-row offer (an auto-accept
-quest is already in the log by then, and is reported accepted); its
+quest has been added to the log by the hello itself, and is reported accepted); its
 request-items or offer-reward window is a quest that completes on the spot, or,
 for a quest already in the log, that quest's turn-in, which is
 `nothing_on_offer` with a hint naming `turnInQuest`. Before the single-quest
 windows were read, both helpers timed out on every such NPC although the
 server had answered. Those windows are matched on the NPC's guid as well,
 since turn-ins and quest-start items send the same opcodes.
+Showing an auto-accept quest's details is what takes it (the single-quest hello
+and `CMSG_QUESTGIVER_QUERY_QUEST` both add it), but the window goes out at once
+and the quest-log field only with the map's next object flush, which on a
+continent comes every few world ticks (8–13 ms measured). Asked again inside
+that gap, as `questsAvailableFrom` then `acceptQuestFrom` at once does, the
+NPC's menu no longer holds the quest although the log is about to: the orc,
+undead and draenei starts read as `not_offered` with an empty menu. So when the
+menu lacks the quest and the event buffer holds this NPC's own details window
+for it, `acceptQuestFrom` gives the log up to a second to catch up and answers
+`already_in_log` when it does; without that window, `not_offered` is answered
+at once, as before.
 `turnInQuest` handles the other branch of the
 same asymmetry: `SMSG_QUESTGIVER_REQUEST_ITEMS` that says the quest *is*
 completable is the client's cue to send the completion again. The completion

@@ -2199,6 +2199,115 @@ describe("client: quests", () => {
     await stub.stop();
   });
 
+  // The core adds an auto-accept quest to the log on the packet that shows its
+  // details (a single-quest hello, or CMSG_QUESTGIVER_QUERY_QUEST) and sends
+  // the details at once; the quest-log field rides the map's next object
+  // flush, a few world ticks later on a continent. Asking again inside that
+  // gap gets a menu without the quest. Live, at the orc, undead and draenei
+  // starts, questsAvailableFrom then acceptQuestFrom at once came back
+  // not_offered with an empty menu.
+  /** The menu a non-gossip NPC answers the hello with once its one quest is taken: no options, no quests. */
+  const emptyMenu = (seq: number) => ({
+    seq,
+    opcode: "SMSG_GOSSIP_MESSAGE",
+    opcodeId: 0x17d,
+    ts: 1_700_000_000_000 + seq,
+    data: { guid: CREATURE_GUID, menuId: 0, textId: 16777215, options: [], quests: [] },
+  });
+
+  test("a quest the previous hello auto-accepted is already_in_log when its log field trails the next answer", async () => {
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    const listed = client.questsAvailableFrom(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify(questDetails(QUEST_ID, 73)));
+    expect(await listed).toMatchObject({ ok: true, quests: [{ questId: QUEST_ID }] });
+    expect(client.state.quest(QUEST_ID)).toBeUndefined();
+
+    const before = stub.actions.length;
+    const pending = client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 2000 });
+    await untilAction(stub, "quest_list", before);
+    stub.push(JSON.stringify(emptyMenu(74)));
+    await Bun.sleep(20);
+    stub.push(JSON.stringify({ ...(questAccepted as object), seq: 75 }));
+    expect(await pending).toMatchObject({
+      ok: true,
+      status: "already_in_log",
+      questId: QUEST_ID,
+      title: `fixture quest ${QUEST_ID}`,
+    });
+    expect(stub.actions.map((a) => a.action)).not.toContain("quest_accept");
+    client.close();
+    await stub.stop();
+  });
+
+  test("the same when the log field lands between the second hello and its answer", async () => {
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    const listed = client.questsAvailableFrom(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify(questDetails(QUEST_ID, 73)));
+    await listed;
+    const before = stub.actions.length;
+    const pending = client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 2000 });
+    await untilAction(stub, "quest_list", before);
+    stub.push(JSON.stringify({ ...(questAccepted as object), seq: 74 }));
+    stub.push(JSON.stringify(emptyMenu(75)));
+    expect(await pending).toMatchObject({ ok: true, status: "already_in_log", questId: QUEST_ID });
+    expect(stub.actions.map((a) => a.action)).not.toContain("quest_accept");
+    client.close();
+    await stub.stop();
+  });
+
+  test("a gossip NPC whose quest query auto-accepted lists its other quests; the queried one is already_in_log", async () => {
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    await client.questDetails(CREATURE_GUID, QUEST_ID);
+    stub.push(JSON.stringify(questDetails(QUEST_ID, 73)));
+    await client.events.waitFor((e) => e.seq === 73, { timeout: 2000 });
+    const pending = client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 2000 });
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify(gossipWithQuests([OTHER_QUEST_ID], 74)));
+    await Bun.sleep(20);
+    stub.push(JSON.stringify({ ...(questAccepted as object), seq: 75 }));
+    expect(await pending).toMatchObject({ ok: true, status: "already_in_log", questId: QUEST_ID });
+    client.close();
+    await stub.stop();
+  });
+
+  test("an offered-alone quest that never lands is not_offered after a short wait, with the menu as it was", async () => {
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    const listed = client.questsAvailableFrom(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify(questDetails(QUEST_ID, 73)));
+    await listed;
+    const before = stub.actions.length;
+    const pending = client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 150 });
+    await untilAction(stub, "quest_list", before);
+    stub.push(JSON.stringify(gossipWithQuests([OTHER_QUEST_ID], 74)));
+    const result = await pending;
+    if (result.ok || result.status !== "not_offered") throw new Error(`unexpected ${result.status}`);
+    expect(result.offered.map((q) => q.questId)).toEqual([OTHER_QUEST_ID]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("with no details window from that NPC for that quest, not_offered does not wait", async () => {
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    const pending = client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 5000 });
+    await untilAction(stub, "quest_list");
+    const answered = Date.now();
+    stub.push(JSON.stringify(gossipWithQuests([OTHER_QUEST_ID], 74)));
+    const result = await pending;
+    expect(Date.now() - answered).toBeLessThan(500);
+    if (result.ok || result.status !== "not_offered") throw new Error(`unexpected ${result.status}`);
+    expect(result.offered.map((q) => q.questId)).toEqual([OTHER_QUEST_ID]);
+    client.close();
+    await stub.stop();
+  });
+
   test("a single-quest NPC offering another quest is not_offered, naming it", async () => {
     const stub = startStub({ onConnect: () => questWorld() });
     const client = await inWorld(stub);

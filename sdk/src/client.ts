@@ -1857,6 +1857,14 @@ const SINGLE_OFFER_OPCODES: ReadonlySet<string> = new Set([
   "SMSG_QUESTGIVER_OFFER_REWARD",
 ]);
 
+/**
+ * How long `acceptQuestFrom` lets the quest log catch up with a quest the
+ * NPC's own details window just took (`questTakenByItsOwnOffer`). The field
+ * rides the map's next object flush, measured live at 8–13 ms after the
+ * window; the bound leaves room for a loaded server.
+ */
+const QUEST_LOG_CATCH_UP_MS = 1000;
+
 /** The questgiver markers that say "nothing to offer" before a quest list is even asked for. */
 const OFFERS_NOTHING: ReadonlySet<QuestGiverStatusName> = new Set([
   "none",
@@ -5726,7 +5734,13 @@ export class WrathClient {
           return { ok: false, status: "too_far", questId, distance: offered.tooFar, hint: offered.hint };
         }
         wanted = offered.quests.find((q) => q.questId === questId);
-        if (!wanted) return { ok: false, status: "not_offered", questId, offered: offered.quests };
+        if (!wanted) {
+          const landed = await this.questTakenByItsOwnOffer(npc, questId, timeout);
+          if (landed !== undefined) {
+            return { ok: true, status: "already_in_log", questId, quest: landed.quest, title: landed.title };
+          }
+          return { ok: false, status: "not_offered", questId, offered: offered.quests };
+        }
         // An auto-accept quest offered on its own is added to the log by the
         // hello itself; there is nothing left to accept.
         const added = this.state.quest(questId);
@@ -6490,6 +6504,53 @@ export class WrathClient {
       level: this.state.quests.get(single.questId)?.value.level,
     };
     return { quests: [row] };
+  }
+
+  /**
+   * A quest this NPC no longer offers because showing it already took it.
+   *
+   * The core adds an auto-accept quest to the log on the packet that shows
+   * its details — a hello answered with the one quest in the menu
+   * (`Player::SendPreparedQuest`), or `CMSG_QUESTGIVER_QUERY_QUEST` — and
+   * sends the details window at once, while the quest-log field waits for the
+   * map's next object flush, which on a continent comes only every few world
+   * ticks. Ask the NPC again inside that gap (`questsAvailableFrom`, then
+   * `acceptQuestFrom` at once) and its menu no longer holds the quest, though
+   * the log is about to. Live, at the orc, undead and draenei starts, that read
+   * as `not_offered` with an empty menu.
+   *
+   * So when this NPC's own details window for this quest is in the buffer, the
+   * log gets a short while to catch up, and the quest is returned if it lands.
+   * Without that window nothing waits: a quest the NPC simply does not offer
+   * is answered as fast as before.
+   */
+  private async questTakenByItsOwnOffer(
+    npcGuid: GuidArg,
+    questId: number,
+    timeout: number,
+  ): Promise<{ quest: QuestLogEntry; title: string } | undefined> {
+    const npcKey = guidKey(npcGuid);
+    const shown = this.events
+      .recent()
+      .findLast(
+        (e) =>
+          isEvent(e, "SMSG_QUESTGIVER_QUEST_DETAILS") &&
+          !isDecodeError(e.data) &&
+          (e.data as QuestGiverQuestDetailsData).questId === questId &&
+          guidKey((e.data as QuestGiverQuestDetailsData).guid) === npcKey,
+      );
+    if (shown === undefined) return undefined;
+    try {
+      const quest = await this.waitForState(
+        () => this.state.quest(questId),
+        Math.min(QUEST_LOG_CATCH_UP_MS, timeout),
+        `quest ${questId} to reach the quest log after its details window`,
+      );
+      return { quest, title: (shown.data as QuestGiverQuestDetailsData).title };
+    } catch (e: unknown) {
+      if (e instanceof EventTimeoutError) return undefined;
+      throw e;
+    }
   }
 
   /**
