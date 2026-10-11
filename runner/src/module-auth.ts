@@ -8,7 +8,7 @@
  *    environment (Bun loads it from the repo-root `.env`; docs/RUNBOOK.md
  *    "Secrets"). It is the operator class: the host process presents it on
  *    hygiene, `/health`, and to lease. It never reaches the snippet child —
- *    `sandboxChildEnv` drops it — because a snippet holding it could list and
+ *    `sandboxChildEnv` does not forward it — because a snippet holding it could list and
  *    delete characters on any allowlisted account.
  *  - The **session secret**, leased per token with `POST /lease` and handed to
  *    the child as `WRATHBENCH_SECRET`. It is the only credential the child
@@ -89,6 +89,27 @@ export async function leaseSessionSecret(o: LeaseOptions): Promise<LeaseOutcome>
     throw new Error(`POST /lease for this run's token failed: HTTP ${res.status} ${body?.error ?? ""} — check ${MODULE_SECRET_ENV} matches the worldserver's WrathBench.Secret`);
   }
   return { secret: body.secret, account: body.account };
+}
+
+/**
+ * Lease this run's session secret and register it for redaction in the same
+ * step, so no caller can hold one without the other.
+ *
+ * The secret is handed to the snippet child in its environment, and a snippet
+ * can read its own environment and print it; whatever it prints lands in the
+ * trajectory, and from there in the derived store and the published feed. So
+ * the value must be on the run's redaction list before the child exists. The
+ * session token beside it is deliberately not (run.ts says why: meta.json is
+ * scrubbed with the same list and `--resume` reads the token back) — and it
+ * authenticates nothing without this secret.
+ */
+export async function leaseRunSecret(
+  o: LeaseOptions,
+  sink: { redact(secret: string | undefined): void },
+): Promise<LeaseOutcome> {
+  const lease = await leaseSessionSecret(o);
+  sink.redact(lease.secret);
+  return lease;
 }
 
 /** Best effort: forget the token's lease at the end of a run. Never throws. */
