@@ -15,6 +15,8 @@ import {
   addKill,
   attackStopped,
   BACKPACK_SLOT,
+  BAG_GUID,
+  BAGGED_GUID,
   chatEcho,
   corpseQuery,
   corpseReclaimDelay,
@@ -73,6 +75,9 @@ import {
   trainerBuyFailed,
   trainerBuySucceeded,
   trainerList,
+  wornBagCreate,
+  wornBagQuery,
+  wornBagSlot,
   CHEST_GUID,
   castFailed,
   chestCreate,
@@ -3167,6 +3172,233 @@ describe("client: equipItem", () => {
   });
 });
 
+describe("client: sellItem reports what the server did", () => {
+  // The pinned core accepts a sale with update fields alone (the item leaves
+  // the bags, coinage rises) and refuses one with SMSG_SELL_ITEM. These build
+  // both, in the shapes module/PROTOCOL.md gives.
+  const values = (seq: number, guid: string, fields: Record<string, number>) => ({
+    seq,
+    opcode: "SMSG_UPDATE_OBJECT",
+    opcodeId: 0x0a9,
+    ts: 1_700_000_000_000 + seq,
+    data: { blocks: 1, objects: [{ update: "values", guid, fields }] },
+  });
+  /** `HandleSellItemOpcode`'s refusal. The vendor guid is 0 when the core could not find the vendor. */
+  const sellRefused = (seq: number, result: number, itemGuid = ITEM_GUID, vendorGuid = "0") => ({
+    seq,
+    opcode: "SMSG_SELL_ITEM",
+    opcodeId: 0x1a1,
+    ts: 1_700_000_000_000 + seq,
+    data: { vendorGuid, itemGuid, result },
+  });
+  /** selfProgress puts 12345 copper on the character. */
+  const MONEY = 12345;
+  // Backpack slot 23 holds a stack of five Gritstone Charms; money observed.
+  const bagWorld = () => frames([...loginSequence, selfCreate, selfProgress, inventorySlot, itemCreate, itemQuery]);
+  // A worn bag in slot 19 holds two more charms (BAGGED_GUID) in its slot 2.
+  const wornBagWorld = () => frames([...loginSequence, selfCreate, selfProgress, wornBagSlot, wornBagCreate, wornBagQuery]);
+
+  test("a whole stack leaving the backpack, with the money for it, is sold", async () => {
+    const stub = startStub({ onConnect: () => bagWorld() });
+    const client = await inWorld(stub);
+    const pending = client.sellItem(CREATURE_GUID, ITEM_GUID, undefined, { timeout: 2000 });
+    await untilAction(stub, "sell_item");
+    expect(stub.actions.at(-1)).toMatchObject({ action: "sell_item", guid: CREATURE_GUID, itemGuid: ITEM_GUID });
+    // One player update, as the core sends it for a whole-stack sale: the slot
+    // zeroed, the guid written into the first buyback slot (74), and the
+    // coinage raised. The buyback write is here so that a wider inventory view
+    // cannot make a sale look unsold.
+    stub.push(
+      JSON.stringify(
+        values(70, SELF_GUID, {
+          [`invSlot${BACKPACK_SLOT}Lo`]: 0,
+          [`invSlot${BACKPACK_SLOT}Hi`]: 0,
+          invSlot74Lo: ITEM_GUID_LO,
+          invSlot74Hi: ITEM_GUID_HI,
+          money: MONEY + 200,
+        }),
+      ),
+    );
+    expect(await pending).toEqual({
+      ok: true,
+      status: "sold",
+      itemGuid: ITEM_GUID,
+      itemId: ITEM_ENTRY,
+      name: "Gritstone Charm",
+      count: 5,
+      earned: 200,
+    });
+    expect(client.drainActionHints()).toEqual([]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("part of a stack is sold when its count drops, and waits for the money that follows", async () => {
+    const stub = startStub({ onConnect: () => bagWorld() });
+    const client = await inWorld(stub);
+    let settled = false;
+    const pending = client.sellItem(CREATURE_GUID, ITEM_GUID, 2, { timeout: 2000 }).finally(() => (settled = true));
+    await untilAction(stub, "sell_item");
+    expect(stub.actions.at(-1)).toMatchObject({ action: "sell_item", count: 2 });
+    // The core sends the split item's own update at once and the coinage on
+    // the next tick.
+    stub.push(JSON.stringify(values(70, ITEM_GUID, { stackCount: 3 })));
+    await Bun.sleep(30);
+    expect(settled).toBe(false);
+    stub.push(JSON.stringify(values(71, SELF_GUID, { money: MONEY + 80 })));
+    const result = await pending;
+    expect(result).toMatchObject({ ok: true, status: "sold", count: 2, earned: 80 });
+    client.close();
+    await stub.stop();
+  });
+
+  test("an item sold out of a worn bag is seen leaving that bag", async () => {
+    const stub = startStub({ onConnect: () => wornBagWorld() });
+    const client = await inWorld(stub);
+    const pending = client.sellItem(CREATURE_GUID, BAGGED_GUID, undefined, { timeout: 2000 });
+    await untilAction(stub, "sell_item");
+    stub.push(
+      JSON.stringify({
+        seq: 70,
+        opcode: "SMSG_UPDATE_OBJECT",
+        opcodeId: 0x0a9,
+        ts: 1_700_000_000_070,
+        data: {
+          blocks: 2,
+          objects: [
+            { update: "values", guid: BAG_GUID, fields: { bagSlot2Lo: 0, bagSlot2Hi: 0 } },
+            { update: "values", guid: SELF_GUID, fields: { money: MONEY + 76 } },
+          ],
+        },
+      }),
+    );
+    expect(await pending).toMatchObject({ ok: true, status: "sold", itemGuid: BAGGED_GUID, count: 2, earned: 76 });
+    client.close();
+    await stub.stop();
+  });
+
+  test("with money never observed, the item leaving is enough and earned stays unknown", async () => {
+    const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate, inventorySlot, itemCreate, itemQuery]) });
+    const client = await inWorld(stub);
+    const pending = client.sellItem(CREATURE_GUID, ITEM_GUID, undefined, { timeout: 2000 });
+    await untilAction(stub, "sell_item");
+    stub.push(JSON.stringify(inventorySlotCleared(70, BACKPACK_SLOT)));
+    expect(await pending).toMatchObject({ ok: true, status: "sold", earned: undefined });
+    client.close();
+    await stub.stop();
+  });
+
+  test("an item gone with no money by the deadline is still sold, with earned unknown", async () => {
+    const stub = startStub({ onConnect: () => bagWorld() });
+    const client = await inWorld(stub);
+    const pending = client.sellItem(CREATURE_GUID, ITEM_GUID, undefined, { timeout: 100 });
+    await untilAction(stub, "sell_item");
+    stub.push(JSON.stringify(inventorySlotCleared(70, BACKPACK_SLOT)));
+    expect(await pending).toMatchObject({ ok: true, status: "sold", count: 5, earned: undefined });
+    client.close();
+    await stub.stop();
+  });
+
+  // Every code HandleSellItemOpcode sends at the pinned core, with its sentence.
+  const refusals: readonly [number, string, string][] = [
+    [1, "SELL_ERR_CANT_FIND_ITEM", "refused: you do not have that item (SELL_ERR_CANT_FIND_ITEM) — re-read state.bag() for its guid"],
+    [2, "SELL_ERR_CANT_SELL_ITEM", "refused: the vendor will not buy that item (SELL_ERR_CANT_SELL_ITEM) — no sell price, a non-empty bag, or count over the stack"],
+    [3, "SELL_ERR_CANT_FIND_VENDOR", "refused: too far from the vendor, or it is not a vendor (SELL_ERR_CANT_FIND_VENDOR) — move within 5 yards and retry"],
+    [5, "SELL_ERR_UNK", "refused: the sale would take your money past the gold cap (SELL_ERR_UNK)"],
+    [7, "SELL_ERR_CANT_SELL_TO_THIS_MERCHANT", "refused: this vendor does not buy items (SELL_ERR_CANT_SELL_TO_THIS_MERCHANT) — sell to another vendor"],
+  ];
+  for (const [code, name, hint] of refusals) {
+    test(`SellResult ${code} is refused with ${name}, its hint, and is recorded for the harness`, async () => {
+      const stub = startStub({ onConnect: () => bagWorld() });
+      const client = await inWorld(stub);
+      const pending = client.sellItem(CREATURE_GUID, ITEM_GUID, undefined, { timeout: 2000 });
+      await untilAction(stub, "sell_item");
+      // Only CANT_FIND_VENDOR goes out with a zero vendor guid; the rest name it.
+      stub.push(JSON.stringify(sellRefused(70, code, ITEM_GUID, code === 3 ? "0" : CREATURE_GUID)));
+      expect(await pending).toEqual({
+        ok: false,
+        status: "refused",
+        itemGuid: ITEM_GUID,
+        itemId: ITEM_ENTRY,
+        name: "Gritstone Charm",
+        result: code,
+        reason: name,
+        hint,
+      });
+      expect(client.drainActionHints()).toMatchObject([{ action: "sellItem", status: "refused", count: 1, hint }]);
+      // Still in the backpack: a refusal is not a sale.
+      expect(client.state.bag().items.map((i) => i.guid)).toContain(ITEM_GUID);
+      client.close();
+      await stub.stop();
+    });
+  }
+
+  test("a named code the handler never sends renders as its name, an unknown one as its number", async () => {
+    const stub = startStub({ onConnect: () => bagWorld() });
+    const client = await inWorld(stub);
+    let pending = client.sellItem(CREATURE_GUID, ITEM_GUID, undefined, { timeout: 2000 });
+    await untilAction(stub, "sell_item");
+    stub.push(JSON.stringify(sellRefused(70, 6)));
+    expect(await pending).toMatchObject({ status: "refused", result: 6, reason: "SELL_ERR_ONLY_EMPTY_BAG", hint: "refused (SELL_ERR_ONLY_EMPTY_BAG)" });
+    pending = client.sellItem(CREATURE_GUID, ITEM_GUID, undefined, { timeout: 2000 });
+    await untilAction(stub, "sell_item", 1);
+    stub.push(JSON.stringify(sellRefused(71, 42)));
+    expect(await pending).toMatchObject({ status: "refused", result: 42, reason: undefined, hint: "refused (SellResult 42, a code the SDK does not name)" });
+    client.close();
+    await stub.stop();
+  });
+
+  test("another item's refusal does not settle this sale", async () => {
+    const stub = startStub({ onConnect: () => bagWorld() });
+    const client = await inWorld(stub);
+    const pending = client.sellItem(CREATURE_GUID, ITEM_GUID, undefined, { timeout: 2000 });
+    await untilAction(stub, "sell_item");
+    stub.push(JSON.stringify(sellRefused(70, 3, "12345")));
+    stub.push(JSON.stringify(values(71, SELF_GUID, { [`invSlot${BACKPACK_SLOT}Lo`]: 0, [`invSlot${BACKPACK_SLOT}Hi`]: 0, money: MONEY + 200 })));
+    expect(await pending).toMatchObject({ ok: true, status: "sold" });
+    client.close();
+    await stub.stop();
+  });
+
+  test("silence is a timeout, not a sale, and is recorded for the harness", async () => {
+    const stub = startStub({ onConnect: () => bagWorld() });
+    const client = await inWorld(stub);
+    const result = await client.sellItem(CREATURE_GUID, ITEM_GUID, undefined, { timeout: 60 });
+    const hint = "no answer from the server — the item is still in your bags; re-read state.bag() before retrying";
+    expect(result).toEqual({ ok: false, status: "timeout", itemGuid: ITEM_GUID, itemId: ITEM_ENTRY, name: "Gritstone Charm", hint });
+    expect(client.drainActionHints()).toMatchObject([{ action: "sellItem", status: "timeout", count: 1, hint }]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a guid the bags never held cannot be seen to go: its silence is a timeout too", async () => {
+    const stub = startStub({ onConnect: () => bagWorld() });
+    const client = await inWorld(stub);
+    const result = await client.sellItem(CREATURE_GUID, "12345", undefined, { timeout: 60 });
+    expect(result).toMatchObject({ ok: false, status: "timeout", itemGuid: "12345", itemId: undefined, name: undefined });
+    client.close();
+    await stub.stop();
+  });
+
+  test("a batch made out of range: each sell reads its own refusal, and the harness hears one hint counted eight times", async () => {
+    const stub = startStub({ onConnect: () => bagWorld() });
+    const client = await inWorld(stub);
+    const results = [];
+    for (let i = 0; i < 8; i++) {
+      const pending = client.sellItem(CREATURE_GUID, ITEM_GUID, undefined, { timeout: 2000 });
+      await untilAction(stub, "sell_item", i);
+      stub.push(JSON.stringify(sellRefused(70 + i, 3)));
+      results.push(await pending);
+    }
+    expect(results.map((r) => [r.ok, r.status])).toEqual(Array.from({ length: 8 }, () => [false, "refused"]));
+    const hints = client.drainActionHints();
+    expect(hints).toHaveLength(1);
+    expect(hints[0]).toMatchObject({ action: "sellItem", status: "refused", count: 8 });
+    client.close();
+    await stub.stop();
+  });
+});
+
 describe("inventoryResultText", () => {
   test("names the codes runs actually hit, and stays silent on the rest", () => {
     // Spot checks against the pinned core's Item.h EQUIP_ERR_* list.
@@ -4867,7 +5099,8 @@ describe("client: a name in view is a referent", () => {
     // name-to-item-guid namespace to resolve it against — so a name there
     // goes to the module as typed (and is refused there), never rewritten
     // into the guid of a unit standing nearby.
-    await client.sellItem("thistle", "thistle");
+    // Nothing answers in the stub, so the sale times out; what matters is the wire.
+    await client.sellItem("thistle", "thistle", undefined, { timeout: 20 });
     expect(stub.actions.at(-1)).toMatchObject({ action: "sell_item", guid: CREATURE_GUID, itemGuid: "thistle" });
     expect(() => client.sellItem("thistle", undefined as never)).toThrow(/sellItem\(\.\.\., itemGuid\)/);
     client.close();

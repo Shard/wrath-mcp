@@ -54,6 +54,7 @@ import {
   type HealthResponse,
   type MailListResultData,
   type PartyCommandResultData,
+  type SellItemData,
   type SendMailResultData,
   type ShowFrameData,
   type SpellFailureData,
@@ -2054,6 +2055,58 @@ const TAXI_REPLY_HINTS: Record<number, string> = {
 };
 
 /**
+ * `SMSG_SELL_ITEM.result` — `enum SellResult` in the pinned core's `Item.h`,
+ * by code. The core sends that packet only to refuse a sale: a sale it accepts
+ * is answered by update fields alone (the item leaves the bag, `state.money`
+ * rises), so 0 never arrives and has no name here.
+ */
+const SELL_RESULT_NAMES: Record<number, string> = {
+  1: "SELL_ERR_CANT_FIND_ITEM",
+  2: "SELL_ERR_CANT_SELL_ITEM",
+  3: "SELL_ERR_CANT_FIND_VENDOR",
+  4: "SELL_ERR_YOU_DONT_OWN_THAT_ITEM",
+  5: "SELL_ERR_UNK",
+  6: "SELL_ERR_ONLY_EMPTY_BAG",
+  7: "SELL_ERR_CANT_SELL_TO_THIS_MERCHANT",
+  8: "SELL_ERR_MUST_REPAIR_ITEM_DURABILITY_TO_USE",
+  9: "SELL_INTERNAL_BAG_ERROR",
+};
+
+/**
+ * The refusals `HandleSellItemOpcode` actually sends at the pinned core, as
+ * the sentence and the recovery that follows from it — rendered the way
+ * `TAXI_REPLY_HINTS` renders flight refusals. The code is the server's word
+ * and is always reported alongside. A named code the handler never sends
+ * (4, 6, 8, 9) renders as its bare name, and an unknown one as its number.
+ *
+ * 3 is `GetNPCIfCanInteractWith` failing, and range is the case runs hit; the
+ * same check also fails on an NPC that is not a vendor, a hostile one, or a
+ * dead character.
+ */
+const SELL_REFUSAL_HINTS: Record<number, string> = {
+  1: "refused: you do not have that item (SELL_ERR_CANT_FIND_ITEM) — re-read state.bag() for its guid",
+  2: "refused: the vendor will not buy that item (SELL_ERR_CANT_SELL_ITEM) — no sell price, a non-empty bag, or count over the stack",
+  3: "refused: too far from the vendor, or it is not a vendor (SELL_ERR_CANT_FIND_VENDOR) — move within 5 yards and retry",
+  // Sent alongside SMSG_INVENTORY_CHANGE_FAILURE EQUIP_ERR_TOO_MUCH_GOLD.
+  5: "refused: the sale would take your money past the gold cap (SELL_ERR_UNK)",
+  7: "refused: this vendor does not buy items (SELL_ERR_CANT_SELL_TO_THIS_MERCHANT) — sell to another vendor",
+};
+
+/** The hint a sell refusal carries: the sentence for a code the handler sends, else its name, else its number. */
+function sellRefusalHint(result: number): string {
+  const sentence = SELL_REFUSAL_HINTS[result];
+  if (sentence !== undefined) return sentence;
+  const name = SELL_RESULT_NAMES[result];
+  return name !== undefined ? `refused (${name})` : `refused (SellResult ${result}, a code the SDK does not name)`;
+}
+
+/**
+ * The `timeout` hint. The pinned core answers every sale it handles except one:
+ * an item still refundable from its purchase is dropped without a packet.
+ */
+const SELL_TIMEOUT_HINT = "no answer from the server — the item is still in your bags; re-read state.bag() before retrying";
+
+/**
  * `SMSG_INVENTORY_CHANGE_FAILURE.result` — the 3.3.5a `InventoryResult` enum
  * (`EQUIP_ERR_*` in the pinned core's `Item.h`), as the short sentence a client
  * would put on screen for it.
@@ -2438,6 +2491,59 @@ export type EquipItemResult =
       readonly status: "no_item";
       readonly hint: string;
     };
+
+export interface SellOptions {
+  /**
+   * How long to wait for the server's verdict, in ms, before answering
+   * `timeout`. Default 3000 — the server answers `CMSG_SELL_ITEM` within a
+   * round trip, and a loop selling a bagful should not be able to eat a
+   * snippet's whole budget.
+   */
+  timeout?: number;
+}
+
+/** What every `sellItem` answer says about the item it was about, as the bags last showed it. */
+interface SellItemFacts {
+  readonly itemGuid: string;
+  readonly itemId: number | undefined;
+  readonly name: string | undefined;
+}
+
+/**
+ * The outcome of one sale, as a value. The pinned core accepts a sale with
+ * update fields alone — the item leaves the bags (part of a stack: its count
+ * drops) and `state.money` rises — and refuses one with `SMSG_SELL_ITEM`
+ * carrying a `SellResult` code. `sellItem` reports which of those happened
+ * rather than that the packet was sent: a freeplay run had eight sells made
+ * ten yards from the vendor come back `ok: true`, every one refused with
+ * `SELL_ERR_CANT_FIND_VENDOR`, and found out from its money and free slots.
+ *
+ * `timeout` is the honest third answer: neither arrived in time, so nothing
+ * was observed — re-read `state.bag()` rather than assume either way.
+ */
+export type SellItemResult =
+  | ({
+      readonly ok: true;
+      readonly status: "sold";
+      /** How many were sold: the `count` asked for, else the whole stack (undefined when its size was never observed). */
+      readonly count: number | undefined;
+      /** Copper: the rise in `state.money` seen with the sale; undefined when money was unobserved before it or no rise arrived. */
+      readonly earned: number | undefined;
+    } & SellItemFacts)
+  | ({
+      readonly ok: false;
+      readonly status: "refused";
+      /** Raw `SellResult` code from `SMSG_SELL_ITEM`. */
+      readonly result: number;
+      /** The code's name in the pinned core (`SELL_ERR_CANT_FIND_VENDOR`); undefined for a code it does not define. */
+      readonly reason: string | undefined;
+      readonly hint: string;
+    } & SellItemFacts)
+  | ({
+      readonly ok: false;
+      readonly status: "timeout";
+      readonly hint: string;
+    } & SellItemFacts);
 
 /**
  * The outcome of `learnTalent`, as a value. The server always
@@ -3331,15 +3437,108 @@ export class WrathClient {
     );
   }
 
-  /** `CMSG_SELL_ITEM`; omit `count` to sell the whole stack. */
-  sellItem(target: GuidOrUnit, itemGuid: GuidArg, count?: number): Promise<WithResolved<ActionResponse>> {
+  /**
+   * `CMSG_SELL_ITEM` — sell a carried item to a vendor and wait for the
+   * server's verdict; omit `count` to sell the whole stack.
+   *
+   * Races the item leaving the bags (part of a stack: its count dropping),
+   * with the money for it, against `SMSG_SELL_ITEM`, which the core sends only
+   * to refuse. A refusal is `status: "refused"` with the `SellResult` code, its
+   * name and a hint (`SELL_REFUSAL_HINTS`); neither within `timeout` is
+   * `status: "timeout"`. Each is a value, not a throw: it is the game
+   * answering, and a loop over a bagful reads every sale's own answer.
+   */
+  sellItem(target: GuidOrUnit, itemGuid: GuidArg, count?: number, options: SellOptions = {}): Promise<WithResolved<SellItemResult>> {
     // The vendor is a unit in view and takes a name; `itemGuid` is an item's
     // own guid, which is not in that namespace — there is no name-to-item-guid
     // resolver, so it stays the strict guid string.
     const item = guidArg(itemGuid, "sellItem(..., itemGuid)");
-    return this.byName(target, "sellItem(guid, ...)", (guid) =>
-      this.action({ action: "sell_item", guid, itemGuid: item, count }),
-    );
+    return this.byName(target, "sellItem(guid, ...)", (guid) => this.sellAndConfirm(guid, item, count, options.timeout ?? 3000));
+  }
+
+  private async sellAndConfirm(vendor: string, itemGuid: string, count: number | undefined, timeout: number): Promise<SellItemResult> {
+    // Where the item is held now, as the cache sees it: the bags (backpack and
+    // worn bags), which is all a client sells from. Deliberately not
+    // `state.inventory`: the core moves a sold item into a buyback slot
+    // (PLAYER_FIELD_VENDORBUYBACK_SLOT_1, invSlot74 on), and a view that ever
+    // served those would make every sale look unsold.
+    const held = (): { itemId: number | undefined; name: string | undefined; count: number | undefined } | undefined => {
+      const row = this.state.bag().items.find((i) => i.guid === itemGuid);
+      return row === undefined ? undefined : { itemId: row.itemId, name: row.name, count: row.count };
+    };
+    const before = held();
+    const facts: SellItemFacts = { itemGuid, itemId: before?.itemId, name: before?.name };
+    // Money is a self-only field, absent until an update carried it: an
+    // unobserved balance is never guessed at, so it neither gates the wait
+    // nor yields an `earned`.
+    const moneyBefore = this.state.money?.value;
+    const earned = (): number | undefined => {
+      const now = this.state.money?.value;
+      return moneyBefore !== undefined && now !== undefined && now > moneyBefore ? now - moneyBefore : undefined;
+    };
+    // Only an item seen held before the sell can be seen to go: a guid the
+    // cache never held is answered by the server's refusal or by the timeout.
+    const sold = (): boolean => {
+      if (before === undefined) return false;
+      const now = held();
+      if (now === undefined) return true;
+      return before.count !== undefined && now.count !== undefined && now.count < before.count;
+    };
+    // The money for a whole stack rides in the same update as the item
+    // leaving; for part of a stack the count drops first and the money follows
+    // a tick later. Settling on both makes `earned` the sale's, not a guess.
+    const settled = (): boolean => sold() && (moneyBefore === undefined || earned() !== undefined);
+    const sinceSeq = this.events.recent(1)[0]?.seq;
+
+    await this.action({ action: "sell_item", guid: vendor, itemGuid, count });
+
+    let refusal: SellItemData | undefined;
+    if (!settled()) {
+      try {
+        await this.waitEvent(
+          (e) => {
+            if (isEvent(e, "SMSG_SELL_ITEM") && !isDecodeError(e.data) && (sinceSeq === undefined || e.seq > sinceSeq)) {
+              const d = e.data as SellItemData;
+              // Matched by item, never by vendor: the core sends the vendor
+              // guid as 0 when it could not find the vendor, the very case
+              // this exists for.
+              if (d.result !== 0 && d.itemGuid === itemGuid) {
+                refusal = d;
+                return true;
+              }
+            }
+            return settled();
+          },
+          {
+            timeout,
+            // Buffered events stay in scope on purpose: the refusal can land on
+            // the stream while the POST is still in flight, which is what
+            // `sinceSeq` fences (the same pattern as equipItem).
+            description: `the verdict on selling ${itemGuid} (the item leaving the bags, or SMSG_SELL_ITEM)`,
+          },
+        );
+      } catch (e) {
+        // A timeout is the `timeout` answer below; anything else (abort,
+        // transport loss) is not this call's to swallow.
+        if (!(e instanceof EventTimeoutError)) throw e;
+      }
+    }
+
+    if (refusal !== undefined) {
+      const result = refusal.result;
+      const hint = sellRefusalHint(result);
+      // Recorded for the harness too, so a snippet that ignores the return
+      // value still hears it — and a loop of refusals arrives as one hint
+      // with its count.
+      this.noteActionHint("sellItem", "refused", hint);
+      return { ok: false, status: "refused", ...facts, result, reason: SELL_RESULT_NAMES[result], hint };
+    }
+    // The item going is the sale; a money update still in flight at the
+    // deadline only leaves `earned` unknown.
+    // `count` 0 is the wire's "whole stack", the same as leaving it out.
+    if (sold()) return { ok: true, status: "sold", ...facts, count: count ? count : before?.count, earned: earned() };
+    this.noteActionHint("sellItem", "timeout", SELL_TIMEOUT_HINT);
+    return { ok: false, status: "timeout", ...facts, hint: SELL_TIMEOUT_HINT };
   }
 
   /** `CMSG_REPAIR_ITEM` with item guid 0 — repair everything. */

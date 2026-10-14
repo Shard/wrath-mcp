@@ -44,6 +44,8 @@ export type {
   QuestRewardChoice,
   QuestsAvailableResult,
   QuestTurnInResult,
+  SellItemResult,
+  SellOptions,
   UseItemResult,
   StoredLootItem,
   TaxiOptions,
