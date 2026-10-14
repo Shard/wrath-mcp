@@ -2211,6 +2211,129 @@ describe("achievements and flight paths", () => {
     expect(cache.self.taxiFlight).toEqual({ value: true, seq: 1, ts: 2001 });
   });
 
+  // Our own flight. AzerothCore's FlightPathMovementGenerator::DoReset
+  // launches one spline per map from the character's position through every
+  // path node (SetFly: the Flying flag, so the client gets every point
+  // uncompressed) at 32 y/s, and `MoveSplineInit::Launch` sends it to the
+  // flier too. The module reduces it to start, last point and duration
+  // (PROTOCOL.md), so that is the shape here: points and spline flags never
+  // reach the SDK. The numbers are invented but flight-sized — thousands of
+  // yards, a few minutes.
+  const TAKE_OFF = { map: 0, x: -8840.0, y: 495.0, z: 110.0, o: 3.75 };
+  const LANDING = { x: -4820.0, y: -1150.0, z: 500.0 };
+  const FLIGHT_MS = 203_500;
+  const at = (seq: number, opcode: string, opcodeId: number, data: unknown) => ({ seq, opcode, opcodeId, ts: 2000 + seq, data });
+  const verifyWorld = (seq: number, pos = TAKE_OFF) => at(seq, "SMSG_LOGIN_VERIFY_WORLD", 0x236, pos);
+  const selfSpline = (seq: number, from: { x: number; y: number; z: number }, to: { x: number; y: number; z: number }, durationMs = FLIGHT_MS) =>
+    at(seq, "SMSG_MONSTER_MOVE", 0x0dd, {
+      guid: SEED.guid,
+      pos: { x: from.x, y: from.y, z: from.z },
+      destination: to,
+      durationMs,
+    });
+  const selfStop = (seq: number, p: { x: number; y: number; z: number }) =>
+    at(seq, "SMSG_MONSTER_MOVE", 0x0dd, { guid: SEED.guid, pos: p, stopped: true });
+  const ownMove = (seq: number, p: { x: number; y: number; z: number; o: number }) =>
+    at(seq, "WB_MOVE_PROGRESS", 0xff02, { moveId: 1, pos: p });
+  /** The order a flight arrives in: the reply, the spline, then the flag on the next server tick. */
+  const takeOff = (seq: number) => [taxiReply(seq, 0), selfSpline(seq + 1, TAKE_OFF, LANDING), unitFlags(seq + 2, 0x0010_0008)];
+
+  test("our own flight's spline lands position at its last point, with taxiEta for the ride", () => {
+    const flying = StateCache.replay(toEvents([verifyWorld(1), ...takeOff(2)]), { seed: SEED });
+    // Mid-flight the position is still the take-off point: the module serves
+    // no point between start and end, so none is made up.
+    expect(flying.self.position?.value).toEqual(TAKE_OFF);
+    expect(flying.self.position?.seq).toBe(1);
+    // Stamped with the spline's packet, which carried the duration.
+    expect(flying.self.taxiEta).toEqual({ value: { durationMs: FLIGHT_MS, landsAt: 2003 + FLIGHT_MS }, seq: 3, ts: 2003 });
+    // Our own guid is never a nearby object.
+    expect(flying.nearby.has(SEED.guid)).toBe(false);
+
+    const landed = StateCache.replay(toEvents([verifyWorld(1), ...takeOff(2), unitFlags(5, 0x8)]), { seed: SEED });
+    // The spline carries no facing, so the last observed one stands.
+    expect(landed.self.position).toEqual({ value: { map: 0, ...LANDING, o: TAKE_OFF.o }, seq: 5, ts: 2005 });
+    expect(landed.self.taxiFlight?.value).toBe(false);
+    expect(landed.self.taxiEta).toBeUndefined();
+  });
+
+  test("a spline arriving while already flying (a relog mid-flight) is the ETA at once", () => {
+    const cache = StateCache.replay(
+      toEvents([verifyWorld(1), unitFlags(2, 0x0010_0008), selfSpline(3, TAKE_OFF, LANDING, 90_000)]),
+      { seed: SEED },
+    );
+    expect(cache.self.taxiEta?.value).toEqual({ durationMs: 90_000, landsAt: 2003 + 90_000 });
+    const landed = StateCache.replay(
+      toEvents([verifyWorld(1), unitFlags(2, 0x0010_0008), selfSpline(3, TAKE_OFF, LANDING, 90_000), unitFlags(4, 0x8)]),
+      { seed: SEED },
+    );
+    expect(landed.self.position?.value).toEqual({ map: 0, ...LANDING, o: TAKE_OFF.o });
+  });
+
+  test("a flight that crosses a map lands at the second map's spline end", () => {
+    // One spline per map: the server transfers the character and launches the
+    // rest of the path from the arrival point.
+    const ARRIVAL = { map: 1, x: 3000.0, y: -4000.0, z: 120.0, o: 1.25 };
+    const SECOND_LANDING = { x: 1500.0, y: -4400.0, z: 40.0 };
+    const cache = StateCache.replay(
+      toEvents([
+        verifyWorld(1),
+        ...takeOff(2),
+        at(5, "SMSG_NEW_WORLD", 0x03e, ARRIVAL),
+        selfSpline(6, ARRIVAL, SECOND_LANDING, 60_000),
+      ]),
+      { seed: SEED },
+    );
+    expect(cache.self.position?.value).toEqual(ARRIVAL);
+    expect(cache.self.taxiEta?.value).toEqual({ durationMs: 60_000, landsAt: 2006 + 60_000 });
+    cache.apply(toEvents([unitFlags(7, 0x8)])[0]!);
+    expect(cache.self.position?.value).toEqual({ map: 1, ...SECOND_LANDING, o: ARRIVAL.o });
+  });
+
+  test("a stop of our own spline is our position, and the landing after it moves nothing", () => {
+    const STOPPED = { x: -6000.0, y: -200.0, z: 400.0 };
+    const cache = StateCache.replay(toEvents([verifyWorld(1), ...takeOff(2), selfStop(5, STOPPED)]), { seed: SEED });
+    expect(cache.self.position).toEqual({ value: { map: 0, ...STOPPED, o: TAKE_OFF.o }, seq: 5, ts: 2005 });
+    expect(cache.self.taxiEta).toBeUndefined();
+    cache.apply(toEvents([unitFlags(6, 0x8)])[0]!);
+    expect(cache.self.position?.value).toEqual({ map: 0, ...STOPPED, o: TAKE_OFF.o });
+  });
+
+  test("a landing never reads a spline that is not this flight's", () => {
+    const CHARGE_END = { x: -8830.0, y: 500.0, z: 110.0 };
+    // A spline from before the accepted reply (a charge, a fear) is not this
+    // flight's: with the flight's own spline missed, the landing leaves
+    // position alone rather than jumping to it.
+    const stale = StateCache.replay(
+      toEvents([verifyWorld(1), selfSpline(2, TAKE_OFF, CHARGE_END, 400), taxiReply(3, 0), unitFlags(4, 0x0010_0008), unitFlags(5, 0x8)]),
+      { seed: SEED },
+    );
+    expect(stale.self.position?.value).toEqual(TAKE_OFF);
+    expect(stale.self.taxiEta).toBeUndefined();
+
+    // A move of the character's own between the spline and a late flag flip
+    // means the character is off the spline; its position stands.
+    const walked = { x: -4800.0, y: -1100.0, z: 501.0, o: 0.5 };
+    const moved = StateCache.replay(
+      toEvents([verifyWorld(1), ...takeOff(2), ownMove(5, walked), unitFlags(6, 0x8)]),
+      { seed: SEED },
+    );
+    expect(moved.self.position?.value).toEqual({ map: 0, ...walked });
+
+    // A same-map port (the teleport ack) ends the spline too.
+    const ported = { x: -9000.0, y: 300.0, z: 90.0, o: 2.0 };
+    const teleported = StateCache.replay(
+      toEvents([
+        verifyWorld(1),
+        ...takeOff(2),
+        at(5, "MSG_MOVE_TELEPORT_ACK", 0x0c7, { guid: SEED.guid, flags: 0, time: 0, pos: ported }),
+        unitFlags(6, 0x8),
+      ]),
+      { seed: SEED },
+    );
+    expect(teleported.self.position?.value).toEqual({ map: 0, ...ported });
+    expect(teleported.self.taxiEta).toBeUndefined();
+  });
+
   /** A self values block carrying `playerFlags`, the players-only field. */
   const playerFlags = (seq: number, flags: number) => ({
     seq,

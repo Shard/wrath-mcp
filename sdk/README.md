@@ -382,8 +382,12 @@ Every observed field group is an `Observed<T> = { value, seq, ts }`, so
 staleness is legible rather than implied. That matters most for position: our
 own is written by `SMSG_LOGIN_VERIFY_WORLD`, then by our own create block, then
 by every `WB_MOVE_PROGRESS` while we walk and by the server-confirmed
-`WB_MOVE_RESULT` at the end — and between events it is stale, which the `seq`
-says out loud.
+`WB_MOVE_RESULT` at the end, and by a flight's landing (`taxiFlight` turning
+false), which puts it at the last point of our own `SMSG_MONSTER_MOVE` spline
+— and between events it is stale, which the `seq` says out loud. A flight is
+the long case: the module serves the spline's start, end and duration but no
+point between, so mid-flight position stays the take-off point and
+`self.taxiEta` says when that changes.
 
 The queries (`nearbyUnits`, `creaturesByEntry`, `closest`) are pure reads.
 `closest` returns `undefined` when we have no position of our own, rather than

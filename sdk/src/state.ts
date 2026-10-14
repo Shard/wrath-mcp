@@ -397,6 +397,15 @@ export interface SelfState extends UnitFieldsState {
    */
   taxiFlight: Observed<boolean> | undefined;
   /**
+   * When the flight lands, from the spline the server flies the character
+   * along (`SMSG_MONSTER_MOVE` for our own guid): `durationMs` is the ride's
+   * length and `landsAt` is the packet's `ts` plus it, in wall-clock ms like
+   * `reclaimDelay.readyAt`. Set while `taxiFlight` is true, `undefined`
+   * otherwise. `position` stays the take-off point until the landing puts it
+   * where the spline ends.
+   */
+  taxiEta: Observed<{ readonly durationMs: number; readonly landsAt: number }> | undefined;
+  /**
    * `PLAYER_FLAGS_RESTING` on our own `playerFlags`: true while the character
    * is in a rest area — an inn or a city — which is what the client's own
    * resting icon says. Read the same way `taxiFlight` reads `unitFlags`: only
@@ -1338,6 +1347,7 @@ export class StateCache {
     targetGuid: undefined,
     achievements: undefined,
     taxiFlight: undefined,
+    taxiEta: undefined,
     resting: undefined,
     ghost: undefined,
     taxiReply: undefined,
@@ -1522,6 +1532,23 @@ export class StateCache {
    * are paired with.
    */
   private selfMap: number | undefined;
+
+  /**
+   * The last spline the server launched for our own character
+   * (`SMSG_MONSTER_MOVE` for our guid), kept until it is landed on or
+   * superseded. A client flies itself along it locally; the module serves its
+   * start, its last point and its duration (PROTOCOL.md), so the last point is
+   * where a landing puts `position`. Cleared by anything that takes the
+   * character off it — a stop, a teleport, a map change, a login, a move of
+   * its own (`WB_MOVE_*`) — and by an accepted taxi reply, so a landing only
+   * ever reads the flight's own spline (players get other server splines
+   * too: a charge, a fear). Mid-flight nothing here moves `position`: the
+   * module serves no points between start and end, so a point in between
+   * would be invented.
+   */
+  private selfSpline:
+    | { readonly destination: Point3; readonly durationMs: number | undefined; readonly seq: number; readonly ts: number }
+    | undefined;
 
   constructor(options: StateCacheOptions = {}) {
     this.chatTail = options.chatTail ?? 200;
@@ -2433,6 +2460,8 @@ export class StateCache {
           seq: event.seq,
           ts: event.ts,
         };
+        // No `endSelfSpline()`: a reattach is the stream's, not the
+        // character's — a flight in progress still lands where its spline ends.
         this.self.level = { value: d.level, seq: event.seq, ts: event.ts };
         if (d.zoneId !== undefined && d.areaId !== undefined) {
           this.self.zone = { value: { id: d.zoneId, name: d.zoneName ?? "" }, seq: event.seq, ts: event.ts };
@@ -2464,6 +2493,9 @@ export class StateCache {
           ts: event.ts,
         };
         this.self.transfer = undefined;
+        // A flight that crosses a map is flown as one spline per map: the
+        // server launches the next one after the transfer.
+        this.endSelfSpline();
         return;
       }
       case "SMSG_TRANSFER_PENDING": {
@@ -2658,6 +2690,10 @@ export class StateCache {
       case "SMSG_ACTIVATETAXIREPLY": {
         const d = event.data as ActivateTaxiReplyData;
         this.self.taxiReply = { value: { reply: d.reply, ok: d.ok }, seq: event.seq, ts: event.ts };
+        // The flight's spline follows this reply (`Player::ActivateTaxiPathTo`
+        // answers, then launches it), so any older self spline is not this
+        // flight's.
+        if (d.ok) this.selfSpline = undefined;
         return;
       }
       case "WB_TALENT_TREE": {
@@ -3050,7 +3086,13 @@ export class StateCache {
       }
       case "SMSG_MONSTER_MOVE": {
         const d = event.data as MonsterMoveData;
-        if (this.isSelfGuid(d.guid)) return;
+        if (this.isSelfGuid(d.guid)) {
+          // Our own character on a server spline: a taxi flight
+          // (`MoveSplineInit::Launch` sends it to the flier too). Never a
+          // nearby object.
+          this.applySelfSpline(d, event.seq, event.ts);
+          return;
+        }
         this.upsertNearby(d.guid, event.seq, (obj) => {
           obj.motion = {
             value: {
@@ -3099,6 +3141,9 @@ export class StateCache {
         // the server sent *before* this result — folding `pos` here would
         // overwrite the arrival with where the character left from.
         const d = event.data as { pos: PositionData; status?: string };
+        // The character moving under its own control is off any server
+        // spline, so a later landing has nothing to put it at.
+        this.endSelfSpline();
         if (event.opcode === "WB_MOVE_RESULT" && (d.status === "transferred" || d.status === "teleported")) return;
         this.applySelfPosition(d.pos, event.seq, event.ts);
         return;
@@ -3236,7 +3281,9 @@ export class StateCache {
             // SMSG_NEW_WORLD follows a same-map port, so this is how self
             // position follows a Hearthstone). Our own synthesized movement
             // is never echoed, but if the server ever relays any other
-            // MSG_MOVE_* under our guid it is still our position.
+            // MSG_MOVE_* under our guid it is still our position. A port
+            // takes the character off any spline it was on.
+            this.endSelfSpline();
             this.applySelfPosition(d.pos, event.seq, event.ts);
             return;
           }
@@ -3560,6 +3607,48 @@ export class StateCache {
   }
 
   /**
+   * A point the server put the character at with no facing (a spline's stop
+   * or its end). The spline carries no orientation, so the last observed one
+   * stands. A map always arrives with a position, so whenever
+   * `applySelfPosition` would accept this there is a last orientation to keep.
+   */
+  private applySelfPoint(p: Point3, seq: number, ts: number): void {
+    this.applySelfPosition({ x: p.x, y: p.y, z: p.z, o: this.self.position?.value.o ?? 0 }, seq, ts);
+  }
+
+  /**
+   * Our own `SMSG_MONSTER_MOVE`. A launch is kept for the landing, and is the
+   * flight's ETA once `taxiFlight` is (or turns) true — the spline is sent
+   * before the flag's values update, which goes out on the next server tick.
+   * A stop is the server's word on where the spline left the character
+   * (`MoveSplineInit::Stop` writes the computed position), so it is a
+   * position, and it ends the spline.
+   */
+  private applySelfSpline(d: MonsterMoveData, seq: number, ts: number): void {
+    if (d.stopped === true || d.destination === undefined) {
+      this.endSelfSpline();
+      if (d.stopped === true) this.applySelfPoint(d.pos, seq, ts);
+      return;
+    }
+    const { x, y, z } = d.destination;
+    this.selfSpline = { destination: { x, y, z }, durationMs: d.durationMs, seq, ts };
+    if (this.self.taxiFlight?.value === true) this.publishTaxiEta();
+  }
+
+  /** `self.taxiEta` from the kept spline, stamped with the packet that carried the duration. */
+  private publishTaxiEta(): void {
+    const s = this.selfSpline;
+    if (s === undefined || s.durationMs === undefined) return;
+    this.self.taxiEta = { value: { durationMs: s.durationMs, landsAt: s.ts + s.durationMs }, seq: s.seq, ts: s.ts };
+  }
+
+  /** The character is off its server spline: nothing left to land on, no ETA. */
+  private endSelfSpline(): void {
+    this.selfSpline = undefined;
+    this.self.taxiEta = undefined;
+  }
+
+  /**
    * Record one achievement, first writer wins. `rebuildAchievements` is the
    * caller's job for the login batch so a backlog of hundreds rebuilds once.
    */
@@ -3650,7 +3739,21 @@ export class StateCache {
       // Derived only from a block that *carried* unitFlags, so the observation
       // keeps the provenance of the packet that made it.
       if (typeof fields.unitFlags === "number") {
-        this.self.taxiFlight = { value: (fields.unitFlags & UNIT_FLAG_TAXI_FLIGHT) !== 0, seq, ts };
+        const wasFlying = this.self.taxiFlight?.value === true;
+        const flying = (fields.unitFlags & UNIT_FLAG_TAXI_FLIGHT) !== 0;
+        this.self.taxiFlight = { value: flying, seq, ts };
+        if (flying && !wasFlying) {
+          // Take-off: the flight's spline arrived just ahead of this flag.
+          this.publishTaxiEta();
+        } else if (!flying && wasFlying) {
+          // Landing: the client has flown itself to the end of the spline,
+          // which is where the server set the character down. No spline
+          // kept (a port, a stop already applied, a move of its own since)
+          // leaves position as it was rather than guessing.
+          const spline = this.selfSpline;
+          this.endSelfSpline();
+          if (spline !== undefined) this.applySelfPoint(spline.destination, seq, ts);
+        }
       }
       // `resting` is the same shape of reading off `playerFlags`, the players-
       // only field the module whitelists (PROTOCOL.md). Guarded the same way:
