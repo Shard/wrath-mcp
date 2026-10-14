@@ -568,6 +568,22 @@ export const updateFieldsSchema = z.looseObject({
   ownerHi: z.number().optional(),
   containedLo: z.number().optional(),
   containedHi: z.number().optional(),
+  /**
+   * An item's random property (`ITEM_FIELD_RANDOM_PROPERTIES_ID`, signed:
+   * positive an ItemRandomProperties row, negative a negated ItemRandomSuffix
+   * row), with the client's own reading of it beside the id — `suffixName`
+   * ("of the Bear") and, for a suffix, `suffixAlloc0..4`, the per-slot
+   * allocation the stat amounts scale by. `propertySeed` is the suffix factor
+   * the core keeps in `ITEM_FIELD_PROPERTY_SEED`. The twelve enchantment slots
+   * ride as `enchant<n>Id` / `enchant<n>Duration` / `enchant<n>Charges`
+   * (n 0-11; a random property's are 7-11), each non-zero id with its
+   * SpellItemEnchantment row beside it — `enchant<n>Effect<i>Type` /
+   * `Amount` / `Arg` (i 0-2) and `enchant<n>Text` — as dynamic keys the
+   * loose schema passes through. The cache folds them (`randomPropertyOf`).
+   */
+  randomPropertyId: z.number().optional(),
+  propertySeed: z.number().optional(),
+  suffixName: z.string().optional(),
   // game objects
   goDisplayId: z.number().optional(),
   goFlags: z.number().optional(),

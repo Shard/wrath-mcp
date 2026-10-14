@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import { parseEventFrame, type GameEvent } from "../src/protocol";
 import { STREAM_GAP, type StreamEvent, type StreamGapEvent } from "../src/events";
-import { gameObjectTypeName, pointOf, reputationRank, StateCache, type UnitFilter } from "../src/state";
+import { gameObjectTypeName, pointOf, randomPropertyOf, reputationRank, StateCache, type UnitFilter } from "../src/state";
 import {
   addKill,
   auraRemoved,
@@ -28,6 +28,16 @@ import {
   nameQuery,
   itemCreate,
   itemQuery,
+  propertyItemCreate,
+  SUFFIX_ITEM_ENTRY,
+  SUFFIX_ITEM_GUID,
+  SUFFIX_SLOT,
+  suffixItemCreate,
+  suffixItemQuery,
+  suffixItemSlot,
+  suffixSeedUpdate,
+  tempEnchantApplied,
+  tempEnchantExpired,
   monsterMove,
   monsterStopped,
   newWorld,
@@ -822,6 +832,96 @@ describe("state cache: self progress, target and inventory", () => {
     const cache = withWorld([inventorySlot]);
     // `invSlot24Lo/Hi` were served as 0/0 in the same block.
     expect(cache.inventory.map((i) => i.slot)).toEqual([BACKPACK_SLOT]);
+  });
+
+  test("a random suffix names the item and scales its stat lines by the seed, on bag and inventory rows alike", () => {
+    const cache = withWorld([suffixItemSlot, suffixItemCreate, suffixItemQuery]);
+    const row = cache.bag().items.find((i) => i.slot === SUFFIX_SLOT);
+    // The client's bag name: template name plus the suffix.
+    expect(row?.name).toBe("Watchman's Leggings of the Badger");
+    expect(row?.suffix).toBe("of the Badger");
+    expect(row?.quality).toBe(2);
+    // The template's own line first, then the suffix's at allocation x seed /
+    // 10000, floored: 10000 x 9 / 10000 = 9 and 6666 x 9 / 10000 = 5.99 -> 5.
+    expect(row?.stats).toEqual([
+      { type: 3, value: 1 },
+      { type: 7, value: 9 },
+      { type: 4, value: 5 },
+    ]);
+    expect(row?.enchants).toEqual(["+9 Grit", "+5 Vigor"]);
+    // The equipment/raw view carries the same instance half.
+    const inv = cache.inventory.find((i) => i.slot === SUFFIX_SLOT);
+    expect(inv?.name).toBe("Watchman's Leggings of the Badger");
+    expect(inv?.stats).toEqual(row?.stats);
+    expect(inv?.enchants).toEqual(["+9 Grit", "+5 Vigor"]);
+    // The template stays what the query said: the suffix is the instance's.
+    expect(cache.items.get(SUFFIX_ITEM_ENTRY)?.value.name).toBe("Watchman's Leggings");
+    expect(cache.items.get(SUFFIX_ITEM_ENTRY)?.value.stats).toEqual([{ type: 3, value: 1 }]);
+    // Pure over the folded fields, exported for anyone holding the raw object.
+    expect(randomPropertyOf(cache.nearby.get(SUFFIX_ITEM_GUID))).toEqual({
+      suffix: "of the Badger",
+      stats: [
+        { type: 7, value: 9 },
+        { type: 4, value: 5 },
+      ],
+      enchants: ["+9 Grit", "+5 Vigor"],
+    });
+  });
+
+  test("a positive random property reads its amounts off the enchant row, unscaled", () => {
+    const cache = withWorld([suffixItemSlot, propertyItemCreate, suffixItemQuery]);
+    const row = cache.bag().items.find((i) => i.slot === SUFFIX_SLOT);
+    expect(row?.name).toBe("Watchman's Leggings of Vigor");
+    expect(row?.stats).toEqual([
+      { type: 3, value: 1 },
+      { type: 4, value: 2 },
+    ]);
+    expect(row?.enchants).toEqual(["+2 Vigor"]);
+  });
+
+  test("a later seed delta re-scales from the fields as they now stand", () => {
+    const cache = withWorld([suffixItemSlot, suffixItemCreate, suffixItemQuery, suffixSeedUpdate]);
+    const row = cache.bag().items.find((i) => i.slot === SUFFIX_SLOT);
+    expect(row?.stats).toEqual([
+      { type: 3, value: 1 },
+      { type: 7, value: 18 },
+      { type: 4, value: 11 },
+    ]);
+    expect(row?.enchants).toEqual(["+18 Grit", "+11 Vigor"]);
+  });
+
+  test("an enchant whose id went to 0 is gone, whatever its row left in the fields", () => {
+    const applied = withWorld([suffixItemSlot, suffixItemCreate, suffixItemQuery, tempEnchantApplied]);
+    expect(applied.bag().items.find((i) => i.slot === SUFFIX_SLOT)?.enchants).toEqual(["+3 Grit", "+9 Grit", "+5 Vigor"]);
+    const expired = withWorld([suffixItemSlot, suffixItemCreate, suffixItemQuery, tempEnchantApplied, tempEnchantExpired]);
+    const row = expired.bag().items.find((i) => i.slot === SUFFIX_SLOT);
+    expect(row?.enchants).toEqual(["+9 Grit", "+5 Vigor"]);
+    expect(row?.stats).toEqual([
+      { type: 3, value: 1 },
+      { type: 7, value: 9 },
+      { type: 4, value: 5 },
+    ]);
+  });
+
+  test("before the item query answers, a suffix item has no name and no stats, honestly", () => {
+    const cache = withWorld([suffixItemSlot, suffixItemCreate]);
+    const row = cache.bag().items.find((i) => i.slot === SUFFIX_SLOT);
+    expect(row?.name).toBeUndefined();
+    expect(row?.stats).toBeUndefined();
+    // The suffix itself was observed on the item's own block, so it is known.
+    expect(row?.suffix).toBe("of the Badger");
+    expect(row?.enchants).toEqual(["+9 Grit", "+5 Vigor"]);
+  });
+
+  test("an item without a random property reads exactly as its template, with no suffix or enchant keys", () => {
+    const cache = withWorld([inventorySlot, itemCreate, itemQuery]);
+    const row = cache.bag().items[0];
+    expect(row?.name).toBe("Gritstone Charm");
+    expect("suffix" in (row ?? {})).toBe(false);
+    expect("enchants" in (row ?? {})).toBe(false);
+    // The fixture template carries no stat list, so neither does the row.
+    expect(row?.stats).toBeUndefined();
+    expect(randomPropertyOf(cache.nearby.get(ITEM_GUID))).toBeUndefined();
   });
 });
 

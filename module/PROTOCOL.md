@@ -1380,7 +1380,36 @@ Served in `SMSG_UPDATE_OBJECT` `fields` alongside the existing set:
   slots, 23-38 = backpack slots. The SDK reassembles guids and joins them to
   item create blocks.
 - items and containers: `stackCount`, `durability`, `maxDurability`,
-  `itemFlags`, `ownerLo`/`ownerHi`, `containedLo`/`containedHi`.
+  `itemFlags`, `ownerLo`/`ownerHi`, `containedLo`/`containedHi`; the random
+  property and the enchantment slots, PUBLIC fields every client in range
+  receives, served raw per field the way the quest log is:
+  `randomPropertyId` (`ITEM_FIELD_RANDOM_PROPERTIES_ID` as a signed integer —
+  positive an `ItemRandomProperties.dbc` row, negative the negated
+  `ItemRandomSuffix.dbc` row), `propertySeed` (`ITEM_FIELD_PROPERTY_SEED`,
+  the suffix factor the core computes from `RandPropPoints.dbc` for the
+  template's level, quality and slot), and `enchant<n>Id` / `enchant<n>Duration`
+  / `enchant<n>Charges` for n 0-11 (`ITEM_FIELD_ENCHANTMENT_1_1`, three u32s
+  per slot: a permanent enchant in 0, a temporary one in 1, gems in 2-4, a
+  random property's enchants in 7-11, which the core fills from the
+  property's row). Beside the ids, as client-cache knowledge the way
+  `skill<n>Name` rides beside a skill id: `suffixName`, the enUS name suffix
+  of the property's row ("of the Bear"), and for a suffix `suffixAlloc0`-`4`,
+  its per-slot allocation (all five, zeros included, so a re-rolled id
+  overwrites every earlier one); and for each non-zero `enchant<n>Id` its
+  `SpellItemEnchantment.dbc` row — `enchant<n>Effect<i>Type` / `Amount` /
+  `Arg` for i 0-2 (type 5 is a stat: `Arg` the `ItemModType`, `Amount` the
+  value; 1/3/7 a spell by id; 4 a resistance by school; all three effects
+  served, zeros included) and `enchant<n>Text`, the enUS text the client draws
+  the green line from, with `$i` left as the client's placeholder for the
+  amount. The amount of a suffix's enchant is the client's arithmetic, not a
+  field: `floor(suffixAlloc<k> × propertySeed / 10000)` for prop slot
+  `7 + k`; a positive property's enchants carry their amount in the row. The
+  module names rows from the core's own stores of those three files (loaded
+  with every other DBC, and empty stores serve ids without names); the SDK
+  does the arithmetic and the join to the template (`randomPropertyOf`,
+  `bag()` rows). The field is what makes an "of the Bear" readable at all:
+  the item template answers `stats: []` for it, because the stats are the
+  instance's.
 - containers only (worn bags): `numSlots`
   (`CONTAINER_FIELD_NUM_SLOTS`) and the bag's contents as
   `bagSlot<n>Lo`/`bagSlot<n>Hi` u32 guid halves, n 0-35

@@ -207,6 +207,12 @@ namespace WrathBench
                 if (f->reputationListID >= 0)
                     _repListToFaction[uint32(f->reputationListID)] = f->ID;
         LOG_INFO("module", "wrathbench: {} reputation factions indexed from Faction.dbc", _repListToFaction.size());
+        // Random item properties are named from the core's own stores of the
+        // client's ItemRandomProperties / ItemRandomSuffix /
+        // SpellItemEnchantment files (loaded with every other DBC); an empty
+        // store serves ids without names, never an error.
+        LOG_INFO("module", "wrathbench: item random properties named from {} ItemRandomProperties, {} ItemRandomSuffix and {} SpellItemEnchantment rows",
+            sItemRandomPropertiesStore.GetNumRows(), sItemRandomSuffixStore.GetNumRows(), sSpellItemEnchantmentStore.GetNumRows());
 
         // The port secret is the floor under every route (PROTOCOL.md,
         // "Authentication"): without one the control surface does not listen
@@ -4010,6 +4016,55 @@ namespace WrathBench
         GuidHalves target, summonedBy, createdBy, charmedBy;
     };
 
+    // An item's random property (ITEM_FIELD_RANDOM_PROPERTIES_ID, PUBLIC):
+    // positive is an ItemRandomProperties.dbc row, negative the negated
+    // ItemRandomSuffix.dbc row. The client reads the name suffix ("of the
+    // Bear") off that row and, for a suffix, the per-slot allocation it
+    // scales the stat amounts by (allocation x ITEM_FIELD_PROPERTY_SEED /
+    // 10000 — the SDK's arithmetic, on fields the wire carried). Served
+    // beside the id the way skill<n>Name rides beside a skill id; the
+    // core's stores are the client's own files. A suffix always serves all
+    // five allocations so a re-rolled id overwrites every earlier one.
+    static void AppendRandomProperty(Json::Writer& f, int32 id)
+    {
+        f.Add("randomPropertyId", id);
+        if (id > 0)
+        {
+            if (ItemRandomPropertiesEntry const* r = sItemRandomPropertiesStore.LookupEntry(uint32(id)))
+                if (r->Name[0] && *r->Name[0])
+                    f.Add("suffixName", r->Name[0]);
+        }
+        else if (id < 0)
+        {
+            if (ItemRandomSuffixEntry const* r = sItemRandomSuffixStore.LookupEntry(uint32(-id)))
+            {
+                if (r->Name[0] && *r->Name[0])
+                    f.Add("suffixName", r->Name[0]);
+                for (size_t k = 0; k < r->AllocationPct.size(); ++k)
+                    f.Add("suffixAlloc" + std::to_string(k), r->AllocationPct[k]);
+            }
+        }
+    }
+
+    // One enchantment slot's SpellItemEnchantment.dbc row beside its id: the
+    // three effects (type, amount, arg — a stat id for type 5, a spell id
+    // for 1/3/7, a school for 4) and the enUS text the client draws the
+    // green line from (`$i` in it is the amount). All three effects are
+    // served, zeros included, so a changed id overwrites every earlier one.
+    static void AppendEnchantment(Json::Writer& f, std::string const& key, uint32 id)
+    {
+        SpellItemEnchantmentEntry const* e = sSpellItemEnchantmentStore.LookupEntry(id);
+        if (!e)
+            return;
+        for (uint32 i = 0; i < MAX_SPELL_ITEM_ENCHANTMENT_EFFECTS; ++i)
+        {
+            std::string ek = key + "Effect" + std::to_string(i);
+            f.Add(ek + "Type", e->type[i]).Add(ek + "Amount", e->amount[i]).Add(ek + "Arg", e->spellid[i]);
+        }
+        if (e->description[0] && *e->description[0])
+            f.Add(key + "Text", e->description[0]);
+    }
+
     static bool AppendNamedField(Json::Writer& f, uint8 typeId, uint32 index, uint32 v,
         PendingGuids& g, uint32* entryOut, uint32* petNumberOut)
     {
@@ -4152,6 +4207,30 @@ namespace WrathBench
             if (index == ITEM_FIELD_OWNER + 1)     { f.Add("ownerHi", v); return true; }
             if (index == ITEM_FIELD_CONTAINED)     { f.Add("containedLo", v); return true; }
             if (index == ITEM_FIELD_CONTAINED + 1) { f.Add("containedHi", v); return true; }
+            // The random property and its enchantments, PUBLIC fields every
+            // client in range receives: the signed property id (with the
+            // suffix name and allocations beside it), the suffix factor the
+            // core keeps in PROPERTY_SEED, and the twelve enchantment slots
+            // as id / duration / charges — a random property's enchants sit
+            // in slots 7-11, a permanent enchant in 0, a temporary one in 1,
+            // gems in 2-4. Raw per field, the quest-log idiom.
+            if (index == ITEM_FIELD_RANDOM_PROPERTIES_ID) { AppendRandomProperty(f, (int32)v); return true; }
+            if (index == ITEM_FIELD_PROPERTY_SEED)        { f.Add("propertySeed", v); return true; }
+            if (index >= ITEM_FIELD_ENCHANTMENT_1_1 && index < ITEM_FIELD_ENCHANTMENT_1_1 + 3 * MAX_ENCHANTMENT_SLOT)
+            {
+                uint32 rel = index - ITEM_FIELD_ENCHANTMENT_1_1;
+                std::string key = "enchant" + std::to_string(rel / 3);
+                switch (rel % 3)
+                {
+                    case 0:
+                        f.Add(key + "Id", v);
+                        if (v)
+                            AppendEnchantment(f, key, v);
+                        return true;
+                    case 1:  f.Add(key + "Duration", v); return true;
+                    default: f.Add(key + "Charges", v); return true;
+                }
+            }
             // Worn-bag contents: a container's slot guids as
             // lo/hi u32 halves keyed by bag slot 0-35, plus its slot count.
             // PUBLIC fields every client in range receives; same idiom as

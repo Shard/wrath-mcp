@@ -576,18 +576,11 @@ export interface QuestCompletion {
  * us yet is still a real observation — the slot is occupied — so it appears
  * with `itemId` and `name` undefined rather than being hidden.
  */
-export interface InventoryItem {
+export interface InventoryItem extends ItemInstance {
   readonly slot: number;
   readonly guid: GuidKey;
   readonly itemId: number | undefined;
-  readonly name: string | undefined;
   readonly stackCount: number | undefined;
-  /**
-   * Item quality (0 poor .. 5 legendary) from the item query, when answered —
-   * the same leg of the join `name` comes off, and the same field `bag()` rows
-   * already carry. Undefined while the query is outstanding, as `name` is.
-   */
-  readonly quality?: number | undefined;
   readonly seq: number;
   readonly ts: number;
 }
@@ -600,16 +593,84 @@ export interface InventoryItem {
  * `Player::GetItemByPos(bag, slot)` resolves behind `CMSG_USE_ITEM` and
  * `CMSG_DESTROYITEM`.
  */
-export interface BagSlotItem {
+export interface BagSlotItem extends ItemInstance {
   readonly bag: number;
   readonly slot: number;
   readonly guid: GuidKey;
   readonly itemId: number | undefined;
-  readonly name: string | undefined;
   readonly count: number | undefined;
+}
+
+/**
+ * What one carried or worn item shows that its template alone does not: the
+ * name as the client's bag draws it — the template name plus the random
+ * suffix ("Sentry's Leggings of the Bear") when the item rolled one — and
+ * the stat lines of the tooltip. `stats` is the template's list followed by
+ * the random property's stat enchants at the amounts the client computes
+ * (ITEM_FIELD_PROPERTY_SEED × the suffix's allocation / 10000, or the
+ * enchant row's own amount for a positive property), so an "of the Bear"
+ * whose template says `stats: []` reads `[{ type: 7, value: 5 }, { type:
+ * 4, value: 3 }]` here; `undefined` until the item query answered.
+ * `suffix` and `enchants` are present only on an item that carries a random
+ * property or an enchantment; `enchants` is the green lines in slot order
+ * ("+5 Stamina", "+3 Strength"), `$i` in the client's text replaced by the
+ * amount.
+ */
+export interface ItemInstance {
+  readonly name: string | undefined;
   /** Item quality (0 poor .. 5 legendary) from the item query, when answered. */
   readonly quality?: number | undefined;
+  readonly suffix?: string;
+  readonly stats?: readonly ItemStat[] | undefined;
+  readonly enchants?: readonly string[];
 }
+
+/**
+ * The client's reading of an item instance's random property and
+ * enchantment update fields (`randomPropertyId`, `propertySeed`, the
+ * `enchant<n>*` keys and the DBC rows the module serves beside them).
+ * Pure over the folded fields. `undefined` when the item has none.
+ */
+export function randomPropertyOf(item: Pick<NearbyObject, "fields" | "texts"> | undefined): { suffix: string | undefined; stats: ItemStat[]; enchants: string[] } | undefined {
+  if (item === undefined) return undefined;
+  const id = item.fields.get("randomPropertyId")?.value ?? 0;
+  const seed = item.fields.get("propertySeed")?.value ?? 0;
+  const suffix = id !== 0 ? item.texts.get("suffixName")?.value : undefined;
+  const stats: ItemStat[] = [];
+  const enchants: string[] = [];
+  for (let n = 0; n < ENCHANTMENT_SLOTS; n++) {
+    const enchantId = item.fields.get(`enchant${n}Id`)?.value ?? 0;
+    if (enchantId === 0) continue;
+    let firstAmount: number | undefined;
+    for (let i = 0; i < ENCHANTMENT_EFFECTS; i++) {
+      const type = item.fields.get(`enchant${n}Effect${i}Type`)?.value ?? 0;
+      if (type === 0) continue;
+      const arg = item.fields.get(`enchant${n}Effect${i}Arg`)?.value ?? 0;
+      let amount = item.fields.get(`enchant${n}Effect${i}Amount`)?.value ?? 0;
+      // A random suffix's enchants (slots 7-11) carry no amount of their own:
+      // the client scales the suffix's per-slot allocation by the seed.
+      if (id < 0 && n >= PROP_ENCHANTMENT_SLOT_0) {
+        const alloc = item.fields.get(`suffixAlloc${n - PROP_ENCHANTMENT_SLOT_0}`)?.value ?? 0;
+        amount = Math.floor((alloc * seed) / 10000);
+      }
+      if (firstAmount === undefined) firstAmount = amount;
+      if (type === ENCHANTMENT_TYPE_STAT) stats.push({ type: arg, value: amount });
+    }
+    const text = item.texts.get(`enchant${n}Text`)?.value;
+    if (text !== undefined) enchants.push(text.replace(/\$i/g, String(firstAmount ?? 0)));
+  }
+  if (suffix === undefined && stats.length === 0 && enchants.length === 0) return undefined;
+  return { suffix, stats, enchants };
+}
+
+/** `MAX_ENCHANTMENT_SLOT`: twelve enchantment slots per item. */
+const ENCHANTMENT_SLOTS = 12;
+/** `MAX_SPELL_ITEM_ENCHANTMENT_EFFECTS`: three effects per enchantment row. */
+const ENCHANTMENT_EFFECTS = 3;
+/** `PROP_ENCHANTMENT_SLOT_0`: the first of the five slots a random property fills. */
+const PROP_ENCHANTMENT_SLOT_0 = 7;
+/** `ITEM_ENCHANTMENT_TYPE_STAT`: the effect's arg is an `ItemModType`, its amount the stat value. */
+const ENCHANTMENT_TYPE_STAT = 5;
 
 /** One worn bag, by the equipment slot the item actions address it as. */
 export interface WornBag {
@@ -1032,6 +1093,12 @@ export interface NearbyObject extends UnitFieldsState {
    * u8; `questGiverStatusName` names it.
    */
   questGiver: Observed<number> | undefined;
+  /**
+   * The string update fields the module serves beside an id as client-cache
+   * knowledge (an item's `suffixName`, each `enchant<n>Text`); `fields`
+   * holds numbers only. Empty on everything but items.
+   */
+  texts: Map<string, Observed<string>>;
   /** Seq of the event that first put this object in view. */
   firstSeq: number;
   /** Seq of the most recent event that touched this object. */
@@ -1753,13 +1820,11 @@ export class StateCache {
       if (guid === "0") continue;
       const item = this.nearby.get(guid);
       const itemId = item?.entry?.value;
-      const info = itemId === undefined ? undefined : this.items.get(itemId)?.value;
       out.push({
         slot,
         guid,
         itemId,
-        name: info?.name,
-        quality: info?.quality,
+        ...this.itemInstance(item),
         stackCount: item?.fields.get("stackCount")?.value,
         seq: Math.max(lo?.seq ?? -1, hi?.seq ?? -1),
         ts: Math.max(lo?.ts ?? 0, hi?.ts ?? 0),
@@ -1814,16 +1879,36 @@ export class StateCache {
    */
   private bagRow(bag: number, slot: number, guid: GuidKey): BagSlotItem {
     const item = this.nearby.get(guid);
-    const itemId = item?.entry?.value;
-    const info = itemId === undefined ? undefined : this.items.get(itemId)?.value;
     return {
       bag,
       slot,
       guid,
-      itemId,
-      name: info?.name,
+      itemId: item?.entry?.value,
+      ...this.itemInstance(item),
       count: item?.fields.get("stackCount")?.value,
+    };
+  }
+
+  /**
+   * The instance half of a bag or equipment row: the template's name and
+   * quality joined through the item's entry, with the random property the
+   * item's own update fields carry laid over them — the suffix on the name,
+   * its stat enchants after the template's stats, the green lines as text
+   * (`ItemInstance`). An item without a random property reads exactly as the
+   * template does; `suffix`/`enchants` keys appear only when there is one.
+   */
+  private itemInstance(item: NearbyObject | undefined): ItemInstance {
+    const itemId = item?.entry?.value;
+    const info = itemId === undefined ? undefined : this.items.get(itemId)?.value;
+    const prop = randomPropertyOf(item);
+    const name = info?.name === undefined ? undefined : prop?.suffix === undefined ? info.name : `${info.name} ${prop.suffix}`;
+    const stats = info === undefined ? undefined : prop === undefined ? info.stats : [...(info.stats ?? []), ...prop.stats];
+    return {
+      name,
       quality: info?.quality,
+      ...(prop?.suffix === undefined ? {} : { suffix: prop.suffix }),
+      stats,
+      ...(prop === undefined || prop.enchants.length === 0 ? {} : { enchants: prop.enchants }),
     };
   }
 
@@ -3719,6 +3804,10 @@ export class StateCache {
           obj.ownerGuid = raw === "0" ? undefined : { value: raw, seq, ts };
         } else if (key === "charmedByGuid") {
           obj.charmedByGuid = raw === "0" ? undefined : { value: raw, seq, ts };
+        } else {
+          // An item's suffix name and enchant texts: the DBC strings the
+          // module serves beside the ids (PROTOCOL.md, "items and containers").
+          obj.texts.set(key, { value: raw, seq, ts });
         }
         continue;
       }
@@ -3886,6 +3975,7 @@ export class StateCache {
         transport: undefined,
         questGiver: undefined,
         fields: new Map<string, Observed<number>>(),
+        texts: new Map<string, Observed<string>>(),
         firstSeq: seq,
         lastSeq: seq,
       };

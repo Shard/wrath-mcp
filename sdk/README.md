@@ -375,6 +375,17 @@ fields and this is where they are folded.
   listeners, invSlot regexes and a full relog when it was already in the cache.
   One caveat: empty slots are zero fields the wire compresses away, so before
   our own create block arrives `freeSlots` reads 16.
+- A bag or equipment row is the instance, not just the template. An item that
+  rolled a random property carries it in its own update fields
+  (`randomPropertyId`, `propertySeed`, the `enchant<n>*` keys, with the DBC
+  rows the module serves beside them), and the row reads them the way the
+  client does: `name` is the template name plus the suffix ("… of the Bear"),
+  `stats` the template's stats followed by the suffix's at
+  `floor(allocation × seed / 10000)`, `enchants` the tooltip's green lines
+  with the amount filled in. A freeplay character once held "Sentry's
+  Leggings" for 17 hours because the template said `stats: []`; the stats
+  were the instance's. `randomPropertyOf(obj)` is the same reading over a raw
+  nearby object.
 - `pointOf(obj)` answers "where do I walk to reach it" from the freshest of the
   two independent sources: an oriented position (update blocks, `MSG_MOVE_*`)
   or `SMSG_MONSTER_MOVE`'s destination, which is what a player reads off a

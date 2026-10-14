@@ -545,6 +545,132 @@ export const itemQuery = {
   data: { itemId: ITEM_ENTRY, found: true, name: "Gritstone Charm", quality: 1, sellPrice: 40 },
 };
 
+// ---------------------------------------------- random item properties
+//
+// An item that rolled a random suffix, in backpack slot 24: the signed
+// property id, the suffix factor the core keeps in PROPERTY_SEED, the
+// suffix's allocations and the two stat enchants in prop slots 7-8, each
+// with the DBC row the module serves beside its id (PROTOCOL.md, "items and
+// containers"). Ids, names and texts are invented; the layout is the wire's.
+export const SUFFIX_ITEM_ENTRY = 55502;
+export const SUFFIX_ITEM_GUID_LO = 4322;
+export const SUFFIX_ITEM_GUID = ((BigInt(ITEM_GUID_HI) << 32n) | BigInt(SUFFIX_ITEM_GUID_LO)).toString();
+export const SUFFIX_SLOT = 24;
+export const SUFFIX_SEED = 9;
+
+export const suffixItemSlot = selfFields(60, {
+  [`invSlot${SUFFIX_SLOT}Lo`]: SUFFIX_ITEM_GUID_LO,
+  [`invSlot${SUFFIX_SLOT}Hi`]: ITEM_GUID_HI,
+});
+
+/** Stat enchant rows as the module lays them beside an id: all three effects, zeros included. */
+function statEnchant(slot: number, id: number, stat: number, amount: number, text: string): Record<string, number | string> {
+  return {
+    [`enchant${slot}Id`]: id,
+    [`enchant${slot}Effect0Type`]: 5,
+    [`enchant${slot}Effect0Amount`]: amount,
+    [`enchant${slot}Effect0Arg`]: stat,
+    [`enchant${slot}Effect1Type`]: 0,
+    [`enchant${slot}Effect1Amount`]: 0,
+    [`enchant${slot}Effect1Arg`]: 0,
+    [`enchant${slot}Effect2Type`]: 0,
+    [`enchant${slot}Effect2Amount`]: 0,
+    [`enchant${slot}Effect2Arg`]: 0,
+    [`enchant${slot}Text`]: text,
+  };
+}
+
+/** A suffix (negative id): allocations 10000 and 6666 over stats 7 and 4, amounts 0 in the rows. */
+export const suffixItemCreate = {
+  seq: 61,
+  opcode: "SMSG_UPDATE_OBJECT",
+  opcodeId: 0x0a9,
+  ts: 1_700_000_000_610,
+  data: {
+    blocks: 1,
+    objects: [
+      {
+        update: "create",
+        guid: SUFFIX_ITEM_GUID,
+        objectType: "item",
+        fields: {
+          entry: SUFFIX_ITEM_ENTRY,
+          stackCount: 1,
+          randomPropertyId: -77,
+          propertySeed: SUFFIX_SEED,
+          suffixName: "of the Badger",
+          suffixAlloc0: 10000,
+          suffixAlloc1: 6666,
+          suffixAlloc2: 0,
+          suffixAlloc3: 0,
+          suffixAlloc4: 0,
+          ...statEnchant(7, 7001, 7, 0, "+$i Grit"),
+          ...statEnchant(8, 7002, 4, 0, "+$i Vigor"),
+        },
+      },
+    ],
+  },
+};
+
+/** The same item as a positive property: the enchant row carries its own amount, nothing scales. */
+export const propertyItemCreate = {
+  ...suffixItemCreate,
+  data: {
+    blocks: 1,
+    objects: [
+      {
+        update: "create",
+        guid: SUFFIX_ITEM_GUID,
+        objectType: "item",
+        fields: {
+          entry: SUFFIX_ITEM_ENTRY,
+          stackCount: 1,
+          randomPropertyId: 9001,
+          suffixName: "of Vigor",
+          ...statEnchant(7, 7003, 4, 2, "+2 Vigor"),
+        },
+      },
+    ],
+  },
+};
+
+/** A later values delta on the item: the seed alone, as a re-send would carry it. */
+export const suffixSeedUpdate = {
+  seq: 63,
+  opcode: "SMSG_UPDATE_OBJECT",
+  opcodeId: 0x0a9,
+  ts: 1_700_000_000_630,
+  data: { blocks: 1, objects: [{ update: "values", guid: SUFFIX_ITEM_GUID, fields: { propertySeed: 18 } }] },
+};
+
+/** A temporary enchant (slot 1) that then expires: the id goes to 0 in a values delta. */
+export const tempEnchantApplied = {
+  seq: 64,
+  opcode: "SMSG_UPDATE_OBJECT",
+  opcodeId: 0x0a9,
+  ts: 1_700_000_000_640,
+  data: {
+    blocks: 1,
+    objects: [{ update: "values", guid: SUFFIX_ITEM_GUID, fields: { ...statEnchant(1, 7004, 7, 3, "+3 Grit"), enchant1Duration: 1800000 } }],
+  },
+};
+export const tempEnchantExpired = {
+  seq: 65,
+  opcode: "SMSG_UPDATE_OBJECT",
+  opcodeId: 0x0a9,
+  ts: 1_700_000_000_650,
+  data: { blocks: 1, objects: [{ update: "values", guid: SUFFIX_ITEM_GUID, fields: { enchant1Id: 0, enchant1Duration: 0 } }] },
+};
+
+/** The template: a name, a quality and one stat line of its own. */
+export const suffixItemQuery = {
+  seq: 62,
+  opcode: "SMSG_ITEM_QUERY_SINGLE_RESPONSE",
+  opcodeId: 0x058,
+  ts: 1_700_000_000_620,
+  data: { itemId: SUFFIX_ITEM_ENTRY, found: true, name: "Watchman's Leggings", quality: 2, stats: [{ type: 3, value: 1 }] },
+};
+
 /** Two aura slots on the creature. */
 export const auraUpdate = {
   seq: 39,
