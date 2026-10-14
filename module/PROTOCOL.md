@@ -325,10 +325,11 @@ during the fall, `MSG_MOVE_FALL_LAND` at the foot — so the server charges the
 fall through its own `Player::HandleFall`, as it would a client's. `force`
 does not apply to a step *up*: a client cannot walk up a ledge the mesh calls
 a climb, and such a route is refused as `drop` (positive `dz`) whatever the
-request says. The module never judges whether a fall is
-survivable: that is a game rule, and the SDK's `moveTo` applies it from the
-facts a `drop` carries (`dz`, `safeFall`) and the character's own health
-before deciding to re-issue with `force`.
+request says. Nor does it apply to a step whose foot lies under the ground
+(`drop` with `surfaceZ`): no client falls through terrain. The module never
+judges whether a fall is survivable: that is a game rule, and the SDK's
+`moveTo` applies it from the facts a `drop` carries (`dz`, `safeFall`) and
+the character's own health before deciding to re-issue with `force`.
 
 Success `200` (means "queued and pathing", not "arrived"):
 ```json
@@ -831,7 +832,7 @@ session's own identity). Their `opcodeId`s are outside the real opcode range.
 | opcode | id | `data` fields |
 |---|---|---|
 | `WB_MOVE_PROGRESS` | 0xFF02 | `{ "moveId": <number>, "pos": { "x","y","z","o" } }` — at most 1/s while moving |
-| `WB_MOVE_RESULT` | 0xFF01 | `{ "moveId": <number>, "status": <str>, "pos": { "x","y","z","o" }, "meshZ": <f?>, "reachedPos": { "x","y","z" }? }` — `meshZ` only on `arrived` when the mesh z differed from the request; `reachedPos` on `path_incomplete` and `drop`; `"dz": <f>, "target": { "x","y","z" }` only on `drop`, plus `"safeFall": <u32>` when the character's own fall-height reduction (`SPELL_AURA_SAFE_FALL`, the client's buff frame) is non-zero; `"nearest": { "x","y","z" } | null` only on `target_off_mesh` (the walkable mesh point nearest the request within 20y, or `null` when none is); `"onTransport": { "guid": <guid-string>, "entry": <u32> }` when the character ended the move aboard a transport |
+| `WB_MOVE_RESULT` | 0xFF01 | `{ "moveId": <number>, "status": <str>, "pos": { "x","y","z","o" }, "meshZ": <f?>, "reachedPos": { "x","y","z" }? }` — `meshZ` only on `arrived` when the mesh z differed from the request; `reachedPos` on `path_incomplete` and `drop`; `"dz": <f>, "target": { "x","y","z" }` only on `drop`, plus `"safeFall": <u32>` when the character's own fall-height reduction (`SPELL_AURA_SAFE_FALL`, the client's buff frame) is non-zero, and `"surfaceZ": <f>` only when the step's foot lies under the ground surface at its x,y (the step is then refused forced or not); `"nearest": { "x","y","z" } | null` only on `target_off_mesh` (the walkable mesh point nearest the request within 20y, or `null` when none is); `"onTransport": { "guid": <guid-string>, "entry": <u32> }` when the character ended the move aboard a transport |
 | `WB_RIDE_PROGRESS` | 0xFF05 | `{ "transportGuid": <guid-string>, "transportEntry": <u32>, "pos": { "x","y","z","o" } }` — at most 1/s while the character rides a transport and is not walking; the server-side position the transport carried it to |
 | `WB_TRANSPORT_PROGRESS` | 0xFF06 | `{ "guid": <guid-string>, "entry": <u32>, "pos": { "x","y","z","o" }, "progressMs": <u32>, "periodMs": <u32?>, "docked": <bool?> }` — at most 1/s per session, one per transport on the character's map whose create block the session has received: the car's current position on its `TransportAnimation.dbc` path (what a client animates locally from `pathProgress`), the clock and period, and `docked` when the keyframe segment the clock is on has no displacement (the car is dwelling at a platform; absent for transports without an animation path) |
 | `WB_AREATRIGGER` | 0xFF04 | `{ "triggerId": <u32>, "moveId": <number>, "pos": { "x","y","z","o" } }` — the mover entered an `AreaTrigger.dbc` volume and sent `CMSG_AREATRIGGER` for it (see below) |
@@ -848,7 +849,13 @@ at the top of this document.
   server-confirmed position. When the navmesh resolved the request to a ground
   z more than 1y from the requested z, the result also carries `meshZ` (the z
   actually walked to): the request's z was off, the mesh's z was used, and the
-  agent should quote `meshZ` next time.
+  agent should quote `meshZ` next time. A request whose z sits more than 2y
+  under the ground is one such case: the core's own path normalization keeps
+  a z it cannot see the ground from (it looks down from 2y above the point,
+  and from inside the terrain finds nothing, or a floor buried under the hill
+  — a tunnel roof 45y down, in Dun Algaz), so the module ends the walk at the
+  height of the polygon the path ends on instead, and the arrival carries that
+  as `meshZ`. The audit log records the lift as `op: "move_end_z"`.
 - `too_far` — destination beyond the single-move cap (~250yd straight-line);
   issue intermediate `move_to`s.
 - `no_mesh` — no navmesh tile is loaded under the character or under the
@@ -892,10 +899,16 @@ at the top of this document.
   of current health or more (a ghost takes no fall damage, so a corpse run is
   never refused). With `force` a downward route is walked and the fall is the
   server's. A step *up* (positive `dz`) is refused forced or not: no client
-  walks up a ledge. The same guard runs per segment while walking; a ledge
-  that slips past planning stops the character at the edge with the same
-  status and `pos` at the edge, or, on a forced downward one, is walked with
-  the client's fall packets.
+  walks up a ledge. A step whose foot lies under the ground is refused forced
+  or not as well, and carries `surfaceZ`: the first surface (terrain, vmap or
+  game-object floor — the geometry a client has) found looking down from the
+  edge's height at the foot's x,y, which the foot sits more than 1y below.
+  Such a foot is a z the request guessed and the mesh never resolved — a
+  point inside solid ground that no client can fall to — and the caller
+  should quote a z on the surface instead. The same guard runs per segment
+  while walking; a ledge that slips past planning stops the character at the
+  edge with the same status and `pos` at the edge, or, on a forced downward
+  one, is walked with the client's fall packets.
 - `transferred` — a map transfer took the character mid-move (an areatrigger
   portal, a cross-map port); the server applies the destination itself. `pos`
   is the last old-map position; the new map and arrival point follow on
@@ -1399,6 +1412,9 @@ edge heartbeat and the `MSG_MOVE_FALL_LAND` of a forced one), so the packet
 sequence the "client" sent is fully reconstructable from the audit log.
 A move whose start the mesh does not cover logs `op: "move_start_snap"` with
 `from` (the true position), `to` (the nearest mesh point) and `distance`.
+A move whose endpoint the core's normalization left under the ground logs
+`op: "move_end_z"` with `normZ` (the z the core settled on) and `meshZ` (the
+height of the polygon the path ends on, where the walk ends instead).
 Each `move_to` that reaches the mesh also logs one `op: "move_path"` record at
 dispatch — `moveId`, `status` (`"ok"` when the walk was dispatched, else the
 `WB_MOVE_RESULT` status), `pointCount`, and `points` (the resolved polyline,

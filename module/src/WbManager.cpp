@@ -1431,6 +1431,81 @@ namespace WrathBench
         return true;
     }
 
+    // The mesh's own height at (x, y): the polygon the core's path builder
+    // picks for that point (the same two-stage poly search as
+    // PathGenerator::GetPolyByLocation — a 3y x 5y box, then 3y x 50y; the
+    // core keeps its end polygon private, so this re-asks the query the way
+    // it did), then that polygon's detail height at (x, y) itself. False
+    // when the point lies beside the polygon rather than over it: Detour's
+    // nearest point is then on the boundary, up to 3y away, and its height
+    // is not the ground at (x, y) — lifting to it would hang the character in
+    // the air beside a cliff edge.
+    static bool MeshHeightAt(Player* player, float x, float y, float z, float* out)
+    {
+        dtNavMeshQuery const* query = player->GetMap()->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
+        if (!query)
+            return false;
+        dtQueryFilter filter;
+        filter.setIncludeFlags(NAV_GROUND | NAV_WATER | NAV_MAGMA);
+        filter.setExcludeFlags(0);
+        float point[3] = { y, z, x };
+        float closest[3] = { 0.0f, 0.0f, 0.0f };
+        for (float vertical : { 5.0f, 50.0f })
+        {
+            float extents[3] = { 3.0f, vertical, 3.0f };
+            dtPolyRef ref = 0;
+            if (dtStatusFailed(query->findNearestPoly(point, extents, &filter, &ref, closest)) || ref == 0)
+                continue;
+            float h = 0.0f;
+            if (dtStatusFailed(query->getPolyHeight(ref, point, &h)))
+                return false;
+            *out = h;
+            return true;
+        }
+        return false;
+    }
+
+    // The core's NormalizePath settles every path point onto the ground by
+    // asking Map::GetHeight from 2y above the point (Z_OFFSET_FIND_HEIGHT in
+    // Object.cpp). The last point keeps the z the request asked for, so a
+    // request more than 2y under the road looks down from inside the terrain:
+    // the terrain is behind it, and the first floor beneath is whatever lies
+    // buried there — nothing (the guessed z is kept, 4y deep) or a WMO roof
+    // under the hill (Dun Algaz: a tunnel roof 45y down). A client's click
+    // lands on the road either way. When the normalized endpoint sits more
+    // than END_SINK_MAX below its own polygon's height, the polygon height is
+    // the endpoint; the arrival then reports `meshZ` as any mesh-corrected
+    // z does. 2y: the same band the core's own normalization tolerates.
+    static constexpr float END_SINK_MAX = 2.0f;
+
+    // The ground a character stepping off `edge` lands on at the foot's x,y:
+    // the first surface Map::GetHeight finds looking down from just above
+    // the edge's height (terrain, vmap and game-object floors, the geometry
+    // a client has too). A foot more than FOOT_UNDER_SURFACE below it is
+    // inside solid ground — a z the request guessed and the mesh never
+    // resolved — and no client falls through terrain, so such a step is
+    // refused forced or not. Searching from the edge rather than from the
+    // foot is the point: the core's own look from 2y above the foot is what
+    // finds nothing (or a buried floor) when the foot is already under the
+    // surface. The look starts 1y over the edge: enough for the slope
+    // between the edge and a foot a step away (the terrain at the foot sat
+    // within 0.3y of the edge in every under-terrain landing of the run that
+    // earned this), and not enough to take a floor over the edge's head — a
+    // walkway's upper landing beside a 2.4y step down (Stormwind) — for the
+    // ground, which a character at the edge is already under.
+    static constexpr float FOOT_UNDER_SURFACE = 1.0f;
+    static constexpr float EDGE_LOOK_OFFSET = 1.0f;
+    static bool FootUnderSurface(Player* player, WbVec const& edge, WbVec const& foot, float* surfaceZ)
+    {
+        float top = edge.z + EDGE_LOOK_OFFSET;
+        float search = std::max(DEFAULT_HEIGHT_SEARCH, top - foot.z + FOOT_UNDER_SURFACE);
+        float s = player->GetMap()->GetHeight(player->GetPhaseMask(), foot.x, foot.y, top, true, search);
+        if (s <= INVALID_HEIGHT || foot.z >= s - FOOT_UNDER_SURFACE)
+            return false;
+        *surfaceZ = s;
+        return true;
+    }
+
     // How far from its own position the mover looks for walkable mesh when
     // the character stands off it (a graveyard tile the mesh misses, a wedge
     // after a fall, the air over a platform). 10y: a few yards past the 7y
@@ -1630,6 +1705,20 @@ namespace WrathBench
             r.status = "path_incomplete";
             return r;
         }
+        // The endpoint: the core's normalization keeps a requested z that
+        // sits under the terrain (see END_SINK_MAX). The polygon the path
+        // ends on knows the ground; when the normalized point is under it by
+        // more than the band, the polygon height is where the walk ends.
+        {
+            WbVec& end = r.points.back();
+            float polyZ = 0.0f;
+            if (MeshHeightAt(player, end.x, end.y, z, &polyZ) && end.z < polyZ - END_SINK_MAX)
+            {
+                r.hasEndLift = true;
+                r.endLiftFrom = end.z;
+                end.z = polyZ;
+            }
+        }
         if (r.hasSnap)
             r.points.insert(r.points.begin(), { player->GetPositionX(), player->GetPositionY(), player->GetPositionZ() });
         // Per-segment drop guard over the whole polyline (the main path and,
@@ -1639,17 +1728,26 @@ namespace WrathBench
         // to judge (TickMover sends the landing a client would). A step up is
         // refused whatever the request says — a client's character cannot
         // walk up a ledge the mesh calls a climb, and heartbeats that climb
-        // it are the server-side shortcut the contract forbids.
+        // it are the server-side shortcut the contract forbids. So is a step
+        // whose foot lies under the ground (FootUnderSurface): no client
+        // falls through terrain, and the foot is reported with the surface
+        // it is under so the caller does not ask again with force.
         for (size_t i = 0; i + 1 < r.points.size(); ++i)
         {
             float dz = 0.0f;
-            if (IsDropSegment(r.points[i], r.points[i + 1], &dz) && (!force || dz > 0.0f))
+            if (!IsDropSegment(r.points[i], r.points[i + 1], &dz))
+                continue;
+            float surfaceZ = 0.0f;
+            bool buried = dz < 0.0f && FootUnderSurface(player, r.points[i], r.points[i + 1], &surfaceZ);
+            if (!force || dz > 0.0f || buried)
             {
                 r.status = "drop";
                 r.hasReached = true;
                 r.reachedX = r.points[i].x; r.reachedY = r.points[i].y; r.reachedZ = r.points[i].z;
                 r.hasDrop = true;
                 r.dropDz = dz;
+                r.hasSurfaceZ = buried;
+                r.surfaceZ = surfaceZ;
                 return r;
             }
         }
@@ -1757,10 +1855,13 @@ namespace WrathBench
             w.Raw("reachedPos", Json::Writer().Add("x", (double)m.curX).Add("y", (double)m.curY).Add("z", (double)m.curZ).Str());
             w.Add("dz", (double)m.dropDz);
             w.Raw("target", Json::Writer().Add("x", (double)m.reqX).Add("y", (double)m.reqY).Add("z", (double)m.reqZ).Str());
+            if (m.hasSurfaceZ)
+                w.Add("surfaceZ", (double)m.surfaceZ);
             if (player)
                 AddSafeFall(w, player);
         }
         m.hasDrop = false;
+        m.hasSurfaceZ = false;
         EmitEvent(s, "WB_MOVE_RESULT", 0xFF01, w.Str());
     }
 
@@ -1877,6 +1978,9 @@ namespace WrathBench
                 if (usedGroundZ)
                     Audit(*s, "action", Json::Writer().Add("op", "move_ground_z").Add("moveId", moveId)
                         .Add("unitTarget", !guid.empty()).Add("z", (double)z).Add("groundZ", (double)groundZ).Str());
+                if (r.hasEndLift)
+                    Audit(*s, "action", Json::Writer().Add("op", "move_end_z").Add("moveId", moveId)
+                        .Add("normZ", (double)r.endLiftFrom).Add("meshZ", (double)r.points.back().z).Str());
                 if (r.hasSnap)
                     Audit(*s, "action", Json::Writer().Add("op", "move_start_snap").Add("moveId", moveId)
                         .Raw("from", PosJson(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation()))
@@ -1906,6 +2010,8 @@ namespace WrathBench
             {
                 w.Add("dz", (double)r.dropDz);
                 w.Raw("target", Json::Writer().Add("x", (double)x).Add("y", (double)y).Add("z", (double)z).Str());
+                if (r.hasSurfaceZ)
+                    w.Add("surfaceZ", (double)r.surfaceZ);
                 AddSafeFall(w, player);
             }
             if (r.nearestSearched)
@@ -1923,6 +2029,7 @@ namespace WrathBench
         m.hasMeshZ = r.hasMeshZ;
         m.reqX = x; m.reqY = y; m.reqZ = z;
         m.hasDrop = false;
+        m.hasSurfaceZ = false;
         m.force = force;
         m.inFall = false;
 
@@ -3053,13 +3160,17 @@ namespace WrathBench
             // during the fall, and the foot of the segment is reported with
             // MSG_MOVE_FALL_LAND, on which the server charges the fall
             // (Player::HandleFall) exactly as it would a client's. A climb is
-            // refused forced or not: no client walks up a ledge.
+            // refused forced or not: no client walks up a ledge. So is a
+            // step whose foot lies under the ground (FootUnderSurface): no
+            // client falls through terrain.
             if (m.segDone <= 0.0f)
             {
                 float dz = 0.0f;
                 if (IsDropSegment(a, b, &dz))
                 {
-                    if (!m.force || dz > 0.0f)
+                    float surfaceZ = 0.0f;
+                    bool buried = dz < 0.0f && FootUnderSurface(player, a, b, &surfaceZ);
+                    if (!m.force || dz > 0.0f || buried)
                     {
                         m.curX = a.x; m.curY = a.y; m.curZ = a.z;
                         SendMovePacket(s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, m.curX, m.curY, m.curZ, m.curO,
@@ -3069,6 +3180,8 @@ namespace WrathBench
                             .Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO)).Str());
                         m.hasDrop = true;
                         m.dropDz = dz;
+                        m.hasSurfaceZ = buried;
+                        m.surfaceZ = surfaceZ;
                         FinishMove(s, "drop");
                         return;
                     }

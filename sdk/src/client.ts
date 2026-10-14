@@ -841,7 +841,8 @@ export interface MoveToOptions {
    * it the ledge is walked whatever the estimate — the fall is then the
    * server's to charge, as it would a client's. It applies to drops only: a
    * step too steep to walk up is refused forced or not, since no client walks
-   * up a ledge.
+   * up a ledge, and so is a step that would land underground (`drop` with
+   * `surfaceZ`).
    */
   force?: boolean;
 }
@@ -933,6 +934,7 @@ export type MoveResult =
       readonly ts?: undefined;
       readonly reachedPos?: undefined;
       readonly dz?: undefined;
+      readonly surfaceZ?: undefined;
       readonly nearest?: undefined;
       /** Why the target resolved to nothing, and what to pass instead. */
       readonly hint: string;
@@ -958,6 +960,12 @@ export type MoveResult =
       readonly nearest?: Point3 | null;
       /** `drop` only: the signed vertical step the route would have taken at `reachedPos`. */
       readonly dz?: number;
+      /**
+       * `drop` only, when the step's foot lies under the ground at its x,y:
+       * the surface it is under. Refused forced or not; quote a z on the
+       * surface instead.
+       */
+      readonly surfaceZ?: number;
       /** What the status means and what to try next. See `MOVE_HINTS`. */
       readonly hint?: string;
     };
@@ -1007,6 +1015,7 @@ export const MOVE_HINTS: Readonly<Record<string, (point: MovePoint, data: MoveRe
   drop: (p, d) => {
     const edge = d.reachedPos ?? d.pos;
     if (d.dz !== undefined && d.dz > 0) return climbHint(d.dz, edge);
+    if (d.surfaceZ !== undefined) return buriedFootHint(p, d, d.surfaceZ);
     const n = d.dz === undefined ? "several" : Math.abs(d.dz).toFixed(1);
     return (
       `the route to (${fmtXY(p)}, z ${p.z.toFixed(1)}) steps off a ledge of ${n} yards at (${fmtXY(edge)}); ` +
@@ -1075,6 +1084,22 @@ function climbHint(dz: number, edge: { x: number; y: number }): string {
   );
 }
 
+/**
+ * A `drop` whose foot lies under the ground (`surfaceZ`): refused forced or
+ * not, since no client falls through terrain. The foot is a z the request
+ * guessed below the surface — the module's guard, not the fall estimate,
+ * is what stops it, and the recovery is a z on the surface, not force.
+ */
+function buriedFootHint(p: MovePoint, d: MoveResultData, surfaceZ: number): string {
+  const edge = d.reachedPos ?? d.pos;
+  const foot = edge.z + (d.dz ?? 0);
+  return (
+    `stopped at the edge (${fmtXY(edge)}): the drop ahead lands at z ${foot.toFixed(1)}, underground (the ground ` +
+    `here is z ${surfaceZ.toFixed(1)}). Your target z ${p.z.toFixed(1)} is below the ground — retry with a z on ` +
+    `the surface. force does not apply.`
+  );
+}
+
 export function judgeDrop(state: StateCache, d: MoveResultData): DropJudgement {
   const edge = d.reachedPos ?? d.pos;
   const dz = d.dz ?? 0;
@@ -1082,6 +1107,9 @@ export function judgeDrop(state: StateCache, d: MoveResultData): DropJudgement {
   const where = `(${fmtXY(edge)})`;
   if (height <= 0) {
     return { take: false, height, note: climbHint(dz, edge) };
+  }
+  if (d.surfaceZ !== undefined) {
+    return { take: false, height, note: buriedFootHint(d.target ?? d.pos, d, d.surfaceZ) };
   }
   const h = height.toFixed(1);
   if (state.self.ghost?.value === true) {
@@ -1117,6 +1145,7 @@ export function judgeDrop(state: StateCache, d: MoveResultData): DropJudgement {
 export function dropRefusalHint(p: MovePoint, d: MoveResultData, j: DropJudgement): string {
   const edge = d.reachedPos ?? d.pos;
   if (j.height <= 0) return j.note;
+  if (d.surfaceZ !== undefined) return buriedFootHint(p, d, d.surfaceZ);
   return (
     `the route to (${fmtXY(p)}, z ${p.z.toFixed(1)}) steps off a ledge of ${j.height.toFixed(1)} yards at ` +
     `(${fmtXY(edge)}); ${j.note}, so the character stopped at the edge. Pass { force: true } to moveTo to take ` +
@@ -1227,11 +1256,16 @@ function samePointish(a: Point3, b: Point3): boolean {
 
 /**
  * What an `arrived` with `meshZ` means. Within 3y the mesh corrected a stale
- * z and the agent should quote the mesh's value. Beyond that the module's
- * drop guard should have refused the walk, so the honest reading is that the
- * character ended a level away from where it asked to go — not that its z
- * was wrong (nav-probe c4, map 369: the old one-shape hint told an agent to
- * "quote z -6.9 next time" after the mesh walked it 7.6y down a ledge).
+ * z and the agent should quote the mesh's value. Further *above* the request
+ * it is the same correction at a larger scale: the z asked for was under the
+ * ground, the core's own normalization could not see the surface from there,
+ * and the module ended the walk at the mesh's height instead (PROTOCOL.md,
+ * `arrived`) — the character stands at the requested x,y, on the ground.
+ * Further *below* the request the module's drop guard should have refused
+ * the walk, so the honest reading is that the character ended a level away
+ * from where it asked to go — not that its z was wrong (nav-probe c4, map
+ * 369: the old one-shape hint told an agent to "quote z -6.9 next time"
+ * after the mesh walked it 7.6y down a ledge).
  */
 export const MESH_Z_QUOTE_BAND = 3;
 export function meshZHint(point: { x: number; y: number; z: number }, meshZ: number): string {
@@ -1240,9 +1274,14 @@ export function meshZHint(point: { x: number; y: number; z: number }, meshZ: num
   if (Math.abs(dz) <= MESH_Z_QUOTE_BAND) {
     return `${head} The mesh owns z; quote ${meshZ.toFixed(1)} for this spot next time.`;
   }
-  const dir = dz < 0 ? "below" : "above";
+  if (dz > 0) {
+    return (
+      `arrived on the ground at (${fmtXY(point)}, z ${meshZ.toFixed(1)}); the requested z ${point.z.toFixed(1)} ` +
+      `was ${dz.toFixed(1)} yards underground.`
+    );
+  }
   return (
-    `${head} The character ended ${Math.abs(dz).toFixed(1)} yards ${dir} the requested point — a different ` +
+    `${head} The character ended ${Math.abs(dz).toFixed(1)} yards below the requested point — a different ` +
     `level, not a stale z: the z passed to moveTo is not what put it there. Check state.self.position before ` +
     `the next move; if this is the wrong level, find the ramp/stairs rather than re-quoting a z.`
   );
@@ -5139,6 +5178,7 @@ export class WrathClient {
       ...common,
       ...(reachedPos !== undefined ? { reachedPos } : {}),
       ...(data.dz !== undefined ? { dz: data.dz } : {}),
+      ...(data.surfaceZ !== undefined ? { surfaceZ: data.surfaceZ } : {}),
       ...(nearest !== undefined ? { nearest } : {}),
       ...(hint !== undefined ? { hint } : {}),
     };

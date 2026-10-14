@@ -122,6 +122,8 @@ namespace WrathBench
         float reqX{0}, reqY{0}, reqZ{0}; // the point the agent asked for (echoed on `drop`)
         bool hasDrop{false};        // TickMover found a ledge in the polyline: FinishMove says `drop`
         float dropDz{0};
+        bool hasSurfaceZ{false};    // ... and the ledge's foot lies under the ground there (refused forced or not)
+        float surfaceZ{0};
         bool force{false};          // request said force: ledges are walked (and fallen off), not refused
         bool inFall{false};         // walking a forced downward ledge: MSG_MOVE_FALL_LAND is owed at its foot
     };
@@ -336,6 +338,10 @@ namespace WrathBench
             float reachedX{0}, reachedY{0}, reachedZ{0};
             bool hasDrop{false};        // drop: the vertical step the polyline takes past reachedPos
             float dropDz{0};
+            bool hasSurfaceZ{false};    // drop: the step's foot lies under the ground surface at its x,y (surfaceZ)
+            float surfaceZ{0};
+            bool hasEndLift{false};     // the endpoint's normalized z sat under its mesh polygon and was lifted to it
+            float endLiftFrom{0};       // ... from this z (audit only)
             bool hasSnap{false};        // the start was off the mesh and was snapped to the nearest point
             float snapX{0}, snapY{0}, snapZ{0};
             bool nearestSearched{false}; // target_off_mesh: the bounded search for mesh near the target ran

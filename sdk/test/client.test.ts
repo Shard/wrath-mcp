@@ -1008,6 +1008,71 @@ describe("client: movement", () => {
       await stub.stop();
     });
 
+    test("a step whose foot lies under the ground is never taken: no re-issue, no force offered, and the hint names the surface", async () => {
+      // The Dun Algaz road: a request 4y under the surface, whose foot the
+      // core's normalization snapped to a tunnel roof 45y down. The module
+      // refuses it with `surfaceZ`; the SDK's judgement is not a fall estimate
+      // (395 damage against 693 health would have taken it) but the ground.
+      const buried = (moveId: number, seq: number): unknown => {
+        const ev = moveResult("drop", moveId, seq) as { data: Record<string, unknown> };
+        ev.data.reachedPos = { x: -4090.4, y: -2460.0, z: 153.9 };
+        ev.data.dz = -45.08;
+        ev.data.target = { x: -4090, y: -2460, z: 150 };
+        ev.data.surfaceZ = 154.04;
+        return ev;
+      };
+      // Wording approved by the operator, 2026-10-14.
+      const expected =
+        "stopped at the edge (-4090.4, -2460.0): the drop ahead lands at z 108.8, underground (the ground here is " +
+        "z 154.0). Your target z 150.0 is below the ground — retry with a z on the surface. force does not apply.";
+      const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate]) });
+      const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+      await client.createSession({ character: "Fenwick" });
+      const p = client.moveTo({ x: -4090, y: -2460, z: 150 }, { timeout: 2000 });
+      stub.push(JSON.stringify(buried(1, 30)));
+      const r = await p;
+      expect(r.ok).toBe(false);
+      if (r.ok) throw new Error("unreachable");
+      expect(r.status).toBe("drop");
+      expect(r.dz).toBe(-45.08);
+      expect(r.surfaceZ).toBe(154.04);
+      expect(r.reachedPos).toEqual({ x: -4090.4, y: -2460.0, z: 153.9 });
+      expect(r.hint).toContain(expected);
+      expect(r.hint).not.toContain("force: true");
+      // One request, then the stop the module left unsent — never a forced re-issue.
+      expect(stub.actions.map((a) => a.action)).toEqual(["move_to", "stop"]);
+      // Forced (a fresh point, past the rejection memo): the module refuses
+      // the same way, and the hint is the same.
+      const p2 = client.moveTo({ x: -4091, y: -2460, z: 150 }, { timeout: 2000, force: true });
+      stub.push(JSON.stringify(buried(2, 31)));
+      const r2 = await p2;
+      expect(r2.ok).toBe(false);
+      if (r2.ok) throw new Error("unreachable");
+      expect(r2.status).toBe("drop");
+      expect(r2.surfaceZ).toBe(154.04);
+      expect(r2.hint).toContain(expected);
+      expect(r2.hint).not.toContain("force: true");
+      expect(stub.actions.filter((a) => a.action === "move_to")).toHaveLength(2);
+      client.close();
+      await stub.stop();
+    });
+
+    test("a ghost does not take a step whose foot lies under the ground", async () => {
+      const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate, ghostFlag(18)]) });
+      const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+      await client.createSession({ character: "Fenwick" });
+      const p = client.moveTo({ x: 10, y: 20, z: -3.5 }, { timeout: 2000 });
+      stub.push(JSON.stringify(dropAt(1, 30, -4.2, { surfaceZ: 0.6 })));
+      const r = await p;
+      expect(r.ok).toBe(false);
+      if (r.ok) throw new Error("unreachable");
+      expect(r.status).toBe("drop");
+      expect(r.hint).toContain("the drop ahead lands at z -3.5, underground (the ground here is z 0.6)");
+      expect(stub.actions.map((a) => a.action)).toEqual(["move_to", "stop"]);
+      client.close();
+      await stub.stop();
+    });
+
     test("force on moveTo and moveToAsync rides the request, and a forced drop verdict is not re-issued", async () => {
       const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate]) });
       const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
@@ -1040,7 +1105,12 @@ describe("client: movement", () => {
     expect(far).toContain("ended 7.6 yards below the requested point");
     expect(far).toContain("not what put it there");
     expect(far).not.toContain("quote");
-    expect(meshZHint({ x: 1, y: 2, z: 0 }, 5)).toContain("5.0 yards above");
+    // Above the request by more than the band: the z asked for was under the
+    // ground and the module ended the walk on it (the Dun Algaz road, z 150
+    // asked for under a surface at 154.2) — a stale z to quote, not a level.
+    // Wording approved by the operator, 2026-10-14.
+    const lifted = meshZHint({ x: -4090, y: -2460, z: 150 }, 154.2);
+    expect(lifted).toBe("arrived on the ground at (-4090.0, -2460.0, z 154.2); the requested z 150.0 was 4.2 yards underground.");
   });
 
   test("arrived with meshZ says which z the mesh used; a plain arrived carries neither", async () => {

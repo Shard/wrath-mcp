@@ -766,6 +766,12 @@ export const moveResultDataSchema = z.looseObject({
   /** `drop` only, when non-zero: the character's own fall-height reduction (Safe Fall), in yards. */
   safeFall: z.number().optional(),
   /**
+   * `drop` only, when the step's foot lies under the ground at its x,y: the
+   * surface it is under. Such a step is refused forced or not (no client falls
+   * through terrain); the z asked for was a guess below the surface.
+   */
+  surfaceZ: z.number().optional(),
+  /**
    * `target_off_mesh` only: the walkable mesh point nearest the request within
    * 20y, or `null` when none is. Absent from a module that predates it.
    */
