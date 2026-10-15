@@ -1101,7 +1101,7 @@ Loot, vendor, inventory:
 
 | opcode | id | `data` fields |
 |---|---|---|
-| `SMSG_LOOT_RESPONSE` | 0x160 | `{ "guid", "lootType": <u8>, "gold", "items": [{ "slot", "itemId", "count", "slotType": <u8> }] }` (slotType 0 = free to loot) |
+| `SMSG_LOOT_RESPONSE` | 0x160 | `{ "guid", "lootType": <u8>, "gold", "items": [{ "slot", "itemId", "count", "slotType": <u8> }] }` (slotType 0 = free to loot). The refusal form, `Player::SendLootError`, is the same opcode with `lootType` 0 (`LOOT_NONE`) and a one-byte `LootError` in place of gold and items: `{ "guid", "lootType": 0, "error": <u8> }` — 0 didn't kill / not yours, 4 too far, 5 bad facing, 6 someone else is looting it, 8 not standing, 9 stunned, 10 player not found, 11 play time exceeded, 12–14 master-loot assignment refused (bags full, unique item, other), 15 already pickpocketed, 16 shapeshifted. No window opens and no release follows; a pending `loot_all` replay is dropped |
 | `SMSG_LOOT_REMOVED` | 0x162 | `{ "slot" }` |
 | `SMSG_LOOT_MONEY_NOTIFY` | 0x163 | `{ "money" }` (copper) |
 | `SMSG_LOOT_CLEAR_MONEY` | 0x165 | `{}` |

@@ -1144,13 +1144,55 @@ export const lootItemSchema = z.looseObject({
 });
 export type LootItemData = z.infer<typeof lootItemSchema>;
 
-export const lootResponseDataSchema = z.looseObject({
+export const lootWindowDataSchema = z.looseObject({
   guid: guidSchema,
   lootType: z.number(),
   gold: z.number(),
   items: z.array(lootItemSchema),
 });
+export type LootWindowData = z.infer<typeof lootWindowDataSchema>;
+
+/**
+ * The refusal form of `SMSG_LOOT_RESPONSE` (`Player::SendLootError`): the
+ * same opcode with `lootType` 0 and a `LootError` code in place of gold and
+ * items. No window opens and no release follows (module/PROTOCOL.md).
+ */
+export const lootErrorDataSchema = z.looseObject({
+  guid: guidSchema,
+  lootType: z.number(),
+  error: z.number(),
+});
+export type LootErrorData = z.infer<typeof lootErrorDataSchema>;
+
+export const lootResponseDataSchema = z.union([lootWindowDataSchema, lootErrorDataSchema]);
 export type LootResponseData = z.infer<typeof lootResponseDataSchema>;
+
+/** True for the refusal form of `SMSG_LOOT_RESPONSE`. */
+export function isLootError(data: LootResponseData): data is LootErrorData {
+  return typeof (data as { error?: unknown }).error === "number";
+}
+
+/** `LootError` (LootMgr.h) by code; what a client's error line would say. */
+export const LOOT_ERROR_NAMES = {
+  0: "didnt_kill",
+  4: "too_far",
+  5: "bad_facing",
+  6: "locked",
+  8: "not_standing",
+  9: "stunned",
+  10: "player_not_found",
+  11: "play_time_exceeded",
+  12: "master_inv_full",
+  13: "master_unique_item",
+  14: "master_other",
+  15: "already_pickpocketed",
+  16: "not_while_shapeshifted",
+} as const satisfies Record<number, string>;
+export type LootErrorName = (typeof LOOT_ERROR_NAMES)[keyof typeof LOOT_ERROR_NAMES] | "unknown";
+
+export function lootErrorName(code: number): LootErrorName {
+  return (LOOT_ERROR_NAMES as Record<number, LootErrorName | undefined>)[code] ?? "unknown";
+}
 
 export const lootRemovedDataSchema = z.looseObject({ slot: z.number() });
 export type LootRemovedData = z.infer<typeof lootRemovedDataSchema>;

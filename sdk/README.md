@@ -123,8 +123,14 @@ pushes are the receipt — a possible no-op is never reported as success). A
 corpse with nothing on it releases without ever opening a window, which is
 `{ ok: false, status: "empty" }`: an answer, not a failure.
 A window that showed items of which not one entered a bag — bags full, or a
-broken store path — is `{ ok: false, status: "none_stored" }`. Silence still
-throws `EventTimeoutError`.
+broken store path — is `{ ok: false, status: "none_stored" }`. A loot the
+server refuses — too far away, not ours to loot, someone else already on it —
+is answered with `SMSG_LOOT_RESPONSE` in its error form (`lootType` 0 and a
+`LootError` code; `module/PROTOCOL.md`) rather than a window, and no release
+follows: that is `{ ok: false, status: "refused", reason, error, hint }` at
+once, with `error` the code's name (`too_far`, `didnt_kill`, `locked`, …;
+`LOOT_ERROR_NAMES`) and nothing left open. Silence still throws
+`EventTimeoutError`.
 
 `questsAvailableFrom` is that same send-and-wait with none of the accepting:
 it returns whatever the NPC offers right now, `{ ok: true, quests: [...] }`,

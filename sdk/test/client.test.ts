@@ -79,6 +79,7 @@ import {
   wornBagQuery,
   wornBagSlot,
   CHEST_GUID,
+  lootError,
   castFailed,
   chestCreate,
   chestLootResponse,
@@ -2211,6 +2212,59 @@ describe("client: lootCorpse", () => {
     await expect(client.lootCorpse(CREATURE_GUID, { timeout: 40 })).rejects.toBeInstanceOf(
       EventTimeoutError,
     );
+    client.close();
+    await stub.stop();
+  });
+
+  test("a loot the server refuses settles at once with the reason, not a timeout", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    // A long timeout: the refusal, not the clock, must end the wait.
+    const pending = client.lootCorpse(CREATURE_GUID, { timeout: 60_000 });
+    await untilAction(stub, "loot_all");
+    const sent = Date.now();
+    stub.push(JSON.stringify(lootError(70, 4))); // LOOT_ERROR_TOO_FAR
+    const loot = await pending;
+    expect(Date.now() - sent).toBeLessThan(5_000);
+    expect(loot).toEqual({
+      ok: false,
+      status: "refused",
+      gold: 0,
+      items: [],
+      reason: 4,
+      error: "too_far",
+      hint: "loot refused: too far away; move within reach of the corpse and retry",
+    });
+    // No release was waited on or sent: the server opened nothing.
+    expect(stub.actions.map((a) => a.action)).not.toContain("loot_release");
+    expect(client.state.lastLoot()).toBeUndefined();
+    client.close();
+    await stub.stop();
+  });
+
+  test("a refusal code the SDK does not name is still a refusal", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const pending = client.lootCorpse(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "loot_all");
+    stub.push(JSON.stringify(lootError(70, 99)));
+    const loot = await pending;
+    expect(loot).toMatchObject({ ok: false, status: "refused", reason: 99, error: "unknown" });
+    client.close();
+    await stub.stop();
+  });
+
+  test("a chest whose loot the server refuses after the cast is refused too", async () => {
+    const stub = startStub({ onConnect: () => chestWorld() });
+    const client = await inWorld(stub);
+    await client.waitForNearby((o) => o.guid === CHEST_GUID, { timeout: 2000 });
+    const pending = client.lootCorpse(CHEST_GUID, { timeout: 2000 });
+    await untilAction(stub, "cast_spell");
+    stub.push(JSON.stringify(lootError(70, 0, CHEST_GUID))); // LOOT_ERROR_DIDNT_KILL
+    const loot = await pending;
+    expect(loot).toMatchObject({ ok: false, status: "refused", reason: 0, error: "didnt_kill" });
+    // The client's store/money/release sequence is for a window; none opened.
+    expect(stub.actions.map((a) => a.action)).not.toContain("loot_release");
     client.close();
     await stub.stop();
   });

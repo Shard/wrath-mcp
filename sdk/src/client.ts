@@ -64,6 +64,10 @@ import {
   type KnownMoveStatus,
   type LootItemData,
   type LootResponseData,
+  type LootErrorName,
+  type LootWindowData,
+  isLootError,
+  lootErrorName,
   type LootRollData,
   type ReadItemData,
   type PageTextQueryResponseData,
@@ -1729,6 +1733,27 @@ export interface StoredLootItem {
 }
 
 /**
+ * What a client's error line says for each `LootError`, as the hint of a
+ * `refused` loot. Short and concrete: the code names the one thing to change.
+ */
+const LOOT_REFUSED_HINTS: Record<LootErrorName, string> = {
+  didnt_kill: "loot refused: not yours to loot; it was tagged by someone else or has already been looted",
+  too_far: "loot refused: too far away; move within reach of the corpse and retry",
+  bad_facing: "loot refused: not facing it; face the corpse and retry",
+  locked: "loot refused: someone else is looting it; wait and retry",
+  not_standing: "loot refused: stand up first",
+  stunned: "loot refused: stunned; wait for it to wear off",
+  player_not_found: "loot refused: that player was not found",
+  play_time_exceeded: "loot refused: play-time limit reached",
+  master_inv_full: "loot refused: that player's bags are full",
+  master_unique_item: "loot refused: that player already has too many of that item",
+  master_other: "loot refused: that item cannot be given to that player",
+  already_pickpocketed: "loot refused: its pockets were already picked",
+  not_while_shapeshifted: "loot refused: not while shapeshifted; cancel the form and retry",
+  unknown: "loot refused: the server sent a LootError code this SDK does not name",
+};
+
+/**
  * What a corpse actually gave up. `items` are the pushes the server confirmed
  * with `SMSG_ITEM_PUSH_RESULT` — reporting the loot *window* contents as a
  * success would call a possible no-op "looted", which is exactly the silent
@@ -1740,6 +1765,10 @@ export interface StoredLootItem {
  * - `none_stored`: the window showed items but not one entered the bag
  *   (bags full, or the items were not ours to take); `window` says what was
  *   shown.
+ * - `refused`: the server answered with the refusal form of
+ *   `SMSG_LOOT_RESPONSE` instead of a window — too far, not ours to loot,
+ *   someone else looting it, and so on (`LOOT_ERROR_NAMES`). Nothing opened,
+ *   so nothing is left to release.
  */
 export type LootResult =
   | {
@@ -1767,6 +1796,18 @@ export type LootResult =
       readonly gold: number;
       readonly items: readonly [];
       readonly window: readonly LootItemData[];
+    }
+  | {
+      /** The server refused to open a window: `SMSG_LOOT_RESPONSE` in its error form. */
+      readonly ok: false;
+      readonly status: "refused";
+      readonly gold: 0;
+      readonly items: readonly [];
+      /** `LootError` code as the server sent it. */
+      readonly reason: number;
+      /** The code's name: `too_far`, `didnt_kill`, `locked`, … (`LOOT_ERROR_NAMES`). */
+      readonly error: LootErrorName;
+      readonly hint: string;
     };
 
 export interface QuestOptions {
@@ -5842,6 +5883,12 @@ export class WrathClient {
    * `{ ok: false, status: "not_opened", reason, hint }`. Seen in two runs
    * (opus-low a11/a12, sonnet-low a2, Coldridge Valley, 2026-08-29) as an
    * `interact` that acked and a `lootCorpse` that timed out.
+   *
+   * A loot the server refuses — too far, not ours, someone else on it — is
+   * answered with `SMSG_LOOT_RESPONSE` in its error form, not a window, and
+   * no release ever follows; that settles at once as
+   * `{ ok: false, status: "refused", reason, error, hint }` for a corpse and
+   * a chest alike.
    */
   async lootCorpse(target: GuidOrUnit, options: LootOptions = {}): Promise<WithResolved<LootResult>> {
     return this.byName(target, "lootCorpse(guid)", async (id) => {
@@ -5888,7 +5935,23 @@ export class WrathClient {
         if (first.opcode === "SMSG_LOOT_RELEASE_RESPONSE") {
           return { ok: false, status: "empty", gold: 0, items: [] };
         }
-        const window = first.data as LootResponseData;
+        const response = first.data as LootResponseData;
+        if (isLootError(response)) {
+          // The refusal form: no window opened and no release will follow, so
+          // waiting on would only time out (gemini-4-argon e90, turns 115–119:
+          // five turns chasing a "stuck" window the server had refused).
+          const error = lootErrorName(response.error);
+          return {
+            ok: false,
+            status: "refused",
+            gold: 0,
+            items: [],
+            reason: response.error,
+            error,
+            hint: LOOT_REFUSED_HINTS[error],
+          };
+        }
+        const window: LootWindowData = response;
         // What the replay will try to store: slots free to loot (0, ALLOW_LOOT)
         // or owned outright (4, OWNER — every slot of a solo loot). Group-only
         // slot types are shown but never auto-stored.

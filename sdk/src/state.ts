@@ -35,6 +35,7 @@
 import {
   formatGuid,
   isDecodeError,
+  isLootError,
   isMoveOpcode,
   type AuraData,
   type AuraUpdateData,
@@ -3320,6 +3321,9 @@ export class StateCache {
       }
       case "SMSG_LOOT_RESPONSE": {
         const d = event.data as LootResponseData;
+        // The refusal form opens nothing: a client shows an error line and
+        // keeps whatever frame it had.
+        if (isLootError(d)) return;
         this.lootWin = {
           guid: d.guid,
           lootType: d.lootType,

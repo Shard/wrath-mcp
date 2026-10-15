@@ -883,6 +883,21 @@ export function inventorySlotMove(seq: number, from: number, to: number): unknow
 }
 
 /** `slotType` defaults to 4 (LOOT_SLOT_TYPE_OWNER): what every solo loot carries. */
+/**
+ * The refusal form of `SMSG_LOOT_RESPONSE` (`Player::SendLootError`): the
+ * same opcode, `lootType` 0 and a `LootError` code in place of gold and items.
+ * 4 is LOOT_ERROR_TOO_FAR; 0 is LOOT_ERROR_DIDNT_KILL.
+ */
+export function lootError(seq = 50, error = 4, guid: string = CREATURE_GUID): unknown {
+  return {
+    seq,
+    opcode: "SMSG_LOOT_RESPONSE",
+    opcodeId: 0x160,
+    ts: 1_700_000_000_500,
+    data: { guid, lootType: 0, error },
+  };
+}
+
 export function lootResponse(seq = 50, slotType = 4): unknown {
   return {
     seq,

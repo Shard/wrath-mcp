@@ -6088,6 +6088,22 @@ namespace WrathBench
                     name = "SMSG_LOOT_RESPONSE";
                     uint64 guid; p >> guid;
                     uint8 lootType; p >> lootType;
+                    // The refusal form (Player::SendLootError): guid, LOOT_NONE,
+                    // one LootError byte — 10 bytes, no gold and no item list.
+                    // The window form below is at least 14. Reading it as a
+                    // window ran off the end and served {"decodeError":true},
+                    // so the SDK waited for a window the server had refused.
+                    if (lootType == LOOT_NONE && p.size() - p.rpos() == 1)
+                    {
+                        uint8 error; p >> error;
+                        w.AddGuid("guid", (uint64_t)guid).Add("lootType", (uint32)lootType)
+                         .Add("error", (uint32)error);
+                        // A refused loot_all has nothing to replay; drop the
+                        // pending flag so a later window is not auto-emptied.
+                        std::lock_guard<std::mutex> lock(s.objMutex);
+                        s.autoLootPending = false;
+                        break;
+                    }
                     uint32 gold; p >> gold;
                     uint8 count; p >> count;
                     std::vector<uint8_t> slots;

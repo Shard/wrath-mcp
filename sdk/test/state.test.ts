@@ -1676,6 +1676,21 @@ describe("state cache: vendor, trainer and loot windows", () => {
     expect(c.lastTrainerList("3003")).toBeDefined();
   });
 
+  test("the refusal form of SMSG_LOOT_RESPONSE opens no window and closes none", () => {
+    const refusal = (guid: string, seq: number) => ({
+      seq,
+      opcode: "SMSG_LOOT_RESPONSE",
+      opcodeId: 0x160,
+      ts: ts(seq),
+      data: { guid, lootType: 0, error: 4 },
+    });
+    expect(withWorld([refusal("4001", 70)]).lastLoot()).toBeUndefined();
+    // A refusal for another corpse leaves the open window alone.
+    const open = withWorld([lootResponse("4001", 70), refusal("4002", 71)]);
+    expect(open.lastLoot()?.guid).toBe("4001");
+    expect(open.lastLoot()?.seq).toBe(70);
+  });
+
   test("a loot window opens, loses taken slots and taken gold, and closes on its release", () => {
     const open = withWorld([lootResponse("4001", 70)]);
     expect(open.lastLoot()?.gold).toBe(42);

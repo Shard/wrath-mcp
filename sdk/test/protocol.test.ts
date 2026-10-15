@@ -11,10 +11,13 @@ import {
   isDecodeError,
   isEvent,
   isKnownOpcode,
+  isLootError,
   isMoveOpcode,
   KNOWN_OPCODES,
+  lootErrorName,
   MOVE_OPCODES,
   moveToResponseSchema,
+  type LootResponseData,
   parseEventFrame,
   sessionResponseSchema,
   spellCastResultName,
@@ -309,6 +312,24 @@ describe("event frames", () => {
     const result = parseEventFrame(JSON.stringify(undecodableChat));
     if (!result.ok) throw new Error("frame should still parse");
     expect(isDecodeError(result.event.data)).toBe(true);
+  });
+
+  test("both forms of SMSG_LOOT_RESPONSE parse: the window and the refusal", () => {
+    const frame = (data: unknown) =>
+      parseEventFrame(JSON.stringify({ seq: 9, opcode: "SMSG_LOOT_RESPONSE", opcodeId: 0x160, ts: 1, data }));
+    const window = frame({ guid: "42", lootType: 1, gold: 5, items: [] });
+    expect(window.ok).toBe(true);
+    if (!window.ok) return;
+    expect((window.event as { schemaError?: string }).schemaError).toBeUndefined();
+    expect(isLootError(window.event.data as LootResponseData)).toBe(false);
+    const refusal = frame({ guid: "42", lootType: 0, error: 4 });
+    expect(refusal.ok).toBe(true);
+    if (!refusal.ok) return;
+    expect((refusal.event as { schemaError?: string }).schemaError).toBeUndefined();
+    expect(isLootError(refusal.event.data as LootResponseData)).toBe(true);
+    expect(lootErrorName(4)).toBe("too_far");
+    expect(lootErrorName(0)).toBe("didnt_kill");
+    expect(lootErrorName(7)).toBe("unknown"); // no such LootError
   });
 
   test("a malformed data payload downgrades to schemaError but keeps the event", () => {
