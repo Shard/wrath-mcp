@@ -357,6 +357,7 @@ namespace WrathBench
         // Drive synthesized movement. World thread: maps are not
         // mid-update here, so reading player state and QueuePacket are both safe.
         TickMovers(nowMs);
+        TickGrounded(nowMs);
         TickRiders(nowMs);
         TickTransports(nowMs);
 
@@ -2766,10 +2767,9 @@ namespace WrathBench
     // WDBC reader for TaxiNodes.dbc (3.3.5a: 24 fields of 4 bytes, record
     // size 96 — verified against the shipped file: id, mapId, x, y, z,
     // name[16 locales + flags] from field 5 with enUS first, mount creature
-    // ids). Only id, mapId and the enUS name are kept: the position is not
-    // served (the client draws the node on its taxi map from it, but the
-    // model-facing surface is names only until an operator decides
-    // otherwise). Same header as AreaTrigger.dbc above.
+    // ids). id, mapId, the position and the enUS name are kept: the client
+    // draws each node on its flight map from the same row it names it from,
+    // so SMSG_SHOWTAXINODES serves both. Same header as AreaTrigger.dbc above.
     bool Manager::LoadTaxiNodesDbc(std::string const& path)
     {
         std::ifstream in(path, std::ios::binary);
@@ -2801,11 +2801,16 @@ namespace WrathBench
         {
             char const* rec = recs.data() + size_t(i) * recordSize;
             uint32 id, map, nameOff;
+            float x, y, z;
             std::memcpy(&id, rec, 4);
             std::memcpy(&map, rec + 4, 4);
+            std::memcpy(&x, rec + 2 * 4, 4);
+            std::memcpy(&y, rec + 3 * 4, 4);
+            std::memcpy(&z, rec + 4 * 4, 4);
             std::memcpy(&nameOff, rec + 5 * 4, 4);
             TaxiNodeRec r;
             r.mapId = map;
+            r.x = x; r.y = y; r.z = z;
             if (nameOff < stringSize)
                 r.name = std::string(strings.data() + nameOff, strnlen(strings.data() + nameOff, stringSize - nameOff));
             _taxiNodes[id] = std::move(r);
@@ -3126,16 +3131,93 @@ namespace WrathBench
                 .Add("moveId", m.moveId).Add("cause", "areatrigger").Raw("pos", PosJson(x, y, z, m.curO)).Str());
         }
 
+        // Outside a move_to (a landing, a transport carrying the character, a
+        // teleport's arrival) the tested position is the server's own, so no
+        // heartbeat is owed and the move id is 0: no move crossed the volume.
+        uint64_t const moveId = s.move.active ? s.move.moveId : 0;
+        float const o = s.move.active ? s.move.curO : player->GetOrientation();
         for (uint32 id : entered)
         {
             WorldPacket* p = new WorldPacket(CMSG_AREATRIGGER, 4);
             *p << uint32(id);
             s.ws->QueuePacket(p);
-            Audit(s, "action", Json::Writer().Add("op", "areatrigger").Add("triggerId", id).Add("moveId", s.move.moveId).Str());
+            Audit(s, "action", Json::Writer().Add("op", "areatrigger").Add("triggerId", id).Add("moveId", moveId).Str());
             Json::Writer w;
-            w.Add("triggerId", id).Add("moveId", s.move.moveId);
-            w.Raw("pos", PosJson(x, y, z, s.move.curO));
+            w.Add("triggerId", id).Add("moveId", moveId);
+            w.Raw("pos", PosJson(x, y, z, o));
             EmitEvent(s, "WB_AREATRIGGER", 0xFF04, w.Str());
+        }
+    }
+
+    // A taxi flight ends with the server's StopMoving at the last path point
+    // (FlightPathMovementGenerator::DoFinalize), which is the flight altitude
+    // over the node, a few yards up. A real client then has control back,
+    // its physics drop the character to the ground and it sends
+    // MSG_MOVE_FALL_LAND there; that packet is the server's next authoritative
+    // position (the fall is measured from the SetFallInformation the finalize
+    // left, so a node's few yards never hurt). The module does the same from
+    // the same knowledge — the ground under x,y from the terrain and vmap a
+    // client has — and reports the packet it sent as WB_SELF_MOVE, the way
+    // WB_MOVE_PROGRESS reports the mover's. The drop is bounded: a surface more
+    // than TAXI_LANDING_MAX_DROP below is not what a client would fall to from
+    // a flight node, so the server's position stands and the audit says why.
+    //
+    // Then the areatrigger test a client runs on its own position every frame,
+    // whatever moved it: the landing position first (the server ignores
+    // CMSG_AREATRIGGER while in flight, HandleAreaTriggerOpcode, so a volume
+    // entered on the way in is reported at the landing, against the set as it
+    // stood at takeoff), and every idle tick after it — a transport carrying
+    // the character, a teleport's arrival inside an inn. The mover does the
+    // same test for a move_to in progress, against the same per-session set,
+    // so nothing fires twice.
+    static constexpr float TAXI_LANDING_MAX_DROP = 10.0f;
+    void Manager::TickGrounded(int64_t nowMs)
+    {
+        std::vector<std::shared_ptr<BenchSession>> sessions;
+        {
+            std::lock_guard<std::mutex> lock(_sessMutex);
+            for (auto& [token, s] : _byToken)
+                if (!s->tearingDown.load() && s->phase.load() == BenchSession::P_INWORLD)
+                    sessions.push_back(s);
+        }
+        for (auto& s : sessions)
+        {
+            if (!s->ws || sWorldSessionMgr->FindSession(s->accountId) != s->ws)
+                continue;
+            Player* player = s->ws->GetPlayer();
+            if (!player || !player->IsInWorld() || player->IsBeingTeleported())
+                continue;
+            bool const flying = player->HasUnitFlag(UNIT_FLAG_TAXI_FLIGHT) || player->IsInFlight();
+            bool const landed = s->wasTaxiFlight && !flying;
+            s->wasTaxiFlight = flying;
+            if (flying || s->move.active)
+                continue;
+
+            float x = player->GetPositionX(), y = player->GetPositionY(), z = player->GetPositionZ();
+            float const o = player->GetOrientation();
+            if (landed)
+            {
+                float const groundZ = player->GetMap()->GetHeight(player->GetPhaseMask(), x, y, z, true);
+                bool const snapped = groundZ > INVALID_HEIGHT && groundZ < z - 0.1f && z - groundZ <= TAXI_LANDING_MAX_DROP;
+                Json::Writer a;
+                a.Add("op", "taxi_landing").Add("snapped", snapped).Add("splineZ", (double)z);
+                if (groundZ > INVALID_HEIGHT) a.Add("groundZ", (double)groundZ);
+                Audit(*s, "action", a.Str());
+                if (snapped)
+                {
+                    float const fromZ = z;
+                    z = groundZ;
+                    SendMovePacket(*s, player, MSG_MOVE_FALL_LAND, MOVEMENTFLAG_NONE, x, y, z, o,
+                        FindTransportAt(player->GetMap(), x, y, z));
+                    Audit(*s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_FALL_LAND")
+                        .Add("cause", "taxi_landing").Raw("pos", PosJson(x, y, z, o)).Str());
+                    Json::Writer w;
+                    w.Add("opcode", "MSG_MOVE_FALL_LAND").Add("cause", "taxi_landing").Add("fromZ", (double)fromZ);
+                    w.Raw("pos", PosJson(x, y, z, o));
+                    EmitEvent(*s, "WB_SELF_MOVE", 0xFF09, w.Str());
+                }
+            }
+            CheckAreaTriggers(*s, player, x, y, z, nowMs);
         }
     }
 
@@ -5293,12 +5375,20 @@ namespace WrathBench
                     // (TaxiMaskSize = 14 u32; node n is bit (n-1)%32 of word
                     // (n-1)/32). Sent when the taxi gossip option is chosen —
                     // the client never asks for it any other way. `known` is
-                    // the mask decoded, with the name a client reads from its
-                    // own TaxiNodes.dbc; nothing about routes or fares is here
-                    // (the client learns those only by asking to fly).
+                    // the mask decoded, with the name and the map position a
+                    // client reads from its own TaxiNodes.dbc (the flight map
+                    // draws each known node at that point); nothing about
+                    // routes or fares is here (the client learns those only
+                    // by asking to fly). Only the mask's nodes are served: a
+                    // client's flight map draws the nodes it has discovered,
+                    // and the rest of the table is not what this packet shows.
                     name = "SMSG_SHOWTAXINODES";
                     uint32 show = 0; uint64 guid = 0; uint32 cur = 0;
                     p >> show >> guid >> cur;
+                    auto addNodePos = [](Json::Writer& n, TaxiNodeRec const& r)
+                    {
+                        n.Add("map", r.mapId).Add("x", (double)r.x).Add("y", (double)r.y).Add("z", (double)r.z);
+                    };
                     std::string mask = "[", known = "[";
                     bool firstKnown = true;
                     for (uint32 word = 0; word < 14 && p.rpos() + 4 <= p.size(); ++word)
@@ -5316,7 +5406,10 @@ namespace WrathBench
                             n.Add("nodeId", node);
                             auto it = _taxiNodes.find(node);
                             if (it != _taxiNodes.end())
+                            {
                                 n.Add("name", it->second.name);
+                                addNodePos(n, it->second);
+                            }
                             known += n.Str();
                         }
                     }
@@ -5324,7 +5417,12 @@ namespace WrathBench
                     w.Add("showWindow", show == 1).AddGuid("guid", (uint64_t)guid).Add("currentNode", cur);
                     auto curIt = _taxiNodes.find(cur);
                     if (curIt != _taxiNodes.end())
+                    {
                         w.Add("currentNodeName", curIt->second.name);
+                        Json::Writer cp;
+                        addNodePos(cp, curIt->second);
+                        w.Raw("currentPos", cp.Str());
+                    }
                     w.Raw("mask", mask).Raw("known", known);
                     break;
                 }

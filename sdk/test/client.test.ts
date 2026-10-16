@@ -3686,6 +3686,7 @@ describe("client: flight master window and activateTaxi", () => {
       status: "accepted",
       reply: 0,
       from: { nodeId: 6, name: "Ironforge, Dun Morogh" },
+      via: [],
       to: { nodeId: 8, name: "Thelsamar, Loch Modan" },
     });
     client.close();
@@ -3713,17 +3714,56 @@ describe("client: flight master window and activateTaxi", () => {
     await stub.stop();
   });
 
-  test("activateTaxi: the silence a destination two hops away gets is explained, naming both nodes", async () => {
+  test("activateTaxi: the silence a destination two hops away gets is an unanswered value naming the route, recorded for the harness", async () => {
     // Player::ActivateTaxiPathTo returns without a reply when no single path
     // joins the two nodes, so ERR_TAXINOSUCHPATH never names that case.
     const stub = startStub({ onConnect: () => combatWorld() });
     const client = await inWorld(stub);
     stub.push(window(345));
     await client.events.waitForOpcode("SMSG_SHOWTAXINODES", { timeout: 2000 });
-    const err = (await client.activateTaxi(CREATURE_GUID, 8, { timeout: 60 }).catch((e: unknown) => e)) as Error;
-    expect(err).toBeInstanceOf(EventTimeoutError);
-    expect(err.message).toContain("no direct flight path joins Ironforge, Dun Morogh and Thelsamar, Loch Modan");
-    expect(err.message).toContain("one hop toward it");
+    const result = await client.activateTaxi(CREATURE_GUID, 8, { timeout: 60 });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.status).toBe("unanswered");
+    expect(result.reply).toBeUndefined();
+    expect(result.via).toEqual([]);
+    expect(result.to.nodeId).toBe(8);
+    expect(result.hint).toBe(
+      "no reply: the server stays silent when no single flight path joins two consecutive nodes. Give the route as " +
+        "hops — activateTaxi(guid, [hop, ..., 8]) — or fly one hop toward it first.",
+    );
+    const hints = client.drainActionHints();
+    expect(hints).toHaveLength(1);
+    expect(hints[0]).toMatchObject({ action: "activateTaxi", status: "unanswered", count: 1 });
+    client.close();
+    await stub.stop();
+  });
+
+  test("activateTaxi: a hop list is CMSG_ACTIVATETAXIEXPRESS with the current node first, every hop resolved against the window", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    stub.push(window(346));
+    await client.events.waitForOpcode("SMSG_SHOWTAXINODES", { timeout: 2000 });
+    const pending = client.activateTaxi(CREATURE_GUID, ["Thelsamar", 6], { timeout: 2000 });
+    const at = await untilAction(stub, "raw");
+    const guidHex = BigInt(CREATURE_GUID).toString(16).padStart(16, "0").match(/../g)!.reverse().join("");
+    // u64 guid, u32 count 3, then the chain: current 6, hop 8, destination 6.
+    expect(stub.actions[at]).toMatchObject({
+      action: "raw",
+      opcode: "CMSG_ACTIVATETAXIEXPRESS",
+      payload: `${guidHex}03000000060000000800000006000000`,
+    });
+    stub.push(reply(347, 0));
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    expect(result.via.map((n) => n.nodeId)).toEqual([8]);
+    expect(result.to.nodeId).toBe(6);
+    // A hop outside the window is refused before anything is sent, like a destination.
+    const bad = await client.activateTaxi(CREATURE_GUID, [8, 9]).catch((e: unknown) => e);
+    expect((bad as Error).message).toContain("not in the window");
+    const empty = await client.activateTaxi(CREATURE_GUID, []).catch((e: unknown) => e);
+    expect((empty as Error).message).toContain("hop list is empty");
+    expect(stub.actions.filter((a) => a.action === "raw")).toHaveLength(1);
     client.close();
     await stub.stop();
   });

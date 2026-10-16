@@ -401,9 +401,12 @@ export interface SelfState extends UnitFieldsState {
    * When the flight lands, from the spline the server flies the character
    * along (`SMSG_MONSTER_MOVE` for our own guid): `durationMs` is the ride's
    * length and `landsAt` is the packet's `ts` plus it, in wall-clock ms like
-   * `reclaimDelay.readyAt`. Set while `taxiFlight` is true, `undefined`
-   * otherwise. `position` stays the take-off point until the landing puts it
-   * where the spline ends.
+   * `reclaimDelay.readyAt`. `undefined` until the flight's spline has arrived
+   * (an accepted reply precedes it by a server tick, so read it after
+   * `taxiFlight` is true, never off the reply alone) and again after the
+   * landing. `position` stays the take-off point until the landing puts it
+   * where the spline ends, and the module's own drop to the ground under that
+   * point (`WB_SELF_MOVE`) follows within a tick.
    */
   taxiEta: Observed<{ readonly durationMs: number; readonly landsAt: number }> | undefined;
   /**
@@ -450,10 +453,19 @@ export interface BindPoint {
   readonly area: AreaRef;
 }
 
-/** One node in a flight master's window: the wire id and the client's TaxiNodes.dbc name (absent when unknown). */
+/**
+ * One node in a flight master's window: the wire id, and the name and map
+ * position the client's own `TaxiNodes.dbc` row gives it — the point its
+ * flight map draws the node at, in the same frame `moveTo` takes. All four
+ * are absent together when the module has no row for the id.
+ */
 export interface TaxiNodeRef {
   readonly nodeId: number;
   readonly name: string | undefined;
+  readonly map?: number | undefined;
+  readonly x?: number | undefined;
+  readonly y?: number | undefined;
+  readonly z?: number | undefined;
 }
 
 /**
@@ -3064,10 +3076,19 @@ export class StateCache {
         // of the mask plus the client's TaxiNodes.dbc names; the mask itself
         // rides along verbatim so nothing about the fold is unverifiable.
         const d = event.data as ShowTaxiNodesData;
-        const known = d.known.map((n) => ({ nodeId: n.nodeId, name: n.name }));
+        const known: TaxiNodeRef[] = d.known.map((n) => ({ nodeId: n.nodeId, name: n.name, map: n.map, x: n.x, y: n.y, z: n.z }));
+        const inKnown = known.find((n) => n.nodeId === d.currentNode);
+        const current: TaxiNodeRef = {
+          nodeId: d.currentNode,
+          name: d.currentNodeName ?? inKnown?.name,
+          map: d.currentPos?.map ?? inKnown?.map,
+          x: d.currentPos?.x ?? inKnown?.x,
+          y: d.currentPos?.y ?? inKnown?.y,
+          z: d.currentPos?.z ?? inKnown?.z,
+        };
         this.taxiWindows.set(d.guid, {
           guid: d.guid,
-          current: { nodeId: d.currentNode, name: d.currentNodeName ?? known.find((n) => n.nodeId === d.currentNode)?.name },
+          current,
           known,
           mask: [...d.mask],
           seq: event.seq,
@@ -3280,10 +3301,14 @@ export class StateCache {
       }
       case "WB_MOVE_PROGRESS":
       case "WB_RIDE_PROGRESS":
+      case "WB_SELF_MOVE":
       case "WB_MOVE_RESULT": {
         // Our own position while moving: the module's movement engine knows it
         // locally, exactly as a running client does. `WB_MOVE_RESULT.pos` is
         // read back from the live character, so it is the server's word.
+        // `WB_SELF_MOVE` is a movement packet the module sent outside a move —
+        // the client's own drop to the ground after a taxi landing — and its
+        // `pos` is where the character stands, under the spline's last point.
         //
         // Except on `transferred`: the module reads the character back *before*
         // the teleport lands, so that `pos` is "the last old-map position"

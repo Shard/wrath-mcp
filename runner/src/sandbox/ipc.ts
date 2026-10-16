@@ -50,6 +50,27 @@ export interface DeathSignal {
 }
 
 /**
+ * A flight transition the child latched the moment the event carrying it
+ * arrived, for the same reason `DeathSignal` exists: the host samples every
+ * 60s, two legs of a chain can both land inside one sample, and the area a
+ * landing is written with must be the landing's, not the sample's (a landing
+ * read a minute late once placed the character in the Deeprun Tram it had
+ * since walked into). `taxi` is the flag turning on after an accepted reply;
+ * `taxi_landed` is it turning off. Both carry the position and zone/area ids
+ * as the cache held them at that instant.
+ */
+export interface FlightSignal {
+  kind: "taxi" | "taxi_landed";
+  /** The timestamp of the event that carried the transition. */
+  ts: number;
+  /** That event's stream seq, for correlation with the event log. */
+  seq: number;
+  position?: { map: number; x: number; y: number; z: number };
+  zone?: number;
+  area?: number;
+}
+
+/**
  * Where the character is trying to get to: the destination of the current or
  * last `move_to` this session dispatched, and what became of it.
  *
@@ -175,7 +196,7 @@ export type HostToChild =
   | {
       t: "rpc";
       id: number;
-      method: "recent_events" | "context_events" | "state_summary" | "death_signals" | "action_hints";
+      method: "recent_events" | "context_events" | "state_summary" | "death_signals" | "flight_signals" | "action_hints";
       params: { limit?: number };
     }
   | { t: "shutdown" };

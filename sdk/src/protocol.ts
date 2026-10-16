@@ -810,6 +810,21 @@ export const rideProgressDataSchema = z.looseObject({
 export type RideProgressData = z.infer<typeof rideProgressDataSchema>;
 
 /**
+ * Module-synthesized: a movement packet the module sent for the character
+ * outside any `move_to`, as a client's own physics would — today only the
+ * drop from a taxi flight's last spline point (`fromZ`) to the ground under
+ * it (`pos`), sent as `MSG_MOVE_FALL_LAND` the tick the flight flag clears.
+ * `pos` is where the character stands after landing.
+ */
+export const selfMoveDataSchema = z.looseObject({
+  opcode: z.string(),
+  cause: z.string(),
+  pos: positionSchema,
+  fromZ: z.number().optional(),
+});
+export type SelfMoveData = z.infer<typeof selfMoveDataSchema>;
+
+/**
  * Module-synthesized: where a transport the session has been sent (a tram
  * car, a boat) is right now, at most once a second. A client animates the car
  * itself from `TransportAnimation.dbc` and the clock its create block carried;
@@ -1430,6 +1445,11 @@ export type ActivateTaxiReplyData = z.infer<typeof activateTaxiReplyDataSchema>;
 export const taxiNodeSchema = z.looseObject({
   nodeId: z.number(),
   name: z.string().optional(),
+  /** The node's `TaxiNodes.dbc` position — what the client's flight map draws it at. Absent with `name` when the module has no row. */
+  map: z.number().optional(),
+  x: z.number().optional(),
+  y: z.number().optional(),
+  z: z.number().optional(),
 });
 export type TaxiNode = z.infer<typeof taxiNodeSchema>;
 
@@ -1438,14 +1458,17 @@ export type TaxiNode = z.infer<typeof taxiNodeSchema>;
  * it when the taxi gossip option is chosen — `showWindow` (the leading u32),
  * the flight master's `guid`, the node the master stands at (`currentNode`),
  * and the character's taximask (`mask`, 14 u32 words as on the wire) decoded
- * into `known`, the nodes this character has visited. Nothing about routes
- * or fares: the client learns those by asking to fly (`activateTaxi`).
+ * into `known`, the nodes this character has visited, each with the name and
+ * map position the client's own `TaxiNodes.dbc` row gives it (what its flight
+ * map draws). Nothing about routes or fares: the client learns those by
+ * asking to fly (`activateTaxi`).
  */
 export const showTaxiNodesDataSchema = z.looseObject({
   showWindow: z.boolean(),
   guid: guidSchema,
   currentNode: z.number(),
   currentNodeName: z.string().optional(),
+  currentPos: z.looseObject({ map: z.number(), x: z.number(), y: z.number(), z: z.number() }).optional(),
   mask: z.array(z.number()),
   known: z.array(taxiNodeSchema),
 });
@@ -1648,6 +1671,7 @@ export const eventDataSchemas = {
   WB_AREA: areaDataSchema,
   WB_MOVE_RESULT: moveResultDataSchema,
   WB_RIDE_PROGRESS: rideProgressDataSchema,
+  WB_SELF_MOVE: selfMoveDataSchema,
   WB_TRANSPORT_PROGRESS: transportProgressDataSchema,
   ...moveOpcodeSchemas,
   // map transfers

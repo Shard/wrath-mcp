@@ -84,10 +84,12 @@ namespace WrathBench
     };
 
     // One TaxiNodes.dbc record (3.3.5a). Client-side knowledge: the client
-    // names the flight-master window's nodes from this table.
+    // names the flight-master window's nodes from this table and draws each
+    // one on its flight map at the position the row carries.
     struct TaxiNodeRec
     {
         uint32 mapId{0};
+        float x{0.0f}, y{0.0f}, z{0.0f};
         std::string name;           // enUS column
     };
 
@@ -189,6 +191,10 @@ namespace WrathBench
         // or is teleported, so a re-entry fires again.
         std::vector<uint32> insideTriggers;
         uint32 insideTriggersMap{0xFFFFFFFF};
+        // UNIT_FLAG_TAXI_FLIGHT as the last world tick read it (world thread
+        // only): the flag turning off is the landing, where the module does
+        // the client's own drop to the ground (TickGrounded).
+        bool wasTaxiFlight{false};
 
         // WB_RIDE_PROGRESS pacing while aboard a transport (world thread only).
         int64_t lastRideEmitMs{0};
@@ -423,6 +429,11 @@ namespace WrathBench
         // Mover (world thread only).
         void TickMovers(int64_t nowMs);
         void TickMover(BenchSession& s, int64_t nowMs);
+        // The character when no move_to is driving it (world thread only): a
+        // taxi landing is dropped to the ground the way a client's physics
+        // drops it, and the live position is tested against the areatrigger
+        // volumes every tick, as a client tests its own position every frame.
+        void TickGrounded(int64_t nowMs);
         void TickRiders(int64_t nowMs);
         void TickTransports(int64_t nowMs);
         void FinishMove(BenchSession& s, char const* status);

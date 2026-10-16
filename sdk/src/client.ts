@@ -2098,7 +2098,7 @@ const TAXI_REPLY_HINTS: Record<number, string> = {
   1: "the server refused the flight without a reason (ERR_TAXIUNSPECIFIEDSERVERERROR); ask again",
   // At the pinned core this code is sent only for a source node the server
   // does not know; two known nodes with no direct path get no reply at all
-  // (see activateTaxi's timeout).
+  // (activateTaxi's `unanswered`).
   2: "the server does not know the node this flight would start from (ERR_TAXINOSUCHPATH); reopen the window with showTaxiNodes(guid) and retry",
   3: "not enough money for the fare (ERR_TAXINOTENOUGHMONEY); state.money is what you have",
   4: "too far from the flight master, or it is not a flight master (ERR_TAXITOOFARAWAY); moveTo the NPC first, then reopen the window with showTaxiNodes(guid)",
@@ -2630,13 +2630,19 @@ export interface TaxiOptions {
   timeout?: number;
 }
 
+/** A flight destination: a known node's name (exact or unique substring) or its id. */
+export type TaxiDest = string | number;
+
 /**
  * The outcome of `activateTaxi`, as a value: the server's
  * `SMSG_ACTIVATETAXIREPLY`. `accepted` means the flight is starting — the
  * ride itself is `state.self.taxiFlight` turning true, and the landing is it
  * turning false again; no packet says "landed", so nothing here does either.
  * `refused` carries the server's reply code and the client-visible sentence
- * for it.
+ * for it. `unanswered` is the one case the server answers with silence: two
+ * known nodes no single flight path joins (`Player::ActivateTaxiPathTo`
+ * returns without a reply), read as no reply within the timeout. `via` is the
+ * chain's intermediate hops, empty for a single-hop flight.
  */
 export type ActivateTaxiResult =
   | {
@@ -2644,6 +2650,7 @@ export type ActivateTaxiResult =
       readonly status: "accepted";
       readonly reply: 0;
       readonly from: TaxiNodeRef;
+      readonly via: readonly TaxiNodeRef[];
       readonly to: TaxiNodeRef;
     }
   | {
@@ -2652,6 +2659,16 @@ export type ActivateTaxiResult =
       /** Raw `ActivateTaxiReply` code (1..12). */
       readonly reply: number;
       readonly from: TaxiNodeRef;
+      readonly via: readonly TaxiNodeRef[];
+      readonly to: TaxiNodeRef;
+      readonly hint: string;
+    }
+  | {
+      readonly ok: false;
+      readonly status: "unanswered";
+      readonly reply: undefined;
+      readonly from: TaxiNodeRef;
+      readonly via: readonly TaxiNodeRef[];
       readonly to: TaxiNodeRef;
       readonly hint: string;
     };
@@ -6320,7 +6337,8 @@ export class WrathClient {
         if (taxi.length !== 1) {
           throw new Error(
             `showTaxiNodes(${id}): the menu that opened has ${taxi.length === 0 ? "no" : taxi.length} taxi option(s) ` +
-              `(gossip icon 2) — is this NPC a flight master (state.units({ role: "flightMaster" }))? Options: ` +
+              `(gossip icon 2) — is this NPC a flight master (state.units({ role: "flightMaster" }))? A first hello ` +
+              `only discovers this master's node; call showTaxiNodes(guid) again to open the window. Options: ` +
               menu.options.map((o) => `${o.optionId}:${JSON.stringify(o.text)} (icon ${o.icon})`).join(", "),
           );
         }
@@ -6339,23 +6357,34 @@ export class WrathClient {
   }
 
   /**
-   * `CMSG_ACTIVATETAXI` — fly from the node this flight master stands at to
-   * `dest`, and read the server's verdict off `SMSG_ACTIVATETAXIREPLY`.
+   * Fly from the node this flight master stands at to `dest`, and read the
+   * server's verdict off `SMSG_ACTIVATETAXIREPLY`.
    *
    * `dest` is a node name (case-insensitive exact, or a unique substring) or
    * a node id, resolved against the window last observed for this master
-   * (`state.lastTaxiNodes(guid)`; `showTaxiNodes` opens one). The source
-   * node is that window's `current`, exactly what a client sends. Throws
-   * (nothing dispatched) when no window has been seen for the guid or the
-   * destination matches no known node or more than one — every rejection
-   * lists the known nodes so the next call is obvious. The refusal codes
-   * come back as values with a hint each (`TAXI_REPLY_HINTS`).
+   * (`state.lastTaxiNodes(guid)`; `showTaxiNodes` opens one) — or a list of
+   * them, the hops of a longer route in order, each a node this character
+   * has visited. One hop is `CMSG_ACTIVATETAXI`; a list is
+   * `CMSG_ACTIVATETAXIEXPRESS` with the chain the client itself names, which
+   * the server flies end to end, charging each leg as it starts. The SDK
+   * computes no route and knows none: which nodes a flight path joins, the
+   * caller knows or learns by asking. The source node is the window's
+   * `current`, exactly what a client sends. Throws (nothing dispatched) when
+   * no window has been seen for the guid or a hop matches no known node or
+   * more than one — every rejection lists the known nodes so the next call
+   * is obvious. The refusal codes come back as values with a hint each
+   * (`TAXI_REPLY_HINTS`); two known nodes no single path joins get no reply
+   * at all from the server, which comes back as `unanswered`.
    *
    * `accepted` is the flight starting; `state.self.taxiFlight` is true for
    * the ride and flips false on landing. The fare is charged by the server
    * and shows on `state.money`.
    */
-  async activateTaxi(npcGuid: GuidOrUnit, dest: string | number, options: TaxiOptions = {}): Promise<WithResolved<ActivateTaxiResult>> {
+  async activateTaxi(
+    npcGuid: GuidOrUnit,
+    dest: TaxiDest | readonly TaxiDest[],
+    options: TaxiOptions = {},
+  ): Promise<WithResolved<ActivateTaxiResult>> {
     return this.byName(npcGuid, "activateTaxi(npcGuid, dest)", async (id) => {
       const window = this.state.lastTaxiNodes(id);
       if (window === undefined) {
@@ -6364,30 +6393,45 @@ export class WrathClient {
             `open one first with showTaxiNodes(guid) (gossipHello on a visible flight master), then fly.`,
         );
       }
-      const to = resolveTaxiNode(window, dest);
+      const hops = Array.isArray(dest) ? (dest as readonly TaxiDest[]) : [dest as TaxiDest];
+      if (hops.length === 0) throw new Error(`activateTaxi(${id}, []): the hop list is empty — name at least one destination`);
+      const chain = hops.map((h) => resolveTaxiNode(window, h));
+      const to = chain[chain.length - 1]!;
+      const via = chain.slice(0, -1);
       const sinceSeq = this.events.recent(1)[0]?.seq;
-      await this.raw("CMSG_ACTIVATETAXI", [{ guid: id }, { u32: window.current.nodeId }, { u32: to.nodeId }]);
-      const event = await this.waitEvent(
-        (e) => isEvent(e, "SMSG_ACTIVATETAXIREPLY") && !isDecodeError(e.data) && (sinceSeq === undefined || e.seq > sinceSeq),
-        {
-          timeout: options.timeout ?? 10_000,
-          // Player::ActivateTaxiPathTo returns without a reply when no single
-          // flight path joins the two nodes; every other refusal is answered.
-          description:
-            `the SMSG_ACTIVATETAXIREPLY answering activateTaxi(${id}, ${JSON.stringify(dest)}) — the server sends ` +
-            `no reply when no direct flight path joins ${window.current.name ?? `node ${window.current.nodeId}`} and ` +
-            `${to.name ?? `node ${to.nodeId}`}: a destination two or more hops away is dropped without an answer, ` +
-            `even when you know it. Fly to a known node one hop toward it, then take the next flight from there.`,
-        },
-      );
+      if (chain.length === 1) {
+        await this.raw("CMSG_ACTIVATETAXI", [{ guid: id }, { u32: window.current.nodeId }, { u32: to.nodeId }]);
+      } else {
+        const nodes = [window.current, ...chain];
+        await this.raw("CMSG_ACTIVATETAXIEXPRESS", [{ guid: id }, { u32: nodes.length }, ...nodes.map((n) => ({ u32: n.nodeId }))]);
+      }
+      // Player::ActivateTaxiPathTo returns without a reply when no single
+      // flight path joins two consecutive nodes of the chain; every other
+      // refusal is answered, in the same server tick as the request.
+      // Operator's wording, 2026-10-16.
+      const silence =
+        `no reply: the server stays silent when no single flight path joins two consecutive nodes. Give the route as ` +
+        `hops — activateTaxi(guid, [hop, ..., ${JSON.stringify(hops[hops.length - 1])}]) — or fly one hop toward it first.` +
+        (chain.length === 1 ? "" : " It does not say which pair; fly the chain in shorter pieces to find it.");
+      let event: StreamEvent;
+      try {
+        event = await this.waitEvent(
+          (e) => isEvent(e, "SMSG_ACTIVATETAXIREPLY") && !isDecodeError(e.data) && (sinceSeq === undefined || e.seq > sinceSeq),
+          { timeout: options.timeout ?? 10_000, description: `the SMSG_ACTIVATETAXIREPLY answering activateTaxi(${id}, ${JSON.stringify(dest)})` },
+        );
+      } catch (e) {
+        if (!(e instanceof EventTimeoutError)) throw e;
+        this.noteActionHint("activateTaxi", "unanswered", silence);
+        return { ok: false, status: "unanswered", reply: undefined, from: window.current, via, to, hint: silence };
+      }
       const reply = (event.data as ActivateTaxiReplyData).reply;
       if (reply === 0) {
-        return { ok: true, status: "accepted", reply: 0, from: window.current, to };
+        return { ok: true, status: "accepted", reply: 0, from: window.current, via, to };
       }
       const named = TAXI_REPLY_HINTS[reply];
       const hint = named === undefined ? `the server refused the flight with reply ${reply}, a code the SDK does not name` : named;
       this.noteActionHint("activateTaxi", "refused", hint);
-      return { ok: false, status: "refused", reply, from: window.current, to, hint };
+      return { ok: false, status: "refused", reply, from: window.current, via, to, hint };
     });
   }
 

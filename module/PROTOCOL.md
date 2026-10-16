@@ -508,7 +508,9 @@ whose handler does nothing a non-GM client could not do:
   `CMSG_RESURRECT_RESPONSE`
 - flight paths: `CMSG_TAXINODE_STATUS_QUERY`, `CMSG_TAXIQUERYAVAILABLENODES`,
   `CMSG_ACTIVATETAXI` (body `u64 guid, u32 fromNode, u32 toNode`; the SDK's
-  `activateTaxi` builds it), `CMSG_ACTIVATETAXIEXPRESS`
+  `activateTaxi` builds it), `CMSG_ACTIVATETAXIEXPRESS` (body `u64 guid,
+  u32 count, u32 node × count`, the current node first; `activateTaxi` with
+  a hop list builds it)
 - innkeeper bind: `CMSG_BINDER_ACTIVATE` (body `u64 guid` — the yes on the
   confirm dialog after `SMSG_BINDER_CONFIRM`; the SDK's `bindAtInnkeeper`
   sends it)
@@ -867,7 +869,8 @@ session's own identity). Their `opcodeId`s are outside the real opcode range.
 | `WB_MOVE_RESULT` | 0xFF01 | `{ "moveId": <number>, "status": <str>, "pos": { "x","y","z","o" }, "meshZ": <f?>, "reachedPos": { "x","y","z" }? }` — `meshZ` only on `arrived` when the mesh z differed from the request; `reachedPos` on `path_incomplete` and `drop`; `"dz": <f>, "target": { "x","y","z" }` only on `drop`, plus `"safeFall": <u32>` when the character's own fall-height reduction (`SPELL_AURA_SAFE_FALL`, the client's buff frame) is non-zero, and `"surfaceZ": <f>` only when the step's foot lies under the ground surface at its x,y (the step is then refused forced or not); `"nearest": { "x","y","z" } | null` only on `target_off_mesh` (the walkable mesh point nearest the request within 20y, or `null` when none is); `"onTransport": { "guid": <guid-string>, "entry": <u32> }` when the character ended the move aboard a transport |
 | `WB_RIDE_PROGRESS` | 0xFF05 | `{ "transportGuid": <guid-string>, "transportEntry": <u32>, "pos": { "x","y","z","o" } }` — at most 1/s while the character rides a transport and is not walking; the server-side position the transport carried it to |
 | `WB_TRANSPORT_PROGRESS` | 0xFF06 | `{ "guid": <guid-string>, "entry": <u32>, "pos": { "x","y","z","o" }, "progressMs": <u32>, "periodMs": <u32?>, "docked": <bool?> }` — at most 1/s per session, one per transport on the character's map whose create block the session has received: the car's current position on its `TransportAnimation.dbc` path (what a client animates locally from `pathProgress`), the clock and period, and `docked` when the keyframe segment the clock is on has no displacement (the car is dwelling at a platform; absent for transports without an animation path) |
-| `WB_AREATRIGGER` | 0xFF04 | `{ "triggerId": <u32>, "moveId": <number>, "pos": { "x","y","z","o" } }` — the mover entered an `AreaTrigger.dbc` volume and sent `CMSG_AREATRIGGER` for it (see below) |
+| `WB_AREATRIGGER` | 0xFF04 | `{ "triggerId": <u32>, "moveId": <number>, "pos": { "x","y","z","o" } }` — the character entered an `AreaTrigger.dbc` volume and `CMSG_AREATRIGGER` was sent for it (see below); `moveId` is the `move_to` that crossed into it, 0 when no move did (a taxi landing, a transport carrying the character, a teleport's arrival) |
+| `WB_SELF_MOVE` | 0xFF09 | `{ "opcode": "MSG_MOVE_FALL_LAND", "cause": "taxi_landing", "pos": { "x","y","z","o" }, "fromZ": <f> }` — a movement packet the module sent for the character outside any `move_to`, as a client's own physics would: today only the drop from a taxi flight's last spline point (`fromZ`) to the ground under it (`pos`), see "Taxi landing" below |
 | `WB_AREA` | 0xFF07 | `{ "mapId": <u32>, "zoneId": <u32>, "zoneName": <str>, "areaId": <u32>, "areaName": <str> }` — the zone and subzone the character is in, named as the client names them; once when the character enters the world and once per change of either id, whatever moved it (walking, a teleport, a map transfer). See "Zone and area" below. |
 | `WB_TALENT_TREE` | 0xFF08 | the class talent frame, the answer to the `talent_tree` action; shape under "Spellbook, cooldowns, talents" below |
 | `WB_SESSION_STATE` | 0xFF03 | `{ "character": <str>, "guid": <guid-string>, "inWorld": true, "map": <n>, "x": <f>, "y": <f>, "z": <f>, "o": <f>, "level": <n>, "zoneId", "zoneName", "areaId", "areaName" }` — emitted once per WS subscribe to an already-in-world session (reattach semantics in the `/events` section above). Strictly client-visible facts: what `SMSG_LOGIN_VERIFY_WORLD` plus the session's own identity would carry, plus the same zone/area fields as `WB_AREA` so a reattached client starts where the stream cannot re-emit. |
@@ -1014,8 +1017,34 @@ are whatever the server does for that trigger, as for a client: a map
 transfer (`SMSG_TRANSFER_PENDING` … `transferred`), exploration quest credit
 (`SMSG_QUESTUPDATE_COMPLETE`), or the inn's rest flag — all of which
 happen without an agent action, because they happen to a client without a
-player action. Triggers fire only while a `move_to` is in progress; the
-server's own radius check rejects any hit the interpolation got wrong.
+player action. The test runs on every position the character has, however it
+got there, as a client's does every frame: the mover's interpolated point
+while a `move_to` is in progress, and otherwise the server's own position for
+the character once per world tick — a transport carrying it, a teleport's
+arrival inside an inn, a taxi landing — against the same per-session set, so
+nothing fires twice and no heartbeat is owed when the tested position is
+already the server's. The server ignores `CMSG_AREATRIGGER` while the
+character is in flight (`HandleAreaTriggerOpcode`), so nothing is tested or
+sent mid-flight and a volume the landing lies in is reported at the landing,
+against the set as it stood at takeoff. The server's own radius check rejects
+any hit the test got wrong.
+
+Taxi landing. The server ends a flight with a stop at
+the path's last point (`FlightPathMovementGenerator::DoFinalize`:
+`StopMoving`, then `UNIT_FLAG_TAXI_FLIGHT` off), which is the flight
+altitude over the node, a few yards above the ground. A client then has
+control back, its physics drop the character to the ground and it sends
+`MSG_MOVE_FALL_LAND` there — the server's next authoritative position (the
+fall is measured from the `SetFallInformation` the finalize left, so a node's
+few yards never hurt). On the first world tick that reads the flag off, the
+module does the same from the same knowledge: the ground under x,y from the
+terrain and vmap (`Map::GetHeight`), sent as `MSG_MOVE_FALL_LAND` and
+reported as `WB_SELF_MOVE` with `cause: "taxi_landing"` (audited as a
+`move_pkt` with the same cause, after a `taxi_landing` audit record carrying
+`splineZ`, `groundZ` and `snapped`). The drop is bounded at 10y: a surface
+farther below is not what a client falls to from a flight node, so the
+server's position stands, `snapped` is false and no packet is sent. The
+areatrigger test then runs at the landing position.
 
 #### Zone and area
 
@@ -1295,7 +1324,7 @@ Achievements and flight paths (issue #8 first half):
 | `SMSG_ACHIEVEMENT_EARNED` | 0x468 | `{ "guid", "self": <bool>, "achievement": { "achievementId", "date": <u32>, "time": "YYYY-MM-DD HH:MM", "name"?, "points"?, "categoryId"? } }` — the core broadcasts this in say range, so `guid` may be another player's; `self` is the equality with the session's own guid, nothing more |
 | `SMSG_ALL_ACHIEVEMENT_DATA` | 0x47D | `{ "count", "achievements": [ <same achievement object> ] }` — sent to self once during login: every achievement already earned. Only the completed block (to its 0xFFFFFFFF terminator) is decoded; the criteria-progress block that follows is consumed and not served |
 | `SMSG_ACTIVATETAXIREPLY` | 0x1AE | `{ "reply": <u32>, "ok": <bool> }` — the answer to `CMSG_ACTIVATETAXI[EXPRESS]` (raw). `ActivateTaxiReply`: 0 ok, 1 server error, 2 no such path, 3 not enough money, 4 too far away, 5 no vendor nearby, 6 not visited, 7 busy, 8 mounted, 9 shapeshifted, 10 moving, 11 same node, 12 not standing |
-| `SMSG_SHOWTAXINODES` | 0x1A9 | `{ "showWindow": <bool>, "guid", "currentNode": <u32>, "currentNodeName"?: <str>, "mask": [<u32> × 14], "known": [{ "nodeId": <u32>, "name"?: <str> }] }` — the flight master's window (`WorldSession::SendTaxiMenu`), sent when the taxi option of the master's gossip menu is chosen: the leading u32 (1 = show), the master's guid, the node it stands at, and the character's taximask verbatim (`TaxiMaskSize` 14 words; node *n* is bit `(n-1)%32` of word `(n-1)/32`). `known` is that mask decoded — the nodes this character has visited, the only destinations the server will sell (and only one flight path away: `CMSG_ACTIVATETAXI` to a farther one gets no reply) — each named as the client names it from its own `TaxiNodes.dbc`. No route, fare or position is served |
+| `SMSG_SHOWTAXINODES` | 0x1A9 | `{ "showWindow": <bool>, "guid", "currentNode": <u32>, "currentNodeName"?: <str>, "currentPos"?: { "map": <u32>, "x","y","z" }, "mask": [<u32> × 14], "known": [{ "nodeId": <u32>, "name"?: <str>, "map"?: <u32>, "x"?, "y"?, "z"? }] }` — the flight master's window (`WorldSession::SendTaxiMenu`), sent when the taxi option of the master's gossip menu is chosen: the leading u32 (1 = show), the master's guid, the node it stands at, and the character's taximask verbatim (`TaxiMaskSize` 14 words; node *n* is bit `(n-1)%32` of word `(n-1)/32`). `known` is that mask decoded — the nodes this character has visited, the only destinations the server will sell (and only one flight path away: `CMSG_ACTIVATETAXI` to a farther one gets no reply) — each named and placed as the client names and draws it from its own `TaxiNodes.dbc` row (the name, map and position are absent together when the file is not loaded). Only the mask's nodes are served: a client's flight map draws the nodes it has discovered. No route or fare is served |
 
 `date` is the wire's packed bitfield (`AppendPackedTime`: `(year-2000)<<24 |
 month<<20 | (day-1)<<14 | weekday<<11 | hour<<6 | minute`); `time` is its
@@ -1310,7 +1339,9 @@ The flight itself has no event: `taxiFlight` on self in `SMSG_UPDATE_OBJECT`
 `fields` (below) is `UNIT_FLAG_TAXI_FLIGHT` read off `unitFlags`, so a
 `reply` of 0 followed by `taxiFlight: true` is the flight starting and the
 flip back to `false` is the landing, exactly as a client sees them. Nothing is
-inferred from the server's taxi state. `SMSG_CRITERIA_UPDATE` (0x46A) and
+inferred from the server's taxi state. The position after the landing is the
+`WB_SELF_MOVE` the module sends for the client's drop to the ground ("Taxi
+landing", above), which follows the flip within a world tick. `SMSG_CRITERIA_UPDATE` (0x46A) and
 `SMSG_TAXINODE_STATUS` are not tapped: the agent finds flight masters the way
 it finds anything, and learns a node by visiting it.
 
@@ -1322,10 +1353,17 @@ sends it straight from the hello). Node names come from `TaxiNodes.dbc` on
 the data volume (`dbc/TaxiNodes.dbc`, 24 fields, record size 96; the loader
 refuses any other layout) and are ids only when it is absent — the same
 client-cache class as area and achievement names. The node positions the
-same table carries are deliberately not served, and `TaxiPath.dbc` is never
-read: which nodes connect, and for how much, the character learns by asking
-(`CMSG_ACTIVATETAXI` with the window's current node and a known node, body
-`u64 guid, u32 from, u32 to`, through raw).
+same rows carry are served beside the names (`map`, `x`, `y`, `z` on each
+known node and `currentPos` for the master's own): the client draws its
+flight map from exactly those rows, so they pass the test the names pass.
+`TaxiPath.dbc` is never read: which nodes connect, and for how much, the
+character learns by asking (`CMSG_ACTIVATETAXI` with the window's current
+node and a known node, body `u64 guid, u32 from, u32 to`, through raw; or
+`CMSG_ACTIVATETAXIEXPRESS`, body `u64 guid, u32 count, u32 node × count`
+starting at the current node, for a chain of hops the client names itself —
+the server flies the whole chain, charging each leg as it starts). A pair of
+known nodes no single path joins gets no reply at all
+(`Player::ActivateTaxiPathTo` returns without one); nothing stands in for it.
 
 Innkeeper bind — the sequence a client runs
 when "Make this inn your home." is chosen:

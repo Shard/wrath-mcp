@@ -109,6 +109,7 @@ describe("event frames", () => {
       "WB_AREA",
       "WB_MOVE_RESULT",
       "WB_RIDE_PROGRESS",
+      "WB_SELF_MOVE",
       "WB_TRANSPORT_PROGRESS",
       ...MOVE_OPCODES,
       // map transfers

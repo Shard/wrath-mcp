@@ -2638,6 +2638,66 @@ describe("achievements and flight paths", () => {
     expect(teleported.self.taxiEta).toBeUndefined();
   });
 
+  test("the landing's drop to the ground (WB_SELF_MOVE) is the position after a flight, and ends the spline for good", () => {
+    // The server stops the flight at the spline's last point, a few yards over
+    // the node; the module then sends the client's own MSG_MOVE_FALL_LAND to
+    // the ground under it and reports it. Invented numbers: a 4.3y drop.
+    const GROUND = { x: LANDING.x, y: LANDING.y, z: LANDING.z - 4.3, o: 1.1 };
+    const drop = (seq: number) =>
+      at(seq, "WB_SELF_MOVE", 0xff09, { opcode: "MSG_MOVE_FALL_LAND", cause: "taxi_landing", pos: GROUND, fromZ: LANDING.z });
+    // The usual order: the flag flips, then the drop follows within a tick.
+    const landed = StateCache.replay(toEvents([verifyWorld(1), ...takeOff(2), unitFlags(5, 0x8), drop(6)]), { seed: SEED });
+    expect(landed.self.position).toEqual({ value: { map: 0, ...GROUND }, seq: 6, ts: 2006 });
+    expect(landed.self.taxiEta).toBeUndefined();
+    // The drop arriving ahead of the flag's block: the flag flip must not put
+    // the character back up at the spline's end.
+    const early = StateCache.replay(toEvents([verifyWorld(1), ...takeOff(2), drop(5), unitFlags(6, 0x8)]), { seed: SEED });
+    expect(early.self.position?.value).toEqual({ map: 0, ...GROUND });
+  });
+
+  test("SMSG_SHOWTAXINODES carries each node's TaxiNodes.dbc position beside its name, absent together when the module has no row", () => {
+    // Positions invented, flight-node-sized; the shape is PROTOCOL.md's.
+    const IF = { map: 0, x: -4821.8, y: -1155.4, z: 502.2 };
+    const THELSAMAR = { map: 0, x: -5421.9, y: -2930.0, z: 347.3 };
+    const cache = StateCache.replay(
+      toEvents([
+        at(1, "SMSG_SHOWTAXINODES", 0x1a9, {
+          showWindow: true,
+          guid: "17365880163140632581",
+          currentNode: 6,
+          currentNodeName: "Ironforge, Dun Morogh",
+          currentPos: IF,
+          mask: [0xa0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          known: [
+            { nodeId: 6, name: "Ironforge, Dun Morogh", ...IF },
+            { nodeId: 8, name: "Thelsamar, Loch Modan", ...THELSAMAR },
+            { nodeId: 9 },
+          ],
+        }),
+      ]),
+      { seed: SEED },
+    );
+    const w = cache.lastTaxiNodes("17365880163140632581")!;
+    expect(w.current).toEqual({ nodeId: 6, name: "Ironforge, Dun Morogh", ...IF });
+    expect(w.known[1]).toEqual({ nodeId: 8, name: "Thelsamar, Loch Modan", ...THELSAMAR });
+    expect(w.known[2]).toEqual({ nodeId: 9, name: undefined, map: undefined, x: undefined, y: undefined, z: undefined });
+    // A module that served no currentPos: the current node's position comes
+    // from its own row in `known` when it is there.
+    const fromKnown = StateCache.replay(
+      toEvents([
+        at(1, "SMSG_SHOWTAXINODES", 0x1a9, {
+          showWindow: true,
+          guid: "8",
+          currentNode: 6,
+          mask: [0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+          known: [{ nodeId: 6, name: "Ironforge, Dun Morogh", ...IF }],
+        }),
+      ]),
+      { seed: SEED },
+    );
+    expect(fromKnown.lastTaxiNodes("8")?.current).toEqual({ nodeId: 6, name: "Ironforge, Dun Morogh", ...IF });
+  });
+
   /** A self values block carrying `playerFlags`, the players-only field. */
   const playerFlags = (seq: number, flags: number) => ({
     seq,

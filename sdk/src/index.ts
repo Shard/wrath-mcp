@@ -17,6 +17,7 @@ export {
 } from "./client";
 export type {
   ActivateTaxiResult,
+  TaxiDest,
   BindOptions,
   BindResult,
   BuySpellResult,
