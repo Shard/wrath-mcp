@@ -200,11 +200,19 @@ silence is explained by the distance afterwards.
 The questgiver marker answers before the wire too. `acceptQuestFrom` and
 `questsAvailableFrom` refuse with `nothing_on_offer` when the NPC's marker says
 it offers nothing, and `turnInQuest` refuses with `not_ready` and the `marker`
-when it says nothing the NPC ends is ready (`none` or `incomplete`). The
-turn-in check trusts only a marker newer than the last change to the quest log
-or the character's level, because the client re-asks for every marker when the
-log changes and a quest just completed still reads `incomplete` until that
-answer lands; an older marker, or none, still sends.
+when it says nothing the NPC ends is ready (`none` or `incomplete`). Both
+checks trust only a marker newer than the last change to the quest log or the
+character's level, because the client re-asks for every marker when the log
+changes and the old marker stands until that answer lands: a quest just
+completed still reads `incomplete`, and an NPC just turned in to still reads
+`reward` while the next quest of its chain is already on offer. An older
+marker, or none, still sends. Event `seq` restarts with every session, so a
+login drops every marker the cache holds, and each questgiver the new session
+puts in view is asked again, as a client asks after logging in; so is each
+questgiver back in view after a trip to another map. The login also
+re-dates the quest-log slot and level fields to itself (their values stand):
+a create block leaves out every zero-valued field, so an empty slot would
+otherwise keep the last session's `seq` and outrank every new marker.
 
 `waitForQuestObjective` waits on the **quest log**, not on an event, because at
 the pinned commit the core sends no `SMSG_QUESTUPDATE_COMPLETE` for a kill
@@ -287,7 +295,11 @@ returns `status: "superseded"`. `stop()` returns as soon as the module has
 queued the `MSG_MOVE_STOP` — it does *not* wait for the character to halt; it is
 the in-flight `moveTo` that resolves, with `status: "stopped"`, once the stop
 has landed. Read the position off that result rather than off the cache right
-after `await client.stop()`.
+after `await client.stop()`. The module says `stopped` only for a `stop`
+action, and only the run's own client sends one — a caller's `stop()`, the
+stop `moveTo` sends after a refusal (which ends a walk another caller started
+meanwhile), and the stop on a snippet's abandon — so that is what its hint
+names.
 
 `waitForNearby` waits on the *cache*, not on one event: a named creature takes a
 create block plus the creature-query answer the module fired on first sight, so

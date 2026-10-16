@@ -1277,6 +1277,16 @@ export function questGiverStatusName(status: number): QuestGiverStatusName {
 }
 
 /**
+ * Whether a self field is one the server computes a questgiver marker from: a
+ * quest-log slot's quest or its state, or our own level. A marker older than
+ * the latest of these may be about to change (the client's marker pre-checks
+ * read it that way), and the login re-dates them for the same reason.
+ */
+export function isQuestGiverMarkerInput(key: string): boolean {
+  return key === "level" || /^quest\d+(Id|State)$/.test(key);
+}
+
+/**
  * Criteria for `units()`. All present criteria are AND-ed; an absent one does
  * not filter. Anything else is rejected loudly.
  */
@@ -2572,6 +2582,10 @@ export class StateCache {
         // Same fold for both; NEW_WORLD additionally closes a pending transfer.
         const d = event.data as WorldPosition;
         this.evictOnMapChange(d.map);
+        if (event.opcode === "SMSG_LOGIN_VERIFY_WORLD") {
+          this.forgetQuestGiverMarkers();
+          this.redateQuestGiverMarkerInputs(event.seq, event.ts);
+        }
         this.selfMap = d.map;
         this.self.position = {
           value: { map: d.map, x: d.x, y: d.y, z: d.z, o: d.o },
@@ -3666,6 +3680,36 @@ export class StateCache {
       const t = obj.objectType?.value;
       if (t === "item" || t === "container") continue;
       this.forget(guid);
+    }
+  }
+
+  /**
+   * A login starts a new session, and `seq` restarts with it, so a questgiver
+   * marker from an earlier session cannot be ordered against the new
+   * session's quest log and level: the new self create block re-stamps those
+   * at low seqs, and the old marker would read as newer than all of them.
+   * Only the markers go — the objects stay, as a same-map login keeps them
+   * (see `evictOnMapChange`) — and the client asks for them again as each
+   * questgiver comes into view in the new session.
+   */
+  private forgetQuestGiverMarkers(): void {
+    for (const obj of this.nearby.values()) obj.questGiver = undefined;
+  }
+
+  /**
+   * The other half of a login: the self fields a marker is ordered against
+   * (`isQuestGiverMarkerInput`) are re-dated to it. A create block never
+   * carries a zero-valued field, so the new session's own create leaves an
+   * empty slot, or an active quest's zero state, stamped with the last
+   * session's seq, which late in a long session is far above anything the
+   * new one has yet produced; every new marker read as older than it. Each
+   * value stands; only its stamp moves to the login, and whatever the new
+   * create restates takes the create's stamp as usual. Entries are replaced,
+   * never mutated, so a snapshot taken earlier keeps its own.
+   */
+  private redateQuestGiverMarkerInputs(seq: number, ts: number): void {
+    for (const [key, field] of this.self.fields) {
+      if (isQuestGiverMarkerInput(key)) this.self.fields.set(key, { value: field.value, seq, ts });
     }
   }
 

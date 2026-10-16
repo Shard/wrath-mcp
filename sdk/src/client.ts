@@ -110,6 +110,7 @@ import {
 import {
   mailResultText,
   partyResultText,
+  isQuestGiverMarkerInput,
   pointOf,
   questGiverStatusName,
   StateCache,
@@ -1035,6 +1036,16 @@ export const MOVE_HINTS: Readonly<Record<string, (point: MovePoint, data: MoveRe
     `a newer moveTo replaced this one and is the move walking now. It came from this run's own code: another ` +
     `routine, a snippet, or a helper's walk (killTarget's approach). Retrying on superseded cancels that newer ` +
     `move in turn, so two callers that both retry cancel each other forever. Let one caller own movement.`,
+  // The module ends a move `stopped` only for a `stop` action while the move
+  // is active (module/PROTOCOL.md, "stop"), and only this run's client sends
+  // one: the caller's own `stop()`, the stop `moveTo` sends after a refusal
+  // in `MOVE_LEAVES_NO_STOP`, and the stop on a snippet's abandon. No SDK
+  // helper stops a walk as part of a flow that succeeds. "after another moveTo
+  // was refused" is that second stop: it ends a walk a different caller
+  // started. The operator's wording (2026-10-16).
+  stopped: () =>
+    `stop() ended this move, called from within this run: by your own code, after another moveTo was refused, ` +
+    `or at a snippet's time limit.`,
 };
 
 /**
@@ -1641,15 +1652,19 @@ function questgiverMarkerOf(state: StateCache, guid: GuidArg, wanted: "reward" |
  * quest log's slots (a quest entering or leaving it, or its state changing)
  * and our own level. The client re-asks for every marker when the log
  * changes, so an older marker may be about to change — finishing the last
- * objective and turning in at once is the common case. Undefined when no
- * marker was observed or it is older than such a change.
+ * objective and turning in at once is the common case, and turning in and
+ * asking the same NPC for the next quest of its chain at once is the other.
+ * Undefined when no marker was observed or it is older than such a change.
+ * The comparison is by `seq`, which restarts with every session; the cache
+ * drops every marker at login, so none from an earlier session is compared,
+ * and re-dates these fields to the login, so none of theirs is either.
  */
 function freshQuestgiverMarkerOf(state: StateCache, guid: GuidArg, wanted: "reward" | "available", questId?: number): QuestGiverMarker | undefined {
   const observed = state.nearby.get(guidKey(guid))?.questGiver;
   if (observed === undefined) return undefined;
   let changed = -1;
   for (const [key, field] of state.self.fields) {
-    if (key === "level" || /^quest\d+(Id|State)$/.test(key)) changed = Math.max(changed, field.seq);
+    if (isQuestGiverMarkerInput(key)) changed = Math.max(changed, field.seq);
   }
   return observed.seq > changed ? { name: questGiverStatusName(observed.value), wanted, questId } : undefined;
 }
@@ -1841,9 +1856,10 @@ export type QuestAcceptResult =
   | {
       readonly ok: false;
       /**
-       * The NPC's observed questgiver marker already says it offers nothing
-       * (nothing was sent), or the NPC answered with the turn-in window of a
-       * quest already in the log: the one quest it has for this character.
+       * The NPC's questgiver marker, newer than the last quest-log or level
+       * change, already says it offers nothing (nothing was sent), or the NPC
+       * answered with the turn-in window of a quest already in the log: the
+       * one quest it has for this character.
        */
       readonly status: "nothing_on_offer";
       readonly questId: number;
@@ -1905,8 +1921,9 @@ export interface QuestOfferRow {
 
 /**
  * `questsAvailableFrom`'s answer. `nothing_on_offer` is the marker pre-check
- * (nothing sent) or the NPC answering with the turn-in window of a quest
- * already in the log; `too_far` is the range pre-check, nothing sent.
+ * (a marker newer than the last quest-log or level change; nothing sent) or
+ * the NPC answering with the turn-in window of a quest already in the log;
+ * `too_far` is the range pre-check, nothing sent.
  */
 export type QuestsAvailableResult =
   | { readonly ok: true; readonly quests: readonly QuestOfferRow[] }
@@ -2866,7 +2883,8 @@ export class WrathClient {
       secret: options.secret,
     });
     this.state = new StateCache(options.state ?? {});
-    // Registered before the socket opens, so the cache sees every frame.
+    // Registered before the socket opens, so the cache sees every frame. The
+    // cache first: the client-parity queries read what each event left in it.
     this.events.onAny((event: StreamEvent) => this.state.apply(event));
     this.events.onAny((event: StreamEvent) => this.clientParityQueries(event));
   }
@@ -2961,7 +2979,9 @@ export class WrathClient {
   //    skipped when a status for that guid already arrived in the same burst.
   //    The core's unprompted login-time `SMSG_QUESTGIVER_STATUS_MULTIPLE` is
   //    empty (sent before visibility is populated; verified live 2026-08-22),
-  //    so these per-guid queries are what populate the initial view.
+  //    so these per-guid queries are what populate the initial view — after
+  //    every login, since the cache drops the last session's markers then,
+  //    and for each questgiver back in view after a trip to another map.
   //  - `questgiver_status_multiple_query` when the quest log's membership or
   //    a quest's complete bit changes (the client re-requests every marker on
   //    a quest-log update; counters alone do not move a marker, so they do
@@ -3001,6 +3021,25 @@ export class WrathClient {
       }
       case "SMSG_DESTROY_OBJECT":
         this.forgetStatus((event.data as { guid: string }).guid);
+        break;
+      case "SMSG_LOGIN_VERIFY_WORLD":
+        // A new session: the cache drops every marker from the last one, and
+        // each questgiver the new session puts in view is asked again, as a
+        // client asks for every marker after logging in.
+        this.statusKnown.clear();
+        this.statusPending.clear();
+        break;
+      case "SMSG_NEW_WORLD":
+      case "WB_SESSION_STATE":
+        // A new map: the cache has already evicted every object the old one
+        // put in view (`state.apply` is subscribed before this handler), and
+        // no out-of-range names them, so each is forgotten here and is first
+        // sight again when it comes back into view, as for a client, whose
+        // world load drops them all. A same-map arrival evicts nothing and so
+        // forgets nothing.
+        for (const guid of [...this.statusKnown, ...this.statusPending]) {
+          if (!this.state.nearby.has(guid)) this.forgetStatus(guid);
+        }
         break;
       case "SMSG_QUESTGIVER_STATUS": {
         const d = event.data as QuestGiverStatusData;
@@ -6731,12 +6770,16 @@ export class WrathClient {
   private async questOffer(npcGuid: GuidArg, timeout: number): Promise<QuestOfferOutcome> {
     const sinceSeq = this.events.recent(1)[0]?.seq;
     const distance = distanceToUnit(this.state, npcGuid);
-    const marker = questgiverMarkerOf(this.state, npcGuid, "available");
+    const marker = freshQuestgiverMarkerOf(this.state, npcGuid, "available");
     if (marker !== undefined && OFFERS_NOTHING.has(marker.name)) {
       // The server already said what this NPC has for us (its questgiver
       // marker, received before the call), and it is not a quest on offer — a
       // turn-in-only or empty-handed NPC answers a quest_list with silence, so
-      // waiting the timeout out would only confirm what is already known.
+      // waiting the timeout out would only confirm what is already known. Only
+      // a marker newer than the last quest-log or level change counts, as in
+      // `turnInQuest`: right after a turn-in the marker still reads `reward`
+      // while the next quest of the chain is already on offer. An unobserved
+      // or older marker sends, as before.
       return {
         nothing: marker,
         hint:
