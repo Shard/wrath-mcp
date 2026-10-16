@@ -20,7 +20,7 @@ Not allowed, even though the server knows them:
 - Aggro and leash radii, loot tables, respawn timers, spawn coordinates, quest objective coordinates from the database, creature AI state.
 - Objects beyond update range or behind the server's visibility checks.
 - Anything about other sessions' characters beyond what a nearby player would see.
-- The module's own diagnostics: the global session count and the packet-drop census. `GET /health` serves those to loopback (operator) callers only; the network view is liveness-only (see PROTOCOL.md).
+- The module's own diagnostics: the global session count, the packet-drop census and the world-load store counts. `GET /health` serves those to loopback (operator) callers only; the network view is liveness-only (see PROTOCOL.md).
 
 Ambiguity resolves toward the client: if it is unclear whether a client could see something, it is not served until someone checks.
 

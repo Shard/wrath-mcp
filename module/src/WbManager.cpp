@@ -31,6 +31,7 @@
 #include "LootMgr.h"
 #include "QuestDef.h"
 #include "ObjectGuid.h"
+#include "ObjectMgr.h"
 #include "Opcodes.h"
 #include "Map.h"
 #include "MapCollisionData.h"
@@ -56,6 +57,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -88,6 +90,83 @@ namespace WrathBench
         w.Add("build", WRATHBENCH_BUILD);
         w.Add("startedAtMs", kStartedAtMs);
         w.Add("uptimeMs", NowMs() - kStartedAtMs);
+    }
+
+    // Whether the world loaded whole, for /health (PROTOCOL.md, GET /health).
+    // The core logs a query that lost its database connection and carries on:
+    // a MySQL restart in the middle of SetInitialWorldSettings leaves a world
+    // with no creatures and a server that otherwise looks fine. Taken once, on
+    // the world thread, from Start(): OnStartup runs after the whole load and
+    // before the first world tick, and the core never refills these stores, so
+    // the snapshot is the truth for the life of the process. Written before
+    // the HTTP threads exist and never again, so they read it without a lock.
+    struct WorldCensus
+    {
+        uint64 creatureSpawns = 0;
+        uint64 gameObjectSpawns = 0;
+        uint64 creatureTemplates = 0;
+        uint64 questTemplates = 0;
+        int64 dbUptimeS = -1;      // the world database server's own Uptime; -1 unread
+        int64 loadedAfterMs = 0;   // this process's age when the census ran
+        bool dbRestarted = false;  // that server started after this process did
+        bool loaded = false;
+    };
+    static WorldCensus sWorldCensus;
+    static auto const kStartedSteady = std::chrono::steady_clock::now();
+
+    static void TakeWorldCensus()
+    {
+        WorldCensus c;
+        c.creatureSpawns = sObjectMgr->GetAllCreatureData().size();
+        c.gameObjectSpawns = sObjectMgr->GetAllGOData().size();
+        c.creatureTemplates = sObjectMgr->GetCreatureTemplates()->size();
+        c.questTemplates = sObjectMgr->GetQuestTemplates().size();
+        c.loadedAfterMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - kStartedSteady).count();
+        // A database that is younger than this process restarted during the
+        // load, and every query in flight then was lost whichever table it
+        // read. Seconds resolution, so allow a few before calling it.
+        if (QueryResult r = WorldDatabase.Query("SHOW GLOBAL STATUS LIKE 'Uptime'"))
+        {
+            std::string const v = r->Fetch()[1].Get<std::string>();
+            char* end = nullptr;
+            unsigned long long const s = std::strtoull(v.c_str(), &end, 10);
+            if (end != v.c_str())
+                c.dbUptimeS = static_cast<int64>(s);
+        }
+        c.dbRestarted = c.dbUptimeS >= 0 && (c.dbUptimeS + 5) * 1000 < c.loadedAfterMs;
+        c.loaded = c.creatureSpawns > 0 && c.gameObjectSpawns > 0 && c.creatureTemplates > 0
+            && c.questTemplates > 0 && !c.dbRestarted;
+        sWorldCensus = c;
+
+        if (c.dbUptimeS < 0)
+            LOG_WARN("module", "wrathbench: could not read the world database's Uptime; the world load is judged on the store counts alone");
+        if (c.dbRestarted)
+            LOG_ERROR("module", "wrathbench: the world database has been up {}s and this process {}s: it restarted during the world load",
+                c.dbUptimeS, c.loadedAfterMs / 1000);
+        if (c.loaded)
+            LOG_INFO("module", "wrathbench: world loaded: {} creature spawns, {} gameobject spawns, {} creature templates, {} quests",
+                c.creatureSpawns, c.gameObjectSpawns, c.creatureTemplates, c.questTemplates);
+        else
+            LOG_ERROR("module", "wrathbench: the world did NOT load whole ({} creature spawns, {} gameobject spawns, {} creature templates, "
+                "{} quests); /health answers 503 world_not_loaded until the worldserver restarts",
+                c.creatureSpawns, c.gameObjectSpawns, c.creatureTemplates, c.questTemplates);
+    }
+
+    static void AddWorldLoad(Json::Writer& w)
+    {
+        Json::Writer c;
+        c.Add("creatureSpawns", sWorldCensus.creatureSpawns);
+        c.Add("gameObjectSpawns", sWorldCensus.gameObjectSpawns);
+        c.Add("creatureTemplates", sWorldCensus.creatureTemplates);
+        c.Add("questTemplates", sWorldCensus.questTemplates);
+        if (sWorldCensus.dbUptimeS >= 0)
+            c.Add("dbUptimeS", sWorldCensus.dbUptimeS);
+        else
+            c.Raw("dbUptimeS", "null");
+        c.Add("loadedAfterMs", sWorldCensus.loadedAfterMs);
+        c.Add("dbRestarted", sWorldCensus.dbRestarted);
+        w.Raw("worldLoad", c.Str());
     }
 
     static std::string Sanitize(std::string const& token)
@@ -213,6 +292,8 @@ namespace WrathBench
         // store serves ids without names, never an error.
         LOG_INFO("module", "wrathbench: item random properties named from {} ItemRandomProperties, {} ItemRandomSuffix and {} SpellItemEnchantment rows",
             sItemRandomPropertiesStore.GetNumRows(), sItemRandomSuffixStore.GetNumRows(), sSpellItemEnchantmentStore.GetNumRows());
+
+        TakeWorldCensus();
 
         // The port secret is the floor under every route (PROTOCOL.md,
         // "Authentication"): without one the control surface does not listen
@@ -533,23 +614,39 @@ namespace WrathBench
 
     HttpReply Manager::HttpHealth(bool operatorView)
     {
+        // A world that did not load whole (TakeWorldCensus) is not ready: 503
+        // with the error envelope every refusal carries, and otherwise the
+        // usual body. Every reader that keys on `ok` (the fleet gate, both
+        // deploy windows, the smokes) waits on it unchanged, the build still
+        // reads off it, and the worldserver's startup probe never passes.
+        bool const loaded = sWorldCensus.loaded;
+        int const status = loaded ? 200 : 503;
+        auto head = [&](Json::Writer& w)
+        {
+            w.Add("ok", loaded);
+            if (!loaded)
+                w.Add("error", "world_not_loaded");
+            w.Add("module", "mod-wrathbench");
+            w.Add("worldStopped", World::IsStopped());
+            w.Add("worldLoaded", loaded);
+        };
+
         // Non-loopback callers (runner, snippet sandbox) get liveness only:
         // the global session count and the drop census describe module
         // internals and other runs' sessions, which the observation contract
         // never serves to a snippet. The counter fields stay present, zeroed,
         // so the SDK's health schema keeps parsing; the census is read
         // by operators via loopback curl inside the worldserver container.
+        // The world-load counts are the same kind of internal: loopback only.
         if (!operatorView)
         {
             Json::Writer w;
-            w.Add("ok", true);
-            w.Add("module", "mod-wrathbench");
-            w.Add("worldStopped", World::IsStopped());
+            head(w);
             w.Add("sessions", 0);
             w.Add("droppedPackets", 0);
             w.Add("droppedPacketsLive", 0);
             AddBuildIdentity(w);
-            return {200, w.Str()};
+            return {status, w.Str()};
         }
 
         uint64_t sessions;
@@ -575,15 +672,14 @@ namespace WrathBench
             byOpcode.Add(DropOpcodeName(opc), count);
 
         Json::Writer w;
-        w.Add("ok", true);
-        w.Add("module", "mod-wrathbench");
-        w.Add("worldStopped", World::IsStopped());
+        head(w);
         w.Add("sessions", sessions);
         w.Add("droppedPackets", _totalDrops.load()); // lifetime
         w.Add("droppedPacketsLive", liveDrops);      // across current sessions
         w.Raw("droppedByOpcode", byOpcode.Str());    // lifetime, top 30 by count
+        AddWorldLoad(w);
         AddBuildIdentity(w);
-        return {200, w.Str()};
+        return {status, w.Str()};
     }
 
     HttpReply Manager::HttpCreateSession(std::string const& body, std::string const& forcedAccount)

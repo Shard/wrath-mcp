@@ -95,9 +95,10 @@ Module and world status. Either credential class, no body.
 
 Two views. Callers on that network — the runner and, through
 it, the snippet sandbox — get liveness plus build identity: `ok`, `module`,
-`worldStopped`, `build`, `startedAtMs`, `uptimeMs`,
+`worldStopped`, `worldLoaded`, `build`, `startedAtMs`, `uptimeMs`,
 with `sessions` / `droppedPackets` / `droppedPacketsLive` present but zeroed
-(kept so the SDK response schema parses) and no `droppedByOpcode`. The global
+(kept so the SDK response schema parses) and no `droppedByOpcode` or
+`worldLoad`. The global
 session count and the drop census describe module internals and other runs'
 sessions, which the observation contract never serves to a snippet. The full
 view below is served only to loopback callers — an operator inside the
@@ -110,15 +111,28 @@ Operator (loopback) response `200`:
   "ok": true,
   "module": "mod-wrathbench",
   "worldStopped": false,
+  "worldLoaded": true,
   "sessions": 1,
   "droppedPackets": 4213,
   "droppedPacketsLive": 37,
   "droppedByOpcode": { "SMSG_POWER_UPDATE": 1400, "SMSG_EMOTE": 220, "0x4F2": 3 },
+  "worldLoad": { "creatureSpawns": 130000, "gameObjectSpawns": 50000, "creatureTemplates": 28000,
+                 "questTemplates": 9500, "dbUptimeS": 86400, "loadedAfterMs": 180000, "dbRestarted": false },
   "build": "harness-0.3-41-g0bfe207",
   "startedAtMs": 1787400000000,
   "uptimeMs": 3600000
 }
 ```
+
+- `worldLoaded` — whether the world loaded whole; `true` on every `200` (see
+  "A world that did not load whole" below).
+- `worldLoad` (operator view only) — what that verdict was taken from:
+  `creatureSpawns`, `gameObjectSpawns`, `creatureTemplates`, `questTemplates`
+  (sizes of the core's in-memory stores), `dbUptimeS` (the world database's
+  `SHOW GLOBAL STATUS` Uptime, `null` when unread, in which case the counts
+  alone decide), `loadedAfterMs` (this process's age when the verdict was
+  taken) and `dbRestarted`. Server internals no client sees, like the drop
+  census, so never on the network view.
 - `build` — the wrathbench repo's `git describe --tags --always --dirty` at
   image build time, compiled into the module from the `WRATHBENCH_BUILD`
   docker build-arg (`infra/build-images.sh` supplies it, and a compose build
@@ -140,6 +154,24 @@ Operator (loopback) response `200`:
   lifetime): the top 30 dropped opcodes by count, keyed by the
   core's opcode-table name where it has one, `"0xNNN"` hex otherwise. This is
   the whitelist-expansion census this anticipates.
+
+**A world that did not load whole is not ready.** The answer is then `503`
+with the usual error envelope, `"ok": false, "error": "world_not_loaded"`,
+and the rest of the body as above with `"worldLoaded": false`, in both views.
+The verdict is taken once, when the module starts (`OnStartup`, after the core
+has loaded every store and before the first world tick), and holds until the
+process exits: the core never reloads those stores, so only a restart clears
+it. It fails when any of the creature spawn, gameobject spawn, creature
+template or quest stores is empty, or when the world database's own `Uptime`
+is shorter than this process's by more than a few seconds, i.e. MySQL
+restarted during the load. The core logs a query that lost its connection and
+carries on with that table empty, so without this a database restart in the
+middle of the load serves a world with no creatures under an `ok` health.
+Every reader that keys on `ok` (the fleet's preflight gate, both deploy
+windows' health waits, the smokes) waits on such a server rather than smoking
+or spawning against it, and the chart's startup probe passes only on a `200`
+here, so Kubernetes restarts the worldserver rather than starting it
+(infra/chart/wrathbench/templates/worldserver.yaml).
 
 ### POST /session
 
