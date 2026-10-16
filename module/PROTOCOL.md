@@ -121,8 +121,8 @@ Operator (loopback) response `200`:
 ```
 - `build` — the wrathbench repo's `git describe --tags --always --dirty` at
   image build time, compiled into the module from the `WRATHBENCH_BUILD`
-  docker build-arg (`infra/build-worldserver.sh` supplies it; see
-  `module/mod-wrathbench.cmake`). `"unknown"` when the image was built without
+  docker build-arg (`infra/build-images.sh` supplies it, and a compose build
+  takes it from the shell; see `module/mod-wrathbench.cmake`). `"unknown"` when the image was built without
   it. Served to every caller: it is ops identity, not game
   state, and lets the fleet gate, trajectories and the dashboard name *which*
   server they talked to.
