@@ -1002,7 +1002,9 @@ export type QuestGiverStatusMultipleData = z.infer<typeof questGiverStatusMultip
  * `SMSG_QUEST_QUERY_RESPONSE`: the quest template the client's log renders
  * from. `requiredNpcOrGo[i].entry` is a creature entry, or a gameobject entry
  * with bit 31 set (the client's own convention); a zero entry with a non-empty
- * `text` is an event/exploration objective.
+ * `text` is a scripted event objective. An exploration objective has no slot:
+ * it is `flags & 0x4` (`QUEST_FLAGS_EXPLORATION`), with `areaDescription` as
+ * its line of text.
  */
 export const questQueryResponseDataSchema = z.looseObject({
   questId: z.number(),
@@ -1011,6 +1013,8 @@ export const questQueryResponseDataSchema = z.looseObject({
   minLevel: z.number().optional(),
   type: z.number().optional(),
   suggestedPlayers: z.number().optional(),
+  /** The template's `QUEST_FLAGS_*` word, raw (`Flags & 0xFFFF`); absent from a module older than the field. */
+  flags: z.number().optional(),
   title: z.string(),
   objectives: z.string().optional(),
   details: z.string().optional(),

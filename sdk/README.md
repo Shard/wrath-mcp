@@ -381,6 +381,18 @@ fields and this is where they are folded.
   into `counts[0..3]`. The log carries the *current* counts only — `required`
   lives on `SMSG_QUESTUPDATE_ADD_KILL` and the quest details — so nothing here
   compares them, and `complete` is the state field's own bit.
+- An exploration objective has no slot and no counter. A quest whose template
+  flags carry `QUEST_FLAGS_EXPLORATION` (0x4, served raw as `flags` on
+  `SMSG_QUEST_QUERY_RESPONSE`) gets one `explore` row, last, with the
+  template's `areaDescription` as its text (the objectives text when that is
+  empty). It is done when the completion bit is set, or when
+  `SMSG_QUESTUPDATE_COMPLETE` named the quest while it was in the log: the
+  core sends that once, when the area is reached, even if kills or items are
+  still open. The credit is dropped when the quest leaves the log and at
+  login, because no field restates it; a quest with other objectives still
+  open then reads not done until the completion bit is set, since nothing
+  the new session receives says otherwise. A module that does not serve
+  `flags` gives no row.
 - `questNId === 0` is an empty slot and does not become a quest with id 0.
 - An inventory slot is a three-way join: the two u32 guid halves, the item's
   own create block (for `entry`), and an item query (for the name). Each leg

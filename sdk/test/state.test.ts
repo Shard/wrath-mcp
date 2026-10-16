@@ -55,6 +55,10 @@ import {
   questGiverStatus,
   questGiverStatusMultiple,
   questQueryResponse,
+  exploreQuestQuery,
+  questUpdateComplete,
+  questSlot0,
+  questSlot0Progress,
   KOBOLD_ENTRY,
   GO_ENTRY,
   REQUIRED_ITEM,
@@ -1971,6 +1975,119 @@ describe("state cache: quest objectives from the quest query", () => {
     const c = withWorld([questAccepted, questChained, questQueryResponse()]);
     expect(c.quest(OTHER_QUEST_ID)?.objectives).toBeUndefined();
     expect(c.quest(QUEST_ID)?.objectives).toHaveLength(4);
+  });
+});
+
+describe("state cache: exploration objectives", () => {
+  // An exploration objective has no slot and no counter on the wire: the row
+  // comes from the template's exploration flag, and done from the server's
+  // SMSG_QUESTUPDATE_COMPLETE or the quest log's completion bit (issue #115).
+  const EXPLORE_QUEST = 5150;
+  const withWorld = (extra: readonly unknown[]) =>
+    StateCache.replay(toEvents([...worldStream, ...extra]), { seed: SEED });
+  const exploreRow = (c: StateCache) => c.quest(EXPLORE_QUEST)?.objectives?.find((o) => o.kind === "explore");
+  const rows = (c: StateCache) => c.quest(EXPLORE_QUEST)!.objectives!.map((o) => [o.kind, o.have, o.done]);
+  const login = (seq: number) => ({
+    seq,
+    opcode: "SMSG_LOGIN_VERIFY_WORLD",
+    opcodeId: 0x236,
+    ts: 1_700_000_000_000 + seq,
+    data: { map: 0, x: -1234.5, y: 987.25, z: 42.125, o: 3.5 },
+  });
+  const accepted = [questSlot0(EXPLORE_QUEST, 60), exploreQuestQuery(EXPLORE_QUEST)];
+  const acceptedMixed = [questSlot0(EXPLORE_QUEST, 60), exploreQuestQuery(EXPLORE_QUEST, { kill: 3 })];
+
+  test("a pure exploration quest lists one explore row, open until the server credits it", () => {
+    const open = withWorld(accepted);
+    expect(open.quests.get(EXPLORE_QUEST)?.value.flags).toBe(0x4 | 0x8);
+    expect(open.quest(EXPLORE_QUEST)!.objectives).toEqual([
+      { kind: "explore", entry: undefined, text: "Scout the old quarry", required: 1, have: 0, done: false },
+    ]);
+    // The credit goes out at once; the completion bit rides the next object flush.
+    const credited = withWorld([...accepted, questUpdateComplete(EXPLORE_QUEST)]);
+    expect(exploreRow(credited)).toMatchObject({ have: 1, done: true });
+    expect(credited.quest(EXPLORE_QUEST)!.complete).toBe(false);
+    const flushed = withWorld([...accepted, questUpdateComplete(EXPLORE_QUEST), questSlot0Progress(63, 0, 1)]);
+    expect(exploreRow(flushed)).toMatchObject({ have: 1, done: true });
+    expect(flushed.quest(EXPLORE_QUEST)!.complete).toBe(true);
+  });
+
+  test("the completion bit alone marks it done, as after a relog, when no packet restates the credit", () => {
+    const relogged = withWorld([...accepted, questUpdateComplete(EXPLORE_QUEST), questSlot0Progress(63, 0, 1), login(70)]);
+    expect(exploreRow(relogged)).toMatchObject({ have: 1, done: true });
+    const bitOnly = withWorld([...accepted, questSlot0Progress(63, 0, 1)]);
+    expect(exploreRow(bitOnly)).toMatchObject({ have: 1, done: true });
+  });
+
+  test("a mixed quest: the credit marks the explore row while the kill and the quest stay open", () => {
+    expect(rows(withWorld(acceptedMixed))).toEqual([
+      ["kill", 0, false],
+      ["explore", 0, false],
+    ]);
+    const credited = withWorld([...acceptedMixed, questUpdateComplete(EXPLORE_QUEST)]);
+    expect(rows(credited)).toEqual([
+      ["kill", 0, false],
+      ["explore", 1, true],
+    ]);
+    expect(credited.quest(EXPLORE_QUEST)!.complete).toBe(false);
+    // A relog restates the log from fields that carry no credit, so the row
+    // reads open until the completion bit says done.
+    const relogged = withWorld([...acceptedMixed, questUpdateComplete(EXPLORE_QUEST), login(70)]);
+    expect(exploreRow(relogged)).toMatchObject({ have: 0, done: false });
+    const finished = withWorld([...acceptedMixed, questUpdateComplete(EXPLORE_QUEST), login(70), questSlot0Progress(71, 3, 1)]);
+    expect(rows(finished)).toEqual([
+      ["kill", 3, true],
+      ["explore", 1, true],
+    ]);
+  });
+
+  test("a quest that leaves the log takes its credit with it, so a re-accept starts unexplored", () => {
+    const reaccepted = withWorld([
+      ...accepted,
+      questUpdateComplete(EXPLORE_QUEST),
+      questSlot0(0, 63), // abandoned
+      questSlot0(EXPLORE_QUEST, 64),
+    ]);
+    expect(exploreRow(reaccepted)).toMatchObject({ have: 0, done: false });
+    // A block that restates the quest in its slot (a far teleport's own create) keeps it.
+    const restated = withWorld([...accepted, questUpdateComplete(EXPLORE_QUEST), questSlot0(EXPLORE_QUEST, 64)]);
+    expect(exploreRow(restated)).toMatchObject({ have: 1, done: true });
+  });
+
+  test("a credit that outruns the quest's own slot field still counts", () => {
+    // The packet is sent direct; the slot field waits for the object flush.
+    const c = withWorld([exploreQuestQuery(EXPLORE_QUEST), questUpdateComplete(EXPLORE_QUEST), questSlot0(EXPLORE_QUEST, 63)]);
+    expect(exploreRow(c)).toMatchObject({ have: 1, done: true });
+  });
+
+  test("no exploration flag, no explore row", () => {
+    // The kill/collect fixture serves no flags at all.
+    const plain = withWorld([questAccepted, questQueryResponse()]);
+    expect(plain.quest(QUEST_ID)!.objectives!.some((o) => o.kind === "explore")).toBe(false);
+    // Sharable only: the credit packet alone does not make a row.
+    const sharable = withWorld([
+      questSlot0(EXPLORE_QUEST, 60),
+      exploreQuestQuery(EXPLORE_QUEST, { flags: 0x8 }),
+      questUpdateComplete(EXPLORE_QUEST),
+    ]);
+    expect(sharable.quest(EXPLORE_QUEST)!.objectives).toEqual([]);
+    // A module older than the field serves no flags: no row, rather than a guess.
+    const older = withWorld([questSlot0(EXPLORE_QUEST, 60), exploreQuestQuery(EXPLORE_QUEST, { flags: undefined })]);
+    expect(older.quests.get(EXPLORE_QUEST)?.value.flags).toBeUndefined();
+    expect(older.quest(EXPLORE_QUEST)!.objectives).toEqual([]);
+  });
+
+  test("an empty areaDescription falls back to the objectives text", () => {
+    const c = withWorld([questSlot0(EXPLORE_QUEST, 60), exploreQuestQuery(EXPLORE_QUEST, { areaDescription: "" })]);
+    expect(exploreRow(c)?.text).toBe("Find the old quarry, then report back to the warden.");
+  });
+
+  test("live equals replay", () => {
+    const frames = [...acceptedMixed, questUpdateComplete(EXPLORE_QUEST), questSlot0(0, 63), questSlot0(EXPLORE_QUEST, 64)];
+    const live = new StateCache({ seed: SEED });
+    for (const e of toEvents([...worldStream, ...frames])) live.apply(e);
+    expect(live.snapshot()).toEqual(withWorld(frames).snapshot());
+    expect(exploreRow(live)).toMatchObject({ done: false });
   });
 });
 

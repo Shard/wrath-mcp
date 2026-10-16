@@ -1184,6 +1184,59 @@ export function questQueryResponse(questId = QUEST_ID, seq = 60): unknown {
   };
 }
 
+/**
+ * A template answer for an exploration quest: `flags` carries
+ * `QUEST_FLAGS_EXPLORATION` (0x4, here beside 0x8 sharable) and
+ * `areaDescription` is the line a quest log lists for it. With `kill`, the
+ * quest also asks for a creature in slot 0 — the mixed shape, explore plus
+ * kill. `flags` left `undefined` is a module older than the field. Ids and
+ * strings are invented.
+ */
+export function exploreQuestQuery(
+  questId: number,
+  opts: { flags?: number | undefined; kill?: number; areaDescription?: string; seq?: number } = {},
+): unknown {
+  const seq = opts.seq ?? 61;
+  const data: Record<string, unknown> = {
+    questId,
+    method: 2,
+    level: 5,
+    minLevel: 3,
+    type: 0,
+    suggestedPlayers: 0,
+    title: "The Quiet Quarry",
+    objectives: "Find the old quarry, then report back to the warden.",
+    details: "Nobody has been down to the quarry in weeks.",
+    areaDescription: opts.areaDescription ?? "Scout the old quarry",
+    completedText: "Report back to the warden.",
+    requiredNpcOrGo: [
+      { entry: opts.kill === undefined ? 0 : KOBOLD_ENTRY, count: opts.kill ?? 0, text: "" },
+      { entry: 0, count: 0, text: "" },
+      { entry: 0, count: 0, text: "" },
+      { entry: 0, count: 0, text: "" },
+    ],
+    requiredItems: Array.from({ length: 6 }, () => ({ itemId: 0, count: 0 })),
+  };
+  if (!("flags" in opts)) data["flags"] = 0x4 | 0x8;
+  else if (opts.flags !== undefined) data["flags"] = opts.flags;
+  return { seq, opcode: "SMSG_QUEST_QUERY_RESPONSE", opcodeId: 0x05d, ts: 1_700_000_000_000 + seq, data };
+}
+
+/** The server's exploration/event credit for one quest (`Player::AreaExploredOrEventHappens`). */
+export function questUpdateComplete(questId: number, seq = 62): unknown {
+  return { seq, opcode: "SMSG_QUESTUPDATE_COMPLETE", opcodeId: 0x198, ts: 1_700_000_000_000 + seq, data: { questId } };
+}
+
+/** Slot 0 set to `questId` (or emptied with 0), at `seq`: an accept, an abandon, a turn-in. */
+export function questSlot0(questId: number, seq: number, state = 0): unknown {
+  return selfFields(seq, { quest0Id: questId, quest0State: state, quest0CountsLo: 0, quest0CountsHi: 0 });
+}
+
+/** Slot 0's fields as a quest finishes: the kill counter and the completion bit. */
+export function questSlot0Progress(seq: number, kills: number, state: number): unknown {
+  return selfFields(seq, { quest0CountsLo: kills, quest0State: state });
+}
+
 // ------------------------------------------------------------------ death
 //
 // Hand-written from PROTOCOL.md's death table. `SMSG_CORPSE_RECLAIM_DELAY`

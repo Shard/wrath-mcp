@@ -513,14 +513,24 @@ export interface QuestLogEntry {
 /**
  * One objective of a quest in the log, client-style. `kind` is what the
  * required entry denotes: `kill` a creature, `interact` a gameobject (the
- * wire's `entry | 0x80000000`), `collect` an item, `event` a scripted or
- * exploration objective that carries text but no entry. `have` is the log's
+ * wire's `entry | 0x80000000`), `collect` an item, `event` a scripted
+ * objective that carries text but no entry, `explore` a place to reach (the
+ * template's exploration flag; one row, after the others). `have` is the log's
  * counter for creature/gameobject/event slots and the backpack stack total for
  * items — the two places a client reads it from.
+ *
+ * An `explore` row has no counter on the wire. Its `text` is the template's
+ * `areaDescription` (the objectives text when that is empty), and it is
+ * `done` (`have` 1 of 1) when the quest log's completion bit is set, or when
+ * `SMSG_QUESTUPDATE_COMPLETE` named the quest during this session while it was
+ * in the log — the server's only report of an exploration credit before the
+ * rest of a quest is done. No packet restates that credit at login, so after
+ * a relog a quest with other objectives still open reads not done until the
+ * completion bit says so.
  */
 export interface QuestObjective {
-  readonly kind: "kill" | "interact" | "collect" | "event";
-  /** Creature entry, gameobject entry, or item id, by `kind`. `undefined` for `event`. */
+  readonly kind: "kill" | "interact" | "collect" | "event" | "explore";
+  /** Creature entry, gameobject entry, or item id, by `kind`. `undefined` for `event` and `explore`. */
   readonly entry: number | undefined;
   /** The objective's own text from the template, when it has one. */
   readonly text: string | undefined;
@@ -540,8 +550,12 @@ export interface QuestInfo {
   readonly title: string;
   readonly level: number | undefined;
   readonly minLevel: number | undefined;
+  /** The template's `QUEST_FLAGS_*` word, raw; `undefined` from a module that does not serve it. */
+  readonly flags: number | undefined;
   readonly objectivesText: string | undefined;
   readonly details: string | undefined;
+  /** The line a quest log lists for an exploration or event objective. */
+  readonly areaDescription: string | undefined;
   readonly completedText: string | undefined;
   /** Four slots, as the wire carries them; unused slots have `entry` 0 and `count` 0. */
   readonly requiredNpcOrGo: readonly { entry: number; count: number; text: string | undefined }[];
@@ -1476,6 +1490,15 @@ export class StateCache {
   readonly quests = new Map<number, Observed<QuestInfo>>();
 
   /**
+   * Quest ids an `SMSG_QUESTUPDATE_COMPLETE` credited with their exploration
+   * or event objective. Held only while the quest stays in the log: a quest
+   * that leaves it (turned in, abandoned) is forgotten, so a re-accept starts
+   * unexplored as it does on the server; and a login forgets them all, since
+   * nothing the new session sends restates the credit.
+   */
+  private readonly questExplored = new Set<number>();
+
+  /**
    * guid -> slot -> aura. Kept per slot because `SMSG_AURA_UPDATE` is a *slot*
    * delta: it names only the slots that changed, and a slot the server clears
    * arrives as `removed` rather than as an absence.
@@ -1725,13 +1748,14 @@ export class StateCache {
         ((hi?.value ?? 0) >>> 16) & 0xffff,
       ];
       const info = this.quests.get(id.value)?.value;
+      const complete = (raw & QUEST_STATE_COMPLETE) !== 0;
       out.push({
         slot,
         questId: id.value,
         title: info?.title,
-        objectives: info === undefined ? undefined : this.questObjectives(info, counts),
+        objectives: info === undefined ? undefined : this.questObjectives(info, counts, complete),
         state: raw,
-        complete: (raw & QUEST_STATE_COMPLETE) !== 0,
+        complete,
         counts,
         timer: timer?.value,
         seq: Math.max(id.seq, state?.seq ?? -1, lo?.seq ?? -1, hi?.seq ?? -1),
@@ -1756,21 +1780,32 @@ export class StateCache {
     return this.questLog.find((q) => q.questId === questId);
   }
 
+  /** The quest ids the log's slot fields hold now. */
+  private questIdsInLog(): Set<number> {
+    const ids = new Set<number>();
+    for (let slot = 0; slot < QUEST_LOG_SLOTS; slot++) {
+      const id = this.self.fields.get(`quest${slot}Id`)?.value;
+      if (id !== undefined && id !== 0) ids.add(id);
+    }
+    return ids;
+  }
+
   /**
    * The objectives of one quest, client-style: the template's required
    * entries and counts joined with the log's counters (creature/gameobject/
    * event slots) or the carried stack totals (item slots: equipment, backpack
-   * and worn bags, as `carriedItems` says). A join over two
-   * observations, nothing invented.
+   * and worn bags, as `carriedItems` says), then the exploration objective
+   * when the template's flags carry one. A join over observations, nothing
+   * invented.
    */
-  private questObjectives(info: QuestInfo, counts: readonly number[]): QuestObjective[] {
+  private questObjectives(info: QuestInfo, counts: readonly number[], complete: boolean): QuestObjective[] {
     const out: QuestObjective[] = [];
     info.requiredNpcOrGo.forEach((req, i) => {
       const text = req.text === undefined || req.text === "" ? undefined : req.text;
       if (req.entry === 0 && req.count === 0 && text === undefined) return;
       const have = counts[i] ?? 0;
       if (req.entry === 0) {
-        // Scripted/exploration objective: text only, credited as a count of 1.
+        // Scripted event objective: text only, credited as a count of 1.
         const required = Math.max(req.count, 1);
         out.push({ kind: "event", entry: undefined, text, required, have, done: have >= required });
         return;
@@ -1794,6 +1829,14 @@ export class StateCache {
         if (row.itemId === item.itemId) have += row.count ?? 1;
       }
       out.push({ kind: "collect", entry: item.itemId, text: undefined, required: item.count, have, done: have >= item.count });
+    }
+    if (((info.flags ?? 0) & QUEST_FLAGS_EXPLORATION) !== 0) {
+      // No counter on the wire: done is the completion bit (a quest complete
+      // is explored), or the server's exploration credit for this quest while
+      // it has been in the log.
+      const done = complete || this.questExplored.has(info.questId);
+      const text = info.areaDescription || info.objectivesText || undefined;
+      out.push({ kind: "explore", entry: undefined, text, required: 1, have: done ? 1 : 0, done });
     }
     return out;
   }
@@ -2585,6 +2628,9 @@ export class StateCache {
         if (event.opcode === "SMSG_LOGIN_VERIFY_WORLD") {
           this.forgetQuestGiverMarkers();
           this.redateQuestGiverMarkerInputs(event.seq, event.ts);
+          // The new session restates the quest log from the server's fields,
+          // which hold the completion bit but not an exploration credit.
+          this.questExplored.clear();
         }
         this.selfMap = d.map;
         this.self.position = {
@@ -2661,6 +2707,16 @@ export class StateCache {
         });
         return;
       }
+      case "SMSG_QUESTUPDATE_COMPLETE": {
+        // The exploration or event credit (`Player::AreaExploredOrEventHappens`
+        // is its only sender): sent once per accept, whether or not the rest of
+        // the quest is done, so it is the only report of an explore objective
+        // on a quest that still has kills or items open. The quest-log fields
+        // carry no such flag.
+        const d = event.data as { questId: number };
+        this.questExplored.add(d.questId);
+        return;
+      }
       case "SMSG_QUESTGIVER_STATUS": {
         const d = event.data as QuestGiverStatusData;
         this.applyQuestGiverStatus(d.guid, d.status, event.seq, event.ts);
@@ -2679,8 +2735,10 @@ export class StateCache {
             title: d.title,
             level: d.level,
             minLevel: d.minLevel,
+            flags: d.flags,
             objectivesText: d.objectives,
             details: d.details,
+            areaDescription: d.areaDescription,
             completedText: d.completedText,
             requiredNpcOrGo: d.requiredNpcOrGo.map((r) => ({ entry: r.entry, count: r.count, text: r.text })),
             requiredItems: d.requiredItems.map((r) => ({ itemId: r.itemId, count: r.count })),
@@ -3829,6 +3887,15 @@ export class StateCache {
   ): void {
     if (!fields) return;
     const healthBefore = target === this.self ? target.fields.get("health")?.value : undefined;
+    // A quest that leaves the log takes its exploration credit with it. Read
+    // as a departure across the whole block — before against after — so a
+    // quest restated in another slot stays, and a credit that arrived ahead
+    // of its own slot field (the direct packet outruns the object flush) is
+    // not dropped for not being there yet.
+    const questsBefore =
+      target === this.self && this.questExplored.size > 0 && Object.keys(fields).some((k) => QUEST_ID_FIELD.test(k))
+        ? this.questIdsInLog()
+        : undefined;
     for (const [key, raw] of Object.entries(fields)) {
       if (key === "targetGuid") {
         if (typeof raw === "string" && "targetGuid" in target) {
@@ -3863,6 +3930,10 @@ export class StateCache {
       // non-numbers; only decoded numeric fields belong in the field record.
       if (typeof raw !== "number") continue;
       target.fields.set(key, { value: raw, seq, ts });
+    }
+    if (questsBefore !== undefined) {
+      const after = this.questIdsInLog();
+      for (const id of questsBefore) if (!after.has(id)) this.questExplored.delete(id);
     }
     const level = target.fields.get("level");
     if (level) target.level = level;
@@ -4438,6 +4509,10 @@ function toUnitPosition(pos: PositionData): UnitPosition {
 const QUEST_LOG_SLOTS = 25;
 /** The quest log's completion bit, the one the probe verified live. */
 const QUEST_STATE_COMPLETE = 1;
+/** `QUEST_FLAGS_EXPLORATION` in the template's flags (QuestDef.h): the quest has an exploration objective. */
+const QUEST_FLAGS_EXPLORATION = 0x4;
+/** A quest-log slot's quest id field, `quest<slot>Id`. */
+const QUEST_ID_FIELD = /^quest\d+Id$/;
 /** Equipment + bags are 0-22, backpack 23-38 (PROTOCOL.md). */
 /** The last `invSlot<n>` the module serves: the bank bags. Older modules stop at 38. */
 const INVENTORY_LAST_SLOT = 73;

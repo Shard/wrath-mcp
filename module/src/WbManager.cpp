@@ -5827,7 +5827,8 @@ namespace WrathBench
                 {
                     // PlayerMenu::SendQuestQueryResponse (3.3.5a layout; field
                     // order cited in PROTOCOL.md). Only what the client's quest
-                    // log renders is named: title/objective text, level, and
+                    // log renders is named: title/objective text, level, the
+                    // quest flags (raw, as the wire's `Flags & 0xFFFF`), and
                     // the per-objective required entries and counts. Rewards
                     // are skipped over (they arrive on QUEST_DETAILS /
                     // OFFER_REWARD when the client asks for them).
@@ -5876,7 +5877,7 @@ namespace WrathBench
                     }
                     reqNpcOrGo += "]";
                     w.Add("questId", questId).Add("method", method).Add("level", level).Add("minLevel", minLevel)
-                     .Add("type", type).Add("suggestedPlayers", suggested)
+                     .Add("type", type).Add("suggestedPlayers", suggested).Add("flags", flags)
                      .Add("title", title).Add("objectives", objectives).Add("details", details)
                      .Add("areaDescription", areaDescription).Add("completedText", completedText)
                      .Raw("requiredNpcOrGo", reqNpcOrGo).Raw("requiredItems", reqItems);

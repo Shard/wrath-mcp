@@ -28,6 +28,7 @@ import {
   chatLayouts,
   creatureCreate,
   CREATURE_GUID,
+  exploreQuestQuery,
   fullStream,
   futureOpcode,
   healthResponseFixture,
@@ -330,6 +331,22 @@ describe("event frames", () => {
     expect(lootErrorName(4)).toBe("too_far");
     expect(lootErrorName(0)).toBe("didnt_kill");
     expect(lootErrorName(7)).toBe("unknown"); // no such LootError
+  });
+
+  test("SMSG_QUEST_QUERY_RESPONSE takes the raw flags word, and parses without it from an older module", () => {
+    const withFlags = parseEventFrame(JSON.stringify(exploreQuestQuery(5150)));
+    if (!withFlags.ok || !isEvent(withFlags.event, "SMSG_QUEST_QUERY_RESPONSE")) throw new Error("should parse as known");
+    expect(withFlags.event.data.flags).toBe(0x4 | 0x8);
+    expect(withFlags.event.data.areaDescription).toBe("Scout the old quarry");
+    const older = parseEventFrame(JSON.stringify(exploreQuestQuery(5150, { flags: undefined })));
+    if (!older.ok || !isEvent(older.event, "SMSG_QUEST_QUERY_RESPONSE")) throw new Error("should parse as known");
+    expect(older.event.data.flags).toBeUndefined();
+    // Declared as a number: anything else is a schema error, not a silent pass-through.
+    const bad = structuredClone(exploreQuestQuery(5150)) as { data: Record<string, unknown> };
+    bad.data["flags"] = "4";
+    const badParse = parseEventFrame(JSON.stringify(bad));
+    if (!badParse.ok) throw new Error("frame should still parse");
+    expect((badParse.event as { schemaError?: string }).schemaError).toBeDefined();
   });
 
   test("a malformed data payload downgrades to schemaError but keeps the event", () => {
