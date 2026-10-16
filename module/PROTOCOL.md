@@ -103,7 +103,8 @@ session count and the drop census describe module internals and other runs'
 sessions, which the observation contract never serves to a snippet. The full
 view below is served only to loopback callers — an operator inside the
 worldserver container, with the port secret the container already holds, e.g.
-`docker compose -f infra/compose.yml exec worldserver sh -c 'curl -s -H "Authorization: Bearer $AC_WRATH_BENCH_SECRET" localhost:8086/health'`.
+`bun wb server health` (`infra/module-health.sh`, a perl probe exec'd into the
+worldserver pod: the image has no curl).
 
 Operator (loopback) response `200`:
 ```json
