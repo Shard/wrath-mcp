@@ -1,15 +1,20 @@
 /**
  * Secret redaction: the one rule every sink the runner writes applies to a
- * registered secret value.
+ * registered secret value, the model included.
  *
  * `Trajectory` holds the run's list and scrubs every string it persists
- * (trajectory.jsonl, meta.json); `SandboxHost` scrubs what the snippet child
- * writes to stdout and stderr before it reaches the runner's own, and from
- * there the job log and the pod log. Both use `SecretRedactor`, so the marker
- * and the length floor cannot drift between them.
+ * (trajectory.jsonl, meta.json), and the drivers scrub with the same list
+ * what the model reads: every tool result (`tools.ts`, `ToolContext.secrets`)
+ * and every turn's context message (`ContextBuilder.build`). That last one is
+ * what keeps a secret a snippet printed out of the CLI drivers' own session
+ * files, which the runner does not write. `SandboxHost` scrubs what the
+ * snippet child writes to stdout and stderr before it reaches the runner's
+ * own, and from there the job log and the pod log. All of them use
+ * `SecretRedactor`, so the marker and the length floor cannot drift between
+ * them.
  */
 
-/** What a registered secret reads as wherever the runner writes it. */
+/** What a registered secret reads as wherever the runner writes it, and wherever the model reads it. */
 export const REDACTED = "[redacted]";
 
 /**

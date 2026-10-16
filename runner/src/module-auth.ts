@@ -100,7 +100,8 @@ export async function leaseSessionSecret(o: LeaseOptions): Promise<LeaseOutcome>
  * trajectory, and from there in the derived store and the published feed. So
  * the value must be on the run's redaction list before the child exists. (What
  * it prints to stdout or stderr the sandbox host scrubs itself, with the same
- * `SecretRedactor`, before the job log.) The session token beside it is deliberately not (run.ts says why: meta.json is
+ * `SecretRedactor`, before the job log; the same registration scrubs it from
+ * every tool result and context message before the model reads them.) The session token beside it is deliberately not (run.ts says why: meta.json is
  * scrubbed with the same list and `--resume` reads the token back) — and it
  * authenticates nothing without this secret.
  */
