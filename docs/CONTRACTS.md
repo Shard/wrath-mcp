@@ -99,7 +99,8 @@ The floor that closes that (`module/PROTOCOL.md`
   not given.** The child is exec'd under a Linux Landlock ruleset
   (runner/README.md, "The sandbox") that the kernel enforces however a
   snippet reaches: reads only of what the snippet runtime needs to run, so
-  `.env`, the repo root, the home directory and `/tmp` answer `EACCES`; TCP
+  `.env`, the repo root, the home directory, `/tmp`, `/dev/shm` and every
+  other process's `/proc` entry answer `EACCES`; TCP
   connections only to the port in the run's module URL, and no listening
   socket; no executable but the interpreter itself, so a spawned shell or
   `curl` never starts; and, where the kernel has Landlock scopes, no signal

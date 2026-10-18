@@ -5,14 +5,15 @@
  * here before it is a behaviour in sandbox-fs.test.ts / sandbox-net.test.ts.
  */
 import { describe, expect, test } from "bun:test";
-import { ACCESS_FS, ACCESS_NET, ConfinementError, confinementPlan, elfInterpreter, modulePort, REQUIRED_ABI, SCOPE } from "../src/sandbox/confine";
+import { ACCESS_FS, ACCESS_NET, ConfinementError, confinementPlan, DEV_NODES, elfInterpreter, modulePort, PROC_GLOBAL_FILES, REQUIRED_ABI, SCOPE } from "../src/sandbox/confine";
 
 const REPO = "/srv/wrathbench";
 const BUN = "/home/bun/.bun/bin/bun";
 const LOADER = "/lib64/ld-linux-x86-64.so.2";
+const PID = 4242;
 
 function plan(abi: number, moduleUrl = "http://worldserver:8086") {
-  return confinementPlan({ repoRoot: REPO, bunExe: BUN, moduleUrl, abi, interpreter: LOADER, exists: () => true });
+  return confinementPlan({ repoRoot: REPO, bunExe: BUN, moduleUrl, abi, pid: PID, interpreter: LOADER, exists: () => true });
 }
 
 describe("confinementPlan", () => {
@@ -49,13 +50,13 @@ describe("confinementPlan", () => {
     const p = plan(6);
     const executable = p.fs.filter((r) => (r.access & ACCESS_FS.EXECUTE) !== 0n).map((r) => r.path);
     expect(executable.sort()).toEqual([BUN, LOADER].sort());
-    // Every directory is read-only (plus write+ioctl on /dev); no directory executes.
+    // Every directory is read-only (plus write+ioctl on the /dev nodes); no directory executes.
     for (const r of p.fs) {
       if (executable.includes(r.path)) continue;
       expect(r.access & ACCESS_FS.EXECUTE).toBe(0n);
     }
     // A static bun (no PT_INTERP) grants EXECUTE on the binary alone.
-    const staticPlan = confinementPlan({ repoRoot: REPO, bunExe: BUN, moduleUrl: "http://m:8086", abi: 6, interpreter: null, exists: () => true });
+    const staticPlan = confinementPlan({ repoRoot: REPO, bunExe: BUN, moduleUrl: "http://m:8086", abi: 6, pid: PID, interpreter: null, exists: () => true });
     expect(staticPlan.fs.filter((r) => (r.access & ACCESS_FS.EXECUTE) !== 0n).map((r) => r.path)).toEqual([BUN]);
   });
 
@@ -72,12 +73,31 @@ describe("confinementPlan", () => {
       `${REPO}/bunfig.toml`,
     ]);
     expect(p.fs.some((r) => r.path === REPO)).toBe(false);
-    // WRITE_FILE only on /dev.
-    expect(p.fs.filter((r) => (r.access & ACCESS_FS.WRITE_FILE) !== 0n).map((r) => r.path)).toEqual(["/dev"]);
+    // WRITE_FILE only on the named /dev nodes.
+    expect(p.fs.filter((r) => (r.access & ACCESS_FS.WRITE_FILE) !== 0n).map((r) => r.path)).toEqual(DEV_NODES.map((d) => `/dev/${d}`));
+  });
+
+  test("/proc: the child's own entry and named system-wide files, never /proc itself or another pid", () => {
+    const p = plan(6);
+    const proc = p.fs.filter((r) => r.path === "/proc" || r.path.startsWith("/proc/"));
+    expect(proc.map((r) => r.path)).toEqual([`/proc/${PID}`, ...PROC_GLOBAL_FILES.map((f) => `/proc/${f}`), "/proc/sys"]);
+    // Reads only: nothing under /proc is writable or executable.
+    for (const r of proc) expect(r.access & ~(ACCESS_FS.READ_FILE | ACCESS_FS.READ_DIR)).toBe(0n);
+    // Directory reads on the child's own entry and on /proc/sys alone; the rest are files.
+    expect(proc.filter((r) => (r.access & ACCESS_FS.READ_DIR) !== 0n).map((r) => r.path)).toEqual([`/proc/${PID}`, "/proc/sys"]);
+    // No per-process name among the globals: every one is a fixed system file.
+    for (const f of PROC_GLOBAL_FILES) expect(f).toMatch(/^[a-z]+$/);
+  });
+
+  test("/dev: five named nodes and never the directory, so /dev/shm is out", () => {
+    const p = plan(6);
+    const dev = p.fs.filter((r) => r.path === "/dev" || r.path.startsWith("/dev/")).map((r) => r.path);
+    expect(dev).toEqual(["/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom"]);
+    expect(p.fs.some((r) => r.path === "/dev" || r.path.startsWith("/dev/shm"))).toBe(false);
   });
 
   test("missing paths are dropped; the executables are listed whether or not they exist", () => {
-    const p = confinementPlan({ repoRoot: REPO, bunExe: BUN, moduleUrl: "http://m:8086", abi: 6, interpreter: LOADER, exists: (path) => path === "/usr" || path === `${REPO}/runner` });
+    const p = confinementPlan({ repoRoot: REPO, bunExe: BUN, moduleUrl: "http://m:8086", abi: 6, pid: PID, interpreter: LOADER, exists: (path) => path === "/usr" || path === `${REPO}/runner` });
     expect(p.fs.map((r) => r.path)).toEqual(["/usr", `${REPO}/runner`]);
   });
 

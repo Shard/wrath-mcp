@@ -13,15 +13,19 @@
  *
  *  - Filesystem: reads only where the child legitimately needs them (the Bun
  *    binary and system libraries, `runner/`, `sdk/`, `node_modules/`, the
- *    workspace manifests). `.env`, the repo root, `$HOME` and `/tmp` are
- *    `EACCES` by any path.
+ *    workspace manifests, its own `/proc` entry and a few system-wide `/proc`
+ *    files, and five `/dev` nodes). `.env`, the repo root, `$HOME`, `/tmp`,
+ *    `/dev/shm` and every other process's `/proc` entry are `EACCES` by any
+ *    path.
  *  - Exec: `LANDLOCK_ACCESS_FS_EXECUTE` is granted on exactly two files, the
  *    Bun binary and its ELF interpreter, because the kernel checks both when
  *    this wrapper execs the child. Nothing else in the sandbox spawns or needs
  *    to (entry.ts and the SDK fork nothing; Bun's workers are threads), so
  *    `/bin/sh`, `curl` and every other binary are `EACCES` at `posix_spawn`.
- *    Re-running `bun` itself stays possible and gains nothing: the new process
- *    is in the same Landlock domain with the same environment.
+ *    Re-running `bun` itself gains nothing: the new process has a pid whose
+ *    `/proc` entry the ruleset does not grant, so it fails to start, and were
+ *    it to start it would be in the same Landlock domain with the same
+ *    environment.
  *  - TCP (ABI 4, Linux 6.7+): `connect` is allowed to one port, the one in the
  *    run's module URL (`WRATHBENCH_MODULE_URL`, HTTP and the `/events`
  *    WebSocket share it); `bind` is allowed nowhere. Landlock network rules
@@ -221,11 +225,22 @@ export function elfInterpreter(path: string): string | null {
   }
 }
 
+/** System-wide /proc files the runtime reads (memory, CPUs, uptime, kernel version); nothing per-process. */
+export const PROC_GLOBAL_FILES: readonly string[] = ["meminfo", "stat", "cpuinfo", "loadavg", "uptime", "version", "filesystems"];
+
+/** The /dev nodes the child may open: the null, zero and full sinks and the random sources. */
+export const DEV_NODES: readonly string[] = ["null", "zero", "full", "random", "urandom"];
+
 export interface PlanInput {
   repoRoot: string;
   bunExe: string;
   moduleUrl: string;
   abi: number;
+  /**
+   * The pid the child will run as: this wrapper's own, since execv keeps it.
+   * Its /proc entry is the only one the child may read.
+   */
+  pid: number;
   /** Override for tests; defaults to reading `bunExe`'s ELF header. */
   interpreter?: string | null;
   /** Override for tests; defaults to `existsSync`. */
@@ -255,13 +270,27 @@ export function confinementPlan(input: PlanInput): ConfinementPlan {
   const fileRead = ACCESS_FS.READ_FILE;
   const fs: FsRule[] = [];
   // System: the interpreter's libraries, loader cache, certificates, timezone
-  // data, /proc and /sys for what the runtime introspects. Read only: shared
-  // libraries are mapped from a plain open, which needs no EXECUTE.
-  for (const d of ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/proc", "/sys", "/opt", "/nix"]) {
+  // data, and /sys for the cgroup limits the runtime sizes its heap by. Read
+  // only: shared libraries are mapped from a plain open, which needs no EXECUTE.
+  for (const d of ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/sys", "/opt", "/nix"]) {
     fs.push({ path: d, access: dirRead });
   }
-  // /dev: null, urandom, tty. Read+write, never create.
-  fs.push({ path: "/dev", access: dirRead | ACCESS_FS.WRITE_FILE | ACCESS_FS.IOCTL_DEV });
+  // /proc: the child's own entry and the system-wide files the runtime reads,
+  // never another process's. /proc/<pid>/environ is already refused across a
+  // Landlock domain (it is a ptrace check), but /proc/<pid>/cmdline is not:
+  // every process in the PID namespace — the runner, the CLIs, a sibling run's
+  // child, and on a desktop every process on the machine — would have its argv
+  // readable. `/proc/self` and `/proc/thread-self` resolve under the child's
+  // own entry, which this wrapper's pid is, because execv keeps the pid.
+  fs.push({ path: `/proc/${input.pid}`, access: dirRead });
+  for (const f of PROC_GLOBAL_FILES) fs.push({ path: `/proc/${f}`, access: fileRead });
+  fs.push({ path: "/proc/sys", access: dirRead });
+  // /dev: the character devices a runtime opens, by name. Never /dev itself,
+  // which would admit /dev/shm — another process's shared memory, readable and
+  // writable — and every other node a container or desktop mounts there.
+  for (const d of DEV_NODES) {
+    fs.push({ path: `/dev/${d}`, access: fileRead | ACCESS_FS.WRITE_FILE | ACCESS_FS.IOCTL_DEV });
+  }
   // The two executables: the bun binary wherever it is installed (often under
   // $HOME/.bun, otherwise unreadable) and the dynamic loader its ELF header
   // names, both opened for execution by the kernel when this wrapper execs.
@@ -379,7 +408,7 @@ if (import.meta.main) {
   const moduleUrl = process.env["WRATHBENCH_MODULE_URL"] ?? "http://worldserver:8086";
   let plan: ConfinementPlan;
   try {
-    plan = confinementPlan({ repoRoot, bunExe: exe, moduleUrl, abi: landlockAbi() });
+    plan = confinementPlan({ repoRoot, bunExe: exe, moduleUrl, abi: landlockAbi(), pid: process.pid });
   } catch (err) {
     fail("planning the ruleset", err instanceof Error ? err.message : String(err));
   }
