@@ -1501,8 +1501,12 @@ dispatched and every event served is appended as:
 { "ts": 1755792000123, "session": "run-abc123", "kind": "action"|"event", "payload": { ... } }
 ```
 `payload` for `event` is the exact event object sent on the WebSocket; for
-`action` it is a short record of the dispatched opcode. This is the trajectory's
-ground truth and the evidence the contracts held (docs/CONTRACTS.md).
+`action` it is a short record of the dispatched opcode. The ground truth for
+the wire while it is kept: an operational record the deployment prunes by age
+(docs/CONTRACTS.md "Audit"); the per-run record that stays is the trajectory's
+`actions` record. The file is opened at session create and held, in append
+mode, for the session's life, so a file whose mtime predates the running
+process is held by nobody — the retention pass rests on that.
 
 Synthesized movement logs one `action` record per `move_to`/`stop`/`face`
 request (`force: true` on the record when the request said so) plus one per
