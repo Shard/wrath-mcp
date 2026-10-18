@@ -193,12 +193,22 @@ export type HostToChild =
    * last `limit` non-ambient events and how many ambient ones the span held
    * (`ContextEvents`). `trace_drain` empties the trace recorder's buffer
    * (`trace-recorder.ts`, a `TraceDrain`): record only, drained by the host's
-   * state ticker, never by anything the model reads.
+   * state ticker, never by anything the model reads. `nearby_drain` is the
+   * same for the nearby recorder (`nearby-recorder.ts`, a `NearbyDrain`),
+   * whose rows go to the live map's ring and nowhere else.
    */
   | {
       t: "rpc";
       id: number;
-      method: "recent_events" | "context_events" | "state_summary" | "death_signals" | "flight_signals" | "action_hints" | "trace_drain";
+      method:
+        | "recent_events"
+        | "context_events"
+        | "state_summary"
+        | "death_signals"
+        | "flight_signals"
+        | "action_hints"
+        | "trace_drain"
+        | "nearby_drain";
       params: { limit?: number };
     }
   | { t: "shutdown" };
