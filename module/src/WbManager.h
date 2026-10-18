@@ -240,8 +240,14 @@ namespace WrathBench
         // Guarded by objMutex (set on world thread, consumed on tap threads).
         bool autoLootPending{false};
 
+        // The audit log (PROTOCOL.md "Audit log"): one file per UTC day,
+        // `<token>.<YYYY-MM-DD>.jsonl`, rolled by the writer at the first
+        // record after a day boundary. auditDay is the day the open file is
+        // for (days since the epoch), -1 until session create opens the first.
+        // Both guarded by auditMutex.
         std::ofstream audit;
         std::mutex auditMutex;
+        int64_t auditDay{-1};
     };
 
     // A lease binds a session token to one account and — once the first
@@ -480,6 +486,8 @@ namespace WrathBench
         // an idempotent same-token createSession so the caller re-syncs state.
         void EmitSessionState(std::shared_ptr<BenchSession> const& s);
         void Audit(BenchSession& s, char const* kind, std::string const& json);
+        // Open (or roll to) the session's audit file for a UTC day. auditMutex held.
+        void OpenAudit(BenchSession& s, int64_t day);
         void SucceedAck(BenchSession& s);
         void FailAck(BenchSession& s, std::string const& message, int status = 502);
 

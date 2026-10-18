@@ -64,7 +64,7 @@ The module resolves "move to position" into the client movement packet sequence 
 
 ## Audit
 
-Every observation served and every action dispatched is logged at the module boundary with session id and timestamp, one file per session token (module/PROTOCOL.md "Audit log"). It is the ground truth for the wire while it is kept, and it is kept for a window, not for good: by the operator's decision of 2026-10-18, audit and server logs are operational records with a retention of a few days (the chart's `worldserver.logRetention`, default 3), pruned by age and never while a session still writes. The long-lived per-run record of what went on the wire is the runner's own `actions` record in the trajectory (docs/ARCHITECTURE.md, "The action log"), which is what a result claim points at.
+Every observation served and every action dispatched is logged at the module boundary with session id and timestamp, one file per session token and UTC day (module/PROTOCOL.md "Audit log"). It is the ground truth for the wire while it is kept, and it is kept for a window, not for good: by the operator's decision of 2026-10-18, audit and server logs are operational records with a retention of a few days (the chart's `worldserver.logRetention`, default 3), pruned by age and never while a session still writes. The long-lived per-run record of what went on the wire is the runner's own `actions` record in the trajectory (docs/ARCHITECTURE.md, "The action log"), which is what a result claim points at.
 
 ## Control-surface authentication
 

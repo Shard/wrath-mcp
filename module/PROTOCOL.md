@@ -1495,8 +1495,10 @@ Served in `SMSG_UPDATE_OBJECT` `fields` alongside the existing set:
 
 ## Audit log
 
-Per session, a JSONL file at `WrathBench.AuditDir/<token>.jsonl`. Every action
-dispatched and every event served is appended as:
+Per session and UTC day, a JSONL file at
+`WrathBench.AuditDir/<token>.<YYYY-MM-DD>.jsonl` (the token sanitized to
+`[A-Za-z0-9_-]`, every other byte `_`). Every action dispatched and every
+event served is appended as:
 ```json
 { "ts": 1755792000123, "session": "run-abc123", "kind": "action"|"event", "payload": { ... } }
 ```
@@ -1504,9 +1506,12 @@ dispatched and every event served is appended as:
 `action` it is a short record of the dispatched opcode. The ground truth for
 the wire while it is kept: an operational record the deployment prunes by age
 (docs/CONTRACTS.md "Audit"); the per-run record that stays is the trajectory's
-`actions` record. The file is opened at session create and held, in append
-mode, for the session's life, so a file whose mtime predates the running
-process is held by nobody — the retention pass rests on that.
+`actions` record. The day's file is opened at session create and held, in
+append mode; the first record after a UTC day boundary closes it and opens the
+next day's, only ever forward, so a session reopened later under the same
+token appends to that day's file and a past day's file gets no further write.
+The retention pass rests on that: a past day's file is deletable once it is
+quiet for the window, whatever the server's start.
 
 Synthesized movement logs one `action` record per `move_to`/`stop`/`face`
 request (`force: true` on the record when the request said so) plus one per

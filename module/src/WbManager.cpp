@@ -61,6 +61,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <initializer_list>
 #include <iterator>
@@ -1351,10 +1352,10 @@ namespace WrathBench
         ws->ValidateAccountFlags();
         s->ws = ws;
 
-        // Open the audit log.
+        // Open the audit log: today's day file.
         {
-            std::string path = _auditDir + "/" + Sanitize(s->token) + ".jsonl";
-            s->audit.open(path, std::ios::out | std::ios::app);
+            std::lock_guard<std::mutex> lock(s->auditMutex);
+            OpenAudit(*s, NowMs() / 86400000);
         }
 
         // Register before AddSession so the tap sees the very first outbound packet.
@@ -3997,13 +3998,35 @@ namespace WrathBench
             c->Send(json);
     }
 
+    void Manager::OpenAudit(BenchSession& s, int64_t day)
+    {
+        if (s.audit.is_open())
+            s.audit.close();
+        s.audit.clear();
+        time_t const t = static_cast<time_t>(day) * 86400;
+        struct tm tm;
+        char date[16] = "";
+        if (gmtime_r(&t, &tm))
+            std::strftime(date, sizeof date, "%Y-%m-%d", &tm);
+        s.audit.open(_auditDir + "/" + Sanitize(s.token) + "." + date + ".jsonl", std::ios::out | std::ios::app);
+        s.auditDay = day;
+    }
+
     void Manager::Audit(BenchSession& s, char const* kind, std::string const& json)
     {
         std::lock_guard<std::mutex> lock(s.auditMutex);
+        if (s.auditDay < 0)     // never opened: the session did not get as far as a WorldSession
+            return;
+        int64_t const ts = NowMs();
+        // The first record after a UTC day boundary rolls to the day's file.
+        // Only ever forward: a past date is never reopened, which is what lets
+        // retention delete a past day's file whatever the server's start.
+        if (int64_t const day = ts / 86400000; day > s.auditDay)
+            OpenAudit(s, day);
         if (!s.audit.is_open())
             return;
         Json::Writer w;
-        w.Add("ts", (int64_t)NowMs()).Add("session", s.token).Add("kind", kind);
+        w.Add("ts", ts).Add("session", s.token).Add("kind", kind);
         w.Raw("payload", json);
         s.audit << w.Str() << '\n';
         s.audit.flush();
