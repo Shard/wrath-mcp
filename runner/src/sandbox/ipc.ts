@@ -4,6 +4,8 @@
  * serialization), so everything here must survive JSON.
  */
 
+import type { ClientCacheFrame } from "./client-cache";
+
 /**
  * A hint-bearing failure the SDK recorded, tallied per (action, status). The
  * hint rides inside the result object too, but a snippet that keeps only
@@ -211,6 +213,13 @@ export type HostToChild =
         | "nearby_drain";
       params: { limit?: number };
     }
+  /**
+   * The client cache a starting child is seeded with (`client-cache.ts`): the
+   * query answers this run's client was given before this child existed,
+   * sent before the host counts the child ready, so they are folded before
+   * any snippet or event reaches it.
+   */
+  | { t: "client_cache_seed"; frames: ClientCacheFrame[] }
   | { t: "shutdown" };
 
 export interface EvalResultMsg {
@@ -280,6 +289,12 @@ export type ChildToHost =
    */
   | { t: "actions"; batches: ActionBatch[] }
   | { t: "hostcall"; id: number; method: "scratchpad_read" | "scratchpad_write" | "scratchpad_append"; params: { content?: string } }
+  /**
+   * A query answer the SDK just folded into its cache, forwarded as it arrived
+   * so the host can keep it for the next child (`client-cache.ts`). Record
+   * only: the model reads these answers through its own cache and nowhere else.
+   */
+  | { t: "client_cache"; frames: ClientCacheFrame[] }
   | { t: "fatal"; error: string };
 
 // host -> child, reply to hostcall
