@@ -528,8 +528,10 @@ export interface QuestLogEntry {
  * wire's `entry | 0x80000000`), `collect` an item, `event` a scripted
  * objective that carries text but no entry, `explore` a place to reach (the
  * template's exploration flag; one row, after the others). `have` is the log's
- * counter for creature/gameobject/event slots and the backpack stack total for
- * items — the two places a client reads it from.
+ * counter for creature/gameobject/event slots and, for items, the stack total
+ * the server's `Player::GetItemCount(id, false)` counts — equipment, the worn
+ * bags themselves, the backpack, the worn bags' contents, the keyring and the
+ * currency token slots, never the bank — the two places a client reads it from.
  *
  * An `explore` row has no counter on the wire. Its `text` is the template's
  * `areaDescription` (the objectives text when that is empty), and it is
@@ -1805,8 +1807,8 @@ export class StateCache {
   /**
    * The objectives of one quest, client-style: the template's required
    * entries and counts joined with the log's counters (creature/gameobject/
-   * event slots) or the carried stack totals (item slots: equipment, backpack
-   * and worn bags, as `carriedItems` says), then the exploration objective
+   * event slots) or the carried stack totals (item slots: everything
+   * `carriedItems` counts), then the exploration objective
    * when the template's flags carry one. A join over observations, nothing
    * invented.
    */
@@ -1856,10 +1858,13 @@ export class StateCache {
   /**
    * Every item the character carries, for counting a collect objective the
    * way the server's `Player::GetItemCount(id, false)` does: the equipment
-   * slots, the backpack, and the contents of the worn bags — not the bank,
-   * whose items the turn-in refuses. Reading only the player's own inventory
-   * fields missed everything in a worn bag, so a collect objective read
-   * `have: 0` while the quest log said complete.
+   * slots and the worn bags themselves, the backpack, the keyring and the
+   * currency token slots (86-149), and the contents of the worn bags — not
+   * the bank or a bank bag's contents, whose items the turn-in refuses.
+   * Reading only the player's own inventory fields missed everything in a
+   * worn bag, so a collect objective read `have: 0` while the quest log said
+   * complete; and a key, which sits on the keyring that no view lists, read
+   * `have: 0` the same way.
    */
   private carriedItems(): { itemId: number | undefined; count: number | undefined }[] {
     const out: { itemId: number | undefined; count: number | undefined }[] = [];
@@ -1867,6 +1872,17 @@ export class StateCache {
       if (row.slot < BACKPACK_FIRST_SLOT) out.push({ itemId: row.itemId, count: row.stackCount });
     }
     for (const row of this.bag().items) out.push({ itemId: row.itemId, count: row.count });
+    // The keyring and the currency tokens: the same guid join as `inventory`,
+    // over the slots past the bank that it does not read.
+    for (let slot = KEYRING_FIRST_SLOT; slot <= CURRENCY_LAST_SLOT; slot++) {
+      const lo = this.self.fields.get(`invSlot${slot}Lo`);
+      const hi = this.self.fields.get(`invSlot${slot}Hi`);
+      if (!lo && !hi) continue;
+      const guid = formatGuid((BigInt(hi?.value ?? 0) << 32n) | BigInt((lo?.value ?? 0) >>> 0));
+      if (guid === "0") continue;
+      const item = this.nearby.get(guid);
+      out.push({ itemId: item?.entry?.value, count: item?.fields.get("stackCount")?.value });
+    }
     return out;
   }
 
@@ -4542,9 +4558,13 @@ const QUEST_ID_FIELD = /^quest\d+Id$/;
 /**
  * The last `invSlot<n>` this view reads: the bank bags. Older modules stop at
  * 38; newer ones also serve the keyring (86-117) and currency tokens
- * (118-149), which no view here reads.
+ * (118-149), which no view lists; only a collect objective's count reads them
+ * (`carriedItems`).
  */
 const INVENTORY_LAST_SLOT = 73;
+/** The keyring's first and the currency tokens' last `invSlot<n>` (`KEYRING_SLOT_START`, `CURRENCYTOKEN_SLOT_END - 1`). */
+const KEYRING_FIRST_SLOT = 86;
+const CURRENCY_LAST_SLOT = 149;
 /** `PLAYER_SKILL_INFO_1_1` holds 128 skill slots of three packed u32s each. */
 const SKILL_SLOTS = 128;
 
