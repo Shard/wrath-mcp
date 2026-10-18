@@ -62,15 +62,16 @@ describe("HTTP response schemas", () => {
   });
 
   test("action and delete acks round-trip", () => {
-    expect(actionResponseSchema.parse({ ok: true, action: "say", token: "t" })).toEqual({
+    expect(actionResponseSchema.parse({ ok: true, action: "say" })).toEqual({
       ok: true,
       action: "say",
-      token: "t",
     });
-    expect(deleteSessionResponseSchema.parse({ ok: true, token: "t" })).toEqual({
+    expect(deleteSessionResponseSchema.parse({ ok: true })).toEqual({
       ok: true,
-      token: "t",
     });
+    // An older module that still echoes the caller's token is tolerated; the
+    // SDK neither needs nor reads it.
+    expect(actionResponseSchema.parse({ ok: true, action: "say", token: "t" }).ok).toBe(true);
   });
 
   test("unknown fields on a response survive instead of being stripped", () => {
@@ -444,8 +445,8 @@ describe("event frames", () => {
   });
 
   test("moveId is a number on the wire, and a numeric string is tolerated", () => {
-    expect(moveToResponseSchema.parse({ ok: true, action: "move_to", token: "t", moveId: 3 }).moveId).toBe(3);
-    expect(moveToResponseSchema.parse({ ok: true, action: "move_to", token: "t", moveId: "3" }).moveId).toBe(3);
+    expect(moveToResponseSchema.parse({ ok: true, action: "move_to", moveId: 3 }).moveId).toBe(3);
+    expect(moveToResponseSchema.parse({ ok: true, action: "move_to", moveId: "3" }).moveId).toBe(3);
   });
 
   test("a move status this revision does not know still parses", () => {

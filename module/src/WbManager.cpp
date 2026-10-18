@@ -748,7 +748,7 @@ namespace WrathBench
             // that orphan is exactly what feeds a dangling-pointer crash on the
             // next create for this account. Tear it down on the world thread.
             PushTask([this, token]() { TeardownByToken(token); });
-            return {504, Json::Writer().Add("ok", false).Add("error", "timeout").Add("token", token).Str()};
+            return {504, Json::Writer().Add("ok", false).Add("error", "timeout").Str()};
         }
         return fut.get();
     }
@@ -1127,7 +1127,7 @@ namespace WrathBench
         if (fut.wait_for(std::chrono::seconds(20)) != std::future_status::ready)
         {
             PushTask([this, token]() { TeardownByToken(token); });
-            return {504, Json::Writer().Add("ok", false).Add("error", "timeout").Add("token", token).Str()};
+            return {504, Json::Writer().Add("ok", false).Add("error", "timeout").Str()};
         }
         return fut.get();
     }
@@ -1156,7 +1156,7 @@ namespace WrathBench
         if (fut.wait_for(std::chrono::seconds(20)) != std::future_status::ready)
         {
             PushTask([this, token]() { TeardownByToken(token); });
-            return {504, Json::Writer().Add("ok", false).Add("error", "timeout").Add("token", token).Str()};
+            return {504, Json::Writer().Add("ok", false).Add("error", "timeout").Str()};
         }
         return fut.get();
     }
@@ -1166,7 +1166,7 @@ namespace WrathBench
     {
         auto fail = [&](std::string const& err, int status = 400) {
             if (!s->ackFired.exchange(true))
-                ack->set_value({status, Json::Writer().Add("ok", false).Add("error", err).Add("token", s->token).Str()});
+                ack->set_value({status, Json::Writer().Add("ok", false).Add("error", err).Str()});
         };
 
         uint32 accountId = AccountMgr::GetId(s->account);
@@ -1207,7 +1207,7 @@ namespace WrathBench
                     // account/charName/targetGuidRaw are create-time-stable and
                     // published before P_INWORLD, so reading them here is safe.
                     if (!s->ackFired.exchange(true))
-                        ack->set_value({200, Json::Writer().Add("ok", true).Add("token", existing->token)
+                        ack->set_value({200, Json::Writer().Add("ok", true)
                             .Add("account", existing->account).Add("character", existing->charName)
                             .AddGuid("guid", existing->targetGuidRaw).Add("inWorld", true).Str()});
                     // No new module session is created, so the SDK's per-session
@@ -1418,7 +1418,7 @@ namespace WrathBench
         s->ws->QueuePacket(p);
 
         Audit(*s, "action", Json::Writer().Add("op", "say").Add("text", text).Str());
-        reply(200, Json::Writer().Add("ok", true).Add("action", "say").Add("token", token).Str());
+        reply(200, Json::Writer().Add("ok", true).Add("action", "say").Str());
     }
 
     // ------------------------------------------------------------- movement
@@ -2006,7 +2006,7 @@ namespace WrathBench
         // Ack means "queued"; the game-level outcome arrives as a WB_MOVE_RESULT
         // event, per the transport/game error split in PROTOCOL.md.
         ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "move_to")
-            .Add("token", token).Add("moveId", moveId).Str()});
+            .Add("moveId", moveId).Str()});
 
         auto failEvent = [&](char const* status) {
             // Nothing moved; if the server still has the character flagged as
@@ -2181,7 +2181,7 @@ namespace WrathBench
                 player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation(),
                 player->GetTransport());
         }
-        ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "stop").Add("token", token).Str()});
+        ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "stop").Str()});
     }
 
     void Manager::DoFace(std::string token, bool hasO, float o, bool hasXY, float x, float y,
@@ -2202,7 +2202,7 @@ namespace WrathBench
         SendMovePacket(*s, player, MSG_MOVE_SET_FACING, MOVEMENTFLAG_NONE,
             player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), target);
         ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "face")
-            .Add("token", token).Add("orientation", (double)target).Str()});
+            .Add("orientation", (double)target).Str()});
     }
 
     // Parse a guid request field (decimal string, see PROTOCOL.md u64 note).
@@ -2609,7 +2609,7 @@ namespace WrathBench
 
         s->ws->QueuePacket(p);
         Audit(*s, "action", auditW.Str());
-        ack->set_value({200, Json::Writer().Add("ok", true).Add("action", action).Add("token", token).Str()});
+        ack->set_value({200, Json::Writer().Add("ok", true).Add("action", action).Str()});
     }
 
     // WDBC reader for AreaTrigger.dbc (3.3.5a: 10 fields of 4 bytes — id,
@@ -2993,7 +2993,7 @@ namespace WrathBench
         std::string json = TalentTreeJson(player);
         Audit(*s, "action", Json::Writer().Add("op", "talent_tree").Str());
         EmitEvent(*s, "WB_TALENT_TREE", 0xFF08, json);
-        ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "talent_tree").Add("token", token).Str()});
+        ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "talent_tree").Str()});
     }
 
     // The wire carries dates as the client's packed bitfield
@@ -3710,7 +3710,7 @@ namespace WrathBench
         if (!s)
             return ack->set_value({404, Json::Writer().Add("ok", false).Add("error", "no_session").Str()});
         Audit(*s, "action", Json::Writer().Add("op", "session_delete").Str());
-        ack->set_value({200, Json::Writer().Add("ok", true).Add("token", token).Str()});
+        ack->set_value({200, Json::Writer().Add("ok", true).Str()});
     }
 
     // --------------------------------------------------------------- tap
@@ -3792,7 +3792,7 @@ namespace WrathBench
                         // dataJson is the whitelisted decode of this very packet:
                         // {"count":N,"characters":[{guid,name,race,class,gender,level},...]}
                         if (!s->ackFired.exchange(true) && s->ack)
-                            s->ack->set_value({200, Json::Writer().Add("ok", true).Add("token", s->token)
+                            s->ack->set_value({200, Json::Writer().Add("ok", true)
                                 .Raw("enum", dataJson).Str()});
                         if (!s->tearingDown.exchange(true))
                         {
@@ -3893,7 +3893,7 @@ namespace WrathBench
                     if (result == CHAR_DELETE_SUCCESS)
                     {
                         if (!s->ackFired.exchange(true) && s->ack)
-                            s->ack->set_value({200, Json::Writer().Add("ok", true).Add("token", s->token)
+                            s->ack->set_value({200, Json::Writer().Add("ok", true)
                                 .Add("character", s->charName).Add("deleted", true).Str()});
                         // The utility session's job is done: discard it the same
                         // way a failed login discards its session.
@@ -3946,12 +3946,17 @@ namespace WrathBench
     }
 
     // ------------------------------------------------------- ack helpers
+    // No reply on the session surface names the caller's token (PROTOCOL.md,
+    // "Authentication"): it is the caller's own opaque session id, so echoing
+    // it told the caller nothing, and an action reply flows into snippet
+    // results and from there into trajectories and the published feed. Only
+    // the operator-only lease replies carry it, to pair a secret with its token.
     void Manager::SucceedAck(BenchSession& s)
     {
         if (s.ackFired.exchange(true) || !s.ack)
             return;
         Json::Writer w;
-        w.Add("ok", true).Add("token", s.token).Add("account", s.account)
+        w.Add("ok", true).Add("account", s.account)
          .Add("character", s.charName).AddGuid("guid", s.targetGuidRaw).Add("inWorld", true);
         s.ack->set_value({200, w.Str()});
     }
@@ -3959,7 +3964,7 @@ namespace WrathBench
     void Manager::FailAck(BenchSession& s, std::string const& message, int status /*= 502*/)
     {
         if (!s.ackFired.exchange(true) && s.ack)
-            s.ack->set_value({status, Json::Writer().Add("ok", false).Add("error", message).Add("token", s.token).Str()});
+            s.ack->set_value({status, Json::Writer().Add("ok", false).Add("error", message).Str()});
 
         // A failure here means the session never reached the world; discard it so it
         // does not linger in the session maps. Called from the tap on the world

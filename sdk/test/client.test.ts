@@ -1394,7 +1394,7 @@ describe("client: movement", () => {
     // stub pins moveId 1 on every ack to force exactly that collision.
     const stub = startStub({
       onConnect: () => frames(loginSequence),
-      routes: { action: () => json({ ok: true, action: "move_to", token: "stub", moveId: 1 }, 200) },
+      routes: { action: () => json({ ok: true, action: "move_to", moveId: 1 }, 200) },
     });
     const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
     await client.createSession({ character: "Fenwick" });
@@ -1434,7 +1434,7 @@ describe("client: movement", () => {
     // must not settle the old waiter with the wrong session's position.
     const stub = startStub({
       onConnect: () => frames(loginSequence),
-      routes: { action: () => json({ ok: true, action: "move_to", token: "stub", moveId: 1 }, 200) },
+      routes: { action: () => json({ ok: true, action: "move_to", moveId: 1 }, 200) },
     });
     const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
     await client.createSession({ character: "Fenwick" });
@@ -1569,7 +1569,7 @@ describe("client: the two error channels", () => {
   test("a synchronous game rejection is kind game, with the result code parsed out", async () => {
     const stub = startStub({
       routes: {
-        session: () => json({ ok: false, error: "char_create_failed_code_47", token: "t" }, 502),
+        session: () => json({ ok: false, error: "char_create_failed_code_47" }, 502),
       },
     });
     const client = await connect({ baseUrl: stub.baseUrl, token: "t", subscribeEvents: false });
@@ -3520,8 +3520,8 @@ describe("client: deleteCharacter", () => {
       // The module answers 504 while the core still tracks an offline session.
       characterDelete: (attempt, body) =>
         attempt < 2
-          ? json({ ok: false, error: "timeout", token: body.token }, 504)
-          : json({ ok: true, token: body.token, character: body.character, deleted: true }, 200),
+          ? json({ ok: false, error: "timeout" }, 504)
+          : json({ ok: true, character: body.character, deleted: true }, 200),
     });
     const client = await connect({ baseUrl: stub.baseUrl, token: "t", subscribeEvents: false });
     const res = await client.deleteCharacter("Fenwick", { account: "PROBE", retryDelayMs: 5 });

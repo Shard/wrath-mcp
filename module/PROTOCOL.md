@@ -38,6 +38,12 @@ Every HTTP request and every `/events` upgrade carries
 `401 unauthorized` before any route runs, including `GET /health`. There is no unauthenticated
 path and no backward compatibility with callers that send none.
 
+No reply names the caller's token. It is the caller's own opaque session id,
+so an echo tells it nothing, and a reply on the session surface flows into
+snippet results and from there into trajectories and the published feed; only
+the operator-only `POST /lease` and `DELETE /lease` replies carry it, to pair
+a secret with its token.
+
 Two credential classes:
 
 - **Operator** — the bearer is the *port secret*, `WrathBench.Secret`
@@ -196,7 +202,7 @@ exists on the account, `race` and `class` are ignored entirely — the existing
 character is logged in as-is. When the character does not exist
 — so this request will CREATE one — both must be numeric and in `[1,11]`;
 anything else (absent, non-numeric, out of range) fails the request with
-`400 {"ok":false,"error":"invalid_race_class","token":...}` before any
+`400 {"ok":false,"error":"invalid_race_class"}` before any
 char-create packet is synthesized. There is no silent default character.
 Whether a create is needed is only known once the module sees the account's
 character list, so this check happens mid-flow (after `SMSG_CHAR_ENUM`),
@@ -206,7 +212,6 @@ Success `200`:
 ```json
 {
   "ok": true,
-  "token": "run-abc123",
   "account": "RUNNER",
   "character": "Benchy",
   "guid": "1",                // full ObjectGuid as a decimal string (see u64 note)
@@ -240,7 +245,7 @@ Errors:
   account other than the lease's.
 - `409 {"ok":false,"error":"character_bound","bound":"<name>"}` — a session-class
   create for a different character than the one this token already played.
-- `400 {"ok":false,"error":"invalid_race_class","token":...}` — the character
+- `400 {"ok":false,"error":"invalid_race_class"}` — the character
   does not exist and race/class are not both in [1,11] (see above; decided at
   char-enum time, before any char-create packet is synthesized).
 - `409 {"ok":false,"error":"token_in_use"}` — a session already exists under
@@ -251,12 +256,12 @@ Errors:
   `WrathBench.Accounts` allowlist.
 - `400 {"ok":false,"error":"unknown_account"}`
 - `400 {"ok":false,"error":"socket_setup_failed"}`
-- `502 {"ok":false,"error":"char_create_failed_code_<N>","token":...}` — game-level
+- `502 {"ok":false,"error":"char_create_failed_code_<N>"}` — game-level
   char-create rejection (N is the `SMSG_CHAR_CREATE` result code); also surfaced as
   a `SMSG_CHAR_CREATE` event.
-- `502 {"ok":false,"error":"login_failed","token":...}`
-- `502 {"ok":false,"error":"character_missing_after_create","token":...}`
-- `504 {"ok":false,"error":"timeout","token":...}` — either the login flow did not
+- `502 {"ok":false,"error":"login_failed"}`
+- `502 {"ok":false,"error":"character_missing_after_create"}`
+- `504 {"ok":false,"error":"timeout"}` — either the login flow did not
   reach the world within 20s, or (see reclaim below) a stale session held the
   account and the core had not released it within the internal reclaim wait.
   Both are transient and retryable.
@@ -320,7 +325,7 @@ Request:
 
 Success `200`:
 ```json
-{ "ok": true, "action": "say", "token": "run-abc123" }
+{ "ok": true, "action": "say" }
 ```
 
 The say language is chosen server-side from the character's team (Common for
@@ -366,7 +371,7 @@ the character's own health before deciding to re-issue with `force`.
 
 Success `200` (means "queued and pathing", not "arrived"):
 ```json
-{ "ok": true, "action": "move_to", "token": "run-abc123", "moveId": 1 }
+{ "ok": true, "action": "move_to", "moveId": 1 }
 ```
 
 Additional error: `400 {"ok":false,"error":"missing_position","action":"move_to","param":"<first missing axis>"}`.
@@ -383,7 +388,7 @@ a stop if the server still holds the character as moving.
 #### stop
 
 Stop moving (sends `MSG_MOVE_STOP` where the character currently is). Always
-acks `200 { "ok": true, "action": "stop", "token": ... }`; if a move was in
+acks `200 { "ok": true, "action": "stop" }`; if a move was in
 progress it additionally ends with a `WB_MOVE_RESULT` status `stopped`.
 
 Request: `{ "token": "run-abc123", "action": "stop" }`
@@ -397,7 +402,7 @@ Turn in place (sends `MSG_MOVE_SET_FACING`). Give either an absolute
 Request: `{ "token": "run-abc123", "action": "face", "orientation": 1.57 }`
 or `{ "token": "run-abc123", "action": "face", "x": -8900.0, "y": -130.0 }`
 
-Success `200`: `{ "ok": true, "action": "face", "token": ..., "orientation": 1.57 }`
+Success `200`: `{ "ok": true, "action": "face", "orientation": 1.57 }`
 Additional errors: `400 {"ok":false,"error":"missing_face_target","action":"face","param":"orientation or x,y"}`,
 `409 {"ok":false,"error":"moving"}` (stop first, or supersede with `move_to`).
 
@@ -409,7 +414,7 @@ sends). The `200` ack means "queued"; game outcomes — cast failures, gossip
 menus, loot windows, inventory errors — arrive as the whitelisted events
 listed further down, never as HTTP errors. All `guid`/`targetGuid`/`itemGuid`
 request fields are decimal strings (u64 note above). Success shape for all of
-them: `{ "ok": true, "action": "<name>", "token": ... }`.
+them: `{ "ok": true, "action": "<name>" }`.
 
 | action | request fields (beyond `token`, `action`) | opcode sent | notes |
 |---|---|---|---|
@@ -484,7 +489,7 @@ bodiless opcode; at most 512 bytes). The bytes are queued verbatim into the
 stock handler for that opcode — the module does not parse or repair them, and
 a body the handler cannot read is the same as a malformed client packet (the
 core logs it and, as for any client, may kick the session). Success `200`:
-`{ "ok": true, "action": "raw", "token": ... }`. The audit record carries
+`{ "ok": true, "action": "raw" }`. The audit record carries
 `opcode` and `payload` so the exact bytes sent are reconstructable.
 
 Errors (all `400`): `missing_opcode`, `opcode_not_allowed` (echoes `opcode`
@@ -596,7 +601,7 @@ Revokes the token's lease secret; a live session under the token is untouched.
 ### POST /characters
 
 Operator only (`403 operator_only` for a session-class caller).
-`{ "token": <str>, "account"?: <str> }` → `200 { "ok": true, "token", "enum": { "count": <number>, "characters": [ { "guid", "name", "race", "class", "gender", "level" }, ... ] } }`.
+`{ "token": <str>, "account"?: <str> }` → `200 { "ok": true, "enum": { "count": <number>, "characters": [ { "guid", "name", "race", "class", "gender", "level" }, ... ] } }`.
 A parked utility session (never enters world) answers with the decoded `SMSG_CHAR_ENUM` for the account — the same data a client's character-select screen shows. Exists for the runner's episode hygiene (list-then-delete leftover characters); errors mirror `/character-delete` (`missing_token`, `token_in_use`, `account_not_permitted`, `unknown_account`, `account_in_use` when a live session holds the account, `504 timeout`).
 
 ### POST /character-delete
@@ -635,7 +640,7 @@ than returning `account_in_use`, so a create never produces `account_in_use`.
 `POST /session` and `POST /characters` apply the same allowlist. Minimal ownership gate for the per-run account scheme;
 per-character credentials are the fuller fix.)
 
-Success `200`: `{ "ok": true, "token": ..., "character": "Benchy", "deleted": true }`
+Success `200`: `{ "ok": true, "character": "Benchy", "deleted": true }`
 Errors: `400 missing_token`, `400 missing_character`, `409 token_in_use`,
 `403 account_not_permitted`, `409 account_owned_by_other_token`,
 `400 unknown_account`, `400 account_in_use`, `400 character_not_found`,
@@ -654,7 +659,7 @@ Request:
 { "token": "run-abc123" }
 ```
 
-Success `200`: `{ "ok": true, "token": "run-abc123" }`
+Success `200`: `{ "ok": true }`
 Errors: `400 missing_token`, `404 no_session`, `401 unauthorized`, `403 token_mismatch`.
 
 ## WebSocket /events?token=...

@@ -110,7 +110,6 @@ export type HealthResponse = z.infer<typeof healthResponseSchema>;
 /** POST /session */
 export const sessionResponseSchema = z.looseObject({
   ok: z.literal(true),
-  token: z.string(),
   account: z.string(),
   character: z.string(),
   guid: guidSchema,
@@ -122,7 +121,6 @@ export type SessionResponse = z.infer<typeof sessionResponseSchema>;
 export const actionResponseSchema = z.looseObject({
   ok: z.literal(true),
   action: z.string(),
-  token: z.string(),
 });
 export type ActionResponse = z.infer<typeof actionResponseSchema>;
 
@@ -138,7 +136,6 @@ export type ActionResponse = z.infer<typeof actionResponseSchema>;
 export const moveToResponseSchema = z.looseObject({
   ok: z.literal(true),
   action: z.string(),
-  token: z.string(),
   moveId: moveIdSchema,
 });
 export type MoveToResponse = z.infer<typeof moveToResponseSchema>;
@@ -147,7 +144,6 @@ export type MoveToResponse = z.infer<typeof moveToResponseSchema>;
 export const faceResponseSchema = z.looseObject({
   ok: z.literal(true),
   action: z.string(),
-  token: z.string(),
   orientation: z.number(),
 });
 export type FaceResponse = z.infer<typeof faceResponseSchema>;
@@ -155,7 +151,6 @@ export type FaceResponse = z.infer<typeof faceResponseSchema>;
 /** POST /character-delete */
 export const characterDeleteResponseSchema = z.looseObject({
   ok: z.literal(true),
-  token: z.string(),
   character: z.string(),
   deleted: z.boolean(),
 });
@@ -164,7 +159,6 @@ export type CharacterDeleteResponse = z.infer<typeof characterDeleteResponseSche
 /** DELETE /session */
 export const deleteSessionResponseSchema = z.looseObject({
   ok: z.literal(true),
-  token: z.string(),
 });
 export type DeleteSessionResponse = z.infer<typeof deleteSessionResponseSchema>;
 

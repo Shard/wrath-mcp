@@ -150,7 +150,6 @@ export function startStub(options: StubOptions = {}): StubServer {
             options.routes?.session?.() ??
             json({
               ok: true,
-              token: "stub",
               account: (body as CreateSessionBody).account ?? "RUNNER",
               character: (body as CreateSessionBody).character ?? "Fenwick",
               guid: 7,
@@ -160,7 +159,7 @@ export function startStub(options: StubOptions = {}): StubServer {
         });
       }
       if (url.pathname === "/session" && req.method === "DELETE") {
-        return options.routes?.deleteSession?.() ?? json({ ok: true, token: "stub" });
+        return options.routes?.deleteSession?.() ?? json({ ok: true });
       }
       if (url.pathname === "/character-delete" && req.method === "POST") {
         return req.json().then((body) => {
@@ -170,7 +169,6 @@ export function startStub(options: StubOptions = {}): StubServer {
             options.characterDelete?.(attempt, body as CharacterDeleteBody) ??
             json({
               ok: true,
-              token: (body as CharacterDeleteBody).token ?? "stub",
               character: (body as CharacterDeleteBody).character ?? "Fenwick",
               deleted: true,
             })
@@ -188,13 +186,13 @@ export function startStub(options: StubOptions = {}): StubServer {
           const refused = options.failAction?.(action);
           if (refused) return refused;
           if (action === "move_to") {
-            return json({ ok: true, action, token: "stub", moveId: ++moveIdGen });
+            return json({ ok: true, action, moveId: ++moveIdGen });
           }
           if (action === "face") {
             const b = body as { orientation?: number; x?: number; y?: number };
-            return json({ ok: true, action, token: "stub", orientation: b.orientation ?? 0 });
+            return json({ ok: true, action, orientation: b.orientation ?? 0 });
           }
-          return json({ ok: true, action, token: "stub" });
+          return json({ ok: true, action });
         });
       }
       return new Response("not found", { status: 404 });
