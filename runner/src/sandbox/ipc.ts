@@ -191,12 +191,14 @@ export type HostToChild =
    * snippet's (`SandboxHost.drainActionHints`); a snippet's own result and
    * pong drain it themselves. `context_events` is the turn's event window: the
    * last `limit` non-ambient events and how many ambient ones the span held
-   * (`ContextEvents`).
+   * (`ContextEvents`). `trace_drain` empties the trace recorder's buffer
+   * (`trace-recorder.ts`, a `TraceDrain`): record only, drained by the host's
+   * state ticker, never by anything the model reads.
    */
   | {
       t: "rpc";
       id: number;
-      method: "recent_events" | "context_events" | "state_summary" | "death_signals" | "flight_signals" | "action_hints";
+      method: "recent_events" | "context_events" | "state_summary" | "death_signals" | "flight_signals" | "action_hints" | "trace_drain";
       params: { limit?: number };
     }
   | { t: "shutdown" };
