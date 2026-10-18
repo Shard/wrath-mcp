@@ -4539,7 +4539,11 @@ const QUEST_FLAGS_EXPLORATION = 0x4;
 /** A quest-log slot's quest id field, `quest<slot>Id`. */
 const QUEST_ID_FIELD = /^quest\d+Id$/;
 /** Equipment + bags are 0-22, backpack 23-38 (PROTOCOL.md). */
-/** The last `invSlot<n>` the module serves: the bank bags. Older modules stop at 38. */
+/**
+ * The last `invSlot<n>` this view reads: the bank bags. Older modules stop at
+ * 38; newer ones also serve the keyring (86-117) and currency tokens
+ * (118-149), which no view here reads.
+ */
 const INVENTORY_LAST_SLOT = 73;
 /** `PLAYER_SKILL_INFO_1_1` holds 128 skill slots of three packed u32s each. */
 const SKILL_SLOTS = 128;

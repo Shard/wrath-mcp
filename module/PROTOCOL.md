@@ -1456,8 +1456,12 @@ Served in `SMSG_UPDATE_OBJECT` `fields` alongside the existing set:
   0-24 and Off one of `Id`, `State`, `CountsLo`, `CountsHi`, `Time` (the
   3.3.5 layout: two u32s of packed u16 objective counters); inventory as
   `invSlot<n>Lo`/`invSlot<n>Hi` u32 guid halves, n 0-22 = equipment + bag
-  slots, 23-38 = backpack slots. The SDK reassembles guids and joins them to
-  item create blocks.
+  slots, 23-38 = backpack slots, 39-66 = bank slots, 67-73 = bank bag slots,
+  86-117 = keyring slots, 118-149 = currency token slots (the core's
+  numbering, `PLAYER_FIELD_INV_SLOT_HEAD` through
+  `PLAYER_FIELD_CURRENCYTOKEN_SLOT_1`). The vendor buyback slots between the
+  bank bags and the keyring (74-85) are not served. The SDK reassembles guids
+  and joins them to item create blocks; its `inventory` view stops at 73.
 - items and containers: `stackCount`, `durability`, `maxDurability`,
   `itemFlags`, `ownerLo`/`ownerHi`, `containedLo`/`containedHi`; the random
   property and the enchantment slots, PUBLIC fields every client in range

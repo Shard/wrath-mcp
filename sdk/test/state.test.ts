@@ -3145,6 +3145,21 @@ describe("pets, group, mail, bank, trade", () => {
     expect(cache.snapshot().bank.items).toHaveLength(2);
   });
 
+  test("keyring and currency slots 86-149 land in self.fields by name and stay out of every view", () => {
+    const selfValues = (seq: number, fields: Record<string, number>) => frame(seq, "SMSG_UPDATE_OBJECT", { blocks: 1, objects: [{ update: "values", guid: SELF_GUID, fields }] });
+    const cache = StateCache.replay(
+      toEvents([...loginSequence, selfValues(50, { invSlot86Lo: ITEM_GUID_LO, invSlot86Hi: ITEM_GUID_HI, invSlot149Lo: 0, invSlot149Hi: 0 }), itemCreate, itemQuery]),
+      { seed: SEED },
+    );
+    expect(cache.self.fields.get("invSlot86Lo")?.value).toBe(ITEM_GUID_LO);
+    expect(cache.self.fields.get("invSlot86Hi")?.value).toBe(ITEM_GUID_HI);
+    expect(cache.self.fields.get("invSlot149Lo")?.value).toBe(0);
+    // The model-facing views are unchanged: `inventory` stops at the bank bags, `bag()` at the worn bags.
+    expect(cache.inventory).toEqual([]);
+    expect(cache.bag().items).toEqual([]);
+    expect(cache.bank().items).toEqual([]);
+  });
+
   test("trade status and both sides of the window fold into trade(); a cancel closes it", () => {
     const cache = StateCache.replay(toEvents([...loginSequence, itemQuery]), { seed: SEED });
     const fold = (f: unknown) => cache.apply(toEvents([f])[0]!);
