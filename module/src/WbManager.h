@@ -359,10 +359,36 @@ namespace WrathBench
             bool nearestSearched{false}; // target_off_mesh: the bounded search for mesh near the target ran
             bool hasNearest{false};      // ... and found a point (nearestX/Y/Z)
             float nearestX{0}, nearestY{0}, nearestZ{0};
+            // The steep re-plan (ReplanSteep), audit only (op: move_replan_steep):
+            // `ran` whenever the mesh's own route tripped the drop guard.
+            struct Replan
+            {
+                bool ran{false};
+                char const* outcome{""};  // "ok" (the re-planned route is the walk), "failed", "skipped"
+                char const* reason{""};   // why it failed or was skipped
+                uint32 rounds{0};         // re-plans run (at most REPLAN_STEEP_ROUNDS)
+                uint32 excluded{0};       // polygons excluded by the last one
+                uint32 firstPoints{0};    // the mesh's own route: point count, refused edge, step
+                WbVec edge;
+                float dz{0};
+                uint32 points{0};         // the last re-planned route's point count (0 when none was built)
+            } replan;
         };
         // One pass of the cause ladder at x,y,z; reqZ is the z the agent asked
         // for (meshZ is reported relative to it).
         PathResolve ResolvePathAt(Player* player, float x, float y, float z, float reqZ, bool force = false);
+        // The tail of the cause ladder over a resolved polyline, the mesh's own
+        // route and a steep re-plan alike: the endpoint lift, the start-snap leg,
+        // the drop guard and meshZ. `refusing`, when given, collects every
+        // segment the guard refuses (the verdict is the first).
+        void SettleRoute(Player* player, PathResolve& r, float z, float reqZ, bool force,
+            std::vector<size_t>* refusing = nullptr);
+        // After the guard refused the mesh's route from (sx, sy, sz): plan again
+        // with the polygons under the refused segments excluded and take the
+        // first route the guard passes. `r` is replaced only then; otherwise
+        // only its `replan` record changes.
+        void ReplanSteep(Player* player, float sx, float sy, float sz, float x, float y, float z, float reqZ,
+            bool force, std::vector<size_t> const& refusing, PathResolve& r);
         // The z-ladder around it: ground height at x,y first for a unit
         // target, as a fallback after target_off_mesh otherwise.
         PathResolve ResolvePath(Player* player, float x, float y, float z, bool unitTarget,

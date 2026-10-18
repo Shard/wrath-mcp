@@ -928,11 +928,14 @@ at the top of this document.
 - `drop` — the mesh's route steps off a ledge: some segment of the resolved
   polyline falls (or climbs) more than 2.0y and steeper than 1.2x its 2D
   length — a cliff, not a ramp (stairs and ramps pass; a stale z within the
-  `meshZ` band passes). Without `force` the walk is not dispatched:
-  `reachedPos` is the last point before the step (the edge, on the
-  character's level), `dz` is the signed vertical step the route would have
-  taken there, `target` echoes the requested point, and `safeFall` rides when
-  non-zero. The module reports the ledge and leaves the verdict to the
+  `meshZ` band passes). Before refusing, the module re-plans around the steep
+  band, up to three times, with the mesh polygons under every refused segment
+  barred, and walks the first re-planned route this same guard passes; when
+  none does, what follows describes the mesh's own route. Without `force` the
+  walk is not dispatched: `reachedPos` is the last point before the step (the
+  edge, on the character's level), `dz` is the signed vertical step the route
+  would have taken there, `target` echoes the requested point, and `safeFall`
+  rides when non-zero. The module reports the ledge and leaves the verdict to the
   caller: the server's fall rule (free under 13.48y, then a share of max
   health rising with height, `Player::HandleFall`) is a game rule, so the
   SDK estimates the fall from `dz` and `safeFall` against the character's own
@@ -1529,6 +1532,13 @@ A move whose start the mesh does not cover logs `op: "move_start_snap"` with
 A move whose endpoint the core's normalization left under the ground logs
 `op: "move_end_z"` with `normZ` (the z the core settled on) and `meshZ` (the
 height of the polygon the path ends on, where the walk ends instead).
+A move whose route the drop guard refused logs `op: "move_replan_steep"`
+(the re-plan under `drop`) with `outcome` — `ok` when a re-planned route
+passed the guard and is the walk, `failed` or `skipped` with a `reason` when
+the `drop` stands — `rounds` (re-plans run, at most three), `excluded` (mesh
+polygons the last one barred), the refused route's `edge`, `dz` and
+`pointCount`, and `replanPointCount` (the last re-planned route's, 0 when none
+was built).
 Each `move_to` that reaches the mesh also logs one `op: "move_path"` record at
 dispatch — `moveId`, `status` (`"ok"` when the walk was dispatched, else the
 `WB_MOVE_RESULT` status), `pointCount`, and `points` (the resolved polyline,

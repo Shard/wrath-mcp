@@ -35,6 +35,7 @@
 #include "Opcodes.h"
 #include "Map.h"
 #include "MapCollisionData.h"
+#include "DetourCommon.h"
 #include "PathGenerator.h"
 #include "Player.h"
 #include "SharedDefines.h"
@@ -56,6 +57,7 @@
 #include <openssl/crypto.h>
 #include <algorithm>
 #include <cctype>
+#include <cfloat>
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
@@ -1679,6 +1681,342 @@ namespace WrathBench
         return ss.str();
     }
 
+    // ------------------------------------------------- the steep re-plan
+    // Detour plans one corridor with the core's cost (dtQueryFilterExt: the
+    // distance, weighted mildly by slope), and the smooth path along it can
+    // cut a single 4y step of 51-58 degrees: steeper than the drop guard's
+    // 1.2 (about 50 degrees), inside the 60 the mesh is built to walk. The
+    // guard is the client-faithfulness line and stays as it is; when it
+    // refuses the mesh's route, the module plans again with the polygons
+    // under the refused segments barred, so the corridor goes around the band
+    // when the mesh has a way, and the walk is that route — guarded the same
+    // way — or the original `drop`. Pathing detail like the z-ladder and the
+    // subdivision retry: the caller sees only the verdict.
+    //
+    // Up to REPLAN_STEEP_ROUNDS re-plans. The first bars the polygons under
+    // every segment of the mesh's route the guard refuses (a 12y climb is
+    // three 4y steps, and barring one only moves the refusal to the next);
+    // each later one adds those of the previous re-plan's refused segments.
+    // It stops at the first route the guard passes, at a round that bars
+    // nothing new, or at a re-plan that finds no complete route.
+    static constexpr uint32 REPLAN_STEEP_ROUNDS = 3;
+    // The re-planned route's reach: two core paths of MAX_POINT_PATH_LENGTH
+    // 4y steps (about 590y), what the subdivision retry already splices for
+    // an ordinary move (the Ashenvale climb that earned this was a 91-point
+    // route), so a re-plan never walks farther than a move without one can.
+    // The corridor buffer has room for the polygons such a route crosses.
+    static constexpr uint32 REPLAN_MAX_POINTS = 2 * MAX_POINT_PATH_LENGTH;
+    static constexpr int REPLAN_MAX_POLYS = 256;
+    // The core's start/end "far from poly" distance (PathGenerator::BuildPolyPath).
+    static constexpr float REPLAN_FAR_FROM_POLY = 7.0f;
+
+    // The player's query filter (PathGenerator::CreateFilter for a Player:
+    // NAV_GROUND | NAV_WATER | NAV_MAGMA, the core's slope-weighted cost)
+    // with a set of polygons it may not enter. Local to the module: the
+    // core's PathGenerator keeps its filter private, and nothing here changes
+    // the core or the shared mesh.
+    class ExcludePolysFilter : public dtQueryFilterExt
+    {
+    public:
+        explicit ExcludePolysFilter(std::vector<dtPolyRef> const* excluded = nullptr) : _excluded(excluded)
+        {
+            setIncludeFlags(NAV_GROUND | NAV_WATER | NAV_MAGMA);
+            setExcludeFlags(0);
+        }
+
+        bool passFilter(dtPolyRef const ref, dtMeshTile const* tile, dtPoly const* poly) const override
+        {
+            if (_excluded && std::find(_excluded->begin(), _excluded->end(), ref) != _excluded->end())
+                return false;
+            return dtQueryFilter::passFilter(ref, tile, poly);
+        }
+
+    private:
+        std::vector<dtPolyRef> const* _excluded;
+    };
+
+    // The polygon the core's path builder picks for a point
+    // (PathGenerator::GetPolyByLocation on a fresh generator: a 3y x 5y box,
+    // then 3y x 50y), with the distance to it. Detour order (y, z, x).
+    static dtPolyRef CorePolyAt(dtNavMeshQuery const* query, dtQueryFilter const& filter, float const* point, float* dist)
+    {
+        float closest[3] = { 0.0f, 0.0f, 0.0f };
+        for (float vertical : { 5.0f, 50.0f })
+        {
+            float extents[3] = { 3.0f, vertical, 3.0f };
+            dtPolyRef ref = 0;
+            if (dtStatusSucceed(query->findNearestPoly(point, extents, &filter, &ref, closest)) && ref != 0)
+            {
+                if (dist)
+                    *dist = dtVdist(closest, point);
+                return ref;
+            }
+        }
+        if (dist)
+            *dist = FLT_MAX;
+        return 0;
+    }
+
+    // The polygons a route segment lies on: the one under its start, each one
+    // a straight walk along the surface toward its end crosses (Detour's
+    // raycast corridor), and the one under its end.
+    static void SegmentPolys(dtNavMeshQuery const* query, dtQueryFilter const& filter, WbVec const& a, WbVec const& b,
+        std::vector<dtPolyRef>& out)
+    {
+        auto add = [&](dtPolyRef ref) {
+            if (ref != 0 && std::find(out.begin(), out.end(), ref) == out.end())
+                out.push_back(ref);
+        };
+        float pa[3] = { a.y, a.z, a.x };
+        float pb[3] = { b.y, b.z, b.x };
+        dtPolyRef ra = CorePolyAt(query, filter, pa, nullptr);
+        if (ra != 0)
+        {
+            add(ra);
+            float t = 0.0f;
+            float normal[3] = { 0.0f, 0.0f, 0.0f };
+            dtPolyRef crossed[16];
+            int n = 0;
+            query->raycast(ra, pa, pb, &filter, &t, normal, crossed, &n, 16);
+            for (int i = 0; i < n; ++i)
+                add(crossed[i]);
+        }
+        add(CorePolyAt(query, filter, pb, nullptr));
+    }
+
+    // The core's smooth path along a corridor, ported because PathGenerator
+    // keeps it private: FindSmoothPath with GetSteerTarget and FixupCorridor
+    // (PathGenerator.cpp, GPL-2.0-or-later like this module), unchanged but
+    // for the filter, the corridor buffer and the point cap (the caller's) —
+    // 4y steps along the surface, each point 0.5y over its polygon, failing
+    // when the route needs the whole cap. A straight-path corner list would not
+    // do: a 30y corner segment across a 55 degree face averages under the
+    // guard's slope, and the walk would interpolate through the hill.
+    static bool InRangeYZX(float const* v1, float const* v2, float r, float h)
+    {
+        float const dx = v2[0] - v1[0];
+        float const dy = v2[1] - v1[1]; // elevation
+        float const dz = v2[2] - v1[2];
+        return (dx * dx + dz * dz) < r * r && std::fabs(dy) < h;
+    }
+
+    static uint32 FixupCorridor(dtPolyRef* path, uint32 npath, uint32 maxPath, dtPolyRef const* visited, uint32 nvisited)
+    {
+        int32 furthestPath = -1;
+        int32 furthestVisited = -1;
+        for (int32 i = int32(npath) - 1; i >= 0; --i)
+        {
+            bool found = false;
+            for (int32 j = int32(nvisited) - 1; j >= 0; --j)
+            {
+                if (path[i] == visited[j])
+                {
+                    furthestPath = i;
+                    furthestVisited = j;
+                    found = true;
+                }
+            }
+            if (found)
+                break;
+        }
+        if (furthestPath == -1 || furthestVisited == -1)
+            return npath;
+
+        uint32 req = nvisited - furthestVisited;
+        uint32 orig = uint32(furthestPath + 1) < npath ? furthestPath + 1 : npath;
+        uint32 size = npath > orig ? npath - orig : 0;
+        if (req + size > maxPath)
+            size = maxPath - req;
+        if (size)
+            memmove(path + req, path + orig, size * sizeof(dtPolyRef));
+        for (uint32 i = 0; i < req; ++i)
+            path[i] = visited[(nvisited - 1) - i];
+        return req + size;
+    }
+
+    static bool SteerTarget(dtNavMeshQuery const* query, float const* startPos, float const* endPos, float minTargetDist,
+        dtPolyRef const* path, uint32 pathSize, float* steerPos, unsigned char& steerPosFlag, dtPolyRef& steerPosRef)
+    {
+        static uint32 const MAX_STEER_POINTS = 3;
+        float steerPath[MAX_STEER_POINTS * VERTEX_SIZE];
+        unsigned char steerPathFlags[MAX_STEER_POINTS];
+        dtPolyRef steerPathPolys[MAX_STEER_POINTS];
+        int nsteerPath = 0;
+        dtStatus st = query->findStraightPath(startPos, endPos, path, int(pathSize),
+            steerPath, steerPathFlags, steerPathPolys, &nsteerPath, int(MAX_STEER_POINTS));
+        if (!nsteerPath || dtStatusFailed(st))
+            return false;
+        uint32 ns = 0;
+        while (ns < uint32(nsteerPath))
+        {
+            if ((steerPathFlags[ns] & DT_STRAIGHTPATH_OFFMESH_CONNECTION)
+                || !InRangeYZX(&steerPath[ns * VERTEX_SIZE], startPos, minTargetDist, 1000.0f))
+                break;
+            ns++;
+        }
+        if (ns >= uint32(nsteerPath))
+            return false;
+        dtVcopy(steerPos, &steerPath[ns * VERTEX_SIZE]);
+        steerPos[1] = startPos[1]; // keep Z value
+        steerPosFlag = steerPathFlags[ns];
+        steerPosRef = steerPathPolys[ns];
+        return true;
+    }
+
+    static dtStatus SmoothPath(dtNavMesh const* navMesh, dtNavMeshQuery const* query, dtQueryFilter const& filter,
+        float const* startPos, float const* endPos, dtPolyRef const* polyPath, uint32 polyPathSize,
+        float* smoothPath, uint32* smoothPathSize, uint32 maxSmoothPathSize)
+    {
+        *smoothPathSize = 0;
+        uint32 nsmoothPath = 0;
+
+        dtPolyRef polys[REPLAN_MAX_POLYS];
+        memcpy(polys, polyPath, sizeof(dtPolyRef) * polyPathSize);
+        uint32 npolys = polyPathSize;
+
+        float iterPos[VERTEX_SIZE], targetPos[VERTEX_SIZE];
+        if (polyPathSize > 1)
+        {
+            if (dtStatusFailed(query->closestPointOnPolyBoundary(polys[0], startPos, iterPos)))
+                return DT_FAILURE;
+            if (dtStatusFailed(query->closestPointOnPolyBoundary(polys[npolys - 1], endPos, targetPos)))
+                return DT_FAILURE;
+        }
+        else
+        {
+            dtVcopy(iterPos, startPos);
+            dtVcopy(targetPos, endPos);
+        }
+
+        dtVcopy(&smoothPath[nsmoothPath * VERTEX_SIZE], iterPos);
+        nsmoothPath++;
+
+        while (npolys && nsmoothPath < maxSmoothPathSize)
+        {
+            float steerPos[VERTEX_SIZE];
+            unsigned char steerPosFlag;
+            dtPolyRef steerPosRef = INVALID_POLYREF;
+            if (!SteerTarget(query, iterPos, targetPos, SMOOTH_PATH_SLOP, polys, npolys, steerPos, steerPosFlag, steerPosRef))
+                break;
+
+            bool endOfPath = (steerPosFlag & DT_STRAIGHTPATH_END) != 0;
+            bool offMeshConnection = (steerPosFlag & DT_STRAIGHTPATH_OFFMESH_CONNECTION) != 0;
+
+            float delta[VERTEX_SIZE];
+            dtVsub(delta, steerPos, iterPos);
+            float len = dtMathSqrtf(dtVdot(delta, delta));
+            if ((endOfPath || offMeshConnection) && len < SMOOTH_PATH_STEP_SIZE)
+                len = 1.0f;
+            else
+                len = SMOOTH_PATH_STEP_SIZE / len;
+
+            float moveTgt[VERTEX_SIZE];
+            dtVmad(moveTgt, iterPos, delta, len);
+
+            float result[VERTEX_SIZE];
+            static uint32 const MAX_VISIT_POLY = 16;
+            dtPolyRef visited[MAX_VISIT_POLY];
+            int nvisited = 0;
+            if (dtStatusFailed(query->moveAlongSurface(polys[0], iterPos, moveTgt, &filter, result, visited, &nvisited, int(MAX_VISIT_POLY))))
+                return DT_FAILURE;
+            npolys = FixupCorridor(polys, npolys, REPLAN_MAX_POLYS, visited, uint32(nvisited));
+
+            query->getPolyHeight(polys[0], result, &result[1]);
+            result[1] += 0.5f;
+            dtVcopy(iterPos, result);
+
+            if (endOfPath && InRangeYZX(iterPos, steerPos, SMOOTH_PATH_SLOP, 1.0f))
+            {
+                dtVcopy(iterPos, targetPos);
+                if (nsmoothPath < maxSmoothPathSize)
+                {
+                    dtVcopy(&smoothPath[nsmoothPath * VERTEX_SIZE], iterPos);
+                    nsmoothPath++;
+                }
+                break;
+            }
+            else if (offMeshConnection && InRangeYZX(iterPos, steerPos, SMOOTH_PATH_SLOP, 1.0f))
+            {
+                dtPolyRef prevRef = INVALID_POLYREF;
+                dtPolyRef polyRef = polys[0];
+                uint32 npos = 0;
+                while (npos < npolys && polyRef != steerPosRef)
+                {
+                    prevRef = polyRef;
+                    polyRef = polys[npos];
+                    npos++;
+                }
+                for (uint32 i = npos; i < npolys; ++i)
+                    polys[i - npos] = polys[i];
+                npolys -= npos;
+
+                float connectionStartPos[VERTEX_SIZE], connectionEndPos[VERTEX_SIZE];
+                if (dtStatusSucceed(navMesh->getOffMeshConnectionPolyEndPoints(prevRef, polyRef, connectionStartPos, connectionEndPos)))
+                {
+                    if (nsmoothPath < maxSmoothPathSize)
+                    {
+                        dtVcopy(&smoothPath[nsmoothPath * VERTEX_SIZE], connectionStartPos);
+                        nsmoothPath++;
+                    }
+                    dtVcopy(iterPos, connectionEndPos);
+                    if (dtStatusFailed(query->getPolyHeight(polys[0], iterPos, &iterPos[1])))
+                        return DT_FAILURE;
+                    iterPos[1] += 0.5f;
+                }
+            }
+
+            if (nsmoothPath < maxSmoothPathSize)
+            {
+                dtVcopy(&smoothPath[nsmoothPath * VERTEX_SIZE], iterPos);
+                nsmoothPath++;
+            }
+        }
+
+        *smoothPathSize = nsmoothPath;
+        return nsmoothPath < maxSmoothPathSize ? DT_SUCCESS : DT_FAILURE;
+    }
+
+    // One re-plan from `start` to `end` (Detour order, the points the core
+    // planned between) with `filter`'s polygons barred, as the core builds a
+    // route: findPath over the corridor, the smooth path along it, every point
+    // settled on the ground the way NormalizePath does
+    // (WorldObject::UpdateAllowedPositionZ). False, with `why`, when the
+    // corridor does not reach the end polygon or the route would not fit
+    // REPLAN_MAX_POINTS; nothing is walked then.
+    static bool PlanAround(Player* player, dtNavMesh const* navMesh, dtNavMeshQuery const* query, ExcludePolysFilter const& filter,
+        dtPolyRef startRef, dtPolyRef endRef, float const* start, float const* end, std::vector<WbVec>& out, char const** why)
+    {
+        dtPolyRef polys[REPLAN_MAX_POLYS];
+        int npolys = 0;
+        dtStatus st = query->findPath(startRef, endRef, start, end, &filter, polys, &npolys, REPLAN_MAX_POLYS);
+        if (dtStatusFailed(st) || npolys <= 0 || (st & DT_PARTIAL_RESULT) || polys[npolys - 1] != endRef)
+        {
+            *why = "no_route";
+            return false;
+        }
+        float pts[REPLAN_MAX_POINTS * VERTEX_SIZE];
+        uint32 npts = 0;
+        dtStatus sst = SmoothPath(navMesh, query, filter, start, end, polys, uint32(npolys), pts, &npts, REPLAN_MAX_POINTS);
+        if (npts >= REPLAN_MAX_POINTS)
+        {
+            *why = "too_long";
+            return false;
+        }
+        if (dtStatusFailed(sst) || npts < 2)
+        {
+            *why = "no_route";
+            return false;
+        }
+        out.clear();
+        for (uint32 i = 0; i < npts; ++i)
+        {
+            WbVec v{ pts[i * VERTEX_SIZE + 2], pts[i * VERTEX_SIZE], pts[i * VERTEX_SIZE + 1] };
+            player->UpdateAllowedPositionZ(v.x, v.y, v.z);
+            out.push_back(v);
+        }
+        return true;
+    }
+
     // The cause ladder behind a move_to (PROTOCOL.md, WB_MOVE_RESULT.status).
     // Returns status == nullptr with `points` filled on success. Order matters:
     // no_mesh must be tested before CalculatePath, because the core hides a
@@ -1809,6 +2147,15 @@ namespace WrathBench
             r.status = "path_incomplete";
             return r;
         }
+        std::vector<size_t> refusing;
+        SettleRoute(player, r, z, reqZ, force, &refusing);
+        if (r.status && std::strcmp(r.status, "drop") == 0)
+            ReplanSteep(player, sx, sy, sz, x, y, z, reqZ, force, refusing, r);
+        return r;
+    }
+
+    void Manager::SettleRoute(Player* player, PathResolve& r, float z, float reqZ, bool force, std::vector<size_t>* refusing)
+    {
         // The endpoint: the core's normalization keeps a requested z that
         // sits under the terrain (see END_SINK_MAX). The polygon the path
         // ends on knows the ground; when the normalized point is under it by
@@ -1835,7 +2182,9 @@ namespace WrathBench
         // it are the server-side shortcut the contract forbids. So is a step
         // whose foot lies under the ground (FootUnderSurface): no client
         // falls through terrain, and the foot is reported with the surface
-        // it is under so the caller does not ask again with force.
+        // it is under so the caller does not ask again with force. The
+        // verdict is the first refused segment; with `refusing` the scan goes
+        // on to list the rest for the steep re-plan.
         for (size_t i = 0; i + 1 < r.points.size(); ++i)
         {
             float dz = 0.0f;
@@ -1845,6 +2194,10 @@ namespace WrathBench
             bool buried = dz < 0.0f && FootUnderSurface(player, r.points[i], r.points[i + 1], &surfaceZ);
             if (!force || dz > 0.0f || buried)
             {
+                if (refusing)
+                    refusing->push_back(i);
+                if (r.status)
+                    continue;
                 r.status = "drop";
                 r.hasReached = true;
                 r.reachedX = r.points[i].x; r.reachedY = r.points[i].y; r.reachedZ = r.points[i].z;
@@ -1852,16 +2205,111 @@ namespace WrathBench
                 r.dropDz = dz;
                 r.hasSurfaceZ = buried;
                 r.surfaceZ = surfaceZ;
-                return r;
+                if (!refusing)
+                    return;
             }
         }
+        if (r.status)
+            return;
         float endZ = r.points.back().z;
         if (std::fabs(endZ - reqZ) > 1.0f)
         {
             r.hasMeshZ = true;
             r.meshZ = endZ;
         }
-        return r;
+    }
+
+    // The steep re-plan (see REPLAN_STEEP_ROUNDS). `r` holds the guard's
+    // `drop` on the mesh's own route from (sx, sy, sz), the point the core
+    // planned from (the snapped start when the character stood off the mesh);
+    // `refusing` lists that route's refused segments. Each re-plan is a whole
+    // route from the same start to the same end, settled by the same tail
+    // (SettleRoute: endpoint lift, start-snap leg, guard), so a route the
+    // guard passes is walked like any other and a route it refuses is never
+    // walked. The start and end polygons are never barred: the first is
+    // where the character stands, the second is where it asked to go.
+    void Manager::ReplanSteep(Player* player, float sx, float sy, float sz, float x, float y, float z, float reqZ,
+        bool force, std::vector<size_t> const& refusing, PathResolve& r)
+    {
+        PathResolve::Replan rp;
+        rp.ran = true;
+        rp.firstPoints = uint32(r.points.size());
+        rp.edge = { r.reachedX, r.reachedY, r.reachedZ };
+        rp.dz = r.dropDz;
+        auto finish = [&](char const* outcome, char const* reason) {
+            rp.outcome = outcome;
+            rp.reason = reason;
+            r.replan = rp;
+        };
+
+        auto& mmap = player->GetMap()->GetMapCollisionData().GetMMapData();
+        dtNavMesh const* navMesh = mmap.GetNavMesh();
+        dtNavMeshQuery const* query = mmap.GetNavMeshQuery();
+        if (!navMesh || !query)
+            return finish("skipped", "no_mesh_query");
+
+        ExcludePolysFilter const base;
+        float start[3] = { sy, sz, sx };
+        float end[3] = { y, z, x };
+        float distStart = 0.0f, distEnd = 0.0f;
+        dtPolyRef startRef = CorePolyAt(query, base, start, &distStart);
+        dtPolyRef endRef = CorePolyAt(query, base, end, &distEnd);
+        if (!startRef || !endRef || distStart > REPLAN_FAR_FROM_POLY || distEnd > REPLAN_FAR_FROM_POLY)
+            return finish("skipped", "far_from_poly");
+
+        std::vector<dtPolyRef> excluded;
+        ExcludePolysFilter const filter(&excluded);
+        // The route whose refused segments feed the next round; the mesh's
+        // own first. Its first segment is the walk onto the mesh when the
+        // start was snapped, which is not a mesh segment to plan around.
+        std::vector<WbVec> route = r.points;
+        std::vector<size_t> segs = refusing;
+        for (uint32 round = 1; round <= REPLAN_STEEP_ROUNDS; ++round)
+        {
+            size_t before = excluded.size();
+            std::vector<dtPolyRef> under;
+            for (size_t i : segs)
+            {
+                if (r.hasSnap && i == 0)
+                    continue;
+                SegmentPolys(query, base, route[i], route[i + 1], under);
+            }
+            for (dtPolyRef ref : under)
+                if (ref != startRef && ref != endRef && std::find(excluded.begin(), excluded.end(), ref) == excluded.end())
+                    excluded.push_back(ref);
+            if (excluded.size() == before)
+                return finish(round == 1 ? "skipped" : "failed", "nothing_to_exclude");
+
+            rp.rounds = round;
+            rp.excluded = uint32(excluded.size());
+            PathResolve cand;
+            cand.hasSnap = r.hasSnap;
+            cand.snapX = r.snapX; cand.snapY = r.snapY; cand.snapZ = r.snapZ;
+            char const* why = "";
+            if (!PlanAround(player, navMesh, query, filter, startRef, endRef, start, end, cand.points, &why))
+                return finish("failed", why);
+            // The core's endpoint check (ResolvePathAt's endpointOk): the
+            // route ends within 4y of the request in 2D.
+            WbVec const& last = cand.points.back();
+            float ex = last.x - x, ey = last.y - y;
+            if (ex * ex + ey * ey > 16.0f)
+                return finish("failed", "end_short");
+
+            std::vector<size_t> again;
+            SettleRoute(player, cand, z, reqZ, force, &again);
+            rp.points = uint32(cand.points.size());
+            if (!cand.status)
+            {
+                rp.outcome = "ok";
+                rp.reason = "";
+                cand.replan = rp;
+                r = std::move(cand);
+                return;
+            }
+            route = std::move(cand.points);
+            segs = std::move(again);
+        }
+        finish("failed", "drop");
     }
 
     // The z-ladder in front of the cause ladder (part 3). A unit
@@ -2091,6 +2539,25 @@ namespace WrathBench
                         .Raw("to", Json::Writer().Add("x", (double)r.snapX).Add("y", (double)r.snapY).Add("z", (double)r.snapZ).Str())
                         .Add("distance", (double)std::sqrt(std::pow(r.snapX - player->GetPositionX(), 2.0f) + std::pow(r.snapY - player->GetPositionY(), 2.0f) + std::pow(r.snapZ - player->GetPositionZ(), 2.0f)))
                         .Str());
+                // The steep re-plan, whenever the guard refused the mesh's own
+                // route: what it refused (edge, dz, pointCount), how many
+                // re-plans ran and how many polygons the last one barred, and
+                // whether the walk is now a re-planned route (outcome "ok",
+                // whose polyline is the move_path below) or the refusal stands.
+                if (r.replan.ran)
+                {
+                    Json::Writer a;
+                    a.Add("op", "move_replan_steep").Add("moveId", moveId).Add("outcome", r.replan.outcome);
+                    if (r.replan.reason[0] != '\0')
+                        a.Add("reason", r.replan.reason);
+                    a.Add("rounds", r.replan.rounds).Add("excluded", r.replan.excluded)
+                        .Add("dz", (double)r.replan.dz)
+                        .Raw("edge", Json::Writer().Add("x", (double)r.replan.edge.x).Add("y", (double)r.replan.edge.y)
+                            .Add("z", (double)r.replan.edge.z).Str())
+                        .Add("pointCount", r.replan.firstPoints)
+                        .Add("replanPointCount", r.replan.points);
+                    Audit(*s, "action", a.Str());
+                }
             }
         }
         // The resolved polyline, at dispatch, so a diagnosis reads the route
