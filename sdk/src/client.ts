@@ -58,6 +58,8 @@ import {
   type SendMailResultData,
   type ShowFrameData,
   type SpellFailureData,
+  type SpellGoData,
+  type SpellStartData,
   type InventoryChangeFailureData,
   type CastFailedData,
   type ItemPushResultData,
@@ -1891,10 +1893,64 @@ export type QuestAcceptResult =
  * `useItem`'s answer: the module's ack, plus — for an item whose tooltip says
  * it starts a quest — the offer the server made from it. `itemGuid` is what
  * `acceptQuestFrom` takes in place of an NPC guid.
+ *
+ * For an item whose tooltip names an on-use spell, the server's first word on
+ * that cast decides the answer. The cast starting (`SMSG_SPELL_START`, or
+ * `SMSG_SPELL_GO` for an instant) is the ack. `cast_failed` is the cast
+ * refused before it began (`SMSG_CAST_FAILED`; `not_ready` is the item's
+ * cooldown or the global one), and `refused` is the item itself refused
+ * (`SMSG_INVENTORY_CHANGE_FAILURE`, e.g. "you are dead"). Silence, or an item
+ * whose tooltip has not been observed, is the plain ack. A cast that starts
+ * and is interrupted later is told by events, as for `castSpell`.
  */
-export type UseItemResult = ActionResponse & {
-  readonly questOffer?: { readonly questId: number; readonly title: string; readonly itemGuid: string };
-};
+export type UseItemResult =
+  | (ActionResponse & {
+      readonly questOffer?: { readonly questId: number; readonly title: string; readonly itemGuid: string };
+    })
+  | {
+      readonly ok: false;
+      readonly status: "cast_failed";
+      readonly spellId: number;
+      /** Raw `SpellCastResult` code from `SMSG_CAST_FAILED`. */
+      readonly result: number;
+      /** The code's name: `not_ready`, `moving`, `caster_dead`, … */
+      readonly reason: string | undefined;
+      readonly questOffer?: undefined;
+      readonly hint: string;
+    }
+  | {
+      readonly ok: false;
+      readonly status: "refused";
+      /** Raw `InventoryResult` code from `SMSG_INVENTORY_CHANGE_FAILURE`. */
+      readonly result: number;
+      readonly questOffer?: undefined;
+      readonly hint: string;
+    };
+
+/** `ITEM_SPELLTRIGGER_ON_USE`: the template spell a client's right-click casts. */
+const ITEM_SPELLTRIGGER_ON_USE = 0;
+/** How long `useItem` waits for the server's first word on the cast, in ms. */
+const USE_ITEM_VERDICT_MS = 2000;
+/** `SPELL_FAILED_NOT_READY`: the spell (or the item that casts it) is cooling down, or the global cooldown is. */
+const SPELL_FAILED_NOT_READY = 67;
+
+/** The on-use spell an item's tooltip names, when the tooltip has been observed and names one. */
+function onUseSpellOf(state: StateCache, item: BagSlotItem | undefined): number | undefined {
+  if (item?.itemId === undefined) return undefined;
+  return state.items.get(item.itemId)?.value?.spells?.find((s) => s.trigger === ITEM_SPELLTRIGGER_ON_USE && s.spellId > 0)?.spellId;
+}
+
+/** The hint for a use the server refused before the cast began. */
+function useItemCastFailedHint(label: string, spellId: number, result: number, reason: string | undefined): string {
+  if (result === SPELL_FAILED_NOT_READY) {
+    return (
+      `${label} was not used: the server answered not_ready, so a cooldown is still running: the item's own, ` +
+      `or the global cooldown right after another cast. The server announces no cooldown for an item use, so ` +
+      `state.cooldowns() can be empty while it runs`
+    );
+  }
+  return `${label} was not used: the server refused its spell ${spellId} before the cast began (${reason ?? `code ${result}`})`;
+}
 
 /** The quest an item's tooltip says it starts, when the tooltip has been observed and says so. */
 function questStartedBy(state: StateCache, item: BagSlotItem | undefined): number | undefined {
@@ -2821,6 +2877,47 @@ export type AcceptResurrectionResult =
   | { readonly ok: true; readonly status: "resurrected"; readonly casterGuid: string }
   | { readonly ok: false; readonly status: "no_offer"; readonly hint: string }
   | { readonly ok: false; readonly status: "unconfirmed"; readonly casterGuid: string; readonly hint: string };
+
+export interface SpiritHealerOptions {
+  /** How long to wait for the resurrection after the activation, in ms. Default 5000. */
+  timeout?: number;
+}
+
+/**
+ * The outcome of `spiritHealerActivate`. `resurrected` is the resurrect
+ * observed (`SMSG_DEATH_RELEASE_LOC { map: -1 }`); `unconfirmed` means the
+ * activation went out and nothing came back, with the yards to the healer
+ * when its position is cached.
+ */
+export type SpiritHealerResult =
+  | { readonly ok: true; readonly status: "resurrected" }
+  | { readonly ok: false; readonly status: "unconfirmed"; readonly distance: number | undefined; readonly hint: string };
+
+/**
+ * Why a spirit healer said nothing, from what the client knows. The core's
+ * handler returns silently when `GetNPCIfCanInteractWith` fails, and the one
+ * cause a client can check is range: the run that earned this stood 14y away
+ * and took the ack for a resurrection.
+ */
+function spiritHealerSilence(distance: number | undefined, timeout: number): string {
+  const head = `no resurrection was observed within ${Math.round(timeout / 1000)}s`;
+  if (distance === undefined) {
+    return (
+      `${head}. The server ignores the activation silently when the spirit healer is out of interact range ` +
+      `(~${INTERACT_RANGE}y), and this SDK has no observed position for that guid: check state.units({ role: "spiritHealer" }) and its distance`
+    );
+  }
+  if (distance > INTERACT_RANGE) {
+    return (
+      `${head}. You are ${distance}y from the spirit healer, and the server ignores the activation silently ` +
+      `outside interact range (~${INTERACT_RANGE}y): moveTo it, then activate again`
+    );
+  }
+  return (
+    `${head}, at ${distance}y, inside interact range (~${INTERACT_RANGE}y), so range is not the cause. The server ` +
+    `also ignores it when that guid is not a spirit healer you can talk to: re-read state.self.health`
+  );
+}
 
 /** `CORPSE_RECLAIM_RADIUS` in the core: a reclaim further than this is dropped silently. */
 export const CORPSE_RECLAIM_RADIUS = 39;
@@ -3893,6 +3990,11 @@ export class WrathClient {
       }
       throw err;
     }
+    const spellId = onUseSpellOf(this.state, item);
+    if (spellId !== undefined && item !== undefined) {
+      const refusal = await this.useItemVerdict(item, spellId, sinceSeq);
+      if (refusal !== undefined) return withResolved(where, refusal);
+    }
     if (startQuest === undefined || item === undefined) return withResolved(where, ack);
     const offer = await this.waitEvent(
       (e) =>
@@ -3909,6 +4011,53 @@ export class WrathClient {
     );
     const data = offer.data as QuestGiverQuestDetailsData;
     return withResolved(where, { ...ack, questOffer: { questId: data.questId, title: data.title, itemGuid: item.guid } });
+  }
+
+  /**
+   * The server's first word on the cast a `useItem` asked for, as a refusal,
+   * or `undefined` when the cast began or nothing was heard. The handler
+   * answers in the same world tick as the dispatch, often before the ack, so
+   * events since `sinceSeq` count. A failure is matched by spell id: a repop
+   * alone sends eight `SMSG_CAST_FAILED` for its own spells, which are not this
+   * item's answer.
+   */
+  private async useItemVerdict(
+    item: BagSlotItem,
+    spellId: number,
+    sinceSeq: number | undefined,
+  ): Promise<Extract<UseItemResult, { ok: false }> | undefined> {
+    const self = this.state.self.guid;
+    const ownCast = (casterGuid: string) => self === undefined || guidKey(casterGuid) === self;
+    let verdict: StreamEvent;
+    try {
+      verdict = await this.waitEvent(
+        (e) =>
+          (sinceSeq === undefined || e.seq > sinceSeq) &&
+          !isDecodeError(e.data) &&
+          ((isEvent(e, "SMSG_SPELL_START") && (e.data as SpellStartData).spellId === spellId && ownCast((e.data as SpellStartData).casterGuid)) ||
+            (isEvent(e, "SMSG_SPELL_GO") && (e.data as SpellGoData).spellId === spellId && ownCast((e.data as SpellGoData).casterGuid)) ||
+            (isEvent(e, "SMSG_CAST_FAILED") && (e.data as CastFailedData).spellId === spellId) ||
+            (isEvent(e, "SMSG_INVENTORY_CHANGE_FAILURE") && isOwnInventoryFailure(e.data as InventoryChangeFailureData, item.guid))),
+        { timeout: USE_ITEM_VERDICT_MS, description: `the server's answer to using ${item.name ?? `item ${item.itemId}`} (spell ${spellId})` },
+      );
+    } catch (e) {
+      if (e instanceof EventTimeoutError) return undefined;
+      throw e;
+    }
+    const label = JSON.stringify(item.name ?? `item ${item.itemId ?? "?"}`);
+    if (isEvent(verdict, "SMSG_CAST_FAILED")) {
+      const d = verdict.data as CastFailedData;
+      const hint = useItemCastFailedHint(label, spellId, d.result, d.reason);
+      this.noteActionHint("useItem", "cast_failed", hint);
+      return { ok: false, status: "cast_failed", spellId, result: d.result, reason: d.reason, hint };
+    }
+    if (isEvent(verdict, "SMSG_INVENTORY_CHANGE_FAILURE")) {
+      const code = (verdict.data as InventoryChangeFailureData).result;
+      const hint = `${label} was not used: ${inventoryResultText(code) ?? `inventory error ${code}`}`;
+      this.noteActionHint("useItem", "refused", hint);
+      return { ok: false, status: "refused", result: code, hint };
+    }
+    return undefined;
   }
 
   /**
@@ -4285,12 +4434,42 @@ export class WrathClient {
   /**
    * `CMSG_SPIRIT_HEALER_ACTIVATE` — resurrect at the graveyard's spirit healer
    * when the corpse is unreachable. Costs durability and applies resurrection
-   * sickness; the outcome arrives through ordinary events (health, auras).
+   * sickness. The verdict is read off `SMSG_DEATH_RELEASE_LOC { map: -1 }`,
+   * which every resurrection sends first. The core drops the packet without a
+   * word when the healer is out of interact range, so silence is answered as
+   * `unconfirmed` with the distance the cached positions give.
    */
-  spiritHealerActivate(target: GuidOrUnit): Promise<WithResolved<ActionResponse>> {
-    return this.byName(target, "spiritHealerActivate(guid)", (guid) =>
-      this.action({ action: "spirit_healer_activate", guid }),
-    );
+  spiritHealerActivate(target: GuidOrUnit, options: SpiritHealerOptions = {}): Promise<WithResolved<SpiritHealerResult>> {
+    return this.byName(target, "spiritHealerActivate(guid)", async (guid) => {
+      let released = false;
+      const offRelease = this.events.on("SMSG_DEATH_RELEASE_LOC", (e) => {
+        if (isDecodeError(e.data)) return;
+        if ((e.data as DeathReleaseLocData).map < 0) released = true;
+      });
+      const timeout = options.timeout ?? 5000;
+      try {
+        await this.action({ action: "spirit_healer_activate", guid });
+        if (!released) {
+          try {
+            await this.waitEvent(() => released, {
+              timeout,
+              includeBuffered: false,
+              description: "the resurrect after CMSG_SPIRIT_HEALER_ACTIVATE (SMSG_DEATH_RELEASE_LOC clearing the marker)",
+            });
+          } catch (e) {
+            if (!(e instanceof EventTimeoutError)) throw e;
+          }
+        }
+      } finally {
+        offRelease();
+      }
+      if (released) return { ok: true, status: "resurrected" } as const;
+      const measured = distanceToUnit(this.state, guid);
+      const distance = measured === undefined ? undefined : Math.round(measured);
+      const hint = spiritHealerSilence(distance, timeout);
+      this.noteActionHint("spiritHealerActivate", "unconfirmed", hint);
+      return { ok: false, status: "unconfirmed", distance, hint } as const;
+    });
   }
 
   /**

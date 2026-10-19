@@ -61,6 +61,8 @@ export type {
   SayType,
   AcceptResurrectionOptions,
   AcceptResurrectionResult,
+  SpiritHealerOptions,
+  SpiritHealerResult,
   LootRollRefusalStatus,
   LootRollResult,
   ReadItemOptions,

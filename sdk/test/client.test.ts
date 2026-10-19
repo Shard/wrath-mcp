@@ -5714,3 +5714,122 @@ describe("connect() closes the stream it fails to open", () => {
     expect(RefusedSocket.instances.length).toBe(atRejection);
   });
 });
+
+describe("client: useItem reads the server's first word on the item's cast", () => {
+  const TS = 1_700_000_000_000;
+  const USE_SPELL = 4242;
+  const frame = (seq: number, opcode: string, data: unknown): string => JSON.stringify({ seq, opcode, opcodeId: 0x100, ts: TS + seq, data });
+  /** The Gritstone Charm carried, with a tooltip naming an on-use spell. */
+  const usable = () =>
+    frames([
+      ...loginSequence,
+      selfCreate,
+      creatureCreate,
+      creatureQuery,
+      inventorySlot,
+      itemCreate,
+      {
+        ...(itemQuery as object),
+        data: { ...(itemQuery as { data: object }).data, spells: [{ spellId: USE_SPELL, trigger: 0, charges: 0, name: "Gritstone" }] },
+      },
+    ]);
+  const ready = async (stub: ReturnType<typeof startStub>) => {
+    const client = await inWorld(stub);
+    await client.events.waitForOpcode("SMSG_ITEM_QUERY_SINGLE_RESPONSE", { timeout: 2000 });
+    return client;
+  };
+
+  test("not_ready is a cast_failed value whose hint names the unannounced cooldown, delivered to the harness too", async () => {
+    const stub = startStub({ onConnect: () => usable() });
+    const client = await ready(stub);
+    const pending = client.useItem("Gritstone Charm");
+    await untilAction(stub, "use_item");
+    stub.push(frame(90, "SMSG_CAST_FAILED", { spellId: USE_SPELL, result: 67 }));
+    const used = await pending;
+    expect(used).toMatchObject({ ok: false, status: "cast_failed", spellId: USE_SPELL, result: 67, reason: "not_ready" });
+    if (used.ok || used.status !== "cast_failed") throw new Error("unreachable");
+    expect(used.hint).toContain("not_ready");
+    expect(used.hint).toContain("state.cooldowns() can be empty");
+    expect(client.drainActionHints()[0]).toMatchObject({ action: "useItem", status: "cast_failed" });
+    client.close();
+    await stub.stop();
+  });
+
+  test("another spell's failure is not the item's answer; the item's own cast starting is the ack", async () => {
+    const stub = startStub({ onConnect: () => usable() });
+    const client = await ready(stub);
+    const pending = client.useItem("Gritstone Charm");
+    await untilAction(stub, "use_item");
+    // What a repop sends alongside: failures for spells that are not this item's.
+    stub.push(frame(90, "SMSG_CAST_FAILED", { spellId: 55164, result: 27 }));
+    stub.push(frame(91, "SMSG_SPELL_START", { casterGuid: SELF_GUID, spellId: USE_SPELL, castTimeMs: 10_000 }));
+    const used = await pending;
+    expect(used).toEqual({ ok: true, action: "use_item" });
+    expect(client.drainActionHints()).toEqual([]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("an item refusal (SMSG_INVENTORY_CHANGE_FAILURE on the item) is a refused value with the client's text", async () => {
+    const stub = startStub({ onConnect: () => usable() });
+    const client = await ready(stub);
+    const pending = client.useItem("Gritstone Charm");
+    await untilAction(stub, "use_item");
+    stub.push(frame(90, "SMSG_INVENTORY_CHANGE_FAILURE", { result: 38, itemGuid: ITEM_GUID, itemGuid2: "0" }));
+    const used = await pending;
+    expect(used).toMatchObject({ ok: false, status: "refused", result: 38 });
+    if (used.ok) throw new Error("unreachable");
+    expect(used.hint).toContain("you are dead");
+    expect(client.drainActionHints()[0]).toMatchObject({ action: "useItem", status: "refused" });
+    client.close();
+    await stub.stop();
+  });
+
+  test("silence is the plain ack, never a guess", async () => {
+    const stub = startStub({ onConnect: () => usable() });
+    const client = await ready(stub);
+    const used = await client.useItem("Gritstone Charm");
+    expect(used).toEqual({ ok: true, action: "use_item" });
+    expect(client.drainActionHints()).toEqual([]);
+    client.close();
+    await stub.stop();
+  });
+});
+
+describe("client: spiritHealerActivate answers with the resurrection or the silence explained", () => {
+  test("the resurrect observed is resurrected", async () => {
+    const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate, selfHealth(1, 90), creatureCreate, creatureQuery]) });
+    const client = await inWorld(stub);
+    const pending = client.spiritHealerActivate(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "spirit_healer_activate");
+    stub.push(JSON.stringify(deathReleaseCleared(91)));
+    expect(await pending).toEqual({ ok: true, status: "resurrected" });
+    client.close();
+    await stub.stop();
+  });
+
+  test("silence from a healer out of interact range is unconfirmed with the distance, and the hint reaches the harness", async () => {
+    const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate, selfHealth(1, 90), creatureCreate, creatureQuery]) });
+    const client = await inWorld(stub);
+    const result = await client.spiritHealerActivate(CREATURE_GUID, { timeout: 200 });
+    expect(stub.actions.map((a) => a.action)).toContain("spirit_healer_activate");
+    expect(result).toMatchObject({ ok: false, status: "unconfirmed", distance: 35 });
+    if (result.ok) throw new Error("unreachable");
+    expect(result.hint).toContain("35y from the spirit healer");
+    expect(result.hint).toContain("moveTo");
+    expect(client.drainActionHints()[0]).toMatchObject({ action: "spiritHealerActivate", status: "unconfirmed" });
+    client.close();
+    await stub.stop();
+  });
+
+  test("silence with no position for the guid says so instead of guessing a distance", async () => {
+    const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate, selfHealth(1, 90)]) });
+    const client = await inWorld(stub);
+    const result = await client.spiritHealerActivate("424242", { timeout: 200 });
+    expect(result).toMatchObject({ ok: false, status: "unconfirmed", distance: undefined });
+    if (result.ok) throw new Error("unreachable");
+    expect(result.hint).toContain("no observed position");
+    client.close();
+    await stub.stop();
+  });
+});

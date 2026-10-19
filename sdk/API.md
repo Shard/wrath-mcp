@@ -144,12 +144,12 @@ stream.) Then, on the client:
 | `vendorList` | `vendorList(guid: GuidOrUnit): Promise<ActionResponse>` | Ask a vendor for its inventory list. |
 | `buyItem` | `buyItem(guid: GuidOrUnit, itemId, slot, count?): Promise<ActionResponse>` | Buy an item from a vendor (slot is the 1-based vendor slot). |
 | `repairAll` | `repairAll(guid: GuidOrUnit): Promise<ActionResponse>` | Repair everything at a repair vendor. |
-| `useItem` | `useItem(bagOrName: number | string, slot?, targetGuid?: GuidOrUnit): Promise<ActionResponse>` | Use a bag item's on-use effect; the item is its bag/slot or its name (with a name, the next argument is the target guid). |
+| `useItem` | `useItem(bagOrName: number | string, slot?, targetGuid?: GuidOrUnit): Promise<UseItemResult>` | Use a bag item's on-use effect; the item is its bag/slot or its name (with a name, the next argument is the target guid). Returns once the server answers the item's cast: the ack when it starts, cast_failed with reason and hint when the server refuses it before it begins (not_ready: a cooldown still running, the item's or the global one; the server announces none for an item use, so state.cooldowns() can miss it), or refused with hint when the item itself is refused. An interruption after the start arrives as events. |
 | `destroyItem` | `destroyItem(bagOrName: number | string, slot?, count?): Promise<ActionResponse>` | Destroy a bag item by bag/slot or by name (with a name, the next argument is the count); omit count to destroy the whole stack. |
 | `repop` | `repop(): Promise<ActionResponse>` | Release the spirit while dead. |
 | `reclaimCorpse` | `reclaimCorpse(guid?: GuidOrUnit, options?: ReclaimCorpseOptions): Promise<ReclaimCorpseResult>` | Wait out the server's corpse reclaim delay, reclaim, and report the verdict: reclaimed / not_reclaimed / unconfirmed. |
 | `reclaimCorpseAsync` | `reclaimCorpseAsync(guid?: GuidOrUnit): Promise<ActionResponse>` | CMSG_RECLAIM_CORPSE, dispatch only. Prefer reclaimCorpse. |
-| `spiritHealerActivate` | `spiritHealerActivate(guid: GuidOrUnit): Promise<ActionResponse>` | Resurrect at a graveyard spirit healer (durability cost, resurrection sickness). |
+| `spiritHealerActivate` | `spiritHealerActivate(guid: GuidOrUnit, options?): Promise<SpiritHealerResult>` | Resurrect at a graveyard spirit healer (durability cost, resurrection sickness) and wait for it: resurrected, or unconfirmed with the distance and a hint (the server ignores it silently outside interact range). |
 | `trainerListAsync` | `trainerListAsync(guid: GuidOrUnit): Promise<ActionResponse>` | Ask a trainer for its list without waiting (prefer trainerList). |
 | `trainerBuySpellAsync` | `trainerBuySpellAsync(guid: GuidOrUnit, spellId): Promise<ActionResponse>` | Buy a spell without waiting (prefer buySpell). |
 | `learnTalentAsync` | `learnTalentAsync(talentId, rank): Promise<ActionResponse>` | Spend a talent point without waiting (prefer learnTalent). |
