@@ -2847,10 +2847,20 @@ export class WrathClient {
   readonly events: EventStream;
   readonly state: StateCache;
 
-  /** The operator-bound game account. Authoritative when set; see ConnectOptions.account. */
-  private readonly boundAccount: string | undefined;
-  private readonly secret: string | undefined;
-  private readonly fetchImpl: typeof fetch;
+  /**
+   * The operator-bound game account. Authoritative when set; see ConnectOptions.account.
+   *
+   * This, the `#secret` below and `#fetchImpl` are ECMAScript private fields,
+   * not TypeScript `private` (which Bun strips to an ordinary enumerable
+   * property). The difference is the sandbox's: the snippet child shares the
+   * ambient client object, and `#`-fields are absent from `Object.keys`,
+   * `Object.getOwnPropertyNames`, `Reflect.ownKeys`, `JSON.stringify` and
+   * `Bun.inspect`, so the leased credential the client holds cannot be read off
+   * it (docs/CONTRACTS.md, the per-token secret scope; operator, 2026-10-19).
+   */
+  readonly #boundAccount: string | undefined;
+  readonly #secret: string | undefined;
+  readonly #fetchImpl: typeof fetch;
   private readonly requestTimeoutMs: number;
   private readonly defaultSignal: (() => AbortSignal | undefined) | undefined;
   private readonly deadlineAt: (() => number | undefined) | undefined;
@@ -2882,14 +2892,14 @@ export class WrathClient {
 
   constructor(options: ConnectOptions) {
     this.token = options.token;
-    this.boundAccount = options.account;
-    this.secret = options.secret;
+    this.#boundAccount = options.account;
+    this.#secret = options.secret;
     const sig = options.signal;
     this.defaultSignal = sig === undefined ? undefined : typeof sig === "function" ? sig : () => sig;
     const dl = options.deadline;
     this.deadlineAt = dl === undefined ? undefined : typeof dl === "function" ? dl : () => dl;
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.#fetchImpl = options.fetchImpl ?? fetch;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
 
     const wsBase = options.eventsUrl ?? this.baseUrl.replace(/^http/, "ws");
@@ -3164,7 +3174,7 @@ export class WrathClient {
     // module default) stands, preserving standalone/MCP behavior. This is what
     // closes the RUNNER6→RUNNER cross-account eviction: an omitted-account
     // createSession can no longer default onto a shared account.
-    const account = this.boundAccount ?? request.account;
+    const account = this.#boundAccount ?? request.account;
     const body: CreateSessionRequest = { token: this.token, ...request, account };
     const res = await this.request("POST", "/session", body, sessionResponseSchema);
     this.state.seedSelf({ guid: res.guid, name: res.character });
@@ -5087,7 +5097,7 @@ export class WrathClient {
             // account is a cross-account hazard even though character-delete
             // refuses an account another live token holds. Unbound, the
             // caller's option (else the module default) stands.
-            account: this.boundAccount ?? options.account,
+            account: this.#boundAccount ?? options.account,
           },
           characterDeleteResponseSchema,
         );
@@ -5120,7 +5130,7 @@ export class WrathClient {
    * `403 operator_only`). See module/PROTOCOL.md, "Authentication".
    */
   lease(account?: string): Promise<LeaseResponse> {
-    const bound = this.boundAccount ?? account;
+    const bound = this.#boundAccount ?? account;
     return this.request(
       "POST",
       "/lease",
@@ -7100,8 +7110,8 @@ export class WrathClient {
     try {
       const headers: Record<string, string> = {};
       if (body !== undefined) headers["content-type"] = "application/json";
-      if (this.secret !== undefined) headers["authorization"] = `Bearer ${this.secret}`;
-      res = await this.fetchImpl(url, {
+      if (this.#secret !== undefined) headers["authorization"] = `Bearer ${this.#secret}`;
+      res = await this.#fetchImpl(url, {
         method,
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),

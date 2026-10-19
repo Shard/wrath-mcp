@@ -54,9 +54,11 @@ no-op while the stream is open, and reopens it once it is not — after a drop t
 reconnect ladder gave up on, or after something called `close()` — so the events
 missed in between arrive as one `stream_gap` and `state` is current again from
 the next packets on. A session the module no longer has is a refusal, not a
-reopen. (The library form `connect(options): Promise<WrathClient>` is for host
-code that builds its own client — not for snippets, where `sdk` already
-exists.) Then, on the client:
+reopen. (The library form `connect(options)` is for host code. In a snippet,
+`sdk` is the only client: it holds the session credential, which cannot be read
+off it, and a client you construct yourself cannot reach the module. If you
+overwrite `sdk`, read it again — it is still there; `connect()` reopens the
+stream.) Then, on the client:
 
 | Method | Signature | Purpose |
 | --- | --- | --- |

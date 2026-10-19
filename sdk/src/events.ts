@@ -219,7 +219,12 @@ export class EventStream implements AsyncIterable<StreamEvent> {
   readonly token: string;
 
   private readonly url: string;
-  private readonly secret: string | undefined;
+  // An ECMAScript private field, not TS `private`: the sandbox shares the
+  // ambient client's event stream with snippet code, and a `#`-field is absent
+  // from `Object.keys`/`Reflect.ownKeys`/`JSON.stringify`/`Bun.inspect`, so the
+  // leased credential cannot be read off `sdk.events` (the client's `#secret`
+  // says the same; docs/CONTRACTS.md, the per-token secret scope).
+  #secret: string | undefined;
   private readonly bufferSize: number;
   private readonly reconnectEnabled: boolean;
   private readonly minDelay: number;
@@ -255,7 +260,7 @@ export class EventStream implements AsyncIterable<StreamEvent> {
   constructor(options: EventStreamOptions) {
     this.token = options.token;
     this.url = `${options.url}?token=${encodeURIComponent(options.token)}`;
-    this.secret = options.secret;
+    this.#secret = options.secret;
     this.bufferSize = options.bufferSize ?? 500;
     this.expectedSeq = options.expectFromSeq ?? 0;
     this.reconnectEnabled = options.reconnect ?? true;
@@ -395,11 +400,11 @@ export class EventStream implements AsyncIterable<StreamEvent> {
     // WHATWG signature has only protocols there, hence the cast). Custom
     // implementations receive the same object and may ignore it.
     const ws =
-      this.secret === undefined
+      this.#secret === undefined
         ? new this.WS(this.url)
         : new (this.WS as unknown as new (url: string, init: { headers: Record<string, string> }) => WebSocket)(
             this.url,
-            { headers: { authorization: `Bearer ${this.secret}` } },
+            { headers: { authorization: `Bearer ${this.#secret}` } },
           );
     this.socket = ws;
 

@@ -89,6 +89,21 @@ The floor that closes that (`module/PROTOCOL.md`
   `/events` (validated against the lease, so the SDK still subscribes before it
   creates and loses none of the login burst) and refused everywhere else: for
   another token, and for leasing, `/characters` and `/character-delete`.
+  **The ambient SDK client is the only holder of that secret, and a hand-built
+  client is refused** (operator, 2026-10-19). A snippet cannot read the secret
+  — it is struck from the child's environment once the one client has read it,
+  and lives in a private field absent from the client object's enumerable
+  surface, its reflection and its stringification — and cannot open its own
+  connection to the module: the child's `fetch` and `WebSocket` refuse every
+  host, the module's included, so the only module connection is the ambient
+  client's own transport. A second `WrathClient` a snippet constructs, or a
+  raw request it assembles, therefore has no credential and no transport.
+  Session lifecycle (`createSession`, `deleteSession`/logout) is reachable only
+  through the ambient client, bound to this run's own token and account; it was
+  a second, hand-built client opening a session the runner did not follow that
+  this narrowing closes (issue #74). The kernel's per-port TCP rule still lets
+  `node:net`/`Bun.connect` open the module's port, but with no credential to
+  read such a connection authenticates nothing.
 - **Token-to-account and token-to-character binding.** A leased token lands on
   its lease's account whatever the body says, and the first create that
   succeeds under it binds the character; a later same-token create for another
