@@ -208,6 +208,7 @@ export type HostToChild =
         | "state_summary"
         | "death_signals"
         | "flight_signals"
+        | "party_signals"
         | "action_hints"
         | "trace_drain"
         | "nearby_drain";
