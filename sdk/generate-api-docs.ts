@@ -83,6 +83,7 @@ const CLIENT_HELPERS: readonly Row[] = [
   { name: "inviteToGroup", sig: "inviteToGroup(name, options?): Promise<InviteResult>", purpose: "Invite a player by name and return the server's verdict on the invite (invited = delivered, not yet accepted; refused carries the reason). Their answer lands in state.group(): inGroup, or lastDecline." },
   { name: "acceptGroupInvite", sig: "acceptGroupInvite(options?): Promise<GroupState>", purpose: "Accept the pending invitation (state.group().pendingInvite) and return the party once the server lists it." },
   { name: "leaveGroup", sig: "leaveGroup(options?): Promise<GroupState>", purpose: "Leave the party and return the state once the server confirms." },
+  { name: "acceptResurrection", sig: "acceptResurrection(options?): Promise<AcceptResurrectionResult>", purpose: "Accept the resurrection someone is offering you while dead (state.pendingResurrect) and wait for it: resurrected, unconfirmed (the accept went out and no resurrect was seen), or no_offer with nothing sent. You come back where the caster stands." },
   { name: "openMailbox", sig: "openMailbox(mailbox: GuidOrUnit, options?): Promise<MailboxState>", purpose: "Use a mailbox game object (goType \"mailbox\", within reach) and wait for its frame; every other mail helper needs this open." },
   { name: "sendMail", sig: "sendMail(to, subject, body, { money?, cod?, items?: ({ bag, slot } | name)[] }?): Promise<MailResult>", purpose: "Send a mail from the open mailbox with optional money, COD and up to 12 carried items (each a bag/slot pair or an item name); returns sent, refused with the server's reason (postage 30c comes out of state.money), or no_mailbox / no_item." },
   { name: "mailList", sig: "mailList(options?): Promise<MailboxState>", purpose: "List the inbox at the open mailbox: mails [{ mailId, senderName, subject, body, money, cod, read, items: [{ itemGuidLow, itemId, name, count }] }]." },
@@ -108,7 +109,7 @@ const CLIENT_HELPERS: readonly Row[] = [
  * outcome lands.
  */
 const CLIENT_RAW: readonly Row[] = [
-  { name: "say", sig: "say(text): Promise<ActionResponse>", purpose: "Say something in local chat." },
+  { name: "say", sig: "say(text, { type?: \"say\" | \"party\" | \"yell\" | \"whisper\", to? }?): Promise<ActionResponse>", purpose: "Say something in local chat; type \"party\", \"yell\" or \"whisper\" (with to, the player's name) sends it to your party, as a yell, or to that one player. The line comes back as SMSG_MESSAGECHAT (state.chat)." },
   { name: "moveToAsync", sig: "moveToAsync(target, { force? }?): Promise<MoveToResponse>", purpose: "Queue a move without waiting — the call for a walk longer than your own time budget; same targets and the same 250y single-move cap as moveTo. No fall estimate here: a ledge answers drop on the WB_MOVE_RESULT event, and { force: true } walks it." },
   { name: "stop", sig: "stop(): Promise<ActionResponse>", purpose: "Queue a movement stop; the in-flight moveTo resolves with status 'stopped'." },
   { name: "face", sig: "face(orientationOrPoint: number | { x, y }): Promise<FaceResponse>", purpose: "Turn in place toward an orientation (radians, 0 = east, counter-clockwise) or a point { x, y }. It takes no guid or name: to face a unit, pass its position, face({ x: unit.x, y: unit.y }). Refused with code moving while a move is running." },
@@ -155,7 +156,7 @@ const CLIENT_RAW: readonly Row[] = [
   { name: "petCast", sig: "petCast(spellNameOrId, target?: GuidOrUnit): Promise<PetActionResult>", purpose: "Have the pet cast one of its own spells (state.pet().spells, by name or by id) at a unit or at nothing; the server's refusal arrives as SMSG_PET_CAST_FAILED, while unknown_spell / ambiguous_spell / passive_spell mean nothing was sent." },
   { name: "petDismiss", sig: "petDismiss(): Promise<PetActionResult>", purpose: "Send the pet away: a hunter casts Dismiss Pet (the pet can be called back), any other pet is abandoned (a demon or temporary summon just goes). state.pet() is undefined once the bar is removed." },
   { name: "declineGroupInvite", sig: "declineGroupInvite(): Promise<RawActionResponse>", purpose: "Decline the pending invitation." },
-  { name: "raw", sig: "raw(opcode: string, payload?: hex | Uint8Array | RawField[]): Promise<RawActionResponse>", purpose: "Escape hatch: send one allowlisted CMSG_* opcode with a body you build — a field list like [{ u32: 5 }, { guid: unit.guid }, { cstring: \"x\" }] is packed little-endian for you; field kinds are u8, u16, u32, i32, f32, u64 (decimal string), guid, packedGuid, cstring (NUL-terminated) and bytes (hex). The allowlist is the module's — ordinary client opcodes no sdk method sends (talents, chat and emotes, item moves and buyback, cancelling an aura, channel or auto-repeat, sheathing, stand state, the resurrect answer, taxi node status); an opcode off it is refused as opcode_not_allowed with a hint, nothing sent. The answer arrives on sdk.events only if its opcode is whitelisted there." },
+  { name: "raw", sig: "raw(opcode: string, payload?: hex | Uint8Array | RawField[]): Promise<RawActionResponse>", purpose: "Escape hatch: send one allowlisted CMSG_* opcode with a body you build — a field list like [{ u32: 5 }, { guid: unit.guid }, { cstring: \"x\" }] is packed little-endian for you; field kinds are u8, u16, u32, i32, f32, u64 (decimal string), guid, packedGuid, cstring (NUL-terminated) and bytes (hex). The allowlist is the module's — ordinary client opcodes no sdk method sends (talents, the other chat types and emotes, item moves and buyback, cancelling an aura, channel or auto-repeat, sheathing, stand state, declining a resurrection, taxi node status); an opcode off it is refused as opcode_not_allowed with a hint, nothing sent. The answer arrives on sdk.events only if its opcode is whitelisted there." },
 ];
 
 /** WrathClient prototype members that are internal plumbing, deliberately undocumented. */
@@ -254,6 +255,7 @@ const STATE_ROWS: readonly Row[] = [
   { name: "group", sig: "state.group(): GroupState | undefined", purpose: "The party: { inGroup, raid, leaderGuid, leaderName, leader (you), members: [{ guid, name, online, leader, assistant }], pendingInvite: { inviterName }, lastResult: { operation, name, result, text }, lastDecline }; undefined until any group packet." },
   { name: "mailbox", sig: "state.mailbox(): MailboxState | undefined", purpose: "The mailbox: { guid (the open mailbox), mails: [{ mailId, senderName, subject, body, money, cod, read, daysLeft, items }], total, newMail, lastResult: { action, result, text } }; undefined until any mail packet." },
   { name: "bank", sig: "state.bank(): BankContents", purpose: "The bank: { guid (the banker the frame was opened at), items: [{ bag (255 for the main bank, else the bank bag's slot 67-73), slot, guid, itemId, name, count }], bags, freeSlots, totalSlots }; the slots are known from login, moving items needs openBank." },
+  { name: "pendingResurrect", sig: "get state.pendingResurrect: PendingResurrect | undefined", purpose: "The resurrection offered to you while dead: { casterGuid, casterName, sickness (accepting brings resurrection sickness), seq, ts }; undefined when none is pending, and again once you are alive." },
   { name: "pendingRolls", sig: "state.pendingRolls(): PendingRoll[]", purpose: "The open group-loot roll frames: [{ rollGuid, itemId, name, quality, count, allowed: [\"need\"|\"greed\"|\"disenchant\"|\"pass\"], deadline }]; empty when nothing is up for a roll." },
   { name: "itemTexts", sig: "state.itemTexts(): ItemText[]", purpose: "The text of every carried item read so far: [{ guid, itemId, name, pages, complete }]." },
   { name: "trade", sig: "state.trade(): TradeState | undefined", purpose: "The trade window: { status, statusText, open, traderGuid, mine: { money, items }, theirs: { money, items } }; undefined until any trade packet." },
@@ -301,6 +303,7 @@ const STATE_INTERNAL = new Set([
   "walkContainer",
   "deriveGauges",
   "evictOnMapChange",
+  "foldMap",
   "forget",
   "forgetQuestGiverMarkers",
   "redateQuestGiverMarkerInputs",
@@ -472,10 +475,13 @@ ${table(CLIENT_RAW)}
 \`state\` (alias for \`sdk.state\`) is a cache folded from events. \`state.self\`
 (guid, name, level, position, zone and area — \`{ id, name }\`, the game's own
 zone/subzone as the client names them on screen, e.g. "Elwynn Forest" /
-"Northshire Valley" — health, targetGuid, and ghost: \`state.self.ghost.value\`
-is true while your released spirit walks as a ghost, whose health reads 1, not
-0) and \`state.nearby\` (a Map keyed by guid) are plain properties; the members
-below are getters and methods.
+"Northshire Valley" — map — \`{ id, name, instanceType }\`, e.g. \`{ id: 36,
+name: "Deadmines", instanceType: "party" }\`, instanceType being "none" in the
+open world, "party" in a dungeon, "raid", "pvp" or "arena" — health,
+targetGuid, and ghost: \`state.self.ghost.value\` is true while your released
+spirit walks as a ghost, whose health reads 1, not 0) and \`state.nearby\` (a
+Map keyed by guid) are plain properties; the members below are getters and
+methods.
 Observed fields are wrapped as \`{ value, seq, ts }\` — read \`.value\`. Every field
 is \`undefined\` until an event carried it; \`undefined\` means unobserved, never
 zero.
@@ -486,9 +492,10 @@ ${table(STATE_ROWS)}
 
 Events are the server's \`SMSG_*\` packets as JSON, plus a few \`WB_*\` events for
 what a client knows locally: \`WB_MOVE_RESULT\` / \`WB_MOVE_PROGRESS\` (own moves),
-\`WB_AREA\` (\`{ mapId, zoneId, zoneName, areaId, areaName }\` on login and whenever
-the zone or subzone changes, by foot, teleport or transfer — what \`state.self.zone\`
-/ \`state.self.area\` are folded from),
+\`WB_AREA\` (\`{ mapId, mapName, instanceType, zoneId, zoneName, areaId, areaName }\` on
+login and whenever the zone or subzone changes, by foot, teleport or transfer —
+what \`state.self.zone\` / \`state.self.area\` / \`state.self.map\` are folded from;
+instanceType is the map's code, 0 open world, 1 dungeon, 2 raid, 3 battleground, 4 arena),
 \`WB_RIDE_PROGRESS\` (own position while a transport carries you, ≤1/s) and
 \`WB_TRANSPORT_PROGRESS\` (\`{ guid, entry, pos, docked, progressMs, periodMs }\`
 for every transport on your map, near or not, each ≤1/s — the same facts as

@@ -416,6 +416,8 @@ export const sessionStateDataSchema = z.looseObject({
   z: z.number(),
   o: z.number(),
   level: z.number(),
+  mapName: z.string().optional(),
+  instanceType: z.number().optional(),
   zoneId: z.number().optional(),
   zoneName: z.string().optional(),
   areaId: z.number().optional(),
@@ -427,9 +429,14 @@ export type SessionStateData = z.infer<typeof sessionStateDataSchema>;
  * Synthetic module event: the zone/subzone the character is in, on login and
  * on every change. Ids are the pair the server derives from the same terrain
  * data a client computes its own from; names are the client's AreaTable.dbc.
+ * `mapName` and `instanceType` are the client's Map.dbc row for `mapId`
+ * (`InstanceType` 0 none, 1 party, 2 raid, 3 pvp, 4 arena), both absent when
+ * the module has no row for the map — or predates the fields.
  */
 export const areaDataSchema = z.looseObject({
   mapId: z.number(),
+  mapName: z.string().optional(),
+  instanceType: z.number().optional(),
   zoneId: z.number(),
   zoneName: z.string(),
   areaId: z.number(),
@@ -972,6 +979,17 @@ export const logXpGainDataSchema = z.looseObject({
   fromKill: z.boolean(),
 });
 export type LogXpGainData = z.infer<typeof logXpGainDataSchema>;
+
+/**
+ * `Unit::Kill`'s kill record: who landed the killing blow and on what, sent
+ * to the killer's party (or the killer alone) for a kill that rewards a
+ * player. `killerGuid` may be another member's.
+ */
+export const partyKillLogDataSchema = z.looseObject({
+  killerGuid: guidSchema,
+  victimGuid: guidSchema,
+});
+export type PartyKillLogData = z.infer<typeof partyKillLogDataSchema>;
 
 export const levelUpInfoDataSchema = z.looseObject({
   level: z.number(),
@@ -1603,6 +1621,19 @@ export const corpseReclaimDelayDataSchema = z.looseObject({ delayMs: z.number() 
 export type CorpseReclaimDelayData = z.infer<typeof corpseReclaimDelayDataSchema>;
 
 /**
+ * Someone is resurrecting this dead character (`Spell::SendResurrectRequest`):
+ * the caster, its name only for a creature caster (a player caster is named
+ * by guid, as a client does), and whether accepting brings resurrection
+ * sickness. Answered with `CMSG_RESURRECT_RESPONSE`.
+ */
+export const resurrectRequestDataSchema = z.looseObject({
+  casterGuid: guidSchema,
+  casterName: z.string().optional(),
+  sickness: z.boolean(),
+});
+export type ResurrectRequestData = z.infer<typeof resurrectRequestDataSchema>;
+
+/**
  * The server's answer to the ghost's `MSG_CORPSE_QUERY` (the module asks once
  * per death on the client's behalf; PROTOCOL.md "Death"). Position fields only
  * when `found`; `map`/x/y/z is where a client draws the corpse marker and
@@ -1693,6 +1724,7 @@ export const eventDataSchemas = {
   SMSG_AURA_UPDATE_ALL: auraUpdateDataSchema,
   // progress
   SMSG_LOG_XPGAIN: logXpGainDataSchema,
+  SMSG_PARTYKILLLOG: partyKillLogDataSchema,
   SMSG_LEVELUP_INFO: levelUpInfoDataSchema,
   SMSG_ITEM_PUSH_RESULT: itemPushResultDataSchema,
   // quests and gossip
@@ -1789,6 +1821,7 @@ export const eventDataSchemas = {
   SMSG_DEATH_RELEASE_LOC: deathReleaseLocDataSchema,
   SMSG_CORPSE_RECLAIM_DELAY: corpseReclaimDelayDataSchema,
   SMSG_DURABILITY_DAMAGE_DEATH: emptyDataSchema,
+  SMSG_RESURRECT_REQUEST: resurrectRequestDataSchema,
   MSG_CORPSE_QUERY: corpseQueryDataSchema,
   // session
   SMSG_CHAR_DELETE: charDeleteDataSchema,

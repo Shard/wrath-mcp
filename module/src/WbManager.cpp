@@ -67,6 +67,7 @@
 #include <filesystem>
 #include <initializer_list>
 #include <iterator>
+#include <stdexcept>
 #include <strings.h>
 
 using boost::asio::ip::tcp;
@@ -273,6 +274,9 @@ namespace WrathBench
         std::string areaPath = sWorld->GetDataPath() + "dbc/AreaTable.dbc";
         if (!LoadAreaTableDbc(areaPath))
             LOG_ERROR("module", "wrathbench: AreaTable.dbc not loaded from '{}'; WB_AREA will carry ids without names", areaPath);
+        std::string mapPath = sWorld->GetDataPath() + "dbc/Map.dbc";
+        if (!LoadMapDbc(mapPath))
+            LOG_ERROR("module", "wrathbench: Map.dbc not loaded from '{}'; WB_AREA will carry map ids without a name or instance type", mapPath);
         std::string achPath = sWorld->GetDataPath() + "dbc/Achievement.dbc";
         if (!LoadAchievementDbc(achPath))
             LOG_ERROR("module", "wrathbench: Achievement.dbc not loaded from '{}'; achievement events will carry ids without names or points", achPath);
@@ -3178,6 +3182,57 @@ namespace WrathBench
         return _areaTableLoaded;
     }
 
+    // WDBC reader for Map.dbc (3.3.5a: 66 fields of 4 bytes, record size 264
+    // — verified against the shipped file and the core's MapEntryfmt: id,
+    // internal directory name, InstanceType, flags, pvp, name[16 locales +
+    // flags] from field 5 with enUS first, ...). Only id, InstanceType and the
+    // enUS name are kept. Same header as AreaTrigger.dbc above.
+    bool Manager::LoadMapDbc(std::string const& path)
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (!in)
+            return false;
+        char magic[4];
+        uint32 recordCount = 0, fieldCount = 0, recordSize = 0, stringSize = 0;
+        in.read(magic, 4);
+        in.read(reinterpret_cast<char*>(&recordCount), 4);
+        in.read(reinterpret_cast<char*>(&fieldCount), 4);
+        in.read(reinterpret_cast<char*>(&recordSize), 4);
+        in.read(reinterpret_cast<char*>(&stringSize), 4);
+        if (!in || std::memcmp(magic, "WDBC", 4) != 0 || fieldCount != 66 || recordSize != 264)
+        {
+            LOG_ERROR("module", "wrathbench: '{}' is not a 3.3.5a Map.dbc (fields {}, record size {})", path, fieldCount, recordSize);
+            return false;
+        }
+        std::vector<char> recs(size_t(recordCount) * recordSize);
+        in.read(recs.data(), recs.size());
+        std::vector<char> strings(stringSize);
+        in.read(strings.data(), stringSize);
+        if (!in)
+        {
+            LOG_ERROR("module", "wrathbench: '{}' truncated ({} records, {} string bytes expected)", path, recordCount, stringSize);
+            return false;
+        }
+        size_t loaded = 0;
+        for (uint32 i = 0; i < recordCount; ++i)
+        {
+            char const* rec = recs.data() + size_t(i) * recordSize;
+            uint32 id, instanceType, nameOff;
+            std::memcpy(&id, rec, 4);
+            std::memcpy(&instanceType, rec + 2 * 4, 4);
+            std::memcpy(&nameOff, rec + 5 * 4, 4);
+            MapRec r;
+            r.instanceType = instanceType;
+            if (nameOff < stringSize)
+                r.name = std::string(strings.data() + nameOff, strnlen(strings.data() + nameOff, stringSize - nameOff));
+            _maps[id] = std::move(r);
+            ++loaded;
+        }
+        _mapsLoaded = loaded > 0;
+        LOG_INFO("module", "wrathbench: loaded {} maps from '{}'", loaded, path);
+        return _mapsLoaded;
+    }
+
     // WDBC reader for Achievement.dbc (3.3.5a: 62 fields of 4 bytes, record
     // size 248 — verified against the shipped file: id, faction, map,
     // previous, name[16 locales + flags] from field 4 with enUS first,
@@ -3489,8 +3544,16 @@ namespace WrathBench
             auto it = _areaTable.find(id);
             return it == _areaTable.end() ? std::string() : it->second.name;
         };
-        w.Add("mapId", player->GetMapId())
-         .Add("zoneId", zoneId).Add("zoneName", nameOf(zoneId))
+        uint32 const mapId = player->GetMapId();
+        w.Add("mapId", mapId);
+        // The client's Map.dbc row for the map it loaded: its name and
+        // whether it is the open world or an instance. Both are left out for
+        // a map the table has no row for — never a guessed 0, which would
+        // read as the open world.
+        auto map = _maps.find(mapId);
+        if (map != _maps.end())
+            w.Add("mapName", map->second.name).Add("instanceType", map->second.instanceType);
+        w.Add("zoneId", zoneId).Add("zoneName", nameOf(zoneId))
          .Add("areaId", areaId).Add("areaName", nameOf(areaId));
     }
 
@@ -6466,6 +6529,17 @@ namespace WrathBench
                      .Add("fromKill", type == 0);
                     break;
                 }
+                case SMSG_PARTYKILLLOG:
+                {
+                    // Unit::Kill: u64 the player with the killing blow, u64
+                    // the victim. Broadcast to the killer's group (subgroup),
+                    // or sent to the killer alone when it has none; only for
+                    // a kill that rewards a player.
+                    name = "SMSG_PARTYKILLLOG";
+                    uint64 killer, victim; p >> killer >> victim;
+                    w.AddGuid("killerGuid", (uint64_t)killer).AddGuid("victimGuid", (uint64_t)victim);
+                    break;
+                }
                 case SMSG_LEVELUP_INFO:
                 {
                     name = "SMSG_LEVELUP_INFO";
@@ -7293,6 +7367,32 @@ namespace WrathBench
                 case SMSG_DURABILITY_DAMAGE_DEATH:
                     name = "SMSG_DURABILITY_DAMAGE_DEATH";
                     break;
+                case SMSG_RESURRECT_REQUEST:
+                {
+                    // Spell::SendResurrectRequest: u64 caster, u32 name
+                    // length, that many bytes of name (its NUL included;
+                    // empty for a player caster, whom the client names by
+                    // guid), a u8 0, u8 1 when accepting brings resurrection
+                    // sickness (a creature caster), and a u32 0 only for a
+                    // spell that skips the reclaim timer — consumed, not
+                    // served. Answered with CMSG_RESURRECT_RESPONSE (raw).
+                    name = "SMSG_RESURRECT_REQUEST";
+                    uint64 caster; uint32 len; p >> caster >> len;
+                    // A length past the packet's end is a decodeError, never
+                    // an over-read (or an allocation of what it claims).
+                    if (len > p.size() - p.rpos())
+                        throw std::runtime_error("SMSG_RESURRECT_REQUEST name length past the packet end");
+                    std::string casterName(len, '\0');
+                    if (len)
+                        p.read(reinterpret_cast<uint8*>(casterName.data()), len);
+                    casterName.resize(strnlen(casterName.c_str(), casterName.size()));
+                    uint8 pad, sickness; p >> pad >> sickness;
+                    w.AddGuid("casterGuid", (uint64_t)caster);
+                    if (!casterName.empty())
+                        w.Add("casterName", casterName);
+                    w.Add("sickness", sickness != 0);
+                    break;
+                }
                 case MSG_CORPSE_QUERY:
                 {
                     // The server's answer to the ghost's corpse query

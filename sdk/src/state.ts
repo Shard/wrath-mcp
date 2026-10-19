@@ -98,6 +98,7 @@ import {
   type QuestQueryResponseData,
   type MoveUpdateData,
   type PositionData,
+  type ResurrectRequestData,
   type UpdateBlock,
   type UpdateFields,
 } from "./protocol";
@@ -305,6 +306,41 @@ export interface AreaRef {
 }
 
 /**
+ * A map's `InstanceType` in the client's own words for it: `none` the open
+ * world, `party` a dungeon, `raid`, `pvp` a battleground, `arena`.
+ */
+export type InstanceType = "none" | "party" | "raid" | "pvp" | "arena";
+
+/** `Map.dbc`'s `InstanceType` codes, in order. */
+const INSTANCE_TYPES: readonly InstanceType[] = ["none", "party", "raid", "pvp", "arena"];
+
+/**
+ * The map the character is on as the client names it: the id the server's
+ * world packets carry, and the client's `Map.dbc` name and instance type for
+ * it, e.g. `{ id: 36, name: "Deadmines", instanceType: "party" }`.
+ */
+export interface MapRef {
+  readonly id: number;
+  readonly name: string;
+  readonly instanceType: InstanceType;
+}
+
+/**
+ * An offer to resurrect this dead character (`SMSG_RESURRECT_REQUEST`), as a
+ * client's "accept resurrection?" dialog shows it: who is offering (`casterName`
+ * from the packet for a creature, else the name a query returned for the
+ * guid; undefined when neither is known) and whether accepting brings
+ * resurrection sickness.
+ */
+export interface PendingResurrect {
+  readonly casterGuid: GuidKey;
+  readonly casterName: string | undefined;
+  readonly sickness: boolean;
+  readonly seq: number;
+  readonly ts: number;
+}
+
+/**
  * One achievement the character holds, as the packets said it.
  *
  * `source` is which packet carried it: `login` is the `SMSG_ALL_ACHIEVEMENT_DATA`
@@ -358,6 +394,13 @@ export interface SelfState extends UnitFieldsState {
   zone: Observed<AreaRef> | undefined;
   /** The subzone (`WB_AREA`), e.g. "Northshire Valley"; equals `zone` when there is none. */
   area: Observed<AreaRef> | undefined;
+  /**
+   * The map (`WB_AREA`, seeded by the login snapshot): its id, the client's
+   * `Map.dbc` name and instance type — `instanceType: "party"` inside a
+   * dungeon. Undefined until a `WB_AREA` named it, and again from a map
+   * change until the new map's `WB_AREA` (`position.map` is the id alone).
+   */
+  map: Observed<MapRef> | undefined;
   /**
    * The corpse, from death until the resurrect (`SMSG_DEATH_RELEASE_LOC` with
    * `map: -1`). `undefined` while alive, before the first death, or when the
@@ -1446,6 +1489,7 @@ export class StateCache {
     position: undefined,
     zone: undefined,
     area: undefined,
+    map: undefined,
     corpse: undefined,
     graveyard: undefined,
     reclaimDelay: undefined,
@@ -1573,6 +1617,9 @@ export class StateCache {
   private readonly petNames = new Map<number, string>();
 
   private groupState: GroupState | undefined;
+
+  /** The open resurrection offer; closed by the resurrect itself and by a new login. */
+  private resurrectOffer: (ResurrectRequestData & { readonly seq: number; readonly ts: number }) | undefined;
 
   /** rollGuid -> the open roll frame. Closed by the won / all-passed verdict, by our own counted vote, or by its deadline. */
   private readonly rolls = new Map<GuidKey, PendingRoll>();
@@ -2511,6 +2558,24 @@ export class StateCache {
     return this.names.get(guid)?.value;
   }
 
+  /**
+   * The resurrection offer waiting for an answer, from `SMSG_RESURRECT_REQUEST`
+   * until the resurrect (`SMSG_DEATH_RELEASE_LOC { map: -1 }`, which every
+   * resurrection sends first) or a new login; undefined when there is none.
+   * A newer offer replaces an older one, as the server keeps only the last.
+   */
+  get pendingResurrect(): PendingResurrect | undefined {
+    const o = this.resurrectOffer;
+    if (o === undefined) return undefined;
+    return {
+      casterGuid: o.casterGuid,
+      casterName: o.casterName ?? this.nameOf(o.casterGuid) ?? this.nearby.get(o.casterGuid)?.name?.value,
+      sickness: o.sickness,
+      seq: o.seq,
+      ts: o.ts,
+    };
+  }
+
   snapshot(): StateSnapshot {
     return {
       // Field groups are always *replaced*, never mutated in place, so a
@@ -2607,7 +2672,7 @@ export class StateCache {
         // contradicting guid is an anomaly, never an overwrite.
         const d = event.data as {
           character: string; guid: GuidKey; map: number; x: number; y: number;
-          z: number; o: number; level: number;
+          z: number; o: number; level: number; mapName?: string; instanceType?: number;
           zoneId?: number; zoneName?: string; areaId?: number; areaName?: string;
         };
         if (this.seed.guid !== undefined && this.seed.guid !== d.guid) {
@@ -2634,6 +2699,7 @@ export class StateCache {
           this.self.zone = { value: { id: d.zoneId, name: d.zoneName ?? "" }, seq: event.seq, ts: event.ts };
           this.self.area = { value: { id: d.areaId, name: d.areaName ?? "" }, seq: event.seq, ts: event.ts };
         }
+        this.foldMap(d.map, d.mapName, d.instanceType, event.seq, event.ts);
         return;
       }
       case "WB_AREA": {
@@ -2641,9 +2707,13 @@ export class StateCache {
         // the same pair a client computes from its own map files — and names
         // it from the client's AreaTable.dbc (PROTOCOL.md). One event per
         // change, the first at login.
-        const d = event.data as { mapId: number; zoneId: number; zoneName: string; areaId: number; areaName: string };
+        const d = event.data as {
+          mapId: number; mapName?: string; instanceType?: number;
+          zoneId: number; zoneName: string; areaId: number; areaName: string;
+        };
         this.self.zone = { value: { id: d.zoneId, name: d.zoneName }, seq: event.seq, ts: event.ts };
         this.self.area = { value: { id: d.areaId, name: d.areaName }, seq: event.seq, ts: event.ts };
+        this.foldMap(d.mapId, d.mapName, d.instanceType, event.seq, event.ts);
         return;
       }
       case "SMSG_LOGIN_VERIFY_WORLD":
@@ -2659,7 +2729,12 @@ export class StateCache {
           // The new session restates the quest log from the server's fields,
           // which hold the completion bit but not an exploration credit.
           this.questExplored.clear();
+          // A fresh login has no dialog open: an old session's offer is gone.
+          this.resurrectOffer = undefined;
         }
+        // The new map's name arrives on its WB_AREA; until then only the id
+        // (position.map) is known, so the old map's name is not kept.
+        if (this.self.map !== undefined && this.self.map.value.id !== d.map) this.self.map = undefined;
         this.selfMap = d.map;
         this.self.position = {
           value: { map: d.map, x: d.x, y: d.y, z: d.z, o: d.o },
@@ -2690,9 +2765,15 @@ export class StateCache {
           this.self.corpse = undefined;
           this.self.graveyard = undefined;
           this.self.reclaimDelay = undefined;
+          this.resurrectOffer = undefined;
           return;
         }
         this.self.graveyard = { value: { map: d.map, x: d.x, y: d.y, z: d.z }, seq: event.seq, ts: event.ts };
+        return;
+      }
+      case "SMSG_RESURRECT_REQUEST": {
+        const d = event.data as ResurrectRequestData;
+        this.resurrectOffer = { ...d, seq: event.seq, ts: event.ts };
         return;
       }
       case "SMSG_CORPSE_RECLAIM_DELAY": {
@@ -4092,6 +4173,17 @@ export class StateCache {
     }
     const byGuid = this.names.get(obj.guid);
     if (byGuid) obj.name = byGuid;
+  }
+
+  /**
+   * `state.self.map` from an event that carried the map's `Map.dbc` row. One
+   * that did not (an older module, or a map the table has no row for) leaves
+   * the map unnamed rather than guessing; an unknown `InstanceType` code
+   * likewise.
+   */
+  private foldMap(id: number, name: string | undefined, instanceType: number | undefined, seq: number, ts: number): void {
+    const kind = instanceType === undefined ? undefined : INSTANCE_TYPES[instanceType];
+    this.self.map = name === undefined || kind === undefined ? undefined : { value: { id, name, instanceType: kind }, seq, ts };
   }
 
   /**

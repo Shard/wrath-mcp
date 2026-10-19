@@ -74,6 +74,15 @@ namespace WrathBench
         std::string name;           // enUS column
     };
 
+    // One Map.dbc record (3.3.5a). Client-side knowledge: the client names
+    // the map it loads from this table and reads from the same row whether it
+    // is the open world or an instance (the loading screen, the instance UI).
+    struct MapRec
+    {
+        uint32 instanceType{0};     // InstanceType: 0 none, 1 party, 2 raid, 3 pvp, 4 arena
+        std::string name;           // enUS column
+    };
+
     // One Achievement.dbc record (3.3.5a). Client-side knowledge: the client
     // names an earned achievement and its points from this table.
     struct AchievementRec
@@ -415,6 +424,14 @@ namespace WrathBench
         std::unordered_map<uint32, AreaTableRec> _areaTable;
         bool _areaTableLoaded{false};
 
+        // Map.dbc as the client ships it: the map's name and
+        // InstanceType for the map id SMSG_NEW_WORLD / SMSG_LOGIN_VERIFY_WORLD
+        // already carry, served beside it on WB_AREA and WB_SESSION_STATE.
+        // Ids only when the file is absent.
+        bool LoadMapDbc(std::string const& path);
+        std::unordered_map<uint32, MapRec> _maps;
+        bool _mapsLoaded{false};
+
         // Achievement.dbc as the client ships it (issue #8): name,
         // points and category for the ids SMSG_ACHIEVEMENT_EARNED and
         // SMSG_ALL_ACHIEVEMENT_DATA carry. Ids only when the file is absent.
@@ -454,8 +471,10 @@ namespace WrathBench
         // Per tick, every in-world session: emit WB_AREA on login and whenever
         // zone or area id changes (walking, teleport, transfer). World thread only.
         void TickAreas();
-        // Append mapId/zoneId/zoneName/areaId/areaName for the player's current
-        // position to a writer (WB_AREA and WB_SESSION_STATE share it).
+        // Append mapId/mapName/instanceType/zoneId/zoneName/areaId/areaName for
+        // the player's current position to a writer (WB_AREA and
+        // WB_SESSION_STATE share it). mapName and instanceType only when
+        // Map.dbc has a row for the map.
         void AddAreaFields(Json::Writer& w, Player* player);
 
         // Mover (world thread only).

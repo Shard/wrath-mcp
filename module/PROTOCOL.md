@@ -511,7 +511,10 @@ whose handler does nothing a non-GM client could not do:
   `CMSG_OPEN_ITEM`, `CMSG_BUYBACK_ITEM`
 - spell/aura control: `CMSG_CANCEL_AURA`, `CMSG_CANCEL_AUTO_REPEAT_SPELL`,
   `CMSG_CANCEL_CHANNELLING`, `CMSG_SET_SHEATHED`, `CMSG_STANDSTATECHANGE`,
-  `CMSG_RESURRECT_RESPONSE`
+  `CMSG_RESURRECT_RESPONSE` (body `u64 caster guid, u8 status` — 1 accepts,
+  0 declines — the answer to `SMSG_RESURRECT_REQUEST`; the handler ignores it
+  from a living character and an accept that names a caster other than the
+  pending one; the SDK's `acceptResurrection` sends it)
 - flight paths: `CMSG_TAXINODE_STATUS_QUERY`, `CMSG_TAXIQUERYAVAILABLENODES`,
   `CMSG_ACTIVATETAXI` (body `u64 guid, u32 fromNode, u32 toNode`; the SDK's
   `activateTaxi` builds it), `CMSG_ACTIVATETAXIEXPRESS` (body `u64 guid,
@@ -877,9 +880,9 @@ session's own identity). Their `opcodeId`s are outside the real opcode range.
 | `WB_TRANSPORT_PROGRESS` | 0xFF06 | `{ "guid": <guid-string>, "entry": <u32>, "pos": { "x","y","z","o" }, "progressMs": <u32>, "periodMs": <u32?>, "docked": <bool?> }` — at most 1/s per session, one per transport on the character's map whose create block the session has received: the car's current position on its `TransportAnimation.dbc` path (what a client animates locally from `pathProgress`), the clock and period, and `docked` when the keyframe segment the clock is on has no displacement (the car is dwelling at a platform; absent for transports without an animation path) |
 | `WB_AREATRIGGER` | 0xFF04 | `{ "triggerId": <u32>, "moveId": <number>, "pos": { "x","y","z","o" } }` — the character entered an `AreaTrigger.dbc` volume and `CMSG_AREATRIGGER` was sent for it (see below); `moveId` is the `move_to` that crossed into it, 0 when no move did (a taxi landing, a transport carrying the character, a teleport's arrival) |
 | `WB_SELF_MOVE` | 0xFF09 | `{ "opcode": "MSG_MOVE_FALL_LAND", "cause": "taxi_landing", "pos": { "x","y","z","o" }, "fromZ": <f> }` — a movement packet the module sent for the character outside any `move_to`, as a client's own physics would: today only the drop from a taxi flight's last spline point (`fromZ`) to the ground under it (`pos`), see "Taxi landing" below |
-| `WB_AREA` | 0xFF07 | `{ "mapId": <u32>, "zoneId": <u32>, "zoneName": <str>, "areaId": <u32>, "areaName": <str> }` — the zone and subzone the character is in, named as the client names them; once when the character enters the world and once per change of either id, whatever moved it (walking, a teleport, a map transfer). See "Zone and area" below. |
+| `WB_AREA` | 0xFF07 | `{ "mapId": <u32>, "mapName"?: <str>, "instanceType"?: <u32>, "zoneId": <u32>, "zoneName": <str>, "areaId": <u32>, "areaName": <str> }` — the zone and subzone the character is in, named as the client names them, and the map it is on with the client's `Map.dbc` name and `InstanceType` for it (0 the open world, 1 a party dungeon, 2 a raid, 3 a battleground, 4 an arena; both absent when the table has no row for the map, never a guessed 0); once when the character enters the world and once per change of either area id, whatever moved it (walking, a teleport, a map transfer — which always changes the zone). See "Zone and area" below. |
 | `WB_TALENT_TREE` | 0xFF08 | the class talent frame, the answer to the `talent_tree` action; shape under "Spellbook, cooldowns, talents" below |
-| `WB_SESSION_STATE` | 0xFF03 | `{ "character": <str>, "guid": <guid-string>, "inWorld": true, "map": <n>, "x": <f>, "y": <f>, "z": <f>, "o": <f>, "level": <n>, "zoneId", "zoneName", "areaId", "areaName" }` — emitted once per WS subscribe to an already-in-world session (reattach semantics in the `/events` section above). Strictly client-visible facts: what `SMSG_LOGIN_VERIFY_WORLD` plus the session's own identity would carry, plus the same zone/area fields as `WB_AREA` so a reattached client starts where the stream cannot re-emit. |
+| `WB_SESSION_STATE` | 0xFF03 | `{ "character": <str>, "guid": <guid-string>, "inWorld": true, "map": <n>, "x": <f>, "y": <f>, "z": <f>, "o": <f>, "level": <n>, "mapName"?, "instanceType"?, "zoneId", "zoneName", "areaId", "areaName" }` — emitted once per WS subscribe to an already-in-world session (reattach semantics in the `/events` section above). Strictly client-visible facts: what `SMSG_LOGIN_VERIFY_WORLD` plus the session's own identity would carry, plus the same map and zone/area fields as `WB_AREA` so a reattached client starts where the stream cannot re-emit. |
 
 `moveId` is a plain JSON number: it is a per-session counter that cannot exceed
 2^53, so it falls under the counter exemption to the u64-as-string rule stated
@@ -1070,7 +1073,13 @@ data volume, loaded at startup next to `AreaTrigger.dbc` (3.3.5a layout: 36
 fields, 144-byte records; `id`, `mapId`, `parentAreaId`, …, enUS `name` at
 field 11 — a file with any other shape is refused with an error, exactly as
 the areatrigger loader refuses a wrong `AreaTrigger.dbc`, and `WB_AREA` then
-carries ids with empty names). Once per world tick, for every in-world
+carries ids with empty names). The map is named the same way: `Map.dbc`,
+loaded beside it (3.3.5a layout: 66 fields, 264-byte records; `id`, the
+internal directory name, `InstanceType` at field 2, …, enUS `name` at field
+5 — any other shape is refused with an error and the map fields are left
+out), gives the name a client shows for the map id `SMSG_LOGIN_VERIFY_WORLD`
+and `SMSG_NEW_WORLD` already carry, and the `InstanceType` the client reads
+from the same row to know it has entered an instance. Once per world tick, for every in-world
 session, the module compares the pair to the last one announced and emits
 `WB_AREA` when either changed; the first in-world tick counts as a change, so
 login announces the starting zone, and a teleport or map transfer announces
@@ -1144,6 +1153,7 @@ Progress:
 | opcode | id | `data` fields |
 |---|---|---|
 | `SMSG_LOG_XPGAIN` | 0x1D0 | `{ "victimGuid" ("0" for non-kill), "amount", "fromKill": <bool> }` |
+| `SMSG_PARTYKILLLOG` | 0x1F5 | `{ "killerGuid", "victimGuid" }` — `Unit::Kill`: the player who landed the killing blow on a kill that rewards a player, broadcast to the killer's party (its subgroup in a raid), or sent to the killer alone when it has no group. `killerGuid` may be another member; nothing else about the kill is carried |
 | `SMSG_LEVELUP_INFO` | 0x1D4 | `{ "level", "healthGained" }` |
 | `SMSG_ITEM_PUSH_RESULT` | 0x166 | `{ "playerGuid", "itemId", "count", "totalCount", "bagSlot", "itemSlot", "looted": <bool>, "created": <bool> }` |
 
@@ -1394,6 +1404,7 @@ as the absence of an answer, never as a status.
 | `SMSG_DEATH_RELEASE_LOC` | 0x378 | `{ "map" (-1 = clear marker), "x", "y", "z" }` |
 | `SMSG_CORPSE_RECLAIM_DELAY` | 0x269 | `{ "delayMs" }` |
 | `SMSG_DURABILITY_DAMAGE_DEATH` | 0x2BD | `{}` |
+| `SMSG_RESURRECT_REQUEST` | 0x15B | `{ "casterGuid", "casterName"?, "sickness": <bool> }` — `Spell::SendResurrectRequest`, to a dead character someone is resurrecting: the caster, its name only when the packet carries one (a creature caster; a player caster is sent with an empty name, which a client looks up by guid), and whether accepting brings resurrection sickness (true for a creature caster). The wire is `u64 caster, u32 name length, that many bytes of name (its NUL included), u8 0, u8 sickness`, then a `u32 0` only for a spell that skips the reclaim timer; the padding byte and that trailing u32 are consumed. Answered with `CMSG_RESURRECT_RESPONSE` (raw, below) |
 | `MSG_CORPSE_QUERY` | 0x216 | `{ "found": <bool>, "map"?, "x"?, "y"?, "z"?, "corpseMap"? }` — the server's answer to the ghost's corpse query (`HandleCorpseQueryOpcode`); position fields only when `found`. `map`/`x`/`y`/`z` is where a client draws the corpse marker, `corpseMap` the map the corpse is actually on; they differ only for a corpse inside a dungeon, where the marker sits on the entrance. The trailing unused u32 is consumed |
 
 A ghost knows where its corpse is: a real client

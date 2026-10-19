@@ -2775,6 +2775,53 @@ export type ReclaimCorpseReason =
   | "still_ghost"
   | "no_observation";
 
+/** Where `say` sends a line: local say, the party, a yell, or a whisper to one player. */
+export type SayType = "say" | "party" | "yell" | "whisper";
+
+export interface SayOptions {
+  /** Default "say". */
+  type?: SayType;
+  /** The player a whisper goes to, by name; only for `type: "whisper"`. */
+  to?: string;
+}
+
+/** `ChatMsg` codes the core reads from `CMSG_MESSAGECHAT`, for the types `say` sends raw. */
+const CHAT_MSG_CODE = { party: 0x02, yell: 0x06, whisper: 0x07 } as const;
+/** The races whose own language is Common (7); every other playable race speaks Orcish (1). */
+const ALLIANCE_RACES = new Set([1, 3, 4, 7, 11]);
+
+/**
+ * The language a client speaks by default: its race's, from our own `race`
+ * update field or, before the self block, our char-enum row.
+ */
+function chatLanguage(state: StateCache): number {
+  const self = state.self;
+  const race =
+    self.fields.get("race")?.value ??
+    state.characters?.value.find((c) => c.guid === self.guid || (self.guid === undefined && c.name === self.name))?.race;
+  if (race === undefined) {
+    throw new Error("say(text, { type }): your race is not known yet, so the chat language cannot be chosen — log in first (createSession)");
+  }
+  return ALLIANCE_RACES.has(race) ? 7 : 1;
+}
+
+export interface AcceptResurrectionOptions {
+  /** How long to wait for the resurrection after accepting, in ms. Default 15000. */
+  timeout?: number;
+}
+
+/**
+ * The outcome of `acceptResurrection`. `resurrected` is the resurrect observed
+ * (`SMSG_DEATH_RELEASE_LOC { map: -1 }`, which every resurrection sends
+ * first); `no_offer` means nothing was sent because no offer is pending;
+ * `unconfirmed` means the accept went out and no resurrect was seen — the
+ * server ignores an accept silently (alive, or the offer was replaced).
+ */
+export type AcceptResurrectionResult =
+  | { readonly ok: true; readonly status: "resurrected"; readonly casterGuid: string }
+  | { readonly ok: false; readonly status: "no_offer"; readonly hint: string }
+  | { readonly ok: false; readonly status: "unconfirmed"; readonly casterGuid: string; readonly hint: string };
+
 /** `CORPSE_RECLAIM_RADIUS` in the core: a reclaim further than this is dropped silently. */
 export const CORPSE_RECLAIM_RADIUS = 39;
 
@@ -3182,18 +3229,41 @@ export class WrathClient {
   }
 
   /**
-   * POST /action with `action: "say"`. Acks that the opcode was synthesized and
-   * queued — the chat echo (or a `SMSG_NOTIFICATION` rejection) is an event.
-   * The language is chosen server-side from the character's team.
+   * Say a line. Plain `say(text)` is POST /action with `action: "say"`, whose
+   * language the module picks from the character's team. `type` "party",
+   * "yell" or "whisper" (with `to`, the player's name) is the same
+   * `CMSG_MESSAGECHAT` a client sends for those, through `raw`, in the
+   * language a client speaks by default: Common for an Alliance race, Orcish
+   * for a Horde one. Either way the ack only says it was queued — the chat
+   * echo (or a `SMSG_NOTIFICATION` rejection) is an event, and the server
+   * drops a party line from someone in no party without a word.
    */
-  say(text: string): Promise<ActionResponse> {
-    return this.request(
-      "POST",
-      "/action",
-      { token: this.token, action: "say", text },
-      actionResponseSchema,
-    );
+  say(text: string, options: SayOptions = {}): Promise<ActionResponse> {
+    const type = options.type ?? "say";
+    if (type !== "whisper" && options.to !== undefined) {
+      throw new TypeError(`say(text, { to }): to is only for type "whisper" (got type ${JSON.stringify(type)})`);
+    }
+    if (type === "say") {
+      return this.request(
+        "POST",
+        "/action",
+        { token: this.token, action: "say", text },
+        actionResponseSchema,
+      );
+    }
+    if (!Object.hasOwn(CHAT_MSG_CODE, type)) {
+      throw new TypeError(`say(text, { type }): type must be "say", "party", "yell" or "whisper" (got ${JSON.stringify(type)})`);
+    }
+    const lang = chatLanguage(this.state);
+    const message = String(text);
+    if (type === "whisper") {
+      const to = String(options.to ?? "").trim();
+      if (to.length === 0) throw new TypeError('say(text, { type: "whisper", to }): to is the name of the player to whisper');
+      return this.raw("CMSG_MESSAGECHAT", [{ u32: CHAT_MSG_CODE.whisper }, { u32: lang }, { cstring: to }, { cstring: message }]);
+    }
+    return this.raw("CMSG_MESSAGECHAT", [{ u32: CHAT_MSG_CODE[type] }, { u32: lang }, { cstring: message }]);
   }
+
 
   /**
    * POST /action with `action: "move_to"`. Acks "queued and pathing"; the
@@ -4162,6 +4232,54 @@ export class WrathClient {
       }
       signal.addEventListener("abort", onAbort, { once: true });
     });
+  }
+
+  /**
+   * Accept the pending resurrection offer (`state.pendingResurrect`, from
+   * `SMSG_RESURRECT_REQUEST`) with `CMSG_RESURRECT_RESPONSE`, the answer a
+   * client's dialog sends, and wait for the resurrect. The server moves the
+   * character to the caster and resurrects it there; the verdict is read off
+   * `SMSG_DEATH_RELEASE_LOC { map: -1 }`. Nothing is sent without an offer.
+   * Declining is the same opcode with status 0, through `raw`.
+   */
+  async acceptResurrection(options: AcceptResurrectionOptions = {}): Promise<AcceptResurrectionResult> {
+    const offer = this.state.pendingResurrect;
+    if (offer === undefined) {
+      const hint =
+        "nobody is offering to resurrect you (state.pendingResurrect is undefined): an offer arrives as " +
+        "SMSG_RESURRECT_REQUEST when someone casts a resurrection on you while you are dead";
+      this.noteActionHint("acceptResurrection", "no_offer", hint);
+      return { ok: false, status: "no_offer", hint };
+    }
+    let released = false;
+    const offRelease = this.events.on("SMSG_DEATH_RELEASE_LOC", (e) => {
+      if (isDecodeError(e.data)) return;
+      if ((e.data as DeathReleaseLocData).map < 0) released = true;
+    });
+    const timeout = options.timeout ?? 15_000;
+    try {
+      await this.raw("CMSG_RESURRECT_RESPONSE", [{ guid: offer.casterGuid }, { u8: 1 }]);
+      if (!released) {
+        try {
+          await this.waitEvent(() => released, {
+            timeout,
+            includeBuffered: false,
+            description: "the resurrect after CMSG_RESURRECT_RESPONSE (SMSG_DEATH_RELEASE_LOC clearing the marker)",
+          });
+        } catch (e) {
+          if (!(e instanceof EventTimeoutError)) throw e;
+        }
+      }
+    } finally {
+      offRelease();
+    }
+    if (released) return { ok: true, status: "resurrected", casterGuid: offer.casterGuid };
+    const hint =
+      `the accept was sent but no resurrection was observed within ${Math.round(timeout / 1000)}s — the server ` +
+      "ignores it silently when you are already alive or the offer was replaced by another; re-read " +
+      "state.self.health and state.pendingResurrect";
+    this.noteActionHint("acceptResurrection", "unconfirmed", hint);
+    return { ok: false, status: "unconfirmed", casterGuid: offer.casterGuid, hint };
   }
 
   /**
