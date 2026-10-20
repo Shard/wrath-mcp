@@ -79,7 +79,7 @@ describe("castSpell: a refusal reaches the harness, named", () => {
     expect(hints).toHaveLength(1);
     expect(hints[0]).toMatchObject({ action: "castSpell", status: "line_of_sight", count: 1 });
     expect(hints[0]!.hint).toBe(
-      `Mending Word (501) on ${creatureName()}: something blocks the line of sight to the target`,
+      `Mending Word (501) on ${creatureName()}: something blocks the line of sight to the target; move to where it is in view`,
     );
     client.close();
     await stub.stop();
@@ -105,7 +105,7 @@ describe("castSpell: a refusal reaches the harness, named", () => {
       ["unit_not_infront", 3],
     ]);
     expect(hints[1]!.hint).toContain("Frost Lance (502)");
-    expect(hints[1]!.hint).toBe(`Frost Lance (502) on ${creatureName()}: the target is not in front of you`);
+    expect(hints[1]!.hint).toBe(`Frost Lance (502) on ${creatureName()}: the target is not in front of you; sdk.face({ x: target.x, y: target.y }) turns you to it`);
     client.close();
     await stub.stop();
   });

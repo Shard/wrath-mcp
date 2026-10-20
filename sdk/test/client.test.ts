@@ -3153,6 +3153,7 @@ describe("client: equipItem", () => {
       itemId: ITEM_ENTRY,
       name: "Gritstone Charm",
       equippedSlot: 15,
+      replaced: undefined,
     });
     client.close();
     await stub.stop();

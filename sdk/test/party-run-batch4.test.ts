@@ -65,6 +65,35 @@ describe("repop: the call returns once its own release has landed", () => {
     await stub.stop();
   });
 
+  test("a far port whose ghost flag rides the new map's self create block returns at once", async () => {
+    const stub = startStub({ onConnect: () => world([corpse(20)]) });
+    const client = await inWorld(stub);
+    await client.events.waitFor((e) => e.seq === 20, { timeout: 2000 });
+    const started = Date.now();
+    const pending = client.repop();
+    await untilAction(stub, "repop");
+    // The rogue's wire at 13:32:42.880-881: after a worldport the server
+    // restates the character as a create block, playerFlags 16 inside it.
+    push(stub, frame(90, "SMSG_TRANSFER_PENDING", { map: 0 }));
+    push(stub, frame(91, "SMSG_NEW_WORLD", { ...GRAVEYARD, o: 6.18 }));
+    push(stub, deathReleaseLoc(92, GRAVEYARD));
+    push(stub, frame(93, "SMSG_UPDATE_OBJECT", {
+      blocks: 1,
+      objects: [{
+        update: "create", guid: SELF_GUID, objectType: "player", self: true, moveFlags: 0,
+        pos: { ...GRAVEYARD, o: 6.18 },
+        fields: { health: 1, maxHealth: 100, level: 3, playerFlags: 0x10 },
+      }],
+    }));
+    push(stub, area(94, 108, "Sentinel Hill"));
+    await pending;
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(client.state.self.ghost?.value).toBe(true);
+    expect(client.state.self.position?.value).toMatchObject({ x: GRAVEYARD.x, y: GRAVEYARD.y });
+    client.close();
+    await stub.stop();
+  });
+
   test("a same-map port: the teleport ack lands before the release marker", async () => {
     const stub = startStub({ onConnect: () => world([corpse(20)]) });
     const client = await inWorld(stub);

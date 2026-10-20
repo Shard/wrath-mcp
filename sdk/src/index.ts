@@ -64,6 +64,7 @@ export type {
   AcceptResurrectionResult,
   SpiritHealerOptions,
   SpiritHealerResult,
+  RepairAllResult,
   LootRollRefusalStatus,
   LootRollResult,
   ReadItemOptions,

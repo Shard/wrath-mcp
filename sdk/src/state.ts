@@ -977,6 +977,13 @@ export interface AuraEntry {
   readonly maxDuration: number | undefined;
   /** What was left of it in ms when the packet was sent, at `ts`. */
   readonly duration: number | undefined;
+  /**
+   * When it runs out, epoch ms: `ts + duration`, the timer a client's buff
+   * frame counts down from the same packet (the server sends no update as
+   * it ticks, so `duration` alone stays what it was at `ts`). Undefined for
+   * an aura that shows no timer.
+   */
+  readonly expiresAt: number | undefined;
   /** The aura's spell name (Spell.dbc, as the buff frame shows it); undefined when the module served none. `aurasOf` falls back to the spellbook's. */
   readonly name: string | undefined;
   readonly seq: number;
@@ -3489,6 +3496,7 @@ export class StateCache {
             casterGuid: a.casterGuid,
             maxDuration: a.maxDuration,
             duration: a.duration,
+            expiresAt: a.duration !== undefined && a.duration > 0 ? event.ts + a.duration : undefined,
             name: a.name,
             seq: event.seq,
             ts: event.ts,
