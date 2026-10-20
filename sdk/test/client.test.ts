@@ -5568,6 +5568,96 @@ describe("client: quest-start items and the questgiver marker pre-check (2026-08
     await stub.stop();
   });
 
+  /**
+   * A quest in the log, complete, at an NPC whose `reward` marker is newer
+   * than every quest-log field, turned in through the stub up to the
+   * server's SMSG_QUESTGIVER_QUEST_COMPLETE (seq 94) and nothing after it.
+   */
+  async function turnedInJustNow(stub: StubServer, client: Awaited<ReturnType<typeof inWorld>>) {
+    stub.push(JSON.stringify(questAccepted)); // seq 30
+    stub.push(JSON.stringify(questComplete)); // seq 32
+    stub.push(JSON.stringify(questGiverStatus(CREATURE_GUID, 10, 91))); // reward
+    await Bun.sleep(20);
+    const turnIn = client.turnInQuest(CREATURE_GUID, QUEST_ID, 0, { timeout: 2000 });
+    await untilAction(stub, "quest_complete");
+    stub.push(JSON.stringify(offerReward(QUEST_ID, 93)));
+    await untilAction(stub, "quest_choose_reward");
+    stub.push(JSON.stringify(questRewarded(QUEST_ID, 94)));
+    expect(await turnIn).toMatchObject({ ok: true, status: "complete", questId: QUEST_ID });
+  }
+
+  test("accepting the next quest of a chain on the tick the turn-in lands asks the NPC, not its pre-turn-in marker", async () => {
+    // run-20261020-041059 at 04:15:11: SMSG_QUESTGIVER_QUEST_COMPLETE for 7
+    // (seq 6042), then the server's own STATUS_MULTIPLE with McBride at
+    // `available` (6044), then the slot clearing (6045). The snippet asked
+    // McBride for 15 the moment the completion resolved turnInQuest, while
+    // the cache still held `reward` from before the turn-in and no field had
+    // moved yet; the call answered nothing_on_offer with nothing sent.
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    await turnedInJustNow(stub, client);
+    const accept = client.acceptQuestFrom(CREATURE_GUID, OTHER_QUEST_ID, { timeout: 2000 });
+    const at = await untilAction(stub, "quest_list");
+    expect(stub.actions[at]).toMatchObject({ action: "quest_list", guid: CREATURE_GUID });
+    stub.push(JSON.stringify(questGiverStatusMultiple([{ guid: CREATURE_GUID, status: 8 }], 95)));
+    stub.push(frame(96, "SMSG_UPDATE_OBJECT", { blocks: 1, objects: [{ update: "values", guid: SELF_GUID, fields: { quest0Id: 0, quest0State: 0 } }] }));
+    stub.push(JSON.stringify(questGiverList([OTHER_QUEST_ID], 97)));
+    await untilAction(stub, "quest_accept");
+    stub.push(JSON.stringify({ ...(questChained as object), seq: 98 }));
+    expect(await accept).toMatchObject({ ok: true, status: "accepted", questId: OTHER_QUEST_ID });
+    expect(client.drainActionHints()).toEqual([]);
+
+    // The shortcut stands once a marker newer than the exchange and the
+    // fields arrives: the client's own refresh after the log change.
+    stub.push(JSON.stringify(questGiverStatusMultiple([{ guid: CREATURE_GUID, status: 0 }], 99))); // none
+    await Bun.sleep(20);
+    const after = stub.actions.length;
+    const listed = await client.questsAvailableFrom(CREATURE_GUID, { timeout: 10_000 });
+    expect(listed).toMatchObject({ ok: false, status: "nothing_on_offer", quests: [] });
+    expect(stub.actions.slice(after).map((a) => a.action)).not.toContain("quest_list");
+    client.close();
+    await stub.stop();
+  });
+
+  test("questsAvailableFrom on the tick the turn-in lands asks the NPC too", async () => {
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    await turnedInJustNow(stub, client);
+    const listed = client.questsAvailableFrom(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify(questGiverList([OTHER_QUEST_ID], 95)));
+    expect(await listed).toMatchObject({ ok: true, quests: [{ questId: OTHER_QUEST_ID }] });
+    client.close();
+    await stub.stop();
+  });
+
+  test("a level-up or an abandon the fields do not show yet dates the marker as well", async () => {
+    // A level-up's SMSG_LEVELUP_INFO and an abandon's ack both come before the
+    // field update the next world tick carries, so a marker that predates
+    // either is no answer either.
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    stub.push(JSON.stringify(questAccepted)); // seq 30
+    stub.push(JSON.stringify(questGiverStatus(CREATURE_GUID, 0, 91))); // none
+    stub.push(frame(92, "SMSG_LEVELUP_INFO", { level: 4, healthGained: 10 }));
+    await Bun.sleep(20);
+    const levelled = client.questsAvailableFrom(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify(questGiverList([OTHER_QUEST_ID], 93)));
+    expect(await levelled).toMatchObject({ ok: true, quests: [{ questId: OTHER_QUEST_ID }] });
+
+    stub.push(JSON.stringify(questGiverStatus(CREATURE_GUID, 0, 94))); // none, after the level-up
+    await Bun.sleep(20);
+    await client.questAbandon(QUEST_ID);
+    const after = stub.actions.length;
+    const abandoned = client.questsAvailableFrom(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "quest_list", after);
+    stub.push(JSON.stringify(questGiverList([QUEST_ID], 95)));
+    expect(await abandoned).toMatchObject({ ok: true, quests: [{ questId: QUEST_ID }] });
+    client.close();
+    await stub.stop();
+  });
+
   test("a relog drops the old session's markers and asks again, so an old `incomplete` refuses nothing", async () => {
     // `seq` restarts with every session, so a marker kept from the last one
     // cannot be ordered against the new session's fields: the new self create

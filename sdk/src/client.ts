@@ -1692,25 +1692,67 @@ function questgiverMarkerOf(state: StateCache, guid: GuidArg, wanted: "reward" |
 /**
  * The observed questgiver marker of a unit, only when it is newer than every
  * change the cache has seen to what the server computes a marker from: the
- * quest log's slots (a quest entering or leaving it, or its state changing)
- * and our own level. The client re-asks for every marker when the log
- * changes, so an older marker may be about to change — finishing the last
- * objective and turning in at once is the common case, and turning in and
- * asking the same NPC for the next quest of its chain at once is the other.
- * Undefined when no marker was observed or it is older than such a change.
- * The comparison is by `seq`, which restarts with every session; the cache
- * drops every marker at login, so none from an earlier session is compared,
- * and re-dates these fields to the login, so none of theirs is either.
+ * quest log's slots (a quest entering or leaving it, or its state changing),
+ * our own level, and `exchangeSeq`, the latest quest exchange the fields may
+ * not show yet (`Client.questExchangeSeq`). The client re-asks for every
+ * marker when the log changes, so an older marker may be about to change —
+ * finishing the last objective and turning in at once is the common case,
+ * and turning in and asking the same NPC for the next quest of its chain at
+ * once is the other. The second is why the fields alone are not enough: the
+ * turn-in's SMSG_QUESTGIVER_QUEST_COMPLETE resolves `turnInQuest` a world
+ * tick before the slot clears, so a call made straight after it saw the
+ * pre-turn-in `reward` as current (run-20261020-041059 lost quests 15, 3101
+ * and 6 that way). Undefined when no marker was observed or it is older than
+ * such a change. The comparison is by `seq`, which restarts with every
+ * session; the cache drops every marker at login, so none from an earlier
+ * session is compared, and re-dates these fields to the login, so none of
+ * theirs is either.
  */
-function freshQuestgiverMarkerOf(state: StateCache, guid: GuidArg, wanted: "reward" | "available", questId?: number): QuestGiverMarker | undefined {
+function freshQuestgiverMarkerOf(
+  state: StateCache,
+  guid: GuidArg,
+  exchangeSeq: number,
+  wanted: "reward" | "available",
+  questId?: number,
+): QuestGiverMarker | undefined {
   const observed = state.nearby.get(guidKey(guid))?.questGiver;
   if (observed === undefined) return undefined;
-  let changed = -1;
+  let changed = exchangeSeq;
   for (const [key, field] of state.self.fields) {
     if (isQuestGiverMarkerInput(key)) changed = Math.max(changed, field.seq);
   }
   return observed.seq > changed ? { name: questGiverStatusName(observed.value), wanted, questId } : undefined;
 }
+
+/**
+ * Events that say a questgiver marker may have moved before the self fields
+ * do: the turn-in receipt (the slot clears on the next update), a level-up
+ * (the level field likewise), and a quest failing. Each is followed by a
+ * field change, so the dating they add lasts no longer than the fields'
+ * own would, and the log change earns a marker refresh as usual. Kill and
+ * item credit are left out: most of it moves no marker, earns no refresh,
+ * and would switch the pre-checks off until the NPC came back into view;
+ * the credit that completes a quest flips the complete bit, which dates the
+ * marker through the fields.
+ */
+const QUEST_EXCHANGE_EVENTS: ReadonlySet<string> = new Set([
+  "SMSG_QUESTGIVER_QUEST_COMPLETE",
+  "SMSG_LEVELUP_INFO",
+  "SMSG_QUESTGIVER_QUEST_FAILED",
+  "SMSG_QUESTUPDATE_FAILED",
+]);
+
+/**
+ * Actions that change the quest log with no event of their own before the
+ * field update: an accept and an abandon are acked when queued, and the slot
+ * changes a world tick later. Choosing a reward is here as well, although
+ * its receipt dates the marker too.
+ */
+const QUEST_EXCHANGE_ACTIONS: ReadonlySet<ActionBody["action"]> = new Set([
+  "quest_accept",
+  "quest_choose_reward",
+  "quest_abandon",
+]);
 
 /**
  * The markers that say no quest this NPC ends is ready to turn in: `none`
@@ -3207,9 +3249,20 @@ export class WrathClient {
   private multipleTimer: ReturnType<typeof setTimeout> | undefined;
   private questLogKey: string | undefined;
   private readonly questQueried = new Set<number>();
+  /**
+   * The seq of the latest quest exchange (`QUEST_EXCHANGE_EVENTS`, or the
+   * newest event seen when a `QUEST_EXCHANGE_ACTIONS` action was acked): a
+   * questgiver marker no newer than it is no answer for the marker
+   * pre-checks (`freshQuestgiverMarkerOf`). Stamped from the synchronous
+   * event fold, so a call made in the continuation of the event's own waiter
+   * already sees it. Reset at login, where `seq` restarts and every marker
+   * is dropped.
+   */
+  private questExchangeSeq = -1;
 
   private clientParityQueries(event: StreamEvent): void {
     if (isDecodeError(event.data) || ("schemaError" in event && event.schemaError !== undefined)) return;
+    if (QUEST_EXCHANGE_EVENTS.has(event.opcode)) this.questExchangeSeq = Math.max(this.questExchangeSeq, event.seq);
     switch (event.opcode) {
       case "SMSG_UPDATE_OBJECT": {
         const d = event.data as { objects: readonly Record<string, unknown>[] };
@@ -3240,6 +3293,7 @@ export class WrathClient {
         // client asks for every marker after logging in.
         this.statusKnown.clear();
         this.statusPending.clear();
+        this.questExchangeSeq = -1;
         break;
       case "SMSG_NEW_WORLD":
       case "WB_SESSION_STATE":
@@ -6939,11 +6993,12 @@ export class WrathClient {
       // turn-in there cannot succeed, and the core mostly answers it with
       // silence, so waiting the timeout out would only confirm what is
       // already known (three 0.5 probes lost 20–40s a run to it). Only a
-      // marker newer than the last quest-log or level change counts; an
+      // marker newer than the last quest-log or level change, and than the
+      // last quest exchange the fields may not show yet, counts; an
       // unobserved or older one sends, as before. Ahead of the range check, as
       // in `questOffer`: an NPC with nothing to hand in has nothing to walk
       // over for.
-      const marker = freshQuestgiverMarkerOf(this.state, npcId, "reward", questId);
+      const marker = freshQuestgiverMarkerOf(this.state, npcId, this.questExchangeSeq, "reward", questId);
       if (marker !== undefined && TURN_IN_NOT_READY.has(marker.name)) {
         const hint =
           `${questgiverMarkerClause(marker)} Nothing was sent. ` +
@@ -7143,7 +7198,13 @@ export class WrathClient {
 
   /** One `POST /action`, with the session token filled in. */
   private action(body: ActionBody): Promise<ActionResponse> {
-    return this.request("POST", "/action", { token: this.token, ...body }, actionResponseSchema);
+    const sent = this.request("POST", "/action", { token: this.token, ...body }, actionResponseSchema);
+    if (!QUEST_EXCHANGE_ACTIONS.has(body.action)) return sent;
+    return sent.then((ack) => {
+      const latest = this.events.recent(1)[0]?.seq;
+      if (latest !== undefined) this.questExchangeSeq = Math.max(this.questExchangeSeq, latest);
+      return ack;
+    });
   }
 
   /**
@@ -7170,16 +7231,18 @@ export class WrathClient {
   private async questOffer(npcGuid: GuidArg, timeout: number): Promise<QuestOfferOutcome> {
     const sinceSeq = this.events.recent(1)[0]?.seq;
     const distance = distanceToUnit(this.state, npcGuid);
-    const marker = freshQuestgiverMarkerOf(this.state, npcGuid, "available");
+    const marker = freshQuestgiverMarkerOf(this.state, npcGuid, this.questExchangeSeq, "available");
     if (marker !== undefined && OFFERS_NOTHING.has(marker.name)) {
       // The server already said what this NPC has for us (its questgiver
       // marker, received before the call), and it is not a quest on offer — a
       // turn-in-only or empty-handed NPC answers a quest_list with silence, so
       // waiting the timeout out would only confirm what is already known. Only
-      // a marker newer than the last quest-log or level change counts, as in
-      // `turnInQuest`: right after a turn-in the marker still reads `reward`
-      // while the next quest of the chain is already on offer. An unobserved
-      // or older marker sends, as before.
+      // a marker newer than the last quest-log or level change, and than the
+      // last quest exchange, counts, as in `turnInQuest`: right after a
+      // turn-in the marker still reads `reward` while the next quest of the
+      // chain is already on offer, and a call made the moment the turn-in
+      // resolves comes before the slot has cleared. An unobserved or older
+      // marker sends, as before.
       return {
         nothing: marker,
         hint:
