@@ -132,7 +132,8 @@ describe("reclaimCorpse: the core measures the reclaim range in 3D", () => {
     await folded(client, "MSG_CORPSE_QUERY", 21);
     const r = await client.reclaimCorpse();
     expect(r).toMatchObject({ ok: false, status: "not_reclaimed", reason: "too_far", distance: 58, radius: 39, attempts: 0 });
-    expect(!r.ok && r.hint).toStartWith("you are 58y from your corpse at (-1230.5, 984.3) and a reclaim only works within 39y — ");
+    // The wording that names the height is party-run-batch3-wording's.
+    expect(!r.ok && r.hint).toContain("58y in a straight line");
     expect(stub.actions.some((a) => a.action === "reclaim_corpse")).toBe(false);
     client.close();
     await stub.stop();

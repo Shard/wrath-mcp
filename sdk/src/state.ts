@@ -166,6 +166,9 @@ const PET_REACTIONS: readonly PetReaction[] = ["passive", "defensive", "aggressi
 const PET_COMMANDS: readonly PetCommand[] = ["stay", "follow", "attack", "abandon"];
 
 /** A value together with the event that carried it. */
+/** How near its point a character stands at the release graveyard (`self.graveyard`'s zone and area). */
+const GRAVEYARD_NEAR_YARDS = 20;
+
 export interface Observed<T> {
   readonly value: T;
   readonly seq: number;
@@ -192,6 +195,13 @@ export interface UnitPosition {
  */
 export interface WorldPosition extends UnitPosition {
   readonly map: number;
+  /**
+   * On `state.self.position` only, while a flight is in progress
+   * (`taxiFlight`): this is the take-off point, not where the character is.
+   * The flight's own position is not observed until it lands
+   * (`taxiEta.landsAt`), which puts position at the end of the flight path.
+   */
+  readonly inFlight?: true;
 }
 
 /** A point with no orientation: what `SMSG_MONSTER_MOVE` carries. */
@@ -448,8 +458,11 @@ export interface SelfState extends UnitFieldsState {
    * The graveyard the spirit was released to, from `SMSG_DEATH_RELEASE_LOC`
    * (the packet a client draws the spirit-healer marker from). Cleared by the
    * same packet with `map: -1`, which is what a resurrect sends first.
+   * `zone` and `area` are the names the character's own zone text showed
+   * while it stood there (`WB_AREA` within 20y of the point), undefined
+   * until it has: the release port lands the ghost on it.
    */
-  graveyard: Observed<Point3 & { readonly map: number }> | undefined;
+  graveyard: Observed<Point3 & { readonly map: number; readonly zone?: AreaRef; readonly area?: AreaRef }> | undefined;
   /**
    * The server's reclaim delay for this death (`SMSG_CORPSE_RECLAIM_DELAY`):
    * `readyAt` is the event's wall-clock `ts` plus `delayMs`, when a reclaim
@@ -2807,6 +2820,7 @@ export class StateCache {
         this.self.zone = { value: { id: d.zoneId, name: d.zoneName }, seq: event.seq, ts: event.ts };
         this.self.area = { value: { id: d.areaId, name: d.areaName }, seq: event.seq, ts: event.ts };
         this.foldMap(d.mapId, d.mapName, d.instanceType, event.seq, event.ts);
+        this.placeGraveyard(false);
         return;
       }
       case "WB_PORTALS": {
@@ -2885,6 +2899,7 @@ export class StateCache {
           return;
         }
         this.self.graveyard = { value: { map: d.map, x: d.x, y: d.y, z: d.z }, seq: event.seq, ts: event.ts };
+        this.placeGraveyard(true);
         return;
       }
       case "SMSG_RESURRECT_REQUEST": {
@@ -3691,6 +3706,7 @@ export class StateCache {
             // takes the character off any spline it was on.
             this.endSelfSpline();
             this.applySelfPosition(d.pos, event.seq, event.ts);
+            this.placeGraveyard(true);
             return;
           }
           this.upsertNearby(d.guid, event.seq, (obj) => {
@@ -4043,6 +4059,24 @@ export class StateCache {
   }
 
   /**
+   * Name the release graveyard from the zone text, when the character stands
+   * within `GRAVEYARD_NEAR_YARDS` of it on its map. A `WB_AREA` there names
+   * it; a port's arrival names it `provisional`ly, only while nothing has —
+   * the module's `WB_AREA` for the new place follows the port by a tick, and
+   * a port within one area sends none, so the zone text then already reads it.
+   */
+  private placeGraveyard(provisional: boolean): void {
+    const g = this.self.graveyard;
+    const pos = this.self.position?.value;
+    const zone = this.self.zone?.value;
+    const area = this.self.area?.value;
+    if (g === undefined || pos === undefined || zone === undefined || area === undefined) return;
+    if (provisional && g.value.area !== undefined) return;
+    if (pos.map !== g.value.map || Math.hypot(pos.x - g.value.x, pos.y - g.value.y) > GRAVEYARD_NEAR_YARDS) return;
+    this.self.graveyard = { ...g, value: { ...g.value, zone, area } };
+  }
+
+  /**
    * A point the server put the character at with no facing (a spline's stop
    * or its end). The spline carries no orientation, so the last observed one
    * stands. A map always arrives with a position, so whenever
@@ -4198,6 +4232,10 @@ export class StateCache {
         if (flying && !wasFlying) {
           // Take-off: the flight's spline arrived just ahead of this flag.
           this.publishTaxiEta();
+          // Nothing moves position until the landing, so it says it is the
+          // take-off point rather than reading as where the character is.
+          const at = this.self.position;
+          if (at !== undefined) this.self.position = { ...at, value: { ...at.value, inFlight: true } };
         } else if (!flying && wasFlying) {
           // Landing: the client has flown itself to the end of the spline,
           // which is where the server set the character down. No spline
@@ -4206,6 +4244,13 @@ export class StateCache {
           const spline = this.selfSpline;
           this.endSelfSpline();
           if (spline !== undefined) this.applySelfPoint(spline.destination, seq, ts);
+          else {
+            const at = this.self.position;
+            if (at?.value.inFlight === true) {
+              const { inFlight: _, ...rest } = at.value;
+              this.self.position = { ...at, value: rest };
+            }
+          }
         }
       }
       // `resting` is the same shape of reading off `playerFlags`, the players-

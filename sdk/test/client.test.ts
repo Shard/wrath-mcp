@@ -1977,7 +1977,7 @@ describe("client: killTarget", () => {
     expect(result).toMatchObject({ ok: false, status: "timeout", swings: 0, attacking: true, reached: false });
     expect(result.distance).toBeCloseTo(20.6, 1);
     expect(result.detail).toMatch(
-      /^never reached melee range: ~1[45]y covered, ~21y still to go to \(-1200\.0, 980\.0\) when the timeout ran out; the character is still walking; still auto-attacking/,
+      /^never reached melee range: ~1[45]y covered, ~21y still to go to \(-1200\.0, 980\.0\) when the timeout ran out; the character is still walking; nothing in view targets you; your health 80%; still auto-attacking/,
     );
     expect(result.detail).not.toContain("both alive");
     client.close();

@@ -323,7 +323,7 @@ describe("reclaimCorpse: an abandoned wait says what was waiting", () => {
     const err = await pending.catch((e: unknown) => e);
     expect(err).toBeInstanceOf(EventAbortedError);
     const note = (err as { waitAbandon?: string }).waitAbandon;
-    expect(note).toMatch(/^reclaimCorpse was waiting out the server's reclaim delay \(~(19|20)s still to run\) when this was abandoned, 0s into its 25s wait\. Give it a snippet of its own, or pass a \{ timeout \} that fits\.$/);
+    expect(note).toMatch(/^reclaimCorpse was waiting out the server's reclaim delay \(~(19|20)s still to run\) when this was abandoned, 0s into its 25s wait\. Give it a snippet of its own, or pass a timeout that fits the time the snippet has left, as the second argument: sdk\.reclaimCorpse\(undefined, \{ timeout: 20000 \}\)\.$/);
     expect((err as Error).message).toContain(note!);
     client.close();
     await stub.stop();

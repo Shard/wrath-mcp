@@ -2682,8 +2682,8 @@ describe("achievements and flight paths", () => {
   test("our own flight's spline lands position at its last point, with taxiEta for the ride", () => {
     const flying = StateCache.replay(toEvents([verifyWorld(1), ...takeOff(2)]), { seed: SEED });
     // Mid-flight the position is still the take-off point: the module serves
-    // no point between start and end, so none is made up.
-    expect(flying.self.position?.value).toEqual(TAKE_OFF);
+    // no point between start and end, so none is made up — and it says so.
+    expect(flying.self.position?.value).toEqual({ ...TAKE_OFF, inFlight: true });
     expect(flying.self.position?.seq).toBe(1);
     // Stamped with the spline's packet, which carried the duration.
     expect(flying.self.taxiEta).toEqual({ value: { durationMs: FLIGHT_MS, landsAt: 2003 + FLIGHT_MS }, seq: 3, ts: 2003 });
