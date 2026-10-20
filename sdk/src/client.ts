@@ -3284,6 +3284,14 @@ function spiritHealerSilence(distance: number | undefined, timeout: number): str
 const AREA_AFTER_PORT_MS = 500;
 
 /**
+ * How long `repop` waits for its own release to land, in ms: the port, the
+ * graveyard marker and the ghost flag arrive within a world tick or two of
+ * the dispatch, so this only bounds a release the server never makes (no
+ * graveyard for the corpse's zone).
+ */
+const REPOP_SETTLE_MS = 3000;
+
+/**
  * Whether an event moved our own character by teleport: a same-map port's
  * `MSG_MOVE_TELEPORT_ACK` under our guid, or a far port's `SMSG_NEW_WORLD`.
  */
@@ -4748,9 +4756,57 @@ export class WrathClient {
     return this.action({ action: "destroy_item", bag: where.bag, slot: where.slot, count }).then((ack) => withResolved(where, ack));
   }
 
-  /** `CMSG_REPOP_REQUEST` — release the spirit while dead. */
-  repop(): Promise<ActionResponse> {
-    return this.action({ action: "repop" });
+  /**
+   * `CMSG_REPOP_REQUEST` — release the spirit while dead.
+   *
+   * The release is the server moving the spirit: `RepopAtGraveyard` teleports
+   * it to the graveyard (`MSG_MOVE_TELEPORT_ACK` on the same map,
+   * `SMSG_NEW_WORLD` across maps), then sends `SMSG_DEATH_RELEASE_LOC` naming
+   * that graveyard, and the ghost flag follows in our own values update a few
+   * ms later (the 2026-10-20 party runs: all of it within 12 ms of the
+   * dispatch). The ack comes back before any of it is folded, so a caller
+   * reading `state.self.position` the moment the call returned read the
+   * corpse's spot (rogue, 13:32:42: a Deadmines position while the ghost
+   * stood at Sentinel Hill), and a `moveTo` right after it met a corpse. So a
+   * release from a corpse waits, bounded by `REPOP_SETTLE_MS`, for its own
+   * port, the graveyard marker and the ghost flag, then for the `WB_AREA`
+   * naming where it landed. The ack is the answer either way. Nothing is
+   * waited for when the cache does not show a corpse: the core ignores a
+   * repop from the living or from a ghost, so no release is coming.
+   */
+  async repop(): Promise<ActionResponse> {
+    if (!this.isCorpse()) return this.action({ action: "repop" });
+    let released = false;
+    const offRelease = this.events.on("SMSG_DEATH_RELEASE_LOC", (e) => {
+      if (isDecodeError(e.data)) return;
+      if ((e.data as DeathReleaseLocData).map >= 0) released = true;
+    });
+    let portSeq: number | undefined;
+    const offPort = this.events.onAny((e) => {
+      if (isOwnPort(e, this.state.self.guid)) portSeq = e.seq;
+    });
+    const until = Date.now() + REPOP_SETTLE_MS;
+    try {
+      const ack = await this.action({ action: "repop" });
+      const settled = (): boolean => released && portSeq !== undefined && this.state.self.ghost?.value === true;
+      const window = until - Date.now();
+      if (!settled() && window > 0) {
+        try {
+          await this.waitEvent(() => settled(), {
+            timeout: window,
+            includeBuffered: false,
+            description: "the release after CMSG_REPOP_REQUEST (the port to the graveyard and the ghost flag)",
+          });
+        } catch (e) {
+          if (!(e instanceof EventTimeoutError)) throw e;
+        }
+      }
+      if (portSeq !== undefined) await this.awaitAreaAfter(portSeq, until);
+      return ack;
+    } finally {
+      offRelease();
+      offPort();
+    }
   }
 
   /**
@@ -5205,6 +5261,12 @@ export class WrathClient {
       });
       const timeout = options.timeout ?? 5000;
       const started = Date.now();
+      // The distance a silence is explained with is the one at dispatch, when
+      // the server judged the range. Read at the end of the wait, a ghost
+      // walked out of the healer's sight meanwhile had lost it with the
+      // healer's out-of-range block (paladin, 14:17:13: the healer 17y away
+      // three seconds before, "no observed position for that guid" after).
+      const measuredAtSend = distanceToUnit(this.state, guid);
       try {
         await this.action({ action: "spirit_healer_activate", guid });
         if (!released) {
@@ -5238,7 +5300,7 @@ export class WrathClient {
           area: self.area?.value.name || undefined,
         } as const;
       }
-      const measured = distanceToUnit(this.state, guid);
+      const measured = measuredAtSend ?? distanceToUnit(this.state, guid);
       const distance = measured === undefined ? undefined : Math.round(measured);
       const hint = spiritHealerSilence(distance, timeout);
       this.noteActionHint("spiritHealerActivate", "unconfirmed", hint);
