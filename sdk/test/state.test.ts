@@ -2383,6 +2383,39 @@ describe("game objects: names, goType and transports", () => {
     expect(c.units({ type: "gameObject" }).find((r) => r.guid === TRAM_GUID)!.docked).toBe(true);
   });
 
+  test("a car's last report as it leaves the range clears docked and marks it out of range", () => {
+    // The module reports a car only within the map's visibility range of
+    // the character; one that leaves while docked must not read docked at
+    // that platform forever after.
+    const c = StateCache.replay(
+      toEvents([
+        ...worldStream,
+        unitAt(TRAM_GUID, 60, { dx: 0, objectType: "gameObject", entry: TRAM_ENTRY }),
+        transportProgress(TRAM_GUID, TRAM_ENTRY, 62, { x: 4.5, y: 8.4, z: -4.3 }, true, 1000),
+      ]),
+      { seed: SEED },
+    );
+    expect(c.nearby.get(TRAM_GUID)!.transport!.value.inRange).toBe(true);
+    c.apply(
+      toEvents([
+        {
+          seq: 63,
+          opcode: "WB_TRANSPORT_PROGRESS",
+          opcodeId: 0xff06,
+          ts: 1_700_000_000_063,
+          data: { guid: TRAM_GUID, entry: TRAM_ENTRY, pos: { x: 4.5, y: 9.0, z: -4.3, o: 0 }, progressMs: 2000, inRange: false },
+        },
+      ])[0]!,
+    );
+    const t = c.nearby.get(TRAM_GUID)!.transport!.value;
+    expect(t.inRange).toBe(false);
+    expect(t.docked).toBeUndefined();
+    expect(t.docks).toEqual([{ x: 4.5, y: 8.4, z: -4.3 }]);
+    const row = c.units({ type: "gameObject" }).find((r) => r.guid === TRAM_GUID)!;
+    expect(row.docked).toBeUndefined();
+    expect(row.y).toBe(9);
+  });
+
   test("a report for a car the update stream never created still puts it in view, typed by its report", () => {
     const c = StateCache.replay(
       toEvents([...worldStream, transportProgress(TRAM_GUID, TRAM_ENTRY, 62, { x: 4.5, y: 8.4, z: -4.3 }, true)]),

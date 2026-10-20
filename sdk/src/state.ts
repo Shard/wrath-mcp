@@ -1049,16 +1049,26 @@ export function gameObjectTypeName(type: number): GameObjectTypeName {
  * What a client animates for a transport it has been sent: the car's clock
  * on its `TransportAnimation.dbc` period and whether the segment under that
  * clock has no displacement (the car is dwelling at a platform). Folded from
- * `WB_TRANSPORT_PROGRESS`; the position itself goes on `position`.
+ * `WB_TRANSPORT_PROGRESS`, which the module sends only while the car is
+ * within the map's visibility range of the character or carrying it; the
+ * position itself goes on `position`.
  */
 export interface TransportState {
   readonly progressMs: number;
   readonly periodMs: number | undefined;
+  /** Undefined once the car has left the range: it would be stale. */
   readonly docked: boolean | undefined;
   /**
+   * `true` while the module reports the car every second, `false` after its
+   * last report as it left the range (position and clock are then where it
+   * was leaving), undefined for a car known only from its create block.
+   */
+  readonly inRange: boolean | undefined;
+  /**
    * Every point this car has been observed dwelling at (`docked: true`),
-   * deduplicated within 5y: where it stops, as far as this session has seen.
-   * A tram car accrues its two platforms over one round trip.
+   * deduplicated within 5y: where it stops, as far as this session has seen
+   * it. A car accrues the platforms it docks at in range: the near one for a
+   * character waiting there, both ends over a round trip aboard.
    */
   readonly docks: readonly Point3[];
 }
@@ -1248,7 +1258,8 @@ export interface UnitView {
    * Transports only: `true` while the car is dwelling at a platform, `false`
    * while it is between ends — from the same `TransportAnimation.dbc` clock a
    * client animates the car with (`WB_TRANSPORT_PROGRESS`). Undefined for
-   * everything that is not a transport, and until the first report.
+   * everything that is not a transport, until the first report, and while
+   * the car is out of the map's visibility range of the character.
    */
   readonly docked: boolean | undefined;
 }
@@ -3273,7 +3284,10 @@ export class StateCache {
       }
       case "WB_TRANSPORT_PROGRESS": {
         // The car moved (or did not): a client animating the transport from
-        // its own DBC knows exactly this. The object stays in `nearby` only
+        // its own DBC knows exactly this. A report with `inRange: false` is
+        // the last one until the car is back in range, and carries no
+        // `docked`, so a car that left a platform never reads docked there.
+        // The object stays in `nearby` only
         // if the update stream put it there; a report for a guid never
         // created still means the server sent the car, so it is upserted the
         // way a `values` delta for an unseen guid is.
@@ -3286,7 +3300,7 @@ export class StateCache {
             docks.push({ x: d.pos.x, y: d.pos.y, z: d.pos.z });
           }
           obj.transport = {
-            value: { progressMs: d.progressMs, periodMs: d.periodMs, docked: d.docked, docks },
+            value: { progressMs: d.progressMs, periodMs: d.periodMs, docked: d.docked, inRange: d.inRange !== false, docks },
             seq: event.seq,
             ts: event.ts,
           };
@@ -3827,7 +3841,7 @@ export class StateCache {
       if (block.targetGuid !== undefined) obj.targetGuid = { value: block.targetGuid, seq, ts };
       if (block.pathProgress !== undefined) {
         obj.transport = {
-          value: { progressMs: block.pathProgress, periodMs: undefined, docked: undefined, docks: [] },
+          value: { progressMs: block.pathProgress, periodMs: undefined, docked: undefined, inRange: undefined, docks: [] },
           seq,
           ts,
         };

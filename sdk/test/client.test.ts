@@ -692,9 +692,9 @@ describe("client: movement", () => {
     if (r1.ok) throw new Error("unreachable");
     expect(r1.nearest).toEqual({ x: -5611.5, y: -2574.2, z: 366.8 });
     expect(r1.hint).toContain(
-      "(-5620.0, -2580.0) is not on walkable ground within 4y (z is searched ±50y, so a wrong z alone is not the " +
-        "cause); the nearest walkable ground within 20y is (-5611.5, -2574.2, z 366.8), 10y away. Pick a point on a " +
-        "road or floor, or where an NPC stands.",
+      "(-5620.0, -2580.0, z 369.0) is not on walkable ground; the nearest walkable ground within 20y is " +
+        "(-5611.5, -2574.2, z 366.8), 10y away and 2y below the point asked for. Pick a point on a road or floor, " +
+        "or where an NPC stands.",
     );
 
     const p2 = client.moveTo({ x: -5700, y: -2680, z: 330 }, { timeout: 2000 });
@@ -704,7 +704,24 @@ describe("client: movement", () => {
     const r2 = await p2;
     if (r2.ok) throw new Error("unreachable");
     expect(r2.nearest).toBeNull();
-    expect(r2.hint).toContain("cause); nothing walkable lies within 20y of it. Pick a point on a road or floor");
+    expect(r2.hint).toContain(
+      "(-5700.0, -2680.0, z 330.0) is not on walkable ground, and nothing walkable lies within 20y of it. Pick a point on a road or floor",
+    );
+
+    // Walkable ground straight over the point asked for (Westfall, 2026-10-20:
+    // a z read off the character's own lower level, 15.7y under the road): the
+    // hint names that z and how far up it is, never "0y away".
+    const p3 = client.moveTo({ x: -10667.9, y: 1285.86, z: 31.7263 }, { timeout: 2000 });
+    const over = moveResult("target_off_mesh", 3, 32) as { data: Record<string, unknown> };
+    over.data.nearest = { x: -10667.9, y: 1285.86, z: 47.4651 };
+    stub.push(JSON.stringify(over));
+    const r3 = await p3;
+    if (r3.ok) throw new Error("unreachable");
+    expect(r3.hint).toContain(
+      "(-10667.9, 1285.9, z 31.7) is not on walkable ground; walkable ground at this x,y is at z 47.5, 16y above " +
+        "the point asked for. Move to that z, or pick a point on a road or floor, or where an NPC stands.",
+    );
+    expect(r3.hint).not.toContain("0y away");
     client.close();
     await stub.stop();
   });
@@ -741,8 +758,7 @@ describe("client: movement", () => {
     expect(r1.hint).toContain("not on walkable ground");
     // A module that predates `nearest` says nothing about it.
     expect(r1.hint).toContain(
-      "(10.0, 20.0) is not on walkable ground within 4y (z is searched ±50y, so a wrong z alone is not the cause). " +
-        "Pick a point on a road or floor, or where an NPC stands.",
+      "(10.0, 20.0, z 30.0) is not on walkable ground. Pick a point on a road or floor, or where an NPC stands.",
     );
     expect(r1.reachedPos).toBeUndefined();
     expect(r1.nearest).toBeUndefined();
@@ -845,6 +861,29 @@ describe("client: movement", () => {
     expect(r3.ok).toBe(false);
     expect(r3.status).toBe("drop");
     expect((r3 as { onTransport?: unknown }).onTransport).toBeUndefined();
+
+    // The module reports a car only within view range of the character; its
+    // last report as it leaves (inRange: false, no docked) is where it was
+    // last seen, and the hint says so rather than "now at" with a stale clock.
+    stub.push(
+      JSON.stringify({
+        seq: 33,
+        opcode: "WB_TRANSPORT_PROGRESS",
+        opcodeId: 0xff06,
+        ts: 1_700_000_000_033,
+        data: { guid: "9001", entry: 176081, pos: { x: 4.5, y: 105.0, z: -4.3, o: 0 }, progressMs: 44_000, inRange: false },
+      }),
+    );
+    await client.events.waitFor((e) => e.seq === 33, { timeout: 2000 });
+    expect(client.state.units({ type: "gameObject" }).find((u) => u.guid === "9001")?.docked).toBeUndefined();
+    const p4 = client.moveTo({ x: 4.5, y: 9.0, z: -4.3 }, { timeout: 2000 });
+    stub.push(JSON.stringify(moveResult("target_off_mesh", 4, 34)));
+    const r4 = await p4;
+    if (r4.ok) throw new Error("unreachable");
+    expect(r4.hint).toContain(
+      "(4.5, 9.0) is where Subway (guid 9001) docks, and the car is not there now: it is too far away to be " +
+        "reported, last seen at (4.5, 105.0). The empty rail bed",
+    );
     client.close();
     await stub.stop();
   });
@@ -1179,7 +1218,7 @@ describe("client: movement", () => {
     expect(r2.hint).toBeUndefined();
 
     // Aboard a transport at the end of the move: the module says which.
-    const p4 = client.moveTo({ x: 4.5, y: 8.4, z: -4.3 }, { timeout: 2000 });
+    const p4 = client.moveTo({ x: 4.5, y: 9.0, z: -4.3 }, { timeout: 2000 });
     const aboard = moveResult("arrived", 3, 33) as { data: Record<string, unknown> };
     aboard.data.onTransport = { guid: "12345", entry: 176081 };
     stub.push(JSON.stringify(aboard));

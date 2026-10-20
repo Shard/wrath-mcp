@@ -210,8 +210,11 @@ namespace WrathBench
 
         // WB_RIDE_PROGRESS pacing while aboard a transport (world thread only).
         int64_t lastRideEmitMs{0};
-        // TickTransports: last WB_TRANSPORT_PROGRESS batch for this session.
+        // TickTransports: last WB_TRANSPORT_PROGRESS batch for this session,
+        // and the transports that batch reported as within range (a car
+        // leaving the range gets one last report saying so). World thread only.
         int64_t lastTransportEmitMs{0};
+        std::unordered_set<uint64_t> transportsInRange;
 
         // Map transfer in flight: the destination map from SMSG_TRANSFER_PENDING,
         // cleared by SMSG_NEW_WORLD / SMSG_TRANSFER_ABORTED. Set on tap threads,
@@ -416,9 +419,11 @@ namespace WrathBench
         void ReplanSteep(Player* player, float sx, float sy, float sz, float x, float y, float z, float reqZ,
             bool force, std::vector<size_t> const& refusing, PathResolve& r);
         // The z-ladder around it: ground height at x,y first for a unit
-        // target, as a fallback after target_off_mesh otherwise.
+        // target, as a fallback after target_off_mesh otherwise; then the
+        // mesh's walkable level over x,y when it is the column's only one
+        // (`usedMeshZ`, with the level in `groundZOut`).
         PathResolve ResolvePath(Player* player, float x, float y, float z, bool unitTarget,
-            bool* usedGroundZ = nullptr, float* groundZOut = nullptr, bool force = false);
+            bool* usedGroundZ = nullptr, float* groundZOut = nullptr, bool force = false, bool* usedMeshZ = nullptr);
 
         // AreaTrigger.dbc as the client ships it: the
         // module reads the DBC from the server data volume so the mover can

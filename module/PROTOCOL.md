@@ -353,9 +353,25 @@ from its own movement packets and a patrolling or sloped NPC's can sit outside
 the mesh's poly-search box while the ground under it is walkable, so with
 `guid` the module resolves z to the ground height at `x,y` (terrain, vmap and
 model geometry a client has too) before pathing, and falls back to the given z.
-Without `guid` the ground z is tried only after a `target_off_mesh`. Either way
-a target the mesh rejects at both heights is still `target_off_mesh`, and
-`meshZ` is reported relative to the z asked for.
+Without `guid` the ground z is tried only after a `target_off_mesh`. The
+ground height looks down from the z given, so a z under the ground (one read
+off a lower level, often the character's own) finds none; after both, the
+module tries the walkable level of the mesh directly over `x,y`, when it is
+the only one in the column within ±50y (levels within 2y of each other are
+one floor; an island the character cannot reach is not a level) and the
+request rests on no ground of its own (no ground height within 2y of z): a z
+buried in the terrain under a road, whose one reading is the road. The core
+searches that band for the end polygon but refuses an end more than 7y from
+it in 3D (`PATHFIND_FARFROMPOLY_END`), which this rung is for. A column with
+two or more levels is two readings of the request and is not guessed
+between; a request resting on ground the mesh does not walk asked for that
+ground, not a roof over it; and a level below the request is not taken: the
+ground rung has judged that already, and a point on a hillside did not ask
+for the tunnel under it.
+A target the mesh rejects at every height tried is still `target_off_mesh`,
+and `meshZ` is reported relative to the z asked for. The audit log records
+the level rung as `op: "move_mesh_z"` (`z`, `meshZ`), beside the ground rung's
+`move_ground_z`.
 
 Optional `force` (boolean): walk a route that steps *down* off a ledge instead
 of refusing it as `drop` (statuses below). The step is walked the way a
@@ -930,7 +946,7 @@ session's own identity). Their `opcodeId`s are outside the real opcode range.
 | `WB_MOVE_PROGRESS` | 0xFF02 | `{ "moveId": <number>, "pos": { "x","y","z","o" }, "pathLength": <f>, "etaMs": <u64> }` — at most 1/s while moving; `pathLength` is the length in yards of the route the move walks (the resolved polyline, 3D), and `etaMs` how long the module's walker takes over it at the speeds it read at dispatch (move_to, "Walk time"), both the same on every event of the move; `etaMs` is absent when no speed could be read |
 | `WB_MOVE_RESULT` | 0xFF01 | `{ "moveId": <number>, "status": <str>, "pos": { "x","y","z","o" }, "meshZ": <f?>, "reachedPos": { "x","y","z" }? }` — `meshZ` only on `arrived` when the mesh z differed from the request; `reachedPos` on `path_incomplete` and `drop`; `"pathLength": <f>` and `"etaMs": <u64>` on the verdict of any move that was dispatched and walked (a refusal at planning has neither), the route's length in yards and its walk time as on `WB_MOVE_PROGRESS`; `"dz": <f>, "target": { "x","y","z" }` only on `drop`, plus `"safeFall": <u32>` when the character's own fall-height reduction (`SPELL_AURA_SAFE_FALL`, the client's buff frame) is non-zero, and `"surfaceZ": <f>` only when the step's foot lies under the ground surface at its x,y (the step is then refused forced or not); `"nearest": { "x","y","z" } | null` only on `target_off_mesh` (the walkable mesh point nearest the request within 20y, or `null` when none is); `"onTransport": { "guid": <guid-string>, "entry": <u32> }` when the character ended the move aboard a transport |
 | `WB_RIDE_PROGRESS` | 0xFF05 | `{ "transportGuid": <guid-string>, "transportEntry": <u32>, "pos": { "x","y","z","o" } }` — at most 1/s while the character rides a transport and is not walking; the server-side position the transport carried it to |
-| `WB_TRANSPORT_PROGRESS` | 0xFF06 | `{ "guid": <guid-string>, "entry": <u32>, "pos": { "x","y","z","o" }, "progressMs": <u32>, "periodMs": <u32?>, "docked": <bool?> }` — at most 1/s per session, one per transport on the character's map whose create block the session has received: the car's current position on its `TransportAnimation.dbc` path (what a client animates locally from `pathProgress`), the clock and period, and `docked` when the keyframe segment the clock is on has no displacement (the car is dwelling at a platform; absent for transports without an animation path) |
+| `WB_TRANSPORT_PROGRESS` | 0xFF06 | `{ "guid": <guid-string>, "entry": <u32>, "pos": { "x","y","z","o" }, "progressMs": <u32>, "periodMs": <u32?>, "docked": <bool?>, "inRange": <bool?> }` — at most 1/s per session, one per transport on the character's map whose create block the session has received and that is within the map's visibility range of the character in 2D (`Map::GetVisibilityRange()`, the core's `Visibility.Distance.*` for the map — 100y on continents and 170y in instances by default — the distance the core sends every other object at; transports alone are sent map-wide) or is carrying it; a transport that leaves the range gets one last report with `"inRange": false` and no `docked` (its position as it left), then none until it is back: the car's current position on its `TransportAnimation.dbc` path (what a client animates locally from `pathProgress`), the clock and period, and `docked` when the keyframe segment the clock is on has no displacement (the car is dwelling at a platform; absent for transports without an animation path) |
 | `WB_AREATRIGGER` | 0xFF04 | `{ "triggerId": <u32>, "moveId": <number>, "pos": { "x","y","z","o" } }` — the character entered an `AreaTrigger.dbc` volume and `CMSG_AREATRIGGER` was sent for it (see below); `moveId` is the `move_to` that crossed into it, 0 when no move did (a taxi landing, a transport carrying the character, a teleport's arrival) |
 | `WB_SELF_MOVE` | 0xFF09 | `{ "opcode": "MSG_MOVE_FALL_LAND", "cause": "taxi_landing", "pos": { "x","y","z","o" }, "fromZ": <f> }` — a movement packet the module sent for the character outside any `move_to`, as a client's own physics would: today only the drop from a taxi flight's last spline point (`fromZ`) to the ground under it (`pos`), see "Taxi landing" below |
 | `WB_AREA` | 0xFF07 | `{ "mapId": <u32>, "mapName"?: <str>, "instanceType"?: <u32>, "zoneId": <u32>, "zoneName": <str>, "areaId": <u32>, "areaName": <str> }` — the zone and subzone the character is in, named as the client names them, and the map it is on with the client's `Map.dbc` name and `InstanceType` for it (0 the open world, 1 a party dungeon, 2 a raid, 3 a battleground, 4 an arena; both absent when the table has no row for the map, never a guessed 0); once when the character enters the world and once per change of either area id, of the map or of the instance, whatever moved it (walking, a teleport, a map transfer). A transfer always sends one, with the new map's `mapId` and `instanceType`, even when both area ids stay the same: the Deadmines portal does, the mine outside on map 0 and map 36 inside being zone and area 1581 alike. See "Zone and area" below. |
@@ -970,8 +986,12 @@ at the top of this document.
   destination. A harness/data limitation, not a route problem; nothing to
   retry from the agent's side.
 - `target_off_mesh` — the destination has no walkable polygon within the
-  mesh's search box (4y in 2D; z is searched ±50y, so a stale z alone never
-  produces this), or it sits inside geometry. The result
+  mesh's search box (3y in 2D, ±50y in z, and within 7y of the request in 3D)
+  at the z asked for, the ground height under it, or the walkable level over
+  it when that is the column's only one and the request rests on no ground
+  (`move_to` above), or it sits inside geometry. A z buried under the ground
+  alone produces this only where the column at `x,y` holds two or more
+  walkable levels. The result
   carries `nearest`: the walkable mesh point closest to the request within
   20y in 2D that a move from the character's position can reach (Detour's
   nearest-polygon query, at most 128 polygons considered, so in a dense
@@ -1076,7 +1096,12 @@ transport's create block serves `goType` 11 and `pathProgress`, the module
 asks `CMSG_GAMEOBJECT_QUERY` for its name like any other game object, and
 `WB_TRANSPORT_PROGRESS` keeps its position and `docked` state current from
 the same `TransportAnimation.dbc` the client animates from (the server's
-`StaticTransport::RelocateToProgress` runs the same keyframes). The agent
+`StaticTransport::RelocateToProgress` runs the same keyframes) while the car
+is within the map's visibility range or carrying the character. The core
+sends every transport on the map at login, so a character in Westfall knows
+of every ship and zeppelin on the continent; reporting each one's clock every
+second flooded the event stream for nothing a character there could use. A
+car at the character's platform, or pulling in to it, is in range. The agent
 therefore sees "Subway" standing at the platform or absent, and a `move_to`
 onto an empty rail bed still answers `target_off_mesh` — the SDK's hint
 names the docking car when one is known.

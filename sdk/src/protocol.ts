@@ -831,11 +831,16 @@ export type SelfMoveData = z.infer<typeof selfMoveDataSchema>;
 
 /**
  * Module-synthesized: where a transport the session has been sent (a tram
- * car, a boat) is right now, at most once a second. A client animates the car
- * itself from `TransportAnimation.dbc` and the clock its create block carried;
- * the module reports the same animation's result. `docked` is whether the
- * keyframe segment the clock is on has no displacement — the car is dwelling
- * at a platform; absent for transports without an animation path.
+ * car, a boat) is right now, at most once a second, while it is within the
+ * map's visibility range of the character (the core's
+ * `Visibility.Distance.*`: 100y on a continent, 170y in an instance, by
+ * default) or carrying it. A client animates the car itself from
+ * `TransportAnimation.dbc` and the clock its create block carried; the module
+ * reports the same animation's result. `docked` is whether the keyframe
+ * segment the clock is on has no displacement — the car is dwelling at a
+ * platform; absent for transports without an animation path. A car leaving
+ * the range gets one last report with `inRange: false` and no `docked`, and
+ * none after it until it is back in range.
  */
 export const transportProgressDataSchema = z.looseObject({
   guid: guidSchema,
@@ -844,6 +849,7 @@ export const transportProgressDataSchema = z.looseObject({
   progressMs: z.number(),
   periodMs: z.number().optional(),
   docked: z.boolean().optional(),
+  inRange: z.boolean().optional(),
 });
 export type TransportProgressData = z.infer<typeof transportProgressDataSchema>;
 

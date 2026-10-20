@@ -1950,6 +1950,58 @@ namespace WrathBench
         return true;
     }
 
+    // The walkable levels of the mesh over or under (x, y) itself within the
+    // core's own +-50y poly-search band (PathGenerator::GetPolyByLocation's
+    // second box): every ground polygon the vertical line through (x, y)
+    // crosses, at its detail height there, that a move from the character's
+    // position can reach (an island under the hill is not a level, as in
+    // NearestReachablePoint). Heights within MESH_LEVEL_MERGE of each other
+    // are one floor — the drop guard's own bound for a step that is walked.
+    // The core finds such a polygon but measures its distance to the request
+    // in 3D and gives up on an end more than 7y from it (FARFROMPOLY_END), so
+    // a request a floor's height under the road is target_off_mesh although
+    // the road is directly over it, and Map::GetHeight only looks down from
+    // the request, so the ground-z rung never finds a road above it. Returns
+    // how many levels there are, with the level in `only` when there is one.
+    static constexpr float MESH_COLUMN_HALF = 50.0f;
+    static constexpr float MESH_LEVEL_MERGE = 2.0f;
+    static size_t MeshLevelsAt(Player* player, float x, float y, float z, float* only)
+    {
+        auto& mmap = player->GetMap()->GetMapCollisionData().GetMMapData();
+        dtNavMesh const* navMesh = mmap.GetNavMesh();
+        dtNavMeshQuery const* query = mmap.GetNavMeshQuery();
+        if (!navMesh || !query)
+            return 0;
+        WbNav::ExcludePolysFilter const base;
+        float center[3] = { y, z, x };
+        float half[3] = { 0.05f, MESH_COLUMN_HALF, 0.05f };
+        dtPolyRef polys[64];
+        int n = 0;
+        if (dtStatusFailed(query->queryPolygons(center, half, &base, polys, &n, 64)))
+            return 0;
+        dtPolyRef const startRef = MoverStartPoly(player, query);
+        std::vector<float> levels;
+        for (int i = 0; i < n; ++i)
+        {
+            dtMeshTile const* tile = nullptr;
+            dtPoly const* poly = nullptr;
+            if (dtStatusFailed(navMesh->getTileAndPolyByRef(polys[i], &tile, &poly))
+                || poly->getType() == DT_POLYTYPE_OFFMESH_CONNECTION)
+                continue;
+            float h = 0.0f;
+            if (dtStatusFailed(query->getPolyHeight(polys[i], center, &h)) || std::fabs(h - z) > MESH_COLUMN_HALF)
+                continue; // beside (x, y), not under it, or outside the band
+            if (std::any_of(levels.begin(), levels.end(), [h](float l) { return std::fabs(l - h) <= MESH_LEVEL_MERGE; }))
+                continue;
+            if (WbNav::OnIsland(navMesh, base, startRef, polys[i], nullptr))
+                continue;
+            levels.push_back(h);
+        }
+        if (levels.size() == 1 && only)
+            *only = levels.front();
+        return levels.size();
+    }
+
     // How far from a request whose own polygon is on an island the walk may
     // end instead, at the reachable mesh nearest it: the core's own
     // far-from-polygon distance (PathGenerator::BuildPolyPath paths to an end
@@ -2335,12 +2387,19 @@ namespace WrathBench
     // stands on). The ground height at x,y is terrain and model geometry a
     // client has too (Map::GetHeight over maps/vmaps/GO models), so the module
     // resolves it before pathing: first for a unit target, as a fallback after
-    // a `target_off_mesh` for any point. A target the mesh rejects at both its
-    // own z and the ground z is still `target_off_mesh`; `meshZ` is always
-    // relative to the z the agent asked for.
-    Manager::PathResolve Manager::ResolvePath(Player* player, float x, float y, float z, bool unitTarget, bool* usedGroundZ, float* groundZOut, bool force)
+    // a `target_off_mesh` for any point. Map::GetHeight looks down from the
+    // z it is given, so a request under the ground (a z read off a lower
+    // level, often the character's own) gets no ground height; the mesh's
+    // walkable level over x,y is tried after both when it is the only level
+    // in the column (MeshLevelsAt) and the request rests on no ground of its
+    // own, and a request whose column holds two or more levels is not guessed
+    // between. A target the mesh rejects at every one of those heights is
+    // still `target_off_mesh`; `meshZ` is always relative to the z the agent
+    // asked for.
+    Manager::PathResolve Manager::ResolvePath(Player* player, float x, float y, float z, bool unitTarget, bool* usedGroundZ, float* groundZOut, bool force, bool* usedMeshZ)
     {
         if (usedGroundZ) *usedGroundZ = false;
+        if (usedMeshZ) *usedMeshZ = false;
         float groundZ = player->GetMap()->GetHeight(player->GetPhaseMask(), x, y, z, true);
         bool haveGround = groundZ > INVALID_HEIGHT && std::fabs(groundZ - z) > 0.5f;
         if (groundZOut) *groundZOut = haveGround ? groundZ : z;
@@ -2363,6 +2422,34 @@ namespace WrathBench
             return r;
         };
 
+        // The last rung: the walkable level over x,y, when the mesh has
+        // exactly one level in the column there (MeshLevelsAt), the request
+        // is under it, and the request rests on no geometry of its own (no
+        // ground height within MESH_LEVEL_MERGE of z, looking down from it).
+        // That is a z buried in the terrain or in the air under a deck: a
+        // stale or wrong one (the character's own, from a lower stretch of
+        // road), and the level above is its one reading. A request resting on
+        // ground the mesh does not walk asked for that ground, not for a
+        // roof or a hilltop over it; a level below the request is not taken
+        // either — the ground rung has judged that, and a tunnel under a
+        // hill is not what a point on the hill asked for. Two or more levels
+        // are two readings and the move stays refused.
+        bool const restsOnGround = groundZ > INVALID_HEIGHT && std::fabs(z - groundZ) <= MESH_LEVEL_MERGE;
+        auto meshLevel = [&](PathResolve r) {
+            if (!isTargetOffMesh(r) || restsOnGround)
+                return withNearest(r);
+            float level = 0.0f;
+            if (MeshLevelsAt(player, x, y, z, &level) != 1 || level <= z + 0.5f
+                || (haveGround && std::fabs(level - groundZ) <= 0.5f))
+                return withNearest(r);
+            PathResolve r3 = ResolvePathAt(player, x, y, level, z, force);
+            if (isTargetOffMesh(r3))
+                return withNearest(r);
+            if (usedMeshZ) *usedMeshZ = true;
+            if (groundZOut) *groundZOut = level;
+            return r3;
+        };
+
         if (unitTarget && haveGround)
         {
             PathResolve r = ResolvePathAt(player, x, y, groundZ, z, force);
@@ -2371,7 +2458,7 @@ namespace WrathBench
                 if (usedGroundZ) *usedGroundZ = true;
                 return r;
             }
-            return withNearest(ResolvePathAt(player, x, y, z, z, force));
+            return meshLevel(ResolvePathAt(player, x, y, z, z, force));
         }
         PathResolve r = ResolvePathAt(player, x, y, z, z, force);
         if (isTargetOffMesh(r) && haveGround)
@@ -2383,7 +2470,7 @@ namespace WrathBench
                 return r2;
             }
         }
-        return withNearest(r);
+        return meshLevel(r);
     }
 
     void Manager::FinishMove(BenchSession& s, char const* status)
@@ -2550,11 +2637,14 @@ namespace WrathBench
             }
             else
             {
-                bool usedGroundZ = false; float groundZ = z;
-                r = ResolvePath(player, x, y, z, !guid.empty(), &usedGroundZ, &groundZ, force);
+                bool usedGroundZ = false, usedMeshZ = false; float groundZ = z;
+                r = ResolvePath(player, x, y, z, !guid.empty(), &usedGroundZ, &groundZ, force, &usedMeshZ);
                 if (usedGroundZ)
                     Audit(*s, "action", Json::Writer().Add("op", "move_ground_z").Add("moveId", moveId)
                         .Add("unitTarget", !guid.empty()).Add("z", (double)z).Add("groundZ", (double)groundZ).Str());
+                if (usedMeshZ)
+                    Audit(*s, "action", Json::Writer().Add("op", "move_mesh_z").Add("moveId", moveId)
+                        .Add("z", (double)z).Add("meshZ", (double)groundZ).Str());
                 if (r.hasEndLift)
                     Audit(*s, "action", Json::Writer().Add("op", "move_end_z").Add("moveId", moveId)
                         .Add("normZ", (double)r.endLiftFrom).Add("meshZ", (double)r.points.back().z).Str());
@@ -4171,12 +4261,30 @@ namespace WrathBench
     // sitting at a platform. The server keeps the same animation
     // (StaticTransport::RelocateToProgress from the same DBC), so the module
     // reports, at most once a second per session, the current position of
-    // every transport the session has been sent (knownObjects: the client's
-    // own object cache) on the character's map, plus `docked` — whether the
+    // each transport the session has been sent (knownObjects: the client's
+    // own object cache) that is within the map's visibility range of the
+    // character or that the character is aboard, plus `docked` — whether the
     // animation segment the clock is on has no displacement, i.e. the car
     // is dwelling at an end. Nothing here is beyond what the client computes
     // locally; it is the riding counterpart of WB_RIDE_PROGRESS for the car
-    // rather than the passenger. World thread only.
+    // rather than the passenger.
+    //
+    // The range is Map::GetVisibilityRange(), the distance at which the core
+    // sends this client every other object (Visibility.Distance.*: 100y on
+    // continents and 170y in instances by default). Transports are the
+    // exception the core makes:
+    // Map::SendInitTransports sends every one on the map at login, so on map
+    // 0 a character in Westfall was told about every ship and zeppelin on the
+    // continent, and reporting each one's clock every second was 56k of a
+    // tank's 84k audit records and pushed its own move verdicts out of the
+    // SDK's event ring in about 30s. A car the character could board or is
+    // waiting for at a platform is within that range of it: the boarding
+    // walk is a short straight line from the platform, and a tram car or a
+    // ship comes into range while it is still pulling in, seconds before it
+    // docks. When a reported car leaves the range the module sends one last
+    // report with `inRange: false` and no `docked`, so the SDK's state does
+    // not keep a car docked at a platform it has since left. World thread
+    // only.
     void Manager::TickTransports(int64_t nowMs)
     {
         std::vector<std::shared_ptr<BenchSession>> sessions;
@@ -4197,20 +4305,37 @@ namespace WrathBench
             if (!map)
                 continue;
             s->lastTransportEmitMs = nowMs;
+            float const range = map->GetVisibilityRange();
+            Transport const* aboard = player->GetTransport();
+            std::unordered_set<uint64_t> inRange;
             for (Transport* t : map->GetAllTransports())
             {
                 if (!t || !t->IsInWorld())
                     continue;
+                uint64_t const guid = (uint64_t)t->GetGUID().GetRawValue();
                 {
                     std::lock_guard<std::mutex> lock(s->objMutex);
-                    if (s->knownObjects.find((uint64_t)t->GetGUID().GetRawValue()) == s->knownObjects.end())
+                    if (s->knownObjects.find(guid) == s->knownObjects.end())
                         continue; // never sent to this client: not observable
                 }
+                bool const near = t == aboard || player->GetExactDist2d(t) <= range;
+                bool const wasNear = s->transportsInRange.count(guid) != 0;
+                if (!near && !wasNear)
+                    continue;
                 Json::Writer w;
-                w.AddGuid("guid", (uint64_t)t->GetGUID().GetRawValue()).Add("entry", t->GetEntry());
+                w.AddGuid("guid", guid).Add("entry", t->GetEntry());
                 w.Raw("pos", PosJson(t->GetPositionX(), t->GetPositionY(), t->GetPositionZ(), t->GetOrientation()));
                 uint32 progress = t->GetPathProgress();
                 w.Add("progressMs", progress);
+                if (!near)
+                {
+                    // Left the range since the last batch: one last report,
+                    // and no `docked`, which would go stale from here on.
+                    w.Add("inRange", false);
+                    EmitEvent(*s, "WB_TRANSPORT_PROGRESS", 0xFF06, w.Str());
+                    continue;
+                }
+                inRange.insert(guid);
                 if (TransportAnimation const* anim = t->GetGOValue()->Transport.AnimationInfo)
                 {
                     w.Add("periodMs", anim->TotalTime);
@@ -4235,6 +4360,10 @@ namespace WrathBench
                     w.Add("periodMs", st->GetPeriod());
                 EmitEvent(*s, "WB_TRANSPORT_PROGRESS", 0xFF06, w.Str());
             }
+            // A map change leaves the old map's guids behind here unreported:
+            // the core's SendRemoveTransports has already told the client
+            // those cars are gone.
+            s->transportsInRange = std::move(inRange);
         }
     }
 

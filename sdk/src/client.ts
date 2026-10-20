@@ -1012,16 +1012,25 @@ export const MOVE_HINTS: Readonly<Record<string, (point: MovePoint, data: MoveRe
   target_off_mesh: (p, d) => {
     // The module's bounded answer about the agent's own point (operator
     // decision, 2026-10-05): the nearest walkable mesh within 20y, or none.
-    const near =
-      d.nearest === undefined
-        ? ""
-        : d.nearest === null
-          ? `; nothing walkable lies within ${TARGET_NEAREST_RADIUS}y of it`
-          : `; the nearest walkable ground within ${TARGET_NEAREST_RADIUS}y is (${fmtXY(d.nearest)}, z ` +
-            `${d.nearest.z.toFixed(1)}), ${Math.round(distance2d(p, d.nearest))}y away`;
+    // Its distance is said across and up or down, never 2D alone: a road
+    // directly over the point asked for is 0y away on the map and 16y up.
+    const asked = `(${fmtXY(p)}, z ${p.z.toFixed(1)}) is not on walkable ground`;
+    const recover = "Pick a point on a road or floor, or where an NPC stands.";
+    const n = d.nearest;
+    if (n === undefined) return `${asked}. ${recover}`;
+    if (n === null) return `${asked}, and nothing walkable lies within ${TARGET_NEAREST_RADIUS}y of it. ${recover}`;
+    const across = distance2d(p, n);
+    const dz = n.z - p.z;
+    const vertical = Math.abs(dz) < 1 ? "" : `${Math.round(Math.abs(dz))}y ${dz > 0 ? "above" : "below"} the point asked for`;
+    if (across < 1) {
+      return (
+        `${asked}; walkable ground at this x,y is at z ${n.z.toFixed(1)}${vertical ? `, ${vertical}` : ""}. ` +
+        `Move to that z, or pick a point on a road or floor, or where an NPC stands.`
+      );
+    }
     return (
-      `(${fmtXY(p)}) is not on walkable ground within 4y (z is searched ±50y, so a wrong z alone is not the ` +
-      `cause)${near}. Pick a point on a road or floor, or where an NPC stands.`
+      `${asked}; the nearest walkable ground within ${TARGET_NEAREST_RADIUS}y is (${fmtXY(n)}, z ${n.z.toFixed(1)}), ` +
+      `${Math.round(across)}y away${vertical ? ` and ${vertical}` : ""}. ${recover}`
     );
   },
   start_off_mesh: () =>
@@ -1350,14 +1359,18 @@ function transportDockHint(state: StateCache, point: MovePoint): string | undefi
     if (!t.docks.some((k) => distance2d(k, point) <= 12)) continue;
     const name = obj.name?.value ?? `transport ${obj.entry?.value ?? "?"}`;
     const at = obj.position?.value;
+    // The module reports a car only while it is within view range of the
+    // character, so a car that has left it is where it was last seen.
     const where =
       at === undefined
         ? "its position has not been reported yet"
-        : t.docked === true
-          ? `it is docked at the other end, (${fmtXY(at)})`
-          : `it is moving, now at (${fmtXY(at)})`;
+        : t.inRange !== true
+          ? `it is too far away to be reported, last seen at (${fmtXY(at)})`
+          : t.docked === true
+            ? `it is docked at the other end, (${fmtXY(at)})`
+            : `it is moving, now at (${fmtXY(at)})`;
     const clock =
-      t.periodMs !== undefined
+      t.periodMs !== undefined && t.inRange === true
         ? ` ${Math.round(t.progressMs / 1000)}s into its ${Math.round(t.periodMs / 1000)}s cycle`
         : "";
     return (
