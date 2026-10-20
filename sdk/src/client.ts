@@ -831,15 +831,25 @@ export type MoveTarget = MovePoint | GuidOrUnit;
 /** Base run speed in yards per second, 3.3.5a. Used only for the ETA hint. */
 const RUN_SPEED_YPS = 7;
 
+/**
+ * `moveTo`'s default wait for its verdict. Sized for the slower of the two
+ * paces a walk can go at, so a route that is all water fits as a route that is
+ * all ground did under the old 90s: a 250yd cap with a route up to ~2.4× the
+ * straight line, at the 4.72yd/s base swim speed (Unit.cpp `baseMoveSpeed`),
+ * plus the module's 3s confirmation deadline.
+ */
+const DEFAULT_MOVE_TIMEOUT_MS = 135_000;
+
 /** How far around a refused target the module looks for walkable mesh to name (PROTOCOL.md, `target_off_mesh`). */
 export const TARGET_NEAREST_RADIUS = 20;
 
 export interface MoveToOptions {
   /**
-   * How long to wait for the terminal `WB_MOVE_RESULT`, in ms. Default 90000: the
-   * single-move cap is ~250yd, which is ~36s at a base run speed of 7yd/s,
-   * plus the module's 3s server-confirmation deadline and slack for a path
-   * that is longer than the straight line.
+   * How long to wait for the terminal `WB_MOVE_RESULT`, in ms. Default 135000: the
+   * single-move cap is ~250yd, which is ~53s at a base swim speed of 4.72yd/s
+   * (~36s at the 7yd/s base run speed), plus the module's 3s
+   * server-confirmation deadline and slack for a path that is longer than the
+   * straight line.
    */
   timeout?: number;
   /**
@@ -5696,7 +5706,7 @@ export class WrathClient {
             !isDecodeError(e.data) &&
             (e.data as MoveResultData).moveId === ack.moveId,
           {
-            timeout: options.timeout ?? 90_000,
+            timeout: options.timeout ?? DEFAULT_MOVE_TIMEOUT_MS,
             epoch,
             description: `the WB_MOVE_RESULT for moveId ${ack.moveId} (move_to verdict)`,
           },

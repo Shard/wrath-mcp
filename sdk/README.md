@@ -290,8 +290,9 @@ Two things still throw:
 
 - `WrathRequestError`: the request was refused before anything moved
   (`missing_position`, `not_in_world`, …).
-- `EventTimeoutError`: no result arrived within `timeout` (default 90000 ms,
-  which is the ~250 yd single-move cap at about 36 s of running plus the
+- `EventTimeoutError`: no result arrived within `timeout` (default 135000 ms,
+  which is the ~250 yd single-move cap at about 53 s of swimming, the slower
+  pace a move can go at, on a route up to ~2.4x the straight line, plus the
   module's server-confirmation deadline). That is the *absence* of an outcome,
   and the character may still be walking, so it is not dressed up as a
   `status`.

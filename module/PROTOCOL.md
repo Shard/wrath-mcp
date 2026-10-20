@@ -338,8 +338,9 @@ Walk the character to a world position. The module resolves the position against
 the server's navmesh once (the single sanctioned mmaps use, docs/CONTRACTS.md
 "Pathing") and then drives the character with the client movement packet
 sequence a real client would send (`MSG_MOVE_START_FORWARD`, heartbeats every
-~500ms, `MSG_MOVE_STOP`) at the character's real run speed. The caller never
-sees the path — only progress and a terminal result event.
+~500ms, `MSG_MOVE_STOP`) at the character's real run speed, or its swim speed
+in water (Swimming, below). The caller never sees the path — only progress
+and a terminal result event.
 
 Request:
 ```json
@@ -368,6 +369,43 @@ request says. Nor does it apply to a step whose foot lies under the ground
 judges whether a fall is survivable: that is a game rule, and the SDK's
 `moveTo` applies it from the facts a `drop` carries (`dz`, `safeFall`) and
 the character's own health before deciding to re-issue with `force`.
+
+Swimming. A route through water is swum the way a client swims it, decided
+from the server's own liquid status (`Map::GetLiquidData`, the query behind
+`IsInWater`/`IsUnderWater`) and the character's collision height, read every
+tick so a mount counts. The numbers are the pinned core's, not measured off a
+client: the core counts a unit as swimming once the water over its feet is
+deeper than 75% of its collision height (`Unit::ProcessTerrainStatusUpdate`,
+which says it mirrors the client), and runs the breath timer only once that
+depth exceeds the whole height (`LIQUID_MAP_UNDER_WATER`). So where the water
+is deeper than the threshold the module sends `MSG_MOVE_START_SWIM` with
+`MOVEMENTFLAG_SWIMMING`, carries the flag and the pitch field the flag puts in
+the packet (level, 0) on every packet after it, stops and facings included,
+paces the walk at `GetSpeed(MOVE_SWIM)` (base 4.72y/s, swim-speed auras
+included, no mounted bonus, `Unit::UpdateSpeed`), and holds the body just
+past the threshold under the surface, a quarter of its height clear of the
+breath timer; back in shallower water it sends `MSG_MOVE_STOP_SWIM` and runs
+again. Shallower water is waded at run speed with the body on the bed. The
+route's own z says neither: the navmesh over water is the surface (the mmaps
+generator keeps a quad's liquid triangles and drops the terrain under them,
+`TerrainBuilder`, "pick higher one"), and the core's path normalization
+(`PathGenerator::NormalizePath`, `WorldObject::UpdateAllowedPositionZ`) then
+lowers points over deep water to its own floating depth for a creature,
+`GetMinHeightInWater`, about 0.59 of the collision height, which its own swim
+test above reads as not swimming, and leaves points over shallows on the
+surface, where a body sent at that z walks on the water. So depth is the
+liquid's (its level less the bed under it), never the level less the route's
+z, and the body's z is the module's. A walkable surface
+more than 1y above the water (a pier, a dock, a bridge) is not water, nor is a
+transport's deck. A forced fall that ends in swimmable water ends with
+`MSG_MOVE_START_SWIM` and no `MSG_MOVE_FALL_LAND`, as a client's does, so the
+server charges no fall. Everything that follows from the flag is the
+server's: `Player::SetInWater` and the terrain-status update remove the auras
+whose spells end on entering or leaving water (a mount among them, where its
+spell says so), and swimming-only checks apply. Outside a move the flag on a
+`stop` or `face` is the server's record of the last one sent
+(`Player::IsInWater`); a move starts from that record and sends the transition
+first if the character's position now says otherwise.
 
 Success `200` (means "queued and pathing", not "arrived"):
 ```json
@@ -1560,7 +1598,11 @@ Synthesized movement logs one `action` record per `move_to`/`stop`/`face`
 request (`force: true` on the record when the request said so) plus one per
 dispatched movement packet (`op: "move_pkt"` with the opcode and position;
 `cause: "drop"` on the stop at a refused ledge, `cause: "drop_forced"` on the
-edge heartbeat and the `MSG_MOVE_FALL_LAND` of a forced one), so the packet
+edge heartbeat and the `MSG_MOVE_FALL_LAND` of a forced one, or the
+`MSG_MOVE_START_SWIM` it becomes when the foot is deep water; `cause:
+"water"` on the `MSG_MOVE_START_SWIM` / `MSG_MOVE_STOP_SWIM` of a swim
+transition, with the mesh's z there, `meshZ`, beside the body's in `pos`, and
+the `collisionHeight` the threshold came from), so the packet
 sequence the "client" sent is fully reconstructable from the audit log.
 A move whose start the mesh does not cover logs `op: "move_start_snap"` with
 `from` (the true position), `to` (the nearest mesh point) and `distance`.

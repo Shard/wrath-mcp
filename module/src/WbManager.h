@@ -138,6 +138,7 @@ namespace WrathBench
         float surfaceZ{0};
         bool force{false};          // request said force: ledges are walked (and fallen off), not refused
         bool inFall{false};         // walking a forced downward ledge: MSG_MOVE_FALL_LAND is owed at its foot
+        bool swimming{false};       // the "client" is swimming: packets carry MOVEMENTFLAG_SWIMMING, pace is swim speed
     };
 
     // Per-token headless session. See docs/METHODOLOGY.md ("Client fidelity")
@@ -495,6 +496,10 @@ namespace WrathBench
         // Mover (world thread only).
         void TickMovers(int64_t nowMs);
         void TickMover(BenchSession& s, int64_t nowMs);
+        // Put the mover's body where a client's physics would over (x, y)
+        // whose walkable surface is meshZ (m.curX/Y/Z), entering or leaving
+        // the water with MSG_MOVE_START_SWIM / MSG_MOVE_STOP_SWIM. World thread.
+        void PlaceMover(BenchSession& s, Player* player, float x, float y, float meshZ, uint32 moveFlags, int64_t nowMs);
         // The character when no move_to is driving it (world thread only): a
         // taxi landing is dropped to the ground the way a client's physics
         // drops it, and the live position is tested against the areatrigger

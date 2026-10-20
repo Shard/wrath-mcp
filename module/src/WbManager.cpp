@@ -1472,17 +1472,30 @@ namespace WrathBench
     // Synthesize one client movement packet (MovementInfo layout mirrors
     // WorldSession::ReadMovementInfo: flags u32, flags2 u16, time u32, xyzo,
     // [ONTRANSPORT: packGUID transport, local xyzo, u32 transport time, i8 seat,]
-    // fallTime u32; no swim/fall extras for ground movement). The module's
+    // [SWIMMING: f32 pitch,] fallTime u32; no fall extras: the module never
+    // sends a packet mid-fall). The module's
     // clock doubles as the "client" clock; CMSG_TIME_SYNC_RESP below keeps the
     // session's clock delta near zero so these timestamps are accepted. When
     // the point is on a transport the packet says so the way a client's would:
     // the server then carries the character as a passenger.
+    //
+    // A swimming client sets MOVEMENTFLAG_SWIMMING on every movement packet
+    // it sends, stops and facings included, and the flag makes the layout
+    // carry the pitch. Every packet derives it from one place so none can
+    // disagree: during a move the mover's own state (PlaceMover flips it and
+    // sends the MSG_MOVE_START_SWIM / MSG_MOVE_STOP_SWIM), outside one the
+    // server's record of the last flag the module sent (Player::IsInWater,
+    // which ProcessMovementInfo keeps from the packets). Never on a
+    // transport: a deck is not water.
     static void SendMovePacket(BenchSession& s, Player* player, uint16 opcode, uint32 moveFlags,
         float x, float y, float z, float o, Transport* transport = nullptr)
     {
         if (transport)
             moveFlags |= MOVEMENTFLAG_ONTRANSPORT;
-        WorldPacket* p = new WorldPacket(opcode, 8 + 4 + 2 + 4 + 16 + 8 + 16 + 4 + 1 + 4);
+        bool const swimming = !transport && (s.move.active ? s.move.swimming : player->IsInWater());
+        if (swimming)
+            moveFlags |= MOVEMENTFLAG_SWIMMING;
+        WorldPacket* p = new WorldPacket(opcode, 8 + 4 + 2 + 4 + 16 + 8 + 16 + 4 + 1 + 4 + 4);
         *p << player->GetPackGUID();
         *p << uint32(moveFlags);
         *p << uint16(0);            // flags2
@@ -1497,8 +1510,76 @@ namespace WrathBench
             *p << uint32(transport->GetPathProgress());
             *p << int8(-1);         // seat: none (not a vehicle)
         }
+        if (swimming)
+            *p << float(0.0f);      // pitch: level, swimming along the surface
         *p << uint32(0);            // fallTime
         s.ws->QueuePacket(p);
+    }
+
+    // Swimming, as the server judges it and a client does it. Every number
+    // here is the pinned core's (docs in module/PROTOCOL.md "Swimming"):
+    //  - a unit swims once the water over its feet is deeper than 75% of its
+    //    collision height (Unit::ProcessTerrainStatusUpdate, "exact mirror of
+    //    client logic"; Creature::UpdateMovementFlags uses the same fraction);
+    //  - the breath timer runs only while the water over its feet is deeper
+    //    than the whole collision height (LIQUID_MAP_UNDER_WATER,
+    //    Map::GetLiquidData; Player::ProcessTerrainStatusUpdate).
+    // So a swimmer at the surface is held at SWIM_DEPTH_FRACTION of its
+    // height plus a margin under the surface: the server's strict ">" sees it
+    // swimming, and it is far (a quarter of its height) from the depth that
+    // starts the breath timer. GetCollisionHeight includes a mount, so a
+    // mounted character wades deeper before it swims, as the core has it.
+    static constexpr float SWIM_DEPTH_FRACTION = 0.75f;
+    static constexpr float SWIM_DEPTH_MARGIN = 0.05f;
+    // A walkable surface more than this above the water is a pier, a dock or
+    // a bridge, not the water: nobody swims on planks. The mesh's own water
+    // polygons lie on the surface within a voxel or two.
+    static constexpr float SWIM_SURFACE_TOLERANCE = 1.0f;
+
+    struct WaterPose
+    {
+        bool swimming{false};
+        float z{0.0f};  // where the body is: the swim depth, the bed when wading, else the mesh's z
+    };
+
+    // Where a client's character is over (x, y) when the walkable surface the
+    // route gives there is meshZ, from the server's own liquid status
+    // (Map::GetLiquidData, the same query IsInWater/IsUnderWater make: ADT
+    // and WMO liquid, any type) and the character's collision height now.
+    // The route's z says nothing about depth: the navmesh over water is the
+    // surface (the mmaps generator keeps a quad's liquid triangles and drops
+    // the terrain under them, TerrainBuilder "pick higher one"), and the
+    // core's NormalizePath (UpdateAllowedPositionZ) lowers points over deep
+    // water to GetMinHeightInWater, ~0.59 of the height, which its own swim
+    // test reads as not swimming, and leaves points over shallows on the
+    // surface. So the depth is the liquid's own (Level minus the bed,
+    // DepthLevel), never Level minus meshZ. Deeper than the threshold:
+    // swimming, the body held under the surface as above (never below the
+    // bed). Shallower: wading, the body on the bed, at run speed, as a client
+    // walks through shallows. World thread.
+    static WaterPose WaterPoseAt(Player* player, float x, float y, float meshZ)
+    {
+        WaterPose pose;
+        pose.z = meshZ;
+        Map* map = player->GetMap();
+        if (!map)
+            return pose;
+        float const height = player->GetCollisionHeight();
+        LiquidData const liquid = map->GetLiquidData(player->GetPhaseMask(), x, y, meshZ, height, {});
+        if (liquid.Status == LIQUID_MAP_NO_WATER || liquid.Level <= INVALID_HEIGHT || liquid.DepthLevel <= INVALID_HEIGHT
+            || liquid.Level <= liquid.DepthLevel)
+            return pose;
+        if (meshZ > liquid.Level + SWIM_SURFACE_TOLERANCE)
+            return pose;
+        float const swimDepth = height * SWIM_DEPTH_FRACTION + SWIM_DEPTH_MARGIN;
+        if (liquid.Level - liquid.DepthLevel > swimDepth)
+        {
+            pose.swimming = true;
+            pose.z = std::max(liquid.DepthLevel, liquid.Level - swimDepth);
+        }
+        else if (liquid.DepthLevel < meshZ)
+            pose.z = liquid.DepthLevel;
+        return pose;
     }
 
     // Does the navmesh have a tile loaded under this point? Mirrors
@@ -2515,6 +2596,12 @@ namespace WrathBench
         m.curO = Position::NormalizeOrientation(std::atan2(m.points[1].y - m.points[0].y, m.points[1].x - m.points[0].x));
         m.stopping = false;
         m.active = true;
+        // Where the body starts, from the server's record of the last swim
+        // flag sent: a character idling in water starts swimming, and one the
+        // world moved in or out of water since (a teleport, a knockback)
+        // sends the transition first, as a client's physics would.
+        m.swimming = player->IsInWater();
+        PlaceMover(*s, player, m.curX, m.curY, m.curZ, MOVEMENTFLAG_NONE, now);
 
         SendMovePacket(*s, player, MSG_MOVE_START_FORWARD, MOVEMENTFLAG_FORWARD, m.curX, m.curY, m.curZ, m.curO,
             FindTransportAt(player->GetMap(), m.curX, m.curY, m.curZ));
@@ -3654,6 +3741,40 @@ namespace WrathBench
         }
     }
 
+    // The mover's body over a point of its route, and the swim transition a
+    // client sends on its own when it gets there: MSG_MOVE_START_SWIM, the
+    // flag set, on reaching water deeper than the swim threshold, and
+    // MSG_MOVE_STOP_SWIM, the flag cleared, on reaching the shallows again.
+    // The server does the rest from those packets, as for a client: its
+    // Player::SetInWater (ProcessMovementInfo, on the flag changing) and its
+    // terrain-status update remove the auras that end on entering or leaving
+    // water — a mount whose spell says so included — and the pace changes
+    // because TickMover reads GetSpeed(MOVE_SWIM) while swimming, which
+    // carries no mounted-speed bonus (Unit::UpdateSpeed). Not on a transport
+    // (no water on a deck), and nothing while a forced ledge is being fallen:
+    // no packet goes out mid-fall, and the landing decides.
+    void Manager::PlaceMover(BenchSession& s, Player* player, float x, float y, float meshZ, uint32 moveFlags, int64_t nowMs)
+    {
+        MoveState& m = s.move;
+        m.curX = x; m.curY = y; m.curZ = meshZ;
+        if (m.inFall)
+            return;
+        Transport* transport = FindTransportAt(player->GetMap(), x, y, meshZ);
+        WaterPose const pose = transport ? WaterPose{false, meshZ} : WaterPoseAt(player, x, y, meshZ);
+        m.curZ = pose.z;
+        if (pose.swimming == m.swimming)
+            return;
+        m.swimming = pose.swimming;
+        char const* opcode = pose.swimming ? "MSG_MOVE_START_SWIM" : "MSG_MOVE_STOP_SWIM";
+        SendMovePacket(s, player, pose.swimming ? MSG_MOVE_START_SWIM : MSG_MOVE_STOP_SWIM, moveFlags,
+            m.curX, m.curY, m.curZ, m.curO, transport);
+        m.lastPacketMs = nowMs;
+        Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", opcode)
+            .Add("moveId", m.moveId).Add("cause", "water").Add("meshZ", (double)meshZ)
+            .Add("collisionHeight", (double)player->GetCollisionHeight())
+            .Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO)).Str());
+    }
+
     void Manager::TickMovers(int64_t nowMs)
     {
         std::vector<std::shared_ptr<BenchSession>> sessions;
@@ -3744,8 +3865,10 @@ namespace WrathBench
         if (dt <= 0)
             return;
 
-        // Advance along the polyline at the character's current run speed.
-        float advance = player->GetSpeed(MOVE_RUN) * float(dt) / 1000.0f;
+        // Advance along the polyline at the character's current speed: swim
+        // speed while swimming (base 4.72y/s, swim-speed auras included, no
+        // mount bonus), run speed otherwise (wading included), as a client.
+        float advance = player->GetSpeed(m.swimming ? MOVE_SWIM : MOVE_RUN) * float(dt) / 1000.0f;
         while (m.seg + 1 < m.points.size())
         {
             WbVec const& a = m.points[m.seg];
@@ -3789,7 +3912,7 @@ namespace WrathBench
                     bool buried = dz < 0.0f && FootUnderSurface(player, a, b, &surfaceZ);
                     if (!m.force || dz > 0.0f || buried)
                     {
-                        m.curX = a.x; m.curY = a.y; m.curZ = a.z;
+                        PlaceMover(s, player, a.x, a.y, a.z, MOVEMENTFLAG_FORWARD, nowMs);
                         SendMovePacket(s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, m.curX, m.curY, m.curZ, m.curO,
                             FindTransportAt(player->GetMap(), m.curX, m.curY, m.curZ));
                         Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_STOP")
@@ -3805,12 +3928,13 @@ namespace WrathBench
                     if (dz < 0.0f && !m.inFall)
                     {
                         m.curO = Position::NormalizeOrientation(std::atan2(sy, sx));
-                        SendMovePacket(s, player, MSG_MOVE_HEARTBEAT, MOVEMENTFLAG_FORWARD, a.x, a.y, a.z, m.curO,
+                        PlaceMover(s, player, a.x, a.y, a.z, MOVEMENTFLAG_FORWARD, nowMs);
+                        SendMovePacket(s, player, MSG_MOVE_HEARTBEAT, MOVEMENTFLAG_FORWARD, m.curX, m.curY, m.curZ, m.curO,
                             FindTransportAt(player->GetMap(), a.x, a.y, a.z));
                         m.lastPacketMs = nowMs;
                         Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_HEARTBEAT")
                             .Add("moveId", m.moveId).Add("cause", "drop_forced").Add("dz", (double)dz)
-                            .Raw("pos", PosJson(a.x, a.y, a.z, m.curO)).Str());
+                            .Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO)).Str());
                         m.inFall = true;
                     }
                 }
@@ -3833,14 +3957,24 @@ namespace WrathBench
             if (m.inFall)
             {
                 // The foot of the forced ledge: land there, as a client does.
+                // A fall that ends in water deep enough to swim ends the way a
+                // client's does, with MSG_MOVE_START_SWIM and no
+                // MSG_MOVE_FALL_LAND: the server charges a fall only on the
+                // landing (Player::HandleFall), and treats the swim start as
+                // the end of the fall (ProcessMovementInfo).
                 m.inFall = false;
-                m.curX = b.x; m.curY = b.y; m.curZ = b.z;
-                SendMovePacket(s, player, MSG_MOVE_FALL_LAND, MOVEMENTFLAG_FORWARD, b.x, b.y, b.z, m.curO,
-                    FindTransportAt(player->GetMap(), b.x, b.y, b.z));
+                Transport* landT = FindTransportAt(player->GetMap(), b.x, b.y, b.z);
+                WaterPose const pose = landT ? WaterPose{false, b.z} : WaterPoseAt(player, b.x, b.y, b.z);
+                m.curX = b.x; m.curY = b.y; m.curZ = pose.z;
+                bool const intoWater = pose.swimming && !m.swimming;
+                m.swimming = pose.swimming;
+                char const* landOpcode = intoWater ? "MSG_MOVE_START_SWIM" : "MSG_MOVE_FALL_LAND";
+                SendMovePacket(s, player, intoWater ? MSG_MOVE_START_SWIM : MSG_MOVE_FALL_LAND, MOVEMENTFLAG_FORWARD,
+                    m.curX, m.curY, m.curZ, m.curO, landT);
                 m.lastPacketMs = nowMs;
-                Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_FALL_LAND")
+                Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", landOpcode)
                     .Add("moveId", m.moveId).Add("cause", "drop_forced")
-                    .Raw("pos", PosJson(b.x, b.y, b.z, m.curO)).Str());
+                    .Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO)).Str());
                 // The server may have killed the character on landing; the
                 // next heartbeat's drift check or the death handling ends the
                 // move as `interrupted` in that case, as for any other death.
@@ -3849,17 +3983,22 @@ namespace WrathBench
 
         if (m.seg + 1 >= m.points.size())
         {
-            // Geometric end of path: send the stop at the exact destination and
-            // wait for the server to confirm.
-            m.curX = m.destX; m.curY = m.destY; m.curZ = m.destZ;
-            SendMovePacket(s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, m.destX, m.destY, m.destZ, m.curO,
+            // Geometric end of path: send the stop at the exact destination
+            // (the body's z there: under the surface when swimming) and wait
+            // for the server to confirm.
+            PlaceMover(s, player, m.destX, m.destY, m.destZ, MOVEMENTFLAG_FORWARD, nowMs);
+            SendMovePacket(s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, m.curX, m.curY, m.curZ, m.curO,
                 FindTransportAt(player->GetMap(), m.destX, m.destY, m.destZ));
             Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_STOP")
-                .Add("moveId", m.moveId).Raw("pos", PosJson(m.destX, m.destY, m.destZ, m.curO)).Str());
+                .Add("moveId", m.moveId).Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO)).Str());
             m.stopping = true;
             m.stopDeadlineMs = nowMs + 3000;
             return;
         }
+
+        // The body over the point just reached: under the surface or on the
+        // bed in water, with the swim transition when it changes.
+        PlaceMover(s, player, m.curX, m.curY, m.curZ, MOVEMENTFLAG_FORWARD, nowMs);
 
         // Heartbeat cadence, as a real client: ~500ms. Before each heartbeat,
         // verify the server actually applied the previous packets; a large gap
