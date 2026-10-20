@@ -230,13 +230,17 @@ export interface CharacterSummary {
 }
 
 /**
- * One chat line as the module decoded it. `senderName` is present only when
- * the packet's own layout carried a name — creature speech (`type` 12–16,
- * 41–42: say/yell/emote/whisper from an NPC) and foreign-language whispers —
- * since a creature has no name-query path; a player sender is named through
- * `state.nameOf(senderGuid)` when a name query has answered. `channelName`
- * rides channel lines (`type` 17), `achievementId` the achievement broadcast
- * (`type` 48/49, whose `message` is the client's raw `%s`/`$a` template).
+ * One chat line as the module decoded it. `senderName` is the packet's own
+ * name where its layout carries one — creature speech (`type` 12–16, 41–42:
+ * say/yell/emote/whisper from an NPC) and foreign-language whispers — and
+ * otherwise, on `state.chat`, the name query's answer for the sender
+ * (`state.nameOf(senderGuid)`) once one has arrived. `type` 9
+ * (`WHISPER_INFORM`) is the server's echo of our own whisper, and the core
+ * puts the *recipient* in the sender's place: its `senderGuid` and
+ * `senderName` name who it went to. `channelName` rides channel lines
+ * (`type` 17), `achievementId` the achievement broadcast (`type` 48/49, whose
+ * `message` is the client's raw `%s`/`$a` template); a creature emote's
+ * `message` is the same kind of template, `%s` standing for the sender.
  */
 export interface ChatEntry {
   readonly seq: number;
@@ -925,8 +929,12 @@ export interface AuraEntry {
   readonly level: number | undefined;
   readonly stacks: number | undefined;
   readonly casterGuid: GuidKey | undefined;
+  /** Total length in ms, when the aura shows a timer (`flags & 0x20`). */
   readonly maxDuration: number | undefined;
+  /** What was left of it in ms when the packet was sent, at `ts`. */
   readonly duration: number | undefined;
+  /** The aura's spell name (Spell.dbc, as the buff frame shows it); undefined when the module served none. `aurasOf` falls back to the spellbook's. */
+  readonly name: string | undefined;
   readonly seq: number;
   readonly ts: number;
 }
@@ -1766,9 +1774,22 @@ export class StateCache {
     this.adoptOwnCharacter();
   }
 
-  /** Chat lines, oldest first. */
+  /** Chat lines, oldest first, each player sender named once a name query has answered (see `ChatEntry`). */
   get chat(): readonly ChatEntry[] {
-    return this.chatBuf;
+    return this.namedChat();
+  }
+
+  /**
+   * The chat buffer with `senderName` joined from `names` on read: the answer
+   * to a sender's name query often lands after the line itself, so the join
+   * is made when the line is read rather than when it was folded.
+   */
+  private namedChat(): ChatEntry[] {
+    return this.chatBuf.map((c) => {
+      if (c.senderName !== undefined) return c;
+      const name = this.nameOf(c.senderGuid);
+      return name === undefined ? c : { ...c, senderName: name };
+    });
   }
 
   /** Client-visible notifications (the game-error channel), oldest first. */
@@ -2094,11 +2115,17 @@ export class StateCache {
     return this.nearby.get(guid);
   }
 
-  /** Visible auras on a unit, by slot. Empty when none have been observed. */
+  /**
+   * Visible auras on a unit, by slot — your own buff and debuff bar with
+   * `state.aurasOf(state.self.guid)`. Empty when none have been observed.
+   * `name` is the module's Spell.dbc name, else the spellbook's for the id.
+   */
   aurasOf(guid: GuidKey): AuraEntry[] {
     const slots = this.auraSlots.get(guid);
     if (!slots) return [];
-    return [...slots.values()].sort((a, b) => a.slot - b.slot);
+    return [...slots.values()]
+      .sort((a, b) => a.slot - b.slot)
+      .map((a) => (a.name !== undefined ? a : { ...a, name: this.spell(a.spellId)?.name }));
   }
 
   /**
@@ -2616,7 +2643,7 @@ export class StateCache {
       money: this.money,
       xp: this.xp,
       nextLevelXp: this.nextLevelXp,
-      chat: [...this.chatBuf],
+      chat: this.namedChat(),
       notifications: [...this.notifyBuf],
       motd: this.motd,
       gaps: [...this.gapBuf],
@@ -3379,6 +3406,7 @@ export class StateCache {
             casterGuid: a.casterGuid,
             maxDuration: a.maxDuration,
             duration: a.duration,
+            name: a.name,
             seq: event.seq,
             ts: event.ts,
           });

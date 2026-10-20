@@ -1210,9 +1210,12 @@ Combat:
 | `SMSG_AURA_UPDATE_ALL` | 0x495 | same shape, full visible-aura list |
 
 `<aura>` is `{ "slot": <u8>, "spellId": <u32>, "flags"?, "level"?, "stacks"?,
-"casterGuid"?, "maxDuration"?, "duration"? }`; `spellId` 0 means the slot was
+"casterGuid"?, "maxDuration"?, "duration"?, "name"? }`; `spellId` 0 means the slot was
 cleared and the entry carries `"removed": true` instead of the optional fields.
-Durations are in ms and present only when the aura shows one (`flags & 0x20`).
+Durations are in ms and present only when the aura shows one (`flags & 0x20`);
+`duration` is what was left when the packet was sent. `name` is the client's
+Spell.dbc name for the id, the one its buff frame shows (client-cache
+knowledge, as on the spellbook rows); absent when the core has no name for it.
 
 Swing errors. `SMSG_ATTACKSWING_NOTINRANGE` and `SMSG_ATTACKSWING_BADFACING`
 are the two packets a client shows as on-screen errors while auto-attack is

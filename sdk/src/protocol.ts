@@ -973,6 +973,8 @@ export const auraSchema = z.looseObject({
   casterGuid: guidSchema.optional(),
   maxDuration: z.number().optional(),
   duration: z.number().optional(),
+  /** The client's Spell.dbc name for the id, as its buff frame shows it; absent when the module has none. */
+  name: z.string().optional(),
 });
 export type AuraData = z.infer<typeof auraSchema>;
 

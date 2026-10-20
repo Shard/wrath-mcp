@@ -313,6 +313,21 @@ falls through terrain. The split is deliberate: the module reports the ledge
 and walks it on request with the fall packets a client sends, so the server
 charges the fall; what a fall costs is a game rule and lives here.
 
+`moveToAsync` acks with a `moveId` and nothing more, so the client watches that
+move's `WB_MOVE_RESULT` and tallies any verdict but an arrival, a transfer, a
+teleport, `superseded` or `stopped` on the harness hint channel as
+`moveToAsync <status>` (re-sending a move is how a caller steers with it, so
+those two are the steering, not failures; operator, 2026-10-20), the same
+recipe `moveTo` returns: a move refused at planning (`too_far`, `drop`) never
+started, and the ack alone let a snippet sleep on it.
+
+A dead character that has not released its spirit is a body, and a body cannot
+move or fight: `moveTo` answers `dead` and `moveToAsync` rejects, both with
+nothing sent, and `killTarget` answers `dead` for a body and for a ghost alike.
+A ghost walks. Unobserved health is never read as dead. An `interrupted` verdict
+that finds the character dead (the health-0 block precedes the result in the
+same tick) says the character died.
+
 A `moveTo` issued while another is running supersedes it, and the older call
 returns `status: "superseded"`. `stop()` returns as soon as the module has
 queued the `MSG_MOVE_STOP`; it does *not* wait for the character to halt. It is
@@ -386,7 +401,14 @@ for it (`97` is `out_of_range`, `67` `not_ready`; `spellCastResultName`), or
 `undefined` for a code outside that enum. The name is the key the client's own
 failure text uses, so it is client-visible knowledge, like the
 `InventoryResult` sentences. `castSpell` itself still acks the dispatch only:
-these events, or `SMSG_SPELL_GO`, are the outcome.
+these events, or `SMSG_SPELL_GO`, are the outcome. The client watches each
+`castSpell` for that outcome, though, and tallies a failure on the harness
+hint channel as `castSpell <reason>` with the spell and target named, so a
+refusal reaches the model whichever snippet or routine cast it. Matched by
+spell id (`SMSG_CAST_FAILED` names no caster), watched past the cast time once
+the cast starts, ended by `SMSG_SPELL_GO`; `dont_report`, the server's silent
+cancel a repop sends in a burst, is not a refusal. Helpers that read their own
+cast verdicts (the chest's Opening ladder) dispatch untracked.
 
 ## State cache
 

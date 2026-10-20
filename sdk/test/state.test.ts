@@ -139,8 +139,11 @@ describe("state cache: what it learns from events", () => {
     expect(cache.chat[0]).toMatchObject({ type: 12, senderName: "Grizzled Sentry", receiverGuid: "7", message: "Halt, traveller." });
     expect(cache.chat[1]).toMatchObject({ type: 17, channelName: "General", message: "anyone selling linen" });
     expect(cache.chat[2]).toMatchObject({ type: 48, achievementId: 6 });
-    // A player's say carries no optional field at all — nothing is invented.
-    expect(Object.keys(cache.chat[3]!).sort()).toEqual(["chatTag", "language", "message", "senderGuid", "seq", "ts", "type"]);
+    // A player's say carries no optional field of the packet's; its one extra
+    // is the sender's name joined on read (our own, from the seed) — nothing
+    // is invented.
+    expect(Object.keys(cache.chat[3]!).sort()).toEqual(["chatTag", "language", "message", "senderGuid", "senderName", "seq", "ts", "type"]);
+    expect(cache.chat[3]?.senderName).toBe("Fenwick");
     // A chat speaker is still not a nearby object, named or not.
     expect(cache.nearby.size).toBe(0);
   });

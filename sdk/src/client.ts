@@ -944,12 +944,14 @@ export type MoveResult =
       /**
        * Nothing was dispatched: the unit or guid handed to `moveTo` names no
        * position the state cache can see, so there is no point to walk to and
-       * no move to have an outcome. Not a `WB_MOVE_RESULT` status — the module's
+       * no move to have an outcome (`unknown_target`), or the character is a
+       * corpse, which cannot move (`dead`; a released ghost can). Not a `WB_MOVE_RESULT` status — the module's
        * status vocabulary is the module's word; this arm is the SDK
        * answering before the wire, the way `killTarget` answers `lost`.
        */
       readonly ok: false;
-      readonly status: "unknown_target";
+      /** `dead`: our body is dead and not released; a corpse cannot move, a ghost can. */
+      readonly status: "unknown_target" | "dead";
       /** Never present here: there was no move. */
       readonly moveId?: undefined;
       readonly position?: undefined;
@@ -1004,8 +1006,8 @@ export type MoveResult =
  */
 export const MOVE_HINTS: Readonly<Record<string, (point: MovePoint, data: MoveResultData) => string>> = {
   too_far: (p, d) =>
-    `(${fmtXY(p)}) is ${Math.round(Math.hypot(p.x - d.pos.x, p.y - d.pos.y))}y away in a straight line; ` +
-    `a single moveTo covers ~250y. Walk to an intermediate point first.`,
+    `(${fmtXY(p)}) is ${Math.round(Math.hypot(p.x - d.pos.x, p.y - d.pos.y))}y from where you stand, in a straight line; ` +
+    `one move (moveTo or moveToAsync alike) covers ~250y. Walk to an intermediate point first.`,
   no_mesh: (p) =>
     `no navmesh is loaded under you or under (${fmtXY(p)}); this is a harness data limitation, not a route ` +
     `problem. Nothing to retry here — choose a destination in a mapped area.`,
@@ -1053,7 +1055,7 @@ export const MOVE_HINTS: Readonly<Record<string, (point: MovePoint, data: MoveRe
     return (
       `the route to (${fmtXY(p)}, z ${p.z.toFixed(1)}) steps off a ledge of ${n} yards at (${fmtXY(edge)}); ` +
       `the character stopped at the edge and did not take the drop. Pick a destination on this level, ` +
-      `find the ramp/stairs that connect the two, or pass { force: true } to moveTo to take it anyway.`
+      `find the ramp/stairs that connect the two, or pass { force: true } to take it anyway.`
     );
   },
   interrupted: () =>
@@ -1074,6 +1076,23 @@ export const MOVE_HINTS: Readonly<Record<string, (point: MovePoint, data: MoveRe
     `stop() ended this move, called from within this run: by your own code, after another moveTo was refused, ` +
     `or at a snippet's time limit.`,
 };
+
+/**
+ * `moveToAsync` verdicts the harness does not report: the move's own success
+ * (an arrival, a portal, a teleport), and the two ends a caller makes
+ * itself. Re-sending a move is how a caller steers with `moveToAsync`, so a
+ * `superseded` or `stopped` older move is the steering, not a failure
+ * (operator, 2026-10-20).
+ */
+const ASYNC_MOVE_UNREPORTED: ReadonlySet<string> = new Set(["arrived", "transferred", "teleported", "superseded", "stopped"]);
+
+/** The refusal of a move while dead and not released; nothing is sent. */
+const DEAD_MOVE_HINT =
+  "you are dead and a corpse cannot move; nothing was sent. sdk.repop() releases your spirit, and a ghost can walk.";
+
+/** `interrupted` when the verdict found the character dead. */
+const MOVE_DIED_HINT =
+  "the move stopped because the character died. A corpse cannot move: sdk.repop() releases the spirit, and a ghost can walk.";
 
 /**
  * The server's fall-damage rule (Player::HandleFall in the pinned core): a fall
@@ -1607,8 +1626,9 @@ export type KillResult =
       /**
        * `player_died` — we died. `lost` — it left view alive. `timeout` — still
        * up. `aborted_low_health` — we broke off at `abortBelowHealthPct`.
+       * `dead` — we were already dead (a corpse or a ghost) and nothing was sent.
        */
-      readonly status: "player_died" | "lost" | "timeout" | "aborted_low_health";
+      readonly status: "player_died" | "lost" | "timeout" | "aborted_low_health" | "dead";
     } & KillResultFacts);
 
 /** How each outcome reads, before the note and the armed/disarmed clause. */
@@ -1826,6 +1846,7 @@ const KILL_DETAIL: Record<KillResult["status"], string> = {
   lost: "target left view alive",
   timeout: "timed out with both alive",
   aborted_low_health: "broke off on low health",
+  dead: "you are dead",
 };
 
 /**
@@ -2080,6 +2101,77 @@ function useItemCastFailedHint(label: string, spellId: number, result: number, r
     );
   }
   return `${label} was not used: the server refused its spell ${spellId} before the cast began (${reason ?? `code ${result}`})`;
+}
+
+/** A `castSpell` waiting for the server's first word on it (`WrathClient.castVerdict`). */
+interface PendingCast {
+  readonly spellId: number;
+  readonly targetGuid: string | undefined;
+  /** The stream position before the dispatch: a refusal can land before the ack. */
+  readonly sinceSeq: number | undefined;
+  /** When the watch lapses (epoch ms); a cast that starts pushes it out by its cast time. */
+  expiresAt: number;
+}
+
+/**
+ * How long a `castSpell` is watched for a refusal, in ms, past the dispatch or
+ * past its cast time once it starts. The refusal lands in the dispatch's own
+ * world tick (the 2026-10-20 party runs: every `SMSG_CAST_FAILED` in the same
+ * millisecond as its `cast_spell`), so this only bounds a stale match.
+ */
+const CAST_VERDICT_MS = 3000;
+
+/**
+ * What a cast failure means, in a few words, for the reasons runs hit. A
+ * reason not listed is named and nothing more is said.
+ */
+const CAST_FAILURE_MEANING: Readonly<Record<string, string>> = {
+  line_of_sight: "something blocks the line of sight to the target",
+  out_of_range: "the target is out of this spell's range",
+  unit_not_infront: "the target is not in front of you",
+  not_infront: "you are not facing the target",
+  caster_dead: "you are dead",
+  interrupted: "the cast was interrupted (moving or acting during it)",
+  no_power: "not enough mana, rage or energy",
+  moving: "you were moving, and a cast with a cast time needs you standing still",
+  not_ready: "its cooldown, or the global cooldown, is still running",
+  spell_in_progress: "another cast was still in progress",
+  bad_targets: "the target is not a valid target for this spell",
+  bad_implicit_targets: "it has no valid target; pass one",
+  targets_dead: "the target is dead",
+  target_not_dead: "the target is not dead",
+  target_friendly: "the target is friendly",
+  target_enemy: "the target is hostile",
+  too_close: "the target is too close",
+  not_behind: "you must be behind the target",
+  unit_not_behind: "you must be behind the target",
+  silenced: "you are silenced",
+  stunned: "you are stunned",
+  pacified: "you are pacified",
+  not_known: "you do not know this spell",
+  no_combo_points: "it needs combo points on the target",
+  reagents: "a reagent it needs is missing",
+  nothing_to_dispel: "the target has nothing it can dispel",
+};
+
+/**
+ * The harness hint for a cast the server refused or interrupted: the spell
+ * and its target by name where the cache has them, so a failure raised in a
+ * background routine says which cast it was.
+ */
+function castFailedHint(state: StateCache, cast: PendingCast, reason: string): string {
+  const spell = state.spell(cast.spellId)?.name;
+  const label = spell === undefined ? `spell ${cast.spellId}` : `${spell} (${cast.spellId})`;
+  let on = "";
+  if (cast.targetGuid !== undefined) {
+    const key = guidKey(cast.targetGuid);
+    const name = state.nearby.get(key)?.name?.value ?? state.nameOf(key);
+    on = ` on ${name ?? cast.targetGuid}`;
+  }
+  const meaning = CAST_FAILURE_MEANING[reason];
+  // The reason itself is the tally line's status (`castSpell <reason>: …`), so
+  // the hint says what it means and names nothing twice.
+  return `${label}${on}: ${meaning ?? "the server refused it"}`;
 }
 
 /** The quest an item's tooltip says it starts, when the tooltip has been observed and says so. */
@@ -3022,7 +3114,19 @@ export interface SpiritHealerOptions {
  * when its position is cached.
  */
 export type SpiritHealerResult =
-  | { readonly ok: true; readonly status: "resurrected" }
+  | {
+      readonly ok: true;
+      readonly status: "resurrected";
+      /**
+       * Where you are now: the spirit healer resurrects you where you stand, at
+       * the graveyard your spirit was released to, which need not be the one
+       * nearest your corpse. `position` and the zone and subzone names are the
+       * cache's (`state.self`), undefined when unobserved.
+       */
+      readonly position: WorldPosition | undefined;
+      readonly zone: string | undefined;
+      readonly area: string | undefined;
+    }
   | { readonly ok: false; readonly status: "unconfirmed"; readonly distance: number | undefined; readonly hint: string };
 
 /**
@@ -3144,6 +3248,9 @@ export class WrathClient {
   /** Hint-bearing failures since the last drain, by `action:status`. See `ActionHint`. */
   private readonly actionHints = new Map<string, ActionHint>();
 
+  /** `castSpell` casts awaiting the server's first word, by spell id (`castVerdict`). */
+  private readonly pendingCasts = new Map<number, PendingCast>();
+
   /**
    * The last `moveTo` the server refused without moving anything, kept for
    * `MOVE_REJECTION_MEMO_MS` so an identical repeat from the same spot is
@@ -3190,6 +3297,7 @@ export class WrathClient {
     // cache first: the client-parity queries read what each event left in it.
     this.events.onAny((event: StreamEvent) => this.state.apply(event));
     this.events.onAny((event: StreamEvent) => this.clientParityQueries(event));
+    this.events.onAny((event: StreamEvent) => this.castVerdict(event));
   }
 
   /**
@@ -3525,9 +3633,70 @@ export class WrathClient {
           `instead of throwing.)`,
       );
     }
+    if (this.isCorpse()) {
+      this.noteActionHint("moveToAsync", "dead", DEAD_MOVE_HINT);
+      return Promise.reject(new Error(`moveToAsync: ${DEAD_MOVE_HINT}`));
+    }
     // The raw tier: no fall estimate stands in for the caller. A `drop`
     // arrives as the event it is, and `force` is the caller's own word.
-    return this.postMoveTo(resolved.point, resolved.guid, options.force === true);
+    const epoch = this.events.epoch;
+    return this.postMoveTo(resolved.point, resolved.guid, options.force === true).then((ack) => {
+      this.watchAsyncMove(ack.moveId, resolved.point, epoch);
+      return ack;
+    });
+  }
+
+  /**
+   * Tally a `moveToAsync` refusal or other non-arrival (not `superseded` or
+   * `stopped`: see `ASYNC_MOVE_UNREPORTED`), so the hint reaches
+   * the model on its next tool result the way a background `moveTo`'s does:
+   * the ack said only that the move was queued, and a move refused at
+   * planning (`too_far`, `drop`) never starts. Matched on the moveId within
+   * the session epoch, buffered events included (an immediate refusal can
+   * land before the ack); unwatched after the verdict or `moveTo`'s own
+   * default wait.
+   */
+  private watchAsyncMove(moveId: number, point: MovePoint, epoch: number): void {
+    this.events
+      .waitFor(
+        (e) => isEvent(e, "WB_MOVE_RESULT") && !isDecodeError(e.data) && (e.data as MoveResultData).moveId === moveId,
+        { timeout: DEFAULT_MOVE_TIMEOUT_MS, epoch, description: `the WB_MOVE_RESULT for moveToAsync moveId ${moveId}` },
+      )
+      .then((event) => {
+        const data = event.data as MoveResultData;
+        const status = status_(data);
+        if (ASYNC_MOVE_UNREPORTED.has(status)) return;
+        let recipe = this.moveRecipe(status, point, data);
+        if (status === "drop" && this.state.self.ghost?.value === true && recipe !== undefined) {
+          recipe += " A ghost takes no fall damage.";
+        }
+        this.noteActionHint("moveToAsync", status, recipe, point);
+      })
+      .catch(() => {});
+  }
+
+  /**
+   * The per-status recipe for a move verdict that did not arrive, shared by
+   * `moveTo` and `moveToAsync`. An `interrupted` move whose verdict found the
+   * character dead (the server's health-0 update precedes the result in the
+   * same tick) says so instead of listing the possible causes.
+   */
+  private moveRecipe(status: string, point: MovePoint, data: MoveResultData, judged?: DropJudgement): string | undefined {
+    if (status === "interrupted" && this.isCorpse()) return MOVE_DIED_HINT;
+    return (
+      (status === "target_off_mesh" ? transportDockHint(this.state, point) : undefined) ??
+      (status === "drop" && judged !== undefined ? dropRefusalHint(point, data, judged) : undefined) ??
+      MOVE_HINTS[status]?.(point, data)
+    );
+  }
+
+  /**
+   * Dead and not released: own health observed at 0 without the ghost flag.
+   * A body cannot move, attack or cast; a released ghost can walk. Unobserved
+   * health is never read as dead.
+   */
+  private isCorpse(): boolean {
+    return this.state.self.health?.value.current === 0 && this.state.self.ghost?.value !== true;
   }
 
   /** The `move_to` POST itself; `guid` is the planning hint `resolveMoveTarget` attaches to unit targets. */
@@ -3628,12 +3797,86 @@ export class WrathClient {
     return this.action({ action: "attack_stop" });
   }
 
-  /** `CMSG_CAST_SPELL`. No target guid means self/auto-target. */
+  /**
+   * `CMSG_CAST_SPELL`. No target guid means self/auto-target. Acks the
+   * dispatch only: the outcome is `SMSG_SPELL_GO`, or `SMSG_CAST_FAILED` /
+   * `SMSG_SPELL_FAILURE` with `reason`. A failure is also tallied as a
+   * harness hint (`castSpell <reason>`, naming the spell and the target), so
+   * it reaches the model whether a snippet or a background routine cast it.
+   */
   castSpell(spellId: number, targetGuid?: GuidOrUnit): Promise<WithResolved<ActionResponse>> {
-    if (targetGuid === undefined) return this.action({ action: "cast_spell", spellId });
-    return this.byName(targetGuid, "castSpell(spellId, targetGuid)", (guid) =>
-      this.action({ action: "cast_spell", spellId, targetGuid: guid }),
-    );
+    if (targetGuid === undefined) return this.trackedCast(spellId, undefined);
+    return this.byName(targetGuid, "castSpell(spellId, targetGuid)", (guid) => this.trackedCast(spellId, guid));
+  }
+
+  /** The `cast_spell` POST, watched for the server's verdict (`castVerdict`). */
+  private async trackedCast(spellId: number, targetGuid: string | undefined): Promise<ActionResponse> {
+    // Registered before the dispatch: the handler answers in the same world
+    // tick, often before the ack (see `useItemVerdict`).
+    const cast: PendingCast = {
+      spellId,
+      targetGuid,
+      sinceSeq: this.events.recent(1)[0]?.seq,
+      expiresAt: Date.now() + CAST_VERDICT_MS,
+    };
+    this.pendingCasts.set(spellId, cast);
+    try {
+      return await this.dispatchCast(spellId, targetGuid);
+    } catch (err) {
+      if (this.pendingCasts.get(spellId) === cast) this.pendingCasts.delete(spellId);
+      throw err;
+    }
+  }
+
+  /** The bare `cast_spell` POST, for helpers that read the verdict themselves (`openChest`). */
+  private dispatchCast(spellId: number, targetGuid: string | undefined): Promise<ActionResponse> {
+    return targetGuid === undefined
+      ? this.action({ action: "cast_spell", spellId })
+      : this.action({ action: "cast_spell", spellId, targetGuid });
+  }
+
+  /**
+   * Fold the server's answer to a `castSpell` into the hint tally. A cast
+   * starting extends the watch by its cast time, so an interrupt mid-cast is
+   * still this cast's; `SMSG_SPELL_GO` ends it. `SMSG_CAST_FAILED` names no
+   * caster (it goes to the caster alone) and is matched by spell id;
+   * `dont_report` is the server's own silent cancel (a repop sends a burst of
+   * them) and is not a refusal a client shows.
+   */
+  private castVerdict(event: StreamEvent): void {
+    if (this.pendingCasts.size === 0 || isDecodeError(event.data)) return;
+    const own = (caster: string): boolean => this.state.self.guid === undefined || guidKey(caster) === this.state.self.guid;
+    const pendingFor = (spellId: number): PendingCast | undefined => {
+      const cast = this.pendingCasts.get(spellId);
+      if (cast === undefined) return undefined;
+      if (Date.now() > cast.expiresAt) {
+        this.pendingCasts.delete(spellId);
+        return undefined;
+      }
+      return cast.sinceSeq === undefined || event.seq > cast.sinceSeq ? cast : undefined;
+    };
+    if (isEvent(event, "SMSG_SPELL_START")) {
+      const d = event.data as SpellStartData;
+      const cast = own(d.casterGuid) ? pendingFor(d.spellId) : undefined;
+      if (cast !== undefined) cast.expiresAt = Date.now() + d.castTimeMs + CAST_VERDICT_MS;
+      return;
+    }
+    if (isEvent(event, "SMSG_SPELL_GO")) {
+      const d = event.data as SpellGoData;
+      if (own(d.casterGuid) && pendingFor(d.spellId) !== undefined) this.pendingCasts.delete(d.spellId);
+      return;
+    }
+    let failed: { spellId: number; result: number; reason: string | undefined } | undefined;
+    if (isEvent(event, "SMSG_CAST_FAILED")) failed = event.data as CastFailedData;
+    else if (isEvent(event, "SMSG_SPELL_FAILURE") && own((event.data as SpellFailureData).casterGuid)) {
+      failed = event.data as SpellFailureData;
+    }
+    if (failed === undefined || failed.reason === "dont_report") return;
+    const cast = pendingFor(failed.spellId);
+    if (cast === undefined) return;
+    this.pendingCasts.delete(failed.spellId);
+    const status = failed.reason ?? `code_${failed.result}`;
+    this.noteActionHint("castSpell", status, castFailedHint(this.state, cast, status));
   }
 
   /** `CMSG_CANCEL_CAST`. */
@@ -3679,7 +3922,7 @@ export class WrathClient {
     let from = since;
     let lastResult = SPELL_FAILED_BAD_TARGETS;
     for (const spellId of CHEST_OPEN_SPELLS) {
-      await this.castSpell(spellId, guid);
+      await this.dispatchCast(spellId, guid);
       const verdict = await this.waitEvent(
         (e) =>
           (from === undefined || e.seq > from) &&
@@ -4384,11 +4627,31 @@ export class WrathClient {
         if (alive()) break;
         if (Date.now() >= deadline) break;
       }
+    } catch (err) {
+      // An abandoned snippet sees only this error, so it says what was
+      // waiting, the way an abandoned walk's says how far it got.
+      if (err instanceof EventAbortedError) {
+        const readyAt = this.reclaimReadyAt();
+        const left = readyAt === undefined ? 0 : Math.ceil(Math.max(0, readyAt - Date.now()) / 1000);
+        const what =
+          left > 0
+            ? `waiting out the server's reclaim delay (~${left}s still to run)`
+            : `waiting for the resurrect after ${attempts} reclaim${attempts === 1 ? "" : "s"} sent`;
+        const note =
+          `reclaimCorpse was ${what} when this was abandoned, ${Math.round((Date.now() - started) / 1000)}s into its ` +
+          `${Math.round((options.timeout ?? 25_000) / 1000)}s wait. Give it a snippet of its own, or pass a { timeout } that fits.`;
+        err.message = `${err.message} — ${note}`;
+        (err as { waitAbandon?: string }).waitAbandon = note;
+      }
+      throw err;
     } finally {
       offRelease();
     }
 
-    if (alive()) return { ok: true, status: "reclaimed", ...facts(attempts) };
+    if (alive()) {
+      await this.awaitAliveFields(deadline, "reclaimCorpse");
+      return { ok: true, status: "reclaimed", ...facts(attempts) };
+    }
     const after = health();
     if (attempts > 0 && after === undefined) {
       return {
@@ -4510,6 +4773,35 @@ export class WrathClient {
   }
 
   /**
+   * After a resurrect's first word (`SMSG_DEATH_RELEASE_LOC { map: -1 }`),
+   * wait for our own values update to show the character alive — the ghost
+   * flag clear and health above a ghost's 1 — so a caller reading
+   * `state.self` the moment the helper returns does not see the ghost. The
+   * server sends it a few ms after the marker (reference run 2026-10-20:
+   * 2–15 ms, 10 of 10 reclaims). Bounded by `until`, the helper's own
+   * deadline, which it never runs past; health never observed
+   * at all is nothing to wait for. The verdict stands either way: the
+   * marker clearing is the server saying the resurrect happened.
+   */
+  private async awaitAliveFields(until: number, helper: string): Promise<void> {
+    const self = this.state.self;
+    if (self.health === undefined) return;
+    const aliveNow = (): boolean => (self.health?.value.current ?? 0) > 1 && self.ghost?.value !== true;
+    if (aliveNow()) return;
+    const window = until - Date.now();
+    if (window <= 0) return;
+    try {
+      await this.waitEvent(() => aliveNow(), {
+        timeout: window,
+        includeBuffered: false,
+        description: `${helper}'s resurrect reaching our own fields (health above 1, the ghost flag clear)`,
+      });
+    } catch (e) {
+      if (!(e instanceof EventTimeoutError)) throw e;
+    }
+  }
+
+  /**
    * When a reclaim becomes legal (epoch ms), from the server's latest delay
    * as the cache holds it (`state.self.reclaimDelay`); undefined when none has
    * been observed since the last resurrect. Never later than a full delay from
@@ -4567,6 +4859,7 @@ export class WrathClient {
       if ((e.data as DeathReleaseLocData).map < 0) released = true;
     });
     const timeout = options.timeout ?? 15_000;
+    const started = Date.now();
     try {
       await this.raw("CMSG_RESURRECT_RESPONSE", [{ guid: offer.casterGuid }, { u8: 1 }]);
       if (!released) {
@@ -4583,7 +4876,10 @@ export class WrathClient {
     } finally {
       offRelease();
     }
-    if (released) return { ok: true, status: "resurrected", casterGuid: offer.casterGuid };
+    if (released) {
+      await this.awaitAliveFields(started + timeout, "acceptResurrection");
+      return { ok: true, status: "resurrected", casterGuid: offer.casterGuid };
+    }
     const hint =
       `the accept was sent but no resurrection was observed within ${Math.round(timeout / 1000)}s — the server ` +
       "ignores it silently when you are already alive or the offer was replaced by another; re-read " +
@@ -4608,6 +4904,7 @@ export class WrathClient {
         if ((e.data as DeathReleaseLocData).map < 0) released = true;
       });
       const timeout = options.timeout ?? 5000;
+      const started = Date.now();
       try {
         await this.action({ action: "spirit_healer_activate", guid });
         if (!released) {
@@ -4624,7 +4921,17 @@ export class WrathClient {
       } finally {
         offRelease();
       }
-      if (released) return { ok: true, status: "resurrected" } as const;
+      if (released) {
+        await this.awaitAliveFields(started + timeout, "spiritHealerActivate");
+        const self = this.state.self;
+        return {
+          ok: true,
+          status: "resurrected",
+          position: self.position?.value,
+          zone: self.zone?.value.name || undefined,
+          area: self.area?.value.name || undefined,
+        } as const;
+      }
       const measured = distanceToUnit(this.state, guid);
       const distance = measured === undefined ? undefined : Math.round(measured);
       const hint = spiritHealerSilence(distance, timeout);
@@ -4875,7 +5182,7 @@ export class WrathClient {
     const pet = this.petGuidOrRefuse("petDismiss");
     if ("refusal" in pet) return pet.refusal;
     if (this.state.spell(2641) !== undefined) {
-      const ack = await this.castSpell(2641);
+      const ack = await this.dispatchCast(2641, undefined);
       return { ok: true, status: "sent", ack };
     }
     return this.petAction(pet.guid, 3, 0x07);
@@ -5687,6 +5994,10 @@ export class WrathClient {
       this.noteActionHint("moveTo", "unknown_target", resolved.unknown);
       return { ok: false, status: "unknown_target", hint: resolved.unknown };
     }
+    if (this.isCorpse()) {
+      this.noteActionHint("moveTo", "dead", DEAD_MOVE_HINT);
+      return { ok: false, status: "dead", hint: DEAD_MOVE_HINT };
+    }
     const point = resolved.point;
     const repeat = this.recallMoveRejection(point);
     if (repeat !== null) {
@@ -5710,6 +6021,9 @@ export class WrathClient {
     if (resolved.note !== undefined) extras.push(resolved.note);
     const from = this.state.self.position?.value;
     const budgetMs = this.remainingBudgetMs();
+    // Said only of a move that walked (below): a refusal at planning moved
+    // nothing, so a timeout too short for the walk was never the problem.
+    let timeoutNote: string | undefined;
     if (from !== undefined) {
       const yards = distance2d(from, point);
       const walkMs = (yards / RUN_SPEED_YPS) * 1000;
@@ -5718,11 +6032,11 @@ export class WrathClient {
       // typically 1.5–2× the straight line (fleet-nav-probe-freeplay-sonnet
       // -20260823-c4: 27/27 timeouts had their verdict arrive afterwards).
       if (options.timeout !== undefined && options.timeout < walkMs * 1.5) {
-        extras.push(
+        timeoutNote = (
           `this move was ~${Math.round(yards)}y in a straight line — about ${Math.round(walkMs / 1000)}s at ` +
             `${RUN_SPEED_YPS}yd/s — against the ${Math.round(options.timeout / 1000)}s timeout it was given, ` +
             `and mesh paths are typically 1.5–2× the straight line. A move this long often outlasts a timeout ` +
-            `that short: use the default timeout, or sdk.moveToAsync(target) and poll state.self.position.`,
+            `that short: use the default timeout, or sdk.moveToAsync(target) and poll state.self.position.`
         );
       }
     }
@@ -5842,8 +6156,14 @@ export class WrathClient {
         data = event.data as MoveResultData;
       }
     }
-    noteBudget(event);
     const status: MoveStatus = data.status;
+    // Only a move that walked can have outlasted the budget: a refusal at
+    // planning moved nothing, and the note's "dispatch it with moveToAsync"
+    // would point a too_far at a call with the same cap.
+    if (!MOVE_LEAVES_NO_STOP.has(status)) {
+      if (timeoutNote !== undefined) extras.push(timeoutNote);
+      noteBudget(event);
+    }
     const position: UnitPosition = {
       x: data.pos.x,
       y: data.pos.y,
@@ -5940,10 +6260,7 @@ export class WrathClient {
       // than the ten dead minutes the leftover flag cost.
       await this.stop().catch(() => {});
     }
-    const recipe =
-      (status === "target_off_mesh" ? transportDockHint(this.state, point) : undefined) ??
-      (status === "drop" && dropJudgement !== undefined ? dropRefusalHint(point, data, dropJudgement) : undefined) ??
-      MOVE_HINTS[status]?.(point, data);
+    const recipe = this.moveRecipe(status, point, data, dropJudgement);
     // Recorded before the call-specific notes are folded in: the recipe is what
     // the model needs and what dedupes; the notes are per-call (see ActionHint).
     this.noteActionHint("moveTo", status, recipe, point);
@@ -6211,6 +6528,30 @@ export class WrathClient {
         );
       }
       const key = id;
+      // Dead, as a corpse or a released ghost: neither can fight, and nothing
+      // the loop would send changes that. Answered before any opcode.
+      const ghost = this.state.self.ghost?.value === true;
+      if (ghost || this.isCorpse()) {
+        const hint = ghost
+          ? "you are a ghost and cannot attack; nothing was sent. Get back to life first (reclaimCorpse, or a Spirit Healer)."
+          : "you are dead and cannot attack; nothing was sent. sdk.repop() releases your spirit.";
+        this.noteActionHint("killTarget", "dead", hint);
+        const self = this.state.self.position?.value;
+        const obj = this.state.nearby.get(key);
+        const at = obj === undefined ? undefined : pointOf(obj)?.value;
+        const h = this.state.self.health?.value;
+        return {
+          ok: false,
+          status: "dead",
+          guid: id,
+          swings: 0,
+          healthPct: h === undefined || h.max <= 0 ? undefined : (h.current / h.max) * 100,
+          attacking: false,
+          reached: false,
+          distance: self === undefined || at === undefined ? undefined : Math.round(distance2d(self, at) * 10) / 10,
+          detail: hint,
+        };
+      }
       // Whether the cache has ever held the target while this fight ran: it is
       // what separates "left view alive" from "was never in view at all".
       let sawTarget = this.state.nearby.has(key);

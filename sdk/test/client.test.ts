@@ -596,7 +596,7 @@ describe("client: movement", () => {
     expect(tooFar?.count).toBe(3);
     // The last occurrence's hint and point: nearest to where the character is.
     expect(tooFar?.point).toEqual({ x: 12, y: 20, z: 30 });
-    expect(tooFar?.hint).toContain("a single moveTo covers ~250y");
+    expect(tooFar?.hint).toContain("one move (moveTo or moveToAsync alike) covers ~250y");
     expect(drained.find((h) => h.status === "target_off_mesh")?.count).toBe(1);
     // Drained exactly once.
     expect(client.drainActionHints()).toEqual([]);
@@ -1164,7 +1164,7 @@ describe("client: movement", () => {
       const r = await p;
       expect(r.ok).toBe(false);
       expect(r.status).toBe("drop");
-      expect(r.hint).toContain("or pass { force: true } to moveTo to take it anyway");
+      expect(r.hint).toContain("or pass { force: true } to take it anyway");
       await client.moveToAsync({ x: 1, y: 2, z: 3 }, { force: true });
       await client.moveToAsync({ x: 1, y: 2, z: 3 });
       const moves = stub.actions.filter((a) => a.action === "move_to");
@@ -5962,7 +5962,11 @@ describe("client: spiritHealerActivate answers with the resurrection or the sile
     const pending = client.spiritHealerActivate(CREATURE_GUID, { timeout: 2000 });
     await untilAction(stub, "spirit_healer_activate");
     stub.push(JSON.stringify(deathReleaseCleared(91)));
-    expect(await pending).toEqual({ ok: true, status: "resurrected" });
+    // Where the healer left you, from the cache: a spirit-healer resurrection
+    // is in place, at the graveyard the spirit was released to.
+    const result = await pending;
+    expect(result).toMatchObject({ ok: true, status: "resurrected", position: { x: -1234.5, y: 987.25, z: 42.125 } });
+    expect(result).toEqual({ ok: true, status: "resurrected", position: client.state.self.position!.value, zone: undefined, area: undefined });
     client.close();
     await stub.stop();
   });
