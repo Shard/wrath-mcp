@@ -74,6 +74,7 @@ import {
   type ReadItemData,
   type PageTextQueryResponseData,
   type ItemTextQueryResponseData,
+  type MoveProgressData,
   type MoveResultData,
   type MoveUpdateData,
   type MoveStatus,
@@ -963,7 +964,8 @@ export type MoveResult =
       readonly reachedPos?: Point3;
       /**
        * `target_off_mesh` only: the walkable ground nearest the requested
-       * point within 20y, or `null` when none is within that.
+       * point within 20y that a move from where the character stands can
+       * reach, or `null` when none is within that.
        */
       readonly nearest?: Point3 | null;
       /** `drop` only: the signed vertical step the route would have taken at `reachedPos`. */
@@ -1017,7 +1019,7 @@ export const MOVE_HINTS: Readonly<Record<string, (point: MovePoint, data: MoveRe
     `SPELL_FAILED_MOVING.`,
   path_incomplete: (p, d) =>
     `the walkable mesh has no continuous route to (${fmtXY(p)})` +
-    (d.reachedPos ? `; it ends at (${fmtXY(d.reachedPos)})` : "") +
+    (d.reachedPos ? `; it ends at (${fmtXY(d.reachedPos)}, z ${d.reachedPos.z.toFixed(1)})${heightGap(d.reachedPos.z - p.z)}` : "") +
     `. The module already tried one subdivision. Route around (a road, a ramp, a door) or approach from ` +
     `another side.`,
   drop: (p, d) => {
@@ -1286,6 +1288,19 @@ function samePointish(a: Point3, b: Point3): boolean {
  * after the mesh walked it 7.6y down a ledge).
  */
 export const MESH_Z_QUOTE_BAND = 3;
+
+/**
+ * How far above or below the requested point a reported mesh point lies,
+ * as a clause, when it is a different level: past MESH_Z_QUOTE_BAND, the
+ * same band that tells a stale z from a level away on an arrival. Within it
+ * the gap is the request's own z slack and says nothing, so it is omitted.
+ * A `path_incomplete` whose 2D end looked 0.4y from its target (by the
+ * Deadmines entrance) had ended on the hillside 23y over it.
+ */
+export function heightGap(dz: number): string {
+  if (Math.abs(dz) <= MESH_Z_QUOTE_BAND) return "";
+  return `, ${Math.round(Math.abs(dz))}y ${dz > 0 ? "above" : "below"} the point asked for`;
+}
 export function meshZHint(point: { x: number; y: number; z: number }, meshZ: number): string {
   const dz = meshZ - point.z;
   const head = `arrived at (${fmtXY(point)}), but the ground there is at z ${meshZ.toFixed(1)}, not ${point.z.toFixed(1)}.`;
@@ -1350,12 +1365,38 @@ function fmtXY(p: { x: number; y: number }): string {
  * or abandoned `moveTo` uses, and the ones `killTarget` keeps for an approach
  * that ran out its clock.
  */
-function walkProgress(from: Point3 | undefined, at: Point3 | undefined, point: { x: number; y: number }): string {
+function walkProgress(from: Point3 | undefined, at: Point3 | undefined, point: { x: number; y: number }, routeYards?: number): string {
   const covered = at !== undefined && from !== undefined ? distance2d(from, at) : undefined;
   const remaining = at !== undefined ? distance2d(at, point) : undefined;
+  const route =
+    routeYards === undefined
+      ? ""
+      : ` in a straight line, on a route of ~${Math.round(routeYards)}y (about ${Math.round(routeYards / RUN_SPEED_YPS)}s at ${RUN_SPEED_YPS}yd/s)`;
   return covered !== undefined && remaining !== undefined
-    ? `~${Math.round(covered)}y covered, ~${Math.round(remaining)}y still to go to (${fmtXY(point)})`
-    : `no position was observed for it (target (${fmtXY(point)}))`;
+    ? `~${Math.round(covered)}y covered, ~${Math.round(remaining)}y still to go to (${fmtXY(point)})${route}`
+    : `no position was observed for it (target (${fmtXY(point)}))${route}`;
+}
+
+/**
+ * The note on a move longer than the caller's remaining budget: judged by
+ * the route the module walked (`pathLength`, yards) when it is known, else by
+ * the straight line; undefined when the walk fits. It never changes or caps
+ * the move, only says that awaiting it does not fit one snippet.
+ */
+export function walkBudgetNote(straightYards: number, routeYards: number | undefined, budgetMs: number): string | undefined {
+  const yards = routeYards ?? straightYards;
+  const walkMs = (yards / RUN_SPEED_YPS) * 1000;
+  if (walkMs <= budgetMs) return undefined;
+  const what =
+    routeYards === undefined
+      ? `this move is ~${Math.round(straightYards)}y in a straight line`
+      : `this move's route is ~${Math.round(routeYards)}y (~${Math.round(straightYards)}y in a straight line)`;
+  return (
+    `${what} — about ${Math.round(walkMs / 1000)}s at a base run speed of ${RUN_SPEED_YPS}yd/s, and the caller ` +
+    `had ~${Math.round(budgetMs / 1000)}s of its budget left when it was issued. Awaiting a move this long does ` +
+    `not fit one snippet: dispatch it with sdk.moveToAsync(target) or from a background routine, then poll ` +
+    `state.self.position.`
+  );
 }
 
 export interface WaitForTransferOptions {
@@ -5552,14 +5593,6 @@ export class WrathClient {
     if (from !== undefined) {
       const yards = distance2d(from, point);
       const walkMs = (yards / RUN_SPEED_YPS) * 1000;
-      if (budgetMs !== undefined && walkMs > budgetMs) {
-        extras.push(
-          `this move is ~${Math.round(yards)}y in a straight line — about ${Math.round(walkMs / 1000)}s at a ` +
-            `base run speed of ${RUN_SPEED_YPS}yd/s, and the caller had ~${Math.round(budgetMs / 1000)}s of ` +
-            `its budget left when it was issued. Awaiting a move this long does not fit one snippet: dispatch ` +
-            `it with sdk.moveToAsync(target) or from a background routine, then poll state.self.position.`,
-        );
-      }
       // A caller-set timeout below the straight-line walk plus mesh slack will
       // expire on a move that is still going: the path the server walks is
       // typically 1.5–2× the straight line (fleet-nav-probe-freeplay-sonnet
@@ -5618,7 +5651,14 @@ export class WrathClient {
         // How far this walk got, shared by both branches below: an abort and a
         // timeout are both the absence of a verdict, and the caller needs the
         // same two facts either way.
-        const progress = walkProgress(from, this.state.self.position?.value, point);
+        // The route's length, when the module has said it on a progress event
+        // of this move: "still to go" in a straight line understates a tunnel.
+        const progressed = this.events
+          .recent(500)
+          .filter((e) => e.seq > sinceSeq && isEvent(e, "WB_MOVE_PROGRESS") && !isDecodeError(e.data))
+          .map((e) => e.data as MoveProgressData)
+          .findLast((d) => d.moveId === ack.moveId);
+        const progress = walkProgress(from, this.state.self.position?.value, point, progressed?.pathLength);
         if (err instanceof EventTimeoutError) {
           // The timeout is not "the move failed": the character is still walking
           // and the verdict is still coming. Saying so stops the model from
@@ -5651,6 +5691,14 @@ export class WrathClient {
       }
       return event;
     };
+    // The budget note, judged by the route the module walked when the
+    // verdict carries its length (`pathLength`), else by the straight line:
+    // a mine's 165y line was a 660y walk, and the line alone said nothing.
+    const noteBudget = (verdict: MoveResultData) => {
+      if (from === undefined || budgetMs === undefined) return;
+      const note = walkBudgetNote(distance2d(from, point), verdict.pathLength, budgetMs);
+      if (note !== undefined) extras.push(note);
+    };
     let event = await issue(options.force === true);
     let data = event.data as MoveResultData;
     // A ledge the module refused: judge the fall from the facts it gave (the
@@ -5667,6 +5715,7 @@ export class WrathClient {
         data = event.data as MoveResultData;
       }
     }
+    noteBudget(data);
     const status: MoveStatus = data.status;
     const position: UnitPosition = {
       x: data.pos.x,

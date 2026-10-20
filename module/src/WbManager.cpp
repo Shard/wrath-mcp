@@ -18,6 +18,7 @@
 
 #include "WbManager.h"
 #include "WbJson.h"
+#include "WbNav.h"
 
 #include "AccountMgr.h"
 #include "Config.h"
@@ -1704,62 +1705,20 @@ namespace WrathBench
     // It stops at the first route the guard passes, at a round that bars
     // nothing new, or at a re-plan that finds no complete route.
     static constexpr uint32 REPLAN_STEEP_ROUNDS = 3;
-    // The re-planned route's reach: two core paths of MAX_POINT_PATH_LENGTH
-    // 4y steps (about 590y), what the subdivision retry already splices for
-    // an ordinary move (the Ashenvale climb that earned this was a 91-point
-    // route), so a re-plan never walks farther than a move without one can.
-    // The corridor buffer has room for the polygons such a route crosses.
-    static constexpr uint32 REPLAN_MAX_POINTS = 2 * MAX_POINT_PATH_LENGTH;
-    static constexpr int REPLAN_MAX_POLYS = 256;
+    // The re-planned route's reach and corridor are the module planner's
+    // (WbNav::PLAN_MAX_POINTS, PLAN_MAX_POLYS), so a re-plan never walks
+    // farther than a move without one can.
+    static_assert(WbNav::SMOOTH_STEP == SMOOTH_PATH_STEP_SIZE, "WbNav restates the core's smooth-path step");
+    static_assert(WbNav::SMOOTH_SLOP == SMOOTH_PATH_SLOP, "WbNav restates the core's smooth-path slop");
+    static_assert(WbNav::CORE_POINT_PATH == MAX_POINT_PATH_LENGTH, "WbNav restates the core's point-path cap");
+    static_assert(WbNav::PLAYER_FLAGS == (NAV_GROUND | NAV_WATER | NAV_MAGMA), "WbNav restates a player's include flags");
     // The core's start/end "far from poly" distance (PathGenerator::BuildPolyPath).
     static constexpr float REPLAN_FAR_FROM_POLY = 7.0f;
 
-    // The player's query filter (PathGenerator::CreateFilter for a Player:
-    // NAV_GROUND | NAV_WATER | NAV_MAGMA, the core's slope-weighted cost)
-    // with a set of polygons it may not enter. Local to the module: the
-    // core's PathGenerator keeps its filter private, and nothing here changes
-    // the core or the shared mesh.
-    class ExcludePolysFilter : public dtQueryFilterExt
-    {
-    public:
-        explicit ExcludePolysFilter(std::vector<dtPolyRef> const* excluded = nullptr) : _excluded(excluded)
-        {
-            setIncludeFlags(NAV_GROUND | NAV_WATER | NAV_MAGMA);
-            setExcludeFlags(0);
-        }
-
-        bool passFilter(dtPolyRef const ref, dtMeshTile const* tile, dtPoly const* poly) const override
-        {
-            if (_excluded && std::find(_excluded->begin(), _excluded->end(), ref) != _excluded->end())
-                return false;
-            return dtQueryFilter::passFilter(ref, tile, poly);
-        }
-
-    private:
-        std::vector<dtPolyRef> const* _excluded;
-    };
-
-    // The polygon the core's path builder picks for a point
-    // (PathGenerator::GetPolyByLocation on a fresh generator: a 3y x 5y box,
-    // then 3y x 50y), with the distance to it. Detour order (y, z, x).
-    static dtPolyRef CorePolyAt(dtNavMeshQuery const* query, dtQueryFilter const& filter, float const* point, float* dist)
-    {
-        float closest[3] = { 0.0f, 0.0f, 0.0f };
-        for (float vertical : { 5.0f, 50.0f })
-        {
-            float extents[3] = { 3.0f, vertical, 3.0f };
-            dtPolyRef ref = 0;
-            if (dtStatusSucceed(query->findNearestPoly(point, extents, &filter, &ref, closest)) && ref != 0)
-            {
-                if (dist)
-                    *dist = dtVdist(closest, point);
-                return ref;
-            }
-        }
-        if (dist)
-            *dist = FLT_MAX;
-        return 0;
-    }
+    // The player's filter with barred polygons, and the polygon the core's
+    // path builder picks for a point: WbNav.h.
+    using WbNav::CorePolyAt;
+    using WbNav::ExcludePolysFilter;
 
     // The polygons a route segment lies on: the one under its start, each one
     // a straight walk along the surface toward its end crosses (Detour's
@@ -1788,198 +1747,6 @@ namespace WrathBench
         add(CorePolyAt(query, filter, pb, nullptr));
     }
 
-    // The core's smooth path along a corridor, ported because PathGenerator
-    // keeps it private: FindSmoothPath with GetSteerTarget and FixupCorridor
-    // (PathGenerator.cpp, GPL-2.0-or-later like this module), unchanged but
-    // for the filter, the corridor buffer and the point cap (the caller's) —
-    // 4y steps along the surface, each point 0.5y over its polygon, failing
-    // when the route needs the whole cap. A straight-path corner list would not
-    // do: a 30y corner segment across a 55 degree face averages under the
-    // guard's slope, and the walk would interpolate through the hill.
-    static bool InRangeYZX(float const* v1, float const* v2, float r, float h)
-    {
-        float const dx = v2[0] - v1[0];
-        float const dy = v2[1] - v1[1]; // elevation
-        float const dz = v2[2] - v1[2];
-        return (dx * dx + dz * dz) < r * r && std::fabs(dy) < h;
-    }
-
-    static uint32 FixupCorridor(dtPolyRef* path, uint32 npath, uint32 maxPath, dtPolyRef const* visited, uint32 nvisited)
-    {
-        int32 furthestPath = -1;
-        int32 furthestVisited = -1;
-        for (int32 i = int32(npath) - 1; i >= 0; --i)
-        {
-            bool found = false;
-            for (int32 j = int32(nvisited) - 1; j >= 0; --j)
-            {
-                if (path[i] == visited[j])
-                {
-                    furthestPath = i;
-                    furthestVisited = j;
-                    found = true;
-                }
-            }
-            if (found)
-                break;
-        }
-        if (furthestPath == -1 || furthestVisited == -1)
-            return npath;
-
-        uint32 req = nvisited - furthestVisited;
-        uint32 orig = uint32(furthestPath + 1) < npath ? furthestPath + 1 : npath;
-        uint32 size = npath > orig ? npath - orig : 0;
-        if (req + size > maxPath)
-            size = maxPath - req;
-        if (size)
-            memmove(path + req, path + orig, size * sizeof(dtPolyRef));
-        for (uint32 i = 0; i < req; ++i)
-            path[i] = visited[(nvisited - 1) - i];
-        return req + size;
-    }
-
-    static bool SteerTarget(dtNavMeshQuery const* query, float const* startPos, float const* endPos, float minTargetDist,
-        dtPolyRef const* path, uint32 pathSize, float* steerPos, unsigned char& steerPosFlag, dtPolyRef& steerPosRef)
-    {
-        static uint32 const MAX_STEER_POINTS = 3;
-        float steerPath[MAX_STEER_POINTS * VERTEX_SIZE];
-        unsigned char steerPathFlags[MAX_STEER_POINTS];
-        dtPolyRef steerPathPolys[MAX_STEER_POINTS];
-        int nsteerPath = 0;
-        dtStatus st = query->findStraightPath(startPos, endPos, path, int(pathSize),
-            steerPath, steerPathFlags, steerPathPolys, &nsteerPath, int(MAX_STEER_POINTS));
-        if (!nsteerPath || dtStatusFailed(st))
-            return false;
-        uint32 ns = 0;
-        while (ns < uint32(nsteerPath))
-        {
-            if ((steerPathFlags[ns] & DT_STRAIGHTPATH_OFFMESH_CONNECTION)
-                || !InRangeYZX(&steerPath[ns * VERTEX_SIZE], startPos, minTargetDist, 1000.0f))
-                break;
-            ns++;
-        }
-        if (ns >= uint32(nsteerPath))
-            return false;
-        dtVcopy(steerPos, &steerPath[ns * VERTEX_SIZE]);
-        steerPos[1] = startPos[1]; // keep Z value
-        steerPosFlag = steerPathFlags[ns];
-        steerPosRef = steerPathPolys[ns];
-        return true;
-    }
-
-    static dtStatus SmoothPath(dtNavMesh const* navMesh, dtNavMeshQuery const* query, dtQueryFilter const& filter,
-        float const* startPos, float const* endPos, dtPolyRef const* polyPath, uint32 polyPathSize,
-        float* smoothPath, uint32* smoothPathSize, uint32 maxSmoothPathSize)
-    {
-        *smoothPathSize = 0;
-        uint32 nsmoothPath = 0;
-
-        dtPolyRef polys[REPLAN_MAX_POLYS];
-        memcpy(polys, polyPath, sizeof(dtPolyRef) * polyPathSize);
-        uint32 npolys = polyPathSize;
-
-        float iterPos[VERTEX_SIZE], targetPos[VERTEX_SIZE];
-        if (polyPathSize > 1)
-        {
-            if (dtStatusFailed(query->closestPointOnPolyBoundary(polys[0], startPos, iterPos)))
-                return DT_FAILURE;
-            if (dtStatusFailed(query->closestPointOnPolyBoundary(polys[npolys - 1], endPos, targetPos)))
-                return DT_FAILURE;
-        }
-        else
-        {
-            dtVcopy(iterPos, startPos);
-            dtVcopy(targetPos, endPos);
-        }
-
-        dtVcopy(&smoothPath[nsmoothPath * VERTEX_SIZE], iterPos);
-        nsmoothPath++;
-
-        while (npolys && nsmoothPath < maxSmoothPathSize)
-        {
-            float steerPos[VERTEX_SIZE];
-            unsigned char steerPosFlag;
-            dtPolyRef steerPosRef = INVALID_POLYREF;
-            if (!SteerTarget(query, iterPos, targetPos, SMOOTH_PATH_SLOP, polys, npolys, steerPos, steerPosFlag, steerPosRef))
-                break;
-
-            bool endOfPath = (steerPosFlag & DT_STRAIGHTPATH_END) != 0;
-            bool offMeshConnection = (steerPosFlag & DT_STRAIGHTPATH_OFFMESH_CONNECTION) != 0;
-
-            float delta[VERTEX_SIZE];
-            dtVsub(delta, steerPos, iterPos);
-            float len = dtMathSqrtf(dtVdot(delta, delta));
-            if ((endOfPath || offMeshConnection) && len < SMOOTH_PATH_STEP_SIZE)
-                len = 1.0f;
-            else
-                len = SMOOTH_PATH_STEP_SIZE / len;
-
-            float moveTgt[VERTEX_SIZE];
-            dtVmad(moveTgt, iterPos, delta, len);
-
-            float result[VERTEX_SIZE];
-            static uint32 const MAX_VISIT_POLY = 16;
-            dtPolyRef visited[MAX_VISIT_POLY];
-            int nvisited = 0;
-            if (dtStatusFailed(query->moveAlongSurface(polys[0], iterPos, moveTgt, &filter, result, visited, &nvisited, int(MAX_VISIT_POLY))))
-                return DT_FAILURE;
-            npolys = FixupCorridor(polys, npolys, REPLAN_MAX_POLYS, visited, uint32(nvisited));
-
-            query->getPolyHeight(polys[0], result, &result[1]);
-            result[1] += 0.5f;
-            dtVcopy(iterPos, result);
-
-            if (endOfPath && InRangeYZX(iterPos, steerPos, SMOOTH_PATH_SLOP, 1.0f))
-            {
-                dtVcopy(iterPos, targetPos);
-                if (nsmoothPath < maxSmoothPathSize)
-                {
-                    dtVcopy(&smoothPath[nsmoothPath * VERTEX_SIZE], iterPos);
-                    nsmoothPath++;
-                }
-                break;
-            }
-            else if (offMeshConnection && InRangeYZX(iterPos, steerPos, SMOOTH_PATH_SLOP, 1.0f))
-            {
-                dtPolyRef prevRef = INVALID_POLYREF;
-                dtPolyRef polyRef = polys[0];
-                uint32 npos = 0;
-                while (npos < npolys && polyRef != steerPosRef)
-                {
-                    prevRef = polyRef;
-                    polyRef = polys[npos];
-                    npos++;
-                }
-                for (uint32 i = npos; i < npolys; ++i)
-                    polys[i - npos] = polys[i];
-                npolys -= npos;
-
-                float connectionStartPos[VERTEX_SIZE], connectionEndPos[VERTEX_SIZE];
-                if (dtStatusSucceed(navMesh->getOffMeshConnectionPolyEndPoints(prevRef, polyRef, connectionStartPos, connectionEndPos)))
-                {
-                    if (nsmoothPath < maxSmoothPathSize)
-                    {
-                        dtVcopy(&smoothPath[nsmoothPath * VERTEX_SIZE], connectionStartPos);
-                        nsmoothPath++;
-                    }
-                    dtVcopy(iterPos, connectionEndPos);
-                    if (dtStatusFailed(query->getPolyHeight(polys[0], iterPos, &iterPos[1])))
-                        return DT_FAILURE;
-                    iterPos[1] += 0.5f;
-                }
-            }
-
-            if (nsmoothPath < maxSmoothPathSize)
-            {
-                dtVcopy(&smoothPath[nsmoothPath * VERTEX_SIZE], iterPos);
-                nsmoothPath++;
-            }
-        }
-
-        *smoothPathSize = nsmoothPath;
-        return nsmoothPath < maxSmoothPathSize ? DT_SUCCESS : DT_FAILURE;
-    }
-
     // One re-plan from `start` to `end` (Detour order, the points the core
     // planned between) with `filter`'s polygons barred, as the core builds a
     // route: findPath over the corridor, the smooth path along it, every point
@@ -1988,38 +1755,67 @@ namespace WrathBench
     // corridor does not reach the end polygon or the route would not fit
     // REPLAN_MAX_POINTS; nothing is walked then.
     static bool PlanAround(Player* player, dtNavMesh const* navMesh, dtNavMeshQuery const* query, ExcludePolysFilter const& filter,
-        dtPolyRef startRef, dtPolyRef endRef, float const* start, float const* end, std::vector<WbVec>& out, char const** why)
+        dtPolyRef startRef, dtPolyRef endRef, float const* start, float const* end, std::vector<WbVec>& out, char const** why,
+        int* polysOut = nullptr)
     {
-        dtPolyRef polys[REPLAN_MAX_POLYS];
-        int npolys = 0;
-        dtStatus st = query->findPath(startRef, endRef, start, end, &filter, polys, &npolys, REPLAN_MAX_POLYS);
-        if (dtStatusFailed(st) || npolys <= 0 || (st & DT_PARTIAL_RESULT) || polys[npolys - 1] != endRef)
-        {
-            *why = "no_route";
+        std::vector<float> pts;
+        if (!WbNav::PlanCorridor(navMesh, query, filter, startRef, endRef, start, end, WbNav::PLAN_MAX_POINTS, pts, why, polysOut))
             return false;
-        }
-        float pts[REPLAN_MAX_POINTS * VERTEX_SIZE];
-        uint32 npts = 0;
-        dtStatus sst = SmoothPath(navMesh, query, filter, start, end, polys, uint32(npolys), pts, &npts, REPLAN_MAX_POINTS);
-        if (npts >= REPLAN_MAX_POINTS)
-        {
-            *why = "too_long";
-            return false;
-        }
-        if (dtStatusFailed(sst) || npts < 2)
-        {
-            *why = "no_route";
-            return false;
-        }
         out.clear();
-        for (uint32 i = 0; i < npts; ++i)
+        for (size_t i = 0; i + 2 < pts.size(); i += 3)
         {
-            WbVec v{ pts[i * VERTEX_SIZE + 2], pts[i * VERTEX_SIZE], pts[i * VERTEX_SIZE + 1] };
+            WbVec v{ pts[i + 2], pts[i], pts[i + 1] };
             player->UpdateAllowedPositionZ(v.x, v.y, v.z);
             out.push_back(v);
         }
         return true;
     }
+
+    // The polygon a move from where the character stands paths from: the one
+    // under it, else the start snap's (ResolvePathAt). Zero when neither is.
+    static dtPolyRef MoverStartPoly(Player* player, dtNavMeshQuery const* query)
+    {
+        ExcludePolysFilter const base;
+        float dist = 0.0f;
+        float here[3] = { player->GetPositionY(), player->GetPositionZ(), player->GetPositionX() };
+        dtPolyRef ref = CorePolyAt(query, base, here, &dist);
+        if (ref && dist <= REPLAN_FAR_FROM_POLY)
+            return ref;
+        WbVec near;
+        if (!NearestMeshPoint(player, here[2], here[0], here[1], START_SNAP_RADIUS, near))
+            return 0;
+        float snapped[3] = { near.y, near.z, near.x };
+        return CorePolyAt(query, base, snapped, nullptr);
+    }
+
+    // The walkable mesh nearest (x, y, z) within `radius` that a move from
+    // the character's position can reach (WbNav::NearestReachable): the
+    // nearest polygon of a closed island the start is not on is no answer,
+    // since no route gets there (by the Deadmines entrance the nearest
+    // polygon to a guessed point was a 7-polygon island under the hill).
+    static bool NearestReachablePoint(Player* player, float x, float y, float z, float radius, WbVec& out)
+    {
+        auto& mmap = player->GetMap()->GetMapCollisionData().GetMMapData();
+        dtNavMesh const* navMesh = mmap.GetNavMesh();
+        dtNavMeshQuery const* query = mmap.GetNavMeshQuery();
+        if (!navMesh || !query)
+            return false;
+        float point[3] = { y, z, x };
+        float extents[3] = { radius, 50.0f, radius };
+        float closest[3] = { 0.0f, 0.0f, 0.0f };
+        dtPolyRef ref = 0;
+        if (!WbNav::NearestReachable(navMesh, query, MoverStartPoly(player, query), point, extents, &ref, closest))
+            return false;
+        out = { closest[2], closest[0], closest[1] };
+        return true;
+    }
+
+    // How far from a request whose own polygon is on an island the walk may
+    // end instead, at the reachable mesh nearest it: the core's own
+    // far-from-polygon distance (PathGenerator::BuildPolyPath paths to an end
+    // up to 7y from its polygon as if it were on it). The Deadmines entrance
+    // trigger's centre is 4.4y from the tunnel's end, inside its 7y radius.
+    static constexpr float END_REACHABLE_RADIUS = REPLAN_FAR_FROM_POLY;
 
     // The cause ladder behind a move_to (PROTOCOL.md, WB_MOVE_RESULT.status).
     // Returns status == nullptr with `points` filled on success. Order matters:
@@ -2060,6 +1856,43 @@ namespace WrathBench
                 r.hasSnap = true;
                 r.snapX = near.x; r.snapY = near.y; r.snapZ = near.z;
                 sx = near.x; sy = near.y; sz = near.z;
+            }
+        }
+
+        // The end the start can reach. When the polygon the core would path
+        // to is on a closed island of the mesh that does not hold the start
+        // (a sliver under a WMO floor, a ledge no polygon links to), no
+        // search reaches it however long it runs, and the core's partial
+        // path ends wherever its heuristic last got: by the Deadmines
+        // entrance, the hillside 22y over the tunnel the trigger sits in. The
+        // walk ends at the reachable mesh nearest the request instead when
+        // that lies within END_REACHABLE_RADIUS (WbNav::OnIsland,
+        // NearestReachable). Past it the request stays as asked and ends
+        // path_incomplete like any route the mesh does not have: an island is
+        // walkable ground, only not from here.
+        dtNavMeshQuery const* query = player->GetMap()->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
+        ExcludePolysFilter const base;
+        float startPt[3] = { sy, sz, sx };
+        dtPolyRef startRef = query ? CorePolyAt(query, base, startPt, nullptr) : 0;
+        if (query)
+        {
+            float endPt[3] = { y, z, x };
+            dtPolyRef endRef = CorePolyAt(query, base, endPt, nullptr);
+            std::vector<dtPolyRef> island;
+            if (endRef && WbNav::OnIsland(navMesh, base, startRef, endRef, &island))
+            {
+                r.islandPolys = uint32(island.size());
+                float extents[3] = { END_REACHABLE_RADIUS, END_REACHABLE_RADIUS, END_REACHABLE_RADIUS };
+                float closest[3] = { 0.0f, 0.0f, 0.0f };
+                dtPolyRef ref = 0;
+                if (WbNav::NearestReachable(navMesh, query, startRef, endPt, extents, &ref, closest)
+                    && dtVdist(closest, endPt) <= END_REACHABLE_RADIUS)
+                {
+                    r.hasEndReachable = true;
+                    r.endFromX = x; r.endFromY = y; r.endFromZ = z;
+                    x = closest[2]; y = closest[0]; z = closest[1];
+                    r.endToX = x; r.endToY = y; r.endToZ = z;
+                }
             }
         }
 
@@ -2131,18 +1964,51 @@ namespace WrathBench
                 }
                 else
                 {
-                    r.status = "path_incomplete";
                     r.hasReached = true;
                     r.reachedX = mid.x; r.reachedY = mid.y; r.reachedZ = mid.z;
-                    return r;
                 }
             }
             else
             {
-                r.status = "path_incomplete";
                 r.hasReached = true;
                 r.reachedX = player->GetPositionX(); r.reachedY = player->GetPositionY(); r.reachedZ = player->GetPositionZ();
+            }
+            // Neither the core's path nor the subdivision reached the end:
+            // the module's planner (WbNav::PlannerQuery) searches the whole
+            // corridor the core's 74 polygons and 1024 nodes cannot hold — the
+            // Deadmines mine is 177 polygons — exactly as the core would with
+            // room to finish. Only what it cannot route is path_incomplete; an
+            // end known to be on an island is not searched for at all.
+            if (r.hasReached && r.islandPolys && !r.hasEndReachable)
+            {
+                r.status = "path_incomplete";
                 return r;
+            }
+            if (r.hasReached)
+            {
+                float endPt[3] = { y, z, x };
+                dtPolyRef endRef = query ? CorePolyAt(query, base, endPt, nullptr) : 0;
+                dtNavMeshQuery const* plan = WbNav::PlannerQuery(navMesh);
+                char const* why = "";
+                int polys = 0;
+                std::vector<WbVec> planned;
+                if (!plan || !startRef || !endRef
+                    || !PlanAround(player, navMesh, plan, base, startRef, endRef, startPt, endPt, planned, &why, &polys))
+                {
+                    r.status = "path_incomplete";
+                    return r;
+                }
+                WbVec const& last = planned.back();
+                float ex = last.x - x, ey = last.y - y;
+                if (ex * ex + ey * ey > 16.0f) // endpointOk: within 4y of the end, 2D
+                {
+                    r.status = "path_incomplete";
+                    return r;
+                }
+                r.hasReached = false;
+                r.longPlan = true;
+                r.longPolys = uint32(polys);
+                r.points = std::move(planned);
             }
         }
 
@@ -2251,6 +2117,11 @@ namespace WrathBench
         dtNavMeshQuery const* query = mmap.GetNavMeshQuery();
         if (!navMesh || !query)
             return finish("skipped", "no_mesh_query");
+        // The re-plans search with the module planner's node pool: the same
+        // routes as the core's query wherever that one does not run out.
+        dtNavMeshQuery const* plan = WbNav::PlannerQuery(navMesh);
+        if (!plan)
+            plan = query;
 
         ExcludePolysFilter const base;
         float start[3] = { sy, sz, sx };
@@ -2290,7 +2161,7 @@ namespace WrathBench
             cand.hasSnap = r.hasSnap;
             cand.snapX = r.snapX; cand.snapY = r.snapY; cand.snapZ = r.snapZ;
             char const* why = "";
-            if (!PlanAround(player, navMesh, query, filter, startRef, endRef, start, end, cand.points, &why))
+            if (!PlanAround(player, navMesh, plan, filter, startRef, endRef, start, end, cand.points, &why))
                 return finish("failed", why);
             // The core's endpoint check (ResolvePathAt's endpointOk): the
             // route ends within 4y of the request in 2D.
@@ -2343,7 +2214,7 @@ namespace WrathBench
             {
                 r.nearestSearched = true;
                 WbVec near;
-                if (NearestMeshPoint(player, x, y, haveGround ? groundZ : z, TARGET_NEAREST_RADIUS, near))
+                if (NearestReachablePoint(player, x, y, haveGround ? groundZ : z, TARGET_NEAREST_RADIUS, near))
                 {
                     r.hasNearest = true;
                     r.nearestX = near.x; r.nearestY = near.y; r.nearestZ = near.z;
@@ -2386,6 +2257,9 @@ namespace WrathBench
 
         Json::Writer w;
         w.Add("moveId", m.moveId).Add("status", status);
+        if (m.pathLength > 0.0f)
+            w.Add("pathLength", (double)m.pathLength);
+        m.pathLength = 0.0f;
         // Server-confirmed position, when the session is still live: this is the
         // ground truth that the synthesized movement was actually applied.
         Player* player = (s.ws && sWorldSessionMgr->FindSession(s.accountId) == s.ws) ? s.ws->GetPlayer() : nullptr;
@@ -2537,6 +2411,19 @@ namespace WrathBench
                 if (r.hasEndLift)
                     Audit(*s, "action", Json::Writer().Add("op", "move_end_z").Add("moveId", moveId)
                         .Add("normZ", (double)r.endLiftFrom).Add("meshZ", (double)r.points.back().z).Str());
+                if (r.islandPolys)
+                {
+                    Json::Writer a;
+                    a.Add("op", "move_end_reachable").Add("moveId", moveId).Add("islandPolys", r.islandPolys)
+                        .Add("walked", r.hasEndReachable);
+                    if (r.hasEndReachable)
+                        a.Raw("from", Json::Writer().Add("x", (double)r.endFromX).Add("y", (double)r.endFromY).Add("z", (double)r.endFromZ).Str())
+                            .Raw("to", Json::Writer().Add("x", (double)r.endToX).Add("y", (double)r.endToY).Add("z", (double)r.endToZ).Str());
+                    Audit(*s, "action", a.Str());
+                }
+                if (r.longPlan)
+                    Audit(*s, "action", Json::Writer().Add("op", "move_long_plan").Add("moveId", moveId)
+                        .Add("polys", r.longPolys).Add("pointCount", (uint64_t)r.points.size()).Str());
                 if (r.hasSnap)
                     Audit(*s, "action", Json::Writer().Add("op", "move_start_snap").Add("moveId", moveId)
                         .Raw("from", PosJson(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation()))
@@ -2611,6 +2498,13 @@ namespace WrathBench
         int64_t now = NowMs();
         m.points.clear();
         m.points = pts;
+        // The route's length as walked, so a caller can judge the walk by the
+        // route rather than the straight line (a mine's tunnels are three
+        // times it): on every progress event and on the verdict.
+        m.pathLength = 0.0f;
+        for (size_t i = 1; i < m.points.size(); ++i)
+            m.pathLength += std::sqrt(std::pow(m.points[i].x - m.points[i - 1].x, 2.0f)
+                + std::pow(m.points[i].y - m.points[i - 1].y, 2.0f) + std::pow(m.points[i].z - m.points[i - 1].z, 2.0f));
         m.seg = 0;
         m.segDone = 0.0f;
         m.lastMs = now;
@@ -3999,6 +3893,7 @@ namespace WrathBench
             Json::Writer w;
             w.Add("moveId", m.moveId);
             w.Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO));
+            w.Add("pathLength", (double)m.pathLength);
             EmitEvent(s, "WB_MOVE_PROGRESS", 0xFF02, w.Str());
         }
     }

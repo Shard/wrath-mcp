@@ -757,7 +757,7 @@ describe("client: movement", () => {
     if (r2.ok) throw new Error("unreachable");
     expect(r2.status).toBe("path_incomplete");
     expect(r2.reachedPos).toEqual({ x: 5, y: 6, z: 7 });
-    expect(r2.hint).toContain("ends at (5.0, 6.0)");
+    expect(r2.hint).toContain("ends at (5.0, 6.0, z 7.0), 23y below the point asked for. ");
 
     const p3 = client.moveTo({ x: 12, y: 20, z: 30 }, { timeout: 2000 });
     stub.push(JSON.stringify(moveResult("no_mesh", 3, 32)));

@@ -759,6 +759,8 @@ export type MoveStatus = KnownMoveStatus | (string & {});
 export const moveProgressDataSchema = z.looseObject({
   moveId: moveIdSchema,
   pos: positionSchema,
+  /** The length in yards of the route this move walks (the module's resolved polyline); absent from an older module. */
+  pathLength: z.number().optional(),
 });
 export type MoveProgressData = z.infer<typeof moveProgressDataSchema>;
 
@@ -774,6 +776,8 @@ export const moveResultDataSchema = z.looseObject({
   pos: positionSchema,
   /** `arrived` only: the ground z the mesh walked to when the request's z was off by >1y. */
   meshZ: z.number().optional(),
+  /** A move that was dispatched and walked: the length in yards of its route, as on `WB_MOVE_PROGRESS`. */
+  pathLength: z.number().optional(),
   /** `path_incomplete`: how far the mesh could get toward the request; `drop`: the ledge edge. */
   reachedPos: z.looseObject({ x: z.number(), y: z.number(), z: z.number() }).optional(),
   /** `drop` only: the signed vertical step the route would have taken past `reachedPos`. */
