@@ -487,6 +487,23 @@ describe("state cache: a ghost knows where its corpse is", () => {
     expect(cache.self.reclaimDelay).toBeUndefined();
   });
 
+  test("a corpse inside a dungeon is answered with its entrance, and the corpse's own map is kept beside it", () => {
+    // HandleCorpseQueryOpcode, asked from outside the dungeon: the position is
+    // the entrance on map 0, and the trailing corpse map id is the instance.
+    const ENTRANCE = { map: 0, x: -1100.5, y: 1600.25, z: 50.5 };
+    const cache = StateCache.replay(
+      toEvents([...loginSequence, selfCreate, selfHealth(0, 30), corpseQuery(31, { ...ENTRANCE, corpseMap: 36 })]),
+      { seed: SEED },
+    );
+    expect(cache.self.corpse?.value).toEqual({ ...ENTRANCE, source: "corpse_query", instanceMap: 36 });
+    // The same-map answer carries no instanceMap at all.
+    const open = StateCache.replay(
+      toEvents([...loginSequence, selfCreate, selfHealth(0, 30), corpseQuery(31, CORPSE)]),
+      { seed: SEED },
+    );
+    expect(open.self.corpse?.value).not.toHaveProperty("instanceMap");
+  });
+
   test("a corpse query answered not-found leaves no corpse, and a values delta without a death does not invent one", () => {
     const cache = StateCache.replay(
       toEvents([...loginSequence, selfCreate, selfHealth(0, 30), corpseQuery(31)]),

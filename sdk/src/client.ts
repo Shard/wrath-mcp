@@ -2921,10 +2921,11 @@ export type ReclaimCorpseResult =
       readonly attempts: number;
       /**
        * Exactly one cause, the most specific the observations support:
-       * `not_dead`, `not_released` (pre-flight); `too_far` (with `distance`
-       * and `radius`), `delay_not_elapsed` (with `secondsLeft`), `wrong_map`,
-       * `no_corpse` (the server said there is none), else `still_ghost`; and
-       * `no_observation` for `unconfirmed`.
+       * `not_dead`, `not_released` (pre-flight); `corpse_in_instance` (the
+       * corpse lies inside a dungeon and the ghost is outside it), `too_far`
+       * (with `distance` and `radius`), `delay_not_elapsed` (with
+       * `secondsLeft`), `wrong_map`, `no_corpse` (the server said there is
+       * none), else `still_ghost`; and `no_observation` for `unconfirmed`.
        */
       readonly reason: ReclaimCorpseReason;
       /** Straight-line yards from the ghost to the corpse, for `too_far`. */
@@ -2941,6 +2942,7 @@ export type ReclaimCorpseResult =
 export type ReclaimCorpseReason =
   | "not_dead"
   | "not_released"
+  | "corpse_in_instance"
   | "too_far"
   | "delay_not_elapsed"
   | "wrong_map"
@@ -4260,8 +4262,9 @@ export class WrathClient {
    * Refusals are silent (see `ReclaimCorpseResult`), so the loop re-sends
    * every `attemptTimeout` until the budget runs out, and the verdict is read
    * off `SMSG_DEATH_RELEASE_LOC { map: -1 }` and the character's own health.
-   * The one refusal no wait can cure — a ghost observed standing well outside
-   * the reclaim radius — is answered as `too_far` before anything is sent.
+   * The refusals no wait can cure — a ghost observed standing well outside
+   * the reclaim radius, or outside the dungeon its corpse lies in — are
+   * answered as `too_far` and `corpse_in_instance` before anything is sent.
    * The ambient snippet signal aborts every wait here, as everywhere.
    *
    * Every game outcome is a value; the one throw is a refused request — a
@@ -4311,13 +4314,16 @@ export class WrathClient {
     // waiting: the reclaim delay and the re-sends both assume it is standing
     // at the corpse. Nothing is sent, and the refusal is the one the loop would
     // have ended on — after its whole budget — with the distance and the way back.
+    // A corpse inside a dungeon, asked about from outside it, is the same: the
+    // core's `corpse->IsInMap(_player)` drops every reclaim from another map.
     const corpseAt = this.state.self.corpse?.value;
     const here = this.state.self.position?.value;
     if (
-      corpseAt !== undefined &&
-      here !== undefined &&
-      corpseAt.map === here.map &&
-      distance2d(here, corpseAt) > CORPSE_RECLAIM_RADIUS + CORPSE_RECLAIM_SLACK
+      (corpseAt?.instanceMap !== undefined && here?.map !== corpseAt.instanceMap) ||
+      (corpseAt !== undefined &&
+        here !== undefined &&
+        corpseAt.map === here.map &&
+        distance2d(here, corpseAt) > CORPSE_RECLAIM_RADIUS + CORPSE_RECLAIM_SLACK)
     ) {
       return { ok: false, status: "not_reclaimed", ...facts(0), ...this.reclaimRefusal(0, options) };
     }
@@ -4426,6 +4432,19 @@ export class WrathClient {
           "the server says you have no corpse to reclaim (it expired, or a Spirit Healer already took it) — " +
           "the only way back is spiritHealerActivate(guid) at the graveyard's Spirit Healer, which costs " +
           spiritHealerCost(level),
+      };
+    }
+    // Checked before the map and distance below, which would otherwise measure
+    // against the entrance the server substitutes for the corpse.
+    if (corpse?.instanceMap !== undefined && pos?.map !== corpse.instanceMap) {
+      return {
+        reason: "corpse_in_instance",
+        corpse,
+        hint:
+          `your corpse is inside the dungeon on map ${corpse.instanceMap}, which a reclaim can't reach from ` +
+          `${pos === undefined ? "outside it" : `map ${pos.map}`} — as a ghost, walk into that dungeon's portal and you ` +
+          "come back to life inside (half health, no sickness); " +
+          `state.self.corpse.value is the server's entrance marker, not the portal itself, ${healerOption}`,
       };
     }
     if (corpse !== undefined && pos !== undefined && corpse.map !== pos.map) {

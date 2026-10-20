@@ -40,7 +40,7 @@ export interface DeathSignal {
   ts: number;
   /** That event's stream seq, for correlation with the event log. */
   seq: number;
-  /** Death only: the corpse as the cache held it at that instant. */
+  /** Death only: the corpse as the cache held it at that instant; absent when only its dungeon's entrance was known. */
   position?: { map: number; x: number; y: number; z: number; source: "corpse_query" | "death_spot" };
   /** Release only: the graveyard the spirit was released to. */
   graveyard?: { map: number; x: number; y: number; z: number };

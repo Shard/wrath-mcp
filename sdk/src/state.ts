@@ -289,10 +289,19 @@ export interface UnitFieldsState {
  * (the one a client draws its corpse marker from); `death_spot` is the own
  * position at the moment health reached 0, held until that answer lands. Both
  * are things a client shows a player.
+ *
+ * A corpse inside a dungeon, queried from outside it, is answered with the
+ * dungeon's entrance instead (`HandleCorpseQueryOpcode`): `map`/`x`/`y`/`z`
+ * are then that entrance as the server places it, the marker a client draws,
+ * and `instanceMap` is the map the corpse actually lies on. No position inside
+ * the instance is in the packet. A reclaim cannot reach it from outside; a
+ * ghost entering that dungeon's portal comes back to life inside on arrival.
  */
 export interface CorpseLocation extends Point3 {
   readonly map: number;
   readonly source: "corpse_query" | "death_spot";
+  /** The instance map the corpse is in, present only when `map`/`x`/`y`/`z` are its entrance. */
+  readonly instanceMap?: number;
 }
 
 /**
@@ -405,7 +414,8 @@ export interface SelfState extends UnitFieldsState {
    * The corpse, from death until the resurrect (`SMSG_DEATH_RELEASE_LOC` with
    * `map: -1`). `undefined` while alive, before the first death, or when the
    * server answered the corpse query with "no corpse" (a spirit-healer
-   * resurrection or a corpse that expired). A ghost walks here to reclaim.
+   * resurrection or a corpse that expired). A ghost walks here to reclaim,
+   * unless `instanceMap` says the corpse is inside a dungeon (see `CorpseLocation`).
    */
   corpse: Observed<CorpseLocation> | undefined;
   /**
@@ -2790,14 +2800,17 @@ export class StateCache {
         // death-spot fallback. "Not found" is an answer too: there is no
         // corpse to reclaim (healer resurrection, expiry), so nothing is kept.
         const d = event.data as {
-          found: boolean; map?: number; x?: number; y?: number; z?: number;
+          found: boolean; map?: number; x?: number; y?: number; z?: number; corpseMap?: number;
         };
         if (!d.found || d.map === undefined || d.x === undefined || d.y === undefined || d.z === undefined) {
           this.self.corpse = undefined;
           return;
         }
+        // The two maps differ only for a corpse inside a dungeon asked about
+        // from outside it: the position is then the dungeon's entrance.
+        const inside = d.corpseMap !== undefined && d.corpseMap !== d.map ? { instanceMap: d.corpseMap } : {};
         this.self.corpse = {
-          value: { map: d.map, x: d.x, y: d.y, z: d.z, source: "corpse_query" },
+          value: { map: d.map, x: d.x, y: d.y, z: d.z, source: "corpse_query", ...inside },
           seq: event.seq,
           ts: event.ts,
         };

@@ -4396,6 +4396,36 @@ describe("client: reclaimCorpse owns the delay and answers with a verdict", () =
     await stub.stop();
   });
 
+  test("a corpse inside a dungeon is corpse_in_instance at once, with nothing sent and no radius advice", async () => {
+    // The live case: died in the Deadmines (map 36), released to map 0 beside
+    // the entrance; the corpse query answers with the entrance and corpseMap 36.
+    const stub = startStub({
+      onConnect: () =>
+        deadWorld(1, [
+          corpseQuery(91, { map: 0, x: -1100.5, y: 1600.25, z: 50.5, corpseMap: 36 }),
+          selfArrived(92, { x: -1102, y: 1598.5, z: 52 }),
+        ]),
+    });
+    const client = await inWorld(stub);
+    const started = Date.now();
+    const result = await client.reclaimCorpse();
+    expect(Date.now() - started).toBeLessThan(1000);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.reason).toBe("corpse_in_instance");
+    expect(result.attempts).toBe(0);
+    expect(stub.actions.filter((a) => a.action === "reclaim_corpse")).toHaveLength(0);
+    expect(result.corpse).toEqual({ map: 0, x: -1100.5, y: 1600.25, z: 50.5, source: "corpse_query", instanceMap: 36 });
+    expect(result.hint).toStartWith(
+      "your corpse is inside the dungeon on map 36, which a reclaim can't reach from map 0 — as a ghost, walk into " +
+        "that dungeon's portal and you come back to life inside (half health, no sickness); " +
+        "state.self.corpse.value is the server's entrance marker, not the portal itself, or spiritHealerActivate(guid)",
+    );
+    expect(result.hint).not.toContain("39y");
+    expect(result.hint).not.toContain("delay");
+    client.close();
+    await stub.stop();
+  });
+
   test("a corpse on another map is wrong_map, and no corpse at all is no_corpse", async () => {
     const other = startStub({
       onConnect: () => deadWorld(1, [corpseQuery(91, { map: 1, x: 10, y: 10, z: 10 })]),
