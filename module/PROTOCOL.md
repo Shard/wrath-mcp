@@ -674,7 +674,7 @@ the session down. Cannot run while another session is live on the same account
 ~a minute after logout the core still tracks an offline session for the
 character and `CMSG_CHAR_DELETE` is silently ignored (no response packet), which
 surfaces here as `504 timeout` — callers should retry until `deleted` comes
-back (the module-quest probe shows the pattern).
+back (`deleteFixtureCharacters` in `infra/smoke/lib/fixture.ts` shows the pattern).
 
 Request:
 ```json
