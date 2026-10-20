@@ -1025,7 +1025,14 @@ at the top of this document.
   and a route the core runs out on (the Deadmines mine's tunnels are 177
   polygons) is searched again with 16384 nodes, 512 polygons and 256 points
   of 4y — the same route the core would build with room to finish, audited
-  as `op: "move_long_plan"`. Before any of this, a start whose own polygon
+  as `op: "move_long_plan"`. Where the mesh got is never the request itself:
+  the core's partial path ends at the request when its corridor is the start
+  polygon alone, or when it gave up and returned the straight line (74
+  points or more, or no polygon path), and a subdivision from there was the
+  request to itself, which spliced that straight line into the walk (71y
+  through the Deadmines from the pool past the first boss, into a hollow 15y
+  from any polygon); that end is left off and the mesh got as far as the
+  point before it. Before any of this, a start whose own polygon
   is on a closed island that does not hold the destination's (fewer than
   1024 polygons; the Deadmines pool's floor is 6 under the water surface's
   polygons) is planned from the water surface directly over the start, off

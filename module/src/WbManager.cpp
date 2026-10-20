@@ -2164,22 +2164,42 @@ namespace WrathBench
             // target, and splice. The z-ladder and midpoint retries models used
             // to hand-roll (travel.ts) live here now — pathing detail, not a
             // decision the agent should have to make.
-            bool nonTrivial = pts.size() >= 2;
+            //
+            // Where the mesh got is the partial path's last point, except when
+            // that point is the request itself: a corridor of the start
+            // polygon alone ends there (FindSmoothPath's same-polygon case
+            // steers to the request and appends it once it reaches the
+            // polygon's edge), and so does a shortcut (BuildShortcut: SHORT,
+            // NOPATH). That point is not on any route; a subdivision from it
+            // is the request to itself, trivially complete, and the splice
+            // walked the straight line between (71y from the Deadmines pool
+            // toward a patrol, through a hollow 15y from any polygon, where
+            // the character was then start_off_mesh). So the
+            // request is left off, and the mesh got no farther than the point
+            // before it.
+            size_t got = pts.size();
+            if (got >= 2)
+            {
+                float const dx = pts[got - 1].x - x, dy = pts[got - 1].y - y;
+                if (dx * dx + dy * dy < 0.01f)
+                    --got;
+            }
+            bool nonTrivial = got >= 2;
             if (nonTrivial)
             {
                 G3D::Vector3 const& a = pts.front();
-                G3D::Vector3 const& b = pts.back();
+                G3D::Vector3 const& b = pts[got - 1];
                 nonTrivial = (a - b).squaredLength() > 1.0f;
             }
             if (nonTrivial)
             {
-                G3D::Vector3 const& mid = pts.back();
+                G3D::Vector3 const& mid = pts[got - 1];
                 PathGenerator leg2(player);
                 bool built2 = leg2.CalculatePath(mid.x, mid.y, mid.z, x, y, z, false);
                 if (built2 && IsCompletePath(leg2.GetPathType(), leg2.GetPath()) && endpointOk(leg2))
                 {
-                    for (auto const& v : pts)
-                        r.points.push_back({v.x, v.y, v.z});
+                    for (size_t i = 0; i < got; ++i)
+                        r.points.push_back({pts[i].x, pts[i].y, pts[i].z});
                     Movement::PointsArray const& pts2 = leg2.GetPath();
                     for (size_t i = 1; i < pts2.size(); ++i) // pts2[0] == mid
                         r.points.push_back({pts2[i].x, pts2[i].y, pts2[i].z});
