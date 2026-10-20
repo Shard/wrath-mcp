@@ -110,7 +110,7 @@ const CLIENT_HELPERS: readonly Row[] = [
  */
 const CLIENT_RAW: readonly Row[] = [
   { name: "say", sig: "say(text, { type?: \"say\" | \"party\" | \"yell\" | \"whisper\", to? }?): Promise<ActionResponse>", purpose: "Say something in local chat; type \"party\", \"yell\" or \"whisper\" (with to, the player's name) sends it to your party, as a yell, or to that one player. The line comes back as SMSG_MESSAGECHAT (state.chat)." },
-  { name: "moveToAsync", sig: "moveToAsync(target, { force? }?): Promise<MoveToResponse>", purpose: "Queue a move without waiting — the call for a walk longer than your own time budget; same targets and the same 250y single-move cap as moveTo. No fall estimate here: a ledge answers drop on the WB_MOVE_RESULT event, and { force: true } walks it. A refusal or other non-arrival also reaches the harness block as moveToAsync <status> (superseded and stopped do not: re-sending a move is how you steer); a dead body that is not released is refused (the promise rejects) with nothing sent." },
+  { name: "moveToAsync", sig: "moveToAsync(target, { force? }?): Promise<{ ok, action, moveId, pathLength?, hint? }>", purpose: "Queue a move without waiting — the call for a walk longer than your own time budget; same targets and the same 250y single-move cap as moveTo. A dispatched walk acks with its route length, pathLength (yards), and a hint when the route is far longer than the straight line (also in the harness block as moveToAsync long_route). No fall estimate here: a ledge answers drop on the WB_MOVE_RESULT event, and { force: true } walks it. A refusal or other non-arrival also reaches the harness block as moveToAsync <status> (superseded and stopped do not: re-sending a move is how you steer); a dead body that is not released is refused (the promise rejects) with nothing sent." },
   { name: "stop", sig: "stop(): Promise<ActionResponse>", purpose: "Queue a movement stop; the in-flight moveTo resolves with status 'stopped'." },
   { name: "face", sig: "face(orientationOrPoint: number | { x, y }): Promise<FaceResponse>", purpose: "Turn in place toward an orientation (radians, 0 = east, counter-clockwise) or a point { x, y }. It takes no guid or name: to face a unit, pass its position, face({ x: unit.x, y: unit.y }). Refused with code moving while a move is running." },
   { name: "setTarget", sig: "setTarget(target: GuidOrUnit): Promise<ActionResponse>", purpose: "Set the current target." },
@@ -144,7 +144,7 @@ const CLIENT_RAW: readonly Row[] = [
   { name: "repop", sig: "repop(): Promise<ActionResponse>", purpose: "Release the spirit while dead." },
   { name: "reclaimCorpse", sig: "reclaimCorpse(guid?: GuidOrUnit, options?: ReclaimCorpseOptions): Promise<ReclaimCorpseResult>", purpose: "Wait out the server's corpse reclaim delay, reclaim, and report the verdict: reclaimed / not_reclaimed / unconfirmed." },
   { name: "reclaimCorpseAsync", sig: "reclaimCorpseAsync(guid?: GuidOrUnit): Promise<ActionResponse>", purpose: "CMSG_RECLAIM_CORPSE, dispatch only. Prefer reclaimCorpse." },
-  { name: "spiritHealerActivate", sig: "spiritHealerActivate(guid: GuidOrUnit, options?): Promise<SpiritHealerResult>", purpose: "Resurrect at a graveyard spirit healer (durability cost, resurrection sickness) and wait for it: resurrected, with your position, zone and area (the healer resurrects you where you stand), or unconfirmed with the distance and a hint (the server ignores it silently outside interact range)." },
+  { name: "spiritHealerActivate", sig: "spiritHealerActivate(guid: GuidOrUnit, options?): Promise<SpiritHealerResult>", purpose: "Resurrect at a graveyard spirit healer (durability cost, resurrection sickness) and wait for it: resurrected, with your position, zone and area (the server moves you to the graveyard nearest your corpse when that is not the one nearest you), or unconfirmed with the distance and a hint (the server ignores it silently outside interact range)." },
   { name: "trainerListAsync", sig: "trainerListAsync(guid: GuidOrUnit): Promise<ActionResponse>", purpose: "Ask a trainer for its list without waiting (prefer trainerList)." },
   { name: "trainerBuySpellAsync", sig: "trainerBuySpellAsync(guid: GuidOrUnit, spellId): Promise<ActionResponse>", purpose: "Buy a spell without waiting (prefer buySpell)." },
   { name: "learnTalentAsync", sig: "learnTalentAsync(talentId, rank): Promise<ActionResponse>", purpose: "Spend a talent point without waiting (prefer learnTalent)." },
@@ -273,7 +273,7 @@ const STATE_ROWS: readonly Row[] = [
   { name: "xp", sig: "get state.xp: Observed<number> | undefined", purpose: "Current experience (read .value)." },
   { name: "nextLevelXp", sig: "get state.nextLevelXp: Observed<number> | undefined", purpose: "Experience needed for the next level (read .value)." },
   { name: "money", sig: "get state.money: Observed<number> | undefined", purpose: "Money in copper (read .value)." },
-  { name: "inventory", sig: "get state.inventory: InventoryItem[]", purpose: "All observed inventory slots by raw slot id; equipment is `slot < 19` (worn bags 19-22), bag() is the carried view." },
+  { name: "inventory", sig: "get state.inventory: InventoryItem[]", purpose: "All observed inventory slots by raw slot id; equipment is `slot < 19` (worn bags 19-22), bag() is the carried view. An item with a maximum durability carries durability { current, max }; current 0 is broken (no stats, and a broken weapon does not count for a spell that needs one)." },
   { name: "chat", sig: "get state.chat: readonly ChatEntry[]", purpose: "The retained chat tail, oldest first: { type, senderGuid, senderName?, channelName?, message, achievementId?, seq, ts }. senderName is the packet's own for creature speech (an NPC's say/yell/emote/whisper), else the player sender's name once a name query has answered. Type 9 is the echo of your own whisper: its sender fields name the recipient." },
   { name: "notifications", sig: "get state.notifications: readonly NotificationEntry[]", purpose: "The retained notification tail." },
   { name: "gaps", sig: "get state.gaps: readonly GapRecord[]", purpose: "Observed gaps in the event stream." },
@@ -486,7 +486,10 @@ ${table(CLIENT_RAW)}
 zone/subzone as the client names them on screen, e.g. "Elwynn Forest" /
 "Northshire Valley" — map — \`{ id, name, instanceType }\`, e.g. \`{ id: 36,
 name: "Deadmines", instanceType: "party" }\`, instanceType being "none" in the
-open world, "party" in a dungeon, "raid", "pvp" or "arena" — health,
+open world, "party" in a dungeon, "raid", "pvp" or "arena" — portals —
+the dungeon entrances and exits in view, \`[{ triggerId, map, x, y, z, to: { id,
+name, instanceType } }]\`, each the centre of the portal and the map it leads
+to; walking into one takes you through — health,
 targetGuid, and ghost: \`state.self.ghost.value\` is true while your released
 spirit walks as a ghost, whose health reads 1, not 0) and \`state.nearby\` (a
 Map keyed by guid) are plain properties; the members below are getters and
@@ -505,6 +508,8 @@ what a client knows locally: \`WB_MOVE_RESULT\` / \`WB_MOVE_PROGRESS\` (own move
 login and whenever the zone or subzone changes, by foot, teleport or transfer —
 what \`state.self.zone\` / \`state.self.area\` / \`state.self.map\` are folded from;
 instanceType is the map's code, 0 open world, 1 dungeon, 2 raid, 3 battleground, 4 arena),
+\`WB_PORTALS\` (\`{ mapId, portals }\`, the whole set of portals in view each time it
+changes — what \`state.self.portals\` is folded from),
 \`WB_RIDE_PROGRESS\` (own position while a transport carries you, ≤1/s) and
 \`WB_TRANSPORT_PROGRESS\` (\`{ guid, entry, pos, docked, progressMs, periodMs }\`
 for each transport within view range of you or carrying you, each ≤1/s, with

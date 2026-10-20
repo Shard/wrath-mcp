@@ -137,6 +137,12 @@ export const moveToResponseSchema = z.looseObject({
   ok: z.literal(true),
   action: z.string(),
   moveId: moveIdSchema,
+  /**
+   * The dispatched walk's route length in yards (3D), on a module that acks
+   * after planning; absent on a move refused at planning or as `too_far`.
+   * The ack's `etaMs` beside it is lifted off by the SDK (see `moveEtaMs`).
+   */
+  pathLength: z.number().optional(),
 });
 export type MoveToResponse = z.infer<typeof moveToResponseSchema>;
 
@@ -424,6 +430,28 @@ export const sessionStateDataSchema = z.looseObject({
   areaName: z.string().optional(),
 });
 export type SessionStateData = z.infer<typeof sessionStateDataSchema>;
+
+/**
+ * Synthetic module event: the map-transition portals in view (PROTOCOL.md,
+ * `WB_PORTALS`) — each one's `AreaTrigger.dbc` centre and the map it leads
+ * to, with that map's `Map.dbc` name and `InstanceType` code when the module
+ * has the row. The whole current set on each change; `[]` when none is left.
+ */
+export const portalsDataSchema = z.looseObject({
+  mapId: z.number(),
+  portals: z.array(
+    z.looseObject({
+      triggerId: z.number(),
+      x: z.number(),
+      y: z.number(),
+      z: z.number(),
+      toMap: z.number(),
+      toMapName: z.string().optional(),
+      toInstanceType: z.number().optional(),
+    }),
+  ),
+});
+export type PortalsData = z.infer<typeof portalsDataSchema>;
 
 /**
  * Synthetic module event: the zone/subzone the character is in, on login and
@@ -1710,11 +1738,15 @@ export const eventDataSchemas = {
   WB_RIDE_PROGRESS: rideProgressDataSchema,
   WB_SELF_MOVE: selfMoveDataSchema,
   WB_TRANSPORT_PROGRESS: transportProgressDataSchema,
+  WB_PORTALS: portalsDataSchema,
   ...moveOpcodeSchemas,
   // map transfers
   SMSG_TRANSFER_PENDING: transferPendingDataSchema,
   SMSG_NEW_WORLD: newWorldDataSchema,
   SMSG_TRANSFER_ABORTED: transferAbortedDataSchema,
+  // Bodiless: a dungeon portal refused a ghost whose corpse is not inside
+  // that dungeon (MapMgr::PlayerCannotEnter); no transfer starts.
+  SMSG_CORPSE_NOT_IN_INSTANCE: emptyDataSchema,
   // quest/combat extension — combat
   SMSG_ATTACKSTART: attackStartDataSchema,
   SMSG_ATTACKSTOP: attackStopDataSchema,

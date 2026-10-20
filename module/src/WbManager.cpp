@@ -374,6 +374,7 @@ namespace WrathBench
         TickTeleportAcks(nowMs);
         TickCorpseQuery();
         TickAreas();
+        TickPortals(nowMs);
 
         // Keep parked sockets from being reaped by the idle-connection check in
         // WorldSession::Update (it calls CloseSocket once m_timeOutTime hits 0).
@@ -2562,11 +2563,30 @@ namespace WrathBench
         m.moveId = moveId;
 
         // Ack means "queued"; the game-level outcome arrives as a WB_MOVE_RESULT
-        // event, per the transport/game error split in PROTOCOL.md.
-        ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "move_to")
-            .Add("moveId", moveId).Str()});
+        // event, per the transport/game error split in PROTOCOL.md. Sent once
+        // planning has answered, on each of the three ends below (too_far, a
+        // refusal at planning, a dispatched walk), so a dispatched walk's ack
+        // carries the route it walks: its length and the walker's time over it,
+        // the same figures WB_MOVE_PROGRESS repeats. Planning is this call's own
+        // synchronous work on the world thread, so the ack waits milliseconds.
+        bool acked = false;
+        auto sendAck = [&](bool dispatched) {
+            if (acked)
+                return;
+            acked = true;
+            Json::Writer w;
+            w.Add("ok", true).Add("action", "move_to").Add("moveId", moveId);
+            if (dispatched)
+            {
+                w.Add("pathLength", (double)m.pathLength);
+                if (m.etaMs > 0)
+                    w.Add("etaMs", m.etaMs);
+            }
+            ack->set_value({200, w.Str()});
+        };
 
         auto failEvent = [&](char const* status) {
+            sendAck(false);
             // Nothing moved; if the server still has the character flagged as
             // moving (a superseded run it has not yet seen stop), end it the
             // way a client's run ends. A no-op for a character already still.
@@ -2720,6 +2740,7 @@ namespace WrathBench
                 else
                     w.Raw("nearest", "null");
             }
+            sendAck(false);
             EmitEvent(*s, "WB_MOVE_RESULT", 0xFF01, w.Str());
             return;
         }
@@ -2758,6 +2779,9 @@ namespace WrathBench
                 .Add("runSpeed", (double)player->GetSpeed(MOVE_RUN)).Add("swimSpeed", (double)player->GetSpeed(MOVE_SWIM))
                 .Str());
         }
+        // Before the walker starts: nothing below can end the move first, but
+        // FinishMove clears pathLength, so the ack reads it while it holds.
+        sendAck(true);
         m.seg = 0;
         m.segDone = 0.0f;
         m.lastMs = now;
@@ -3749,6 +3773,83 @@ namespace WrathBench
             Json::Writer w;
             AddAreaFields(w, player);
             EmitEvent(*s, "WB_AREA", 0xFF07, w.Str());
+        }
+    }
+
+    // The map-transition portals a client sees around it: a dungeon entrance
+    // or exit is scenery and an AreaTrigger.dbc volume, not an object, so no
+    // create block ever names it, but a player sees the portal on screen and
+    // the dungeon it opens into. Served as the volume's position from the
+    // client's own AreaTrigger.dbc and the map it leads to — the target map
+    // of the server's areatrigger_teleport row, named from Map.dbc — never
+    // the arrival point. Only triggers that change the map, within the map's
+    // visibility range in 2D (the range every object is sent at; the
+    // transports' test, TickTransports). Tested at most once a second per
+    // session, and WB_PORTALS is sent only when the set (or the map) changes:
+    // the whole current set each time, empty when the last one left range.
+    static constexpr int64_t PORTAL_CHECK_MS = 1000;
+    void Manager::TickPortals(int64_t nowMs)
+    {
+        if (!_areaTriggersLoaded)
+            return;
+        std::vector<std::shared_ptr<BenchSession>> sessions;
+        {
+            std::lock_guard<std::mutex> lock(_sessMutex);
+            for (auto& [token, s] : _byToken)
+                if (!s->tearingDown.load() && s->phase.load() == BenchSession::P_INWORLD)
+                    sessions.push_back(s);
+        }
+        for (auto& s : sessions)
+        {
+            if (nowMs - s->lastPortalCheckMs < PORTAL_CHECK_MS)
+                continue;
+            if (!s->ws || sWorldSessionMgr->FindSession(s->accountId) != s->ws)
+                continue;
+            Player* player = s->ws->GetPlayer();
+            if (!player || !player->IsInWorld() || player->IsBeingTeleported())
+                continue;
+            s->lastPortalCheckMs = nowMs;
+            uint32 const mapId = player->GetMapId();
+            float const range = player->GetMap()->GetVisibilityRange();
+            float const px = player->GetPositionX(), py = player->GetPositionY();
+            std::vector<std::pair<AreaTriggerRec const*, uint32>> seen; // trigger, target map
+            auto it = _areaTriggers.find(mapId);
+            if (it != _areaTriggers.end())
+                for (AreaTriggerRec const& t : it->second)
+                {
+                    float const dx = t.x - px, dy = t.y - py;
+                    if (dx * dx + dy * dy > range * range)
+                        continue;
+                    AreaTriggerTeleport const* tele = sObjectMgr->GetAreaTriggerTeleport(t.id);
+                    if (!tele || tele->target_mapId == mapId)
+                        continue;
+                    seen.emplace_back(&t, tele->target_mapId);
+                }
+            std::sort(seen.begin(), seen.end(), [](auto const& a, auto const& b) { return a.first->id < b.first->id; });
+            std::string key = std::to_string(mapId) + ":";
+            for (auto const& [t, to] : seen)
+                key += std::to_string(t->id) + ",";
+            if (key == s->portalsKey)
+                continue;
+            s->portalsKey = key;
+            std::string list = "[";
+            for (size_t i = 0; i < seen.size(); ++i)
+            {
+                AreaTriggerRec const& t = *seen[i].first;
+                uint32 const to = seen[i].second;
+                Json::Writer p;
+                p.Add("triggerId", t.id).Add("x", (double)t.x).Add("y", (double)t.y).Add("z", (double)t.z).Add("toMap", to);
+                auto map = _maps.find(to);
+                if (map != _maps.end())
+                    p.Add("toMapName", map->second.name).Add("toInstanceType", map->second.instanceType);
+                if (i > 0)
+                    list += ",";
+                list += p.Str();
+            }
+            list += "]";
+            Json::Writer w;
+            w.Add("mapId", mapId).Raw("portals", list);
+            EmitEvent(*s, "WB_PORTALS", 0xFF0A, w.Str());
         }
     }
 
@@ -4869,6 +4970,10 @@ namespace WrathBench
          .Add("level", (uint32)player->GetLevel());
         AddAreaFields(w, player);
         EmitEvent(*s, "WB_SESSION_STATE", 0xFF03, w.Str());
+        // A reattached client gets the portals in view again on the next
+        // TickPortals, as it gets its position here.
+        s->portalsKey.clear();
+        s->lastPortalCheckMs = 0;
     }
 
     void Manager::OnWsClose(std::string const& token, IWsConn* conn)
@@ -7725,6 +7830,13 @@ namespace WrathBench
                     s.pendingTransferMap.store(0);
                     break;
                 }
+                // A dungeon portal refused a ghost whose corpse is not inside
+                // that dungeon (MapMgr::PlayerCannotEnter). Bodiless, and the
+                // only word a client gets: no SMSG_TRANSFER_PENDING precedes
+                // it, so nothing about the pending transfer changes.
+                case SMSG_CORPSE_NOT_IN_INSTANCE:
+                    name = "SMSG_CORPSE_NOT_IN_INSTANCE";
+                    break;
                 // ---------------------------------------- creature movement
                 case SMSG_MONSTER_MOVE:
                 {

@@ -215,6 +215,10 @@ namespace WrathBench
         // leaving the range gets one last report saying so). World thread only.
         int64_t lastTransportEmitMs{0};
         std::unordered_set<uint64_t> transportsInRange;
+        // TickPortals: when the in-range portal set was last tested, and the
+        // set (map and trigger ids) the last WB_PORTALS reported. World thread only.
+        int64_t lastPortalCheckMs{0};
+        std::string portalsKey;
 
         // Map transfer in flight: the destination map from SMSG_TRANSFER_PENDING,
         // cleared by SMSG_NEW_WORLD / SMSG_TRANSFER_ABORTED. Set on tap threads,
@@ -493,6 +497,7 @@ namespace WrathBench
         // Per tick, every in-world session: emit WB_AREA on login and whenever
         // zone or area id changes (walking, teleport, transfer). World thread only.
         void TickAreas();
+        void TickPortals(int64_t nowMs);
         // Append mapId/mapName/instanceType/zoneId/zoneName/areaId/areaName for
         // the player's current position to a writer (WB_AREA and
         // WB_SESSION_STATE share it). mapName and instanceType only when

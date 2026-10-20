@@ -339,6 +339,18 @@ export interface MapRef {
 }
 
 /**
+ * One map-transition portal in view: the centre of its `AreaTrigger.dbc`
+ * volume (the client's own cache) on the map the character is on, and the
+ * map it leads to, named and typed from `Map.dbc` (`name`/`instanceType`
+ * undefined for a map the module has no row for). Never the arrival point.
+ */
+export interface PortalInView extends Point3 {
+  readonly triggerId: number;
+  readonly map: number;
+  readonly to: { readonly id: number; readonly name: string | undefined; readonly instanceType: InstanceType | undefined };
+}
+
+/**
  * An offer to resurrect this dead character (`SMSG_RESURRECT_REQUEST`), as a
  * client's "accept resurrection?" dialog shows it: who is offering (`casterName`
  * from the packet for a creature, else the name a query returned for the
@@ -414,6 +426,15 @@ export interface SelfState extends UnitFieldsState {
    * change until the new map's `WB_AREA` (`position.map` is the id alone).
    */
   map: Observed<MapRef> | undefined;
+  /**
+   * The map-transition portals in view (`WB_PORTALS`): each dungeon entrance
+   * or exit on this map within the map's view range, where it stands and the
+   * map it leads to. A portal is scenery and an areatrigger volume, never a
+   * unit or game object, so this is the only place one shows; walking into
+   * it is what takes you through. `[]` when none is in view; undefined until
+   * the module reported (and from a map change until the new map's report).
+   */
+  portals: Observed<readonly PortalInView[]> | undefined;
   /**
    * The corpse, from death until the resurrect (`SMSG_DEATH_RELEASE_LOC` with
    * `map: -1`). `undefined` while alive, before the first death, or when the
@@ -667,6 +688,15 @@ export interface InventoryItem extends ItemInstance {
   readonly guid: GuidKey;
   readonly itemId: number | undefined;
   readonly stackCount: number | undefined;
+  /**
+   * The item's own durability update fields (`ITEM_FIELD_DURABILITY` /
+   * `ITEM_FIELD_MAXDURABILITY`, the "Durability 30 / 40" line of the
+   * client's tooltip), present when the item has a maximum.
+   * `current` 0 is broken: a broken item gives no stats and a broken weapon
+   * does not count for a spell that needs one. A durability field the
+   * create block left out is the wire compressing a zero, so it reads 0.
+   */
+  readonly durability?: { readonly current: number; readonly max: number };
   readonly seq: number;
   readonly ts: number;
 }
@@ -1519,6 +1549,7 @@ export class StateCache {
     zone: undefined,
     area: undefined,
     map: undefined,
+    portals: undefined,
     corpse: undefined,
     graveyard: undefined,
     reclaimDelay: undefined,
@@ -1991,12 +2022,16 @@ export class StateCache {
       if (guid === "0") continue;
       const item = this.nearby.get(guid);
       const itemId = item?.entry?.value;
+      const maxDurability = item?.fields.get("maxDurability")?.value ?? 0;
       out.push({
         slot,
         guid,
         itemId,
         ...this.itemInstance(item),
         stackCount: item?.fields.get("stackCount")?.value,
+        ...(maxDurability > 0
+          ? { durability: { current: item?.fields.get("durability")?.value ?? 0, max: maxDurability } }
+          : {}),
         seq: Math.max(lo?.seq ?? -1, hi?.seq ?? -1),
         ts: Math.max(lo?.ts ?? 0, hi?.ts ?? 0),
       });
@@ -2764,6 +2799,27 @@ export class StateCache {
         this.foldMap(d.mapId, d.mapName, d.instanceType, event.seq, event.ts);
         return;
       }
+      case "WB_PORTALS": {
+        // The portals in view, the whole set on each change (PROTOCOL.md).
+        const d = event.data as {
+          mapId: number;
+          portals: { triggerId: number; x: number; y: number; z: number; toMap: number; toMapName?: string; toInstanceType?: number }[];
+        };
+        const portals: PortalInView[] = d.portals.map((p) => ({
+          triggerId: p.triggerId,
+          map: d.mapId,
+          x: p.x,
+          y: p.y,
+          z: p.z,
+          to: {
+            id: p.toMap,
+            name: p.toMapName,
+            instanceType: p.toInstanceType === undefined ? undefined : INSTANCE_TYPES[p.toInstanceType],
+          },
+        }));
+        this.self.portals = { value: portals, seq: event.seq, ts: event.ts };
+        return;
+      }
       case "SMSG_LOGIN_VERIFY_WORLD":
       case "SMSG_NEW_WORLD": {
         // The two packets that carry a map id to a client: login, and every
@@ -2783,6 +2839,8 @@ export class StateCache {
         // The new map's name arrives on its WB_AREA; until then only the id
         // (position.map) is known, so the old map's name is not kept.
         if (this.self.map !== undefined && this.self.map.value.id !== d.map) this.self.map = undefined;
+        // The old map's portals are not in view on the new one; its own report follows.
+        if (this.selfMap !== d.map) this.self.portals = undefined;
         this.selfMap = d.map;
         this.self.position = {
           value: { map: d.map, x: d.x, y: d.y, z: d.z, o: d.o },

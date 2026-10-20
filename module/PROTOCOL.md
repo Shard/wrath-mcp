@@ -424,8 +424,8 @@ spell says so), and swimming-only checks apply. Outside a move the flag on a
 first if the character's position now says otherwise.
 
 Walk time. At dispatch the module adds up how long its own walker will take
-over the route, `etaMs`, reported beside `pathLength` on `WB_MOVE_PROGRESS`
-and `WB_MOVE_RESULT`, so a caller can judge a move by time rather than by
+over the route, `etaMs`, reported beside `pathLength` on the dispatch ack,
+`WB_MOVE_PROGRESS` and `WB_MOVE_RESULT`, so a caller can judge a move by time rather than by
 yards at a run speed it assumes: a swim is slower than a run, a mount or a
 ghost faster. Each stretch counts at the speed the walker will drive it at,
 `GetSpeed(MOVE_SWIM)` where the water test above says the body swims and
@@ -440,8 +440,15 @@ it.
 
 Success `200` (means "queued and pathing", not "arrived"):
 ```json
-{ "ok": true, "action": "move_to", "moveId": 1 }
+{ "ok": true, "action": "move_to", "moveId": 1, "pathLength": 612.4, "etaMs": 87486 }
 ```
+
+The ack is sent once planning has answered, which is the call's own
+synchronous work on the world thread. A walk that was dispatched carries its
+route's `pathLength` (yards, 3D) and `etaMs` (absent when no speed could be
+read), the same figures every `WB_MOVE_PROGRESS` of the move repeats; a move
+refused at planning or as `too_far` acks with `moveId` alone, and its
+`WB_MOVE_RESULT` follows the ack.
 
 Additional error: `400 {"ok":false,"error":"missing_position","action":"move_to","param":"<first missing axis>"}`.
 
@@ -948,6 +955,7 @@ session's own identity). Their `opcodeId`s are outside the real opcode range.
 | `WB_RIDE_PROGRESS` | 0xFF05 | `{ "transportGuid": <guid-string>, "transportEntry": <u32>, "pos": { "x","y","z","o" } }` — at most 1/s while the character rides a transport and is not walking; the server-side position the transport carried it to |
 | `WB_TRANSPORT_PROGRESS` | 0xFF06 | `{ "guid": <guid-string>, "entry": <u32>, "pos": { "x","y","z","o" }, "progressMs": <u32>, "periodMs": <u32?>, "docked": <bool?>, "inRange": <bool?> }` — at most 1/s per session, one per transport on the character's map whose create block the session has received and that is within the map's visibility range of the character in 2D (`Map::GetVisibilityRange()`, the core's `Visibility.Distance.*` for the map — 100y on continents and 170y in instances by default — the distance the core sends every other object at; transports alone are sent map-wide) or is carrying it; a transport that leaves the range gets one last report with `"inRange": false` and no `docked` (its position as it left), then none until it is back: the car's current position on its `TransportAnimation.dbc` path (what a client animates locally from `pathProgress`), the clock and period, and `docked` when the keyframe segment the clock is on has no displacement (the car is dwelling at a platform; absent for transports without an animation path) |
 | `WB_AREATRIGGER` | 0xFF04 | `{ "triggerId": <u32>, "moveId": <number>, "pos": { "x","y","z","o" } }` — the character entered an `AreaTrigger.dbc` volume and `CMSG_AREATRIGGER` was sent for it (see below); `moveId` is the `move_to` that crossed into it, 0 when no move did (a taxi landing, a transport carrying the character, a teleport's arrival) |
+| `WB_PORTALS` | 0xFF0A | `{ "mapId": <u32>, "portals": [{ "triggerId": <u32>, "x", "y", "z", "toMap": <u32>, "toMapName"?: <str>, "toInstanceType"?: <u32> }] }` — the map-transition portals in view: every `AreaTrigger.dbc` volume on the character's map whose `areatrigger_teleport` row leads to another map, within the map's visibility range of the character in 2D (`Map::GetVisibilityRange()`, the range `WB_TRANSPORT_PROGRESS` uses). `x`,`y`,`z` is the volume's centre from the client's DBC; `toMap` is the map it leads to, named and typed from the client's `Map.dbc` as on `WB_AREA` (both absent for a map the table has no row for); the arrival point is never served. Tested at most once a second and sent only when the set or the map changes, the whole current set each time (`[]` once the last one is out of range); sent again after a reattach's `WB_SESSION_STATE`. A dungeon entrance is scenery and a trigger volume, never an object, so nothing else names it |
 | `WB_SELF_MOVE` | 0xFF09 | `{ "opcode": "MSG_MOVE_FALL_LAND", "cause": "taxi_landing", "pos": { "x","y","z","o" }, "fromZ": <f> }` — a movement packet the module sent for the character outside any `move_to`, as a client's own physics would: today only the drop from a taxi flight's last spline point (`fromZ`) to the ground under it (`pos`), see "Taxi landing" below |
 | `WB_AREA` | 0xFF07 | `{ "mapId": <u32>, "mapName"?: <str>, "instanceType"?: <u32>, "zoneId": <u32>, "zoneName": <str>, "areaId": <u32>, "areaName": <str> }` — the zone and subzone the character is in, named as the client names them, and the map it is on with the client's `Map.dbc` name and `InstanceType` for it (0 the open world, 1 a party dungeon, 2 a raid, 3 a battleground, 4 an arena; both absent when the table has no row for the map, never a guessed 0); once when the character enters the world and once per change of either area id, of the map or of the instance, whatever moved it (walking, a teleport, a map transfer). A transfer always sends one, with the new map's `mapId` and `instanceType`, even when both area ids stay the same: the Deadmines portal does, the mine outside on map 0 and map 36 inside being zone and area 1581 alike. See "Zone and area" below. |
 | `WB_TALENT_TREE` | 0xFF08 | the class talent frame, the answer to the `talent_tree` action; shape under "Spellbook, cooldowns, talents" below |
@@ -1543,6 +1551,7 @@ Map transfers (navigation):
 | `SMSG_TRANSFER_PENDING` | 0x03F | `{ "map": <u32>, "transportEntry": <u32?>, "oldMap": <u32?> }` — the optional pair only when a transport carries the character across |
 | `SMSG_NEW_WORLD` | 0x03E | `{ "map": <u32>, "x", "y", "z", "o" }` — the arrival point (transport-local when aboard one) |
 | `SMSG_TRANSFER_ABORTED` | 0x040 | `{ "map": <u32>, "reason": <u8>, "arg": <u8?> }` — `arg` only for INSUF_EXPAN_LVL / DIFFICULTY / UNIQUE_MESSAGE |
+| `SMSG_CORPSE_NOT_IN_INSTANCE` | 0x506 | `{}` — bodiless: a dead character crossed a dungeon portal's areatrigger and the server refused it because its corpse is not in that dungeon or one inside it (`MapMgr::PlayerCannotEnter`); no transfer follows, and the `move_to` that crossed the trigger ends as it would have anyway |
 
 `SMSG_NEW_WORLD` is the only map id a client receives after login
 (`SMSG_LOGIN_VERIFY_WORLD` is never re-sent), so it is what self position's

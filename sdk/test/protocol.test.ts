@@ -112,11 +112,13 @@ describe("event frames", () => {
       "WB_RIDE_PROGRESS",
       "WB_SELF_MOVE",
       "WB_TRANSPORT_PROGRESS",
+      "WB_PORTALS",
       ...MOVE_OPCODES,
       // map transfers
       "SMSG_TRANSFER_PENDING",
       "SMSG_NEW_WORLD",
       "SMSG_TRANSFER_ABORTED",
+      "SMSG_CORPSE_NOT_IN_INSTANCE",
       // quest/combat extension, in PROTOCOL.md's table order
       "SMSG_ATTACKSTART",
       "SMSG_ATTACKSTOP",

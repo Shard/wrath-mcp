@@ -894,6 +894,11 @@ export type MoveResult =
       readonly seq: number;
       readonly ts: number;
       /**
+       * The route this walk took, in yards (3D), as the module planned it:
+       * present on a verdict of a move that was dispatched and walked.
+       */
+      readonly pathLength?: number;
+      /**
        * Present when the navmesh resolved the request to a ground z more than
        * 1y from the z asked for: the move still arrived (x/y matched), and this
        * is the z it actually walked to. Quote it next time.
@@ -920,6 +925,11 @@ export type MoveResult =
       readonly position: UnitPosition;
       readonly seq: number;
       readonly ts: number;
+      /**
+       * The route this walk took, in yards (3D), as the module planned it:
+       * present on a verdict of a move that was dispatched and walked.
+       */
+      readonly pathLength?: number;
       /** The map and arrival point `SMSG_NEW_WORLD` announced, server-confirmed. */
       readonly to: WorldPosition;
       readonly hint: string;
@@ -937,6 +947,11 @@ export type MoveResult =
       readonly position: UnitPosition;
       readonly seq: number;
       readonly ts: number;
+      /**
+       * The route this walk took, in yards (3D), as the module planned it:
+       * present on a verdict of a move that was dispatched and walked.
+       */
+      readonly pathLength?: number;
       readonly to: UnitPosition;
       readonly hint: string;
     }
@@ -957,6 +972,7 @@ export type MoveResult =
       readonly position?: undefined;
       readonly seq?: undefined;
       readonly ts?: undefined;
+      readonly pathLength?: undefined;
       readonly reachedPos?: undefined;
       readonly dz?: undefined;
       readonly surfaceZ?: undefined;
@@ -971,6 +987,11 @@ export type MoveResult =
       readonly position: UnitPosition;
       readonly seq: number;
       readonly ts: number;
+      /**
+       * The route this walk took, in yards (3D), as the module planned it:
+       * present on a verdict of a move that was dispatched and walked.
+       */
+      readonly pathLength?: number;
       /**
        * `path_incomplete`: how far the mesh could get toward the request (the
        * module already tried one subdivision from here); route around, or
@@ -1093,6 +1114,27 @@ const DEAD_MOVE_HINT =
 /** `interrupted` when the verdict found the character dead. */
 const MOVE_DIED_HINT =
   "the move stopped because the character died. A corpse cannot move: sdk.repop() releases the spirit, and a ghost can walk.";
+
+/**
+ * A ghost walked into a dungeon portal and the server refused it
+ * (`MapMgr::PlayerCannotEnter` sends the bodiless `SMSG_CORPSE_NOT_IN_INSTANCE`
+ * when the corpse is not in that dungeon or one inside it). The move that
+ * crossed the portal still reads `arrived`. Names the corpse from
+ * `state.self.corpse` when the cache has it.
+ */
+function corpseNotInInstanceHint(state: StateCache): string {
+  const corpse = state.self.corpse?.value;
+  const where =
+    corpse === undefined
+      ? "your corpse is not inside it"
+      : corpse.instanceMap !== undefined
+        ? `your corpse is inside map ${corpse.instanceMap}`
+        : `your corpse is on map ${corpse.map} at (${fmtXY(corpse)})`;
+  return (
+    `the server refused the dungeon portal: a ghost can enter only the dungeon its corpse lies in, and ${where}. ` +
+    `Walk to the corpse and reclaimCorpse(), or resurrect at a Spirit Healer (spiritHealerActivate), then enter alive.`
+  );
+}
 
 /**
  * The server's fall-damage rule (Player::HandleFall in the pinned core): a fall
@@ -1464,6 +1506,43 @@ export function walkBudgetNote(
     `state.self.position.`
   );
 }
+
+/**
+ * A route is "far longer than the straight line" when it is at least this many
+ * times the straight line and at least `LONG_ROUTE_EXTRA_YARDS` longer: the
+ * ratio alone would flag a 12y walk round a 4y wall.
+ */
+const LONG_ROUTE_FACTOR = 3;
+const LONG_ROUTE_EXTRA_YARDS = 100;
+
+/**
+ * The note on a dispatched walk whose route is far longer than the straight
+ * line to its target (the Moonbrook graveyard is ~30y from the Deadmines
+ * portal pit and ~870y from it on foot, round through the mine): both
+ * numbers, and the time when the module said it. A fact about this walk, not
+ * a strategy; undefined for an ordinary route.
+ */
+export function longRouteNote(
+  point: { x: number; y: number },
+  straightYards: number,
+  routeYards: number,
+  etaMs?: number,
+): string | undefined {
+  if (routeYards < straightYards * LONG_ROUTE_FACTOR || routeYards - straightYards < LONG_ROUTE_EXTRA_YARDS) {
+    return undefined;
+  }
+  const time =
+    etaMs !== undefined
+      ? `about ${Math.round(etaMs / 1000)}s at the character's own pace`
+      : `about ${Math.round(routeYards / RUN_SPEED_YPS)}s at ${RUN_SPEED_YPS}yd/s`;
+  return (
+    `the walkable route to (${fmtXY(point)}) is ~${Math.round(routeYards)}y though it is ~${Math.round(straightYards)}y ` +
+    `away in a straight line (${time}): the walk goes the long way round.`
+  );
+}
+
+/** `moveToAsync`'s answer: the module's ack, and the long-route note when the route earns one. */
+export type MoveToAsyncResponse = MoveToResponse & { readonly hint?: string };
 
 export interface WaitForTransferOptions {
   /** How long to wait for `SMSG_NEW_WORLD`, in ms. Default 15000: a far teleport is a few server ticks. */
@@ -2152,6 +2231,17 @@ const CAST_FAILURE_MEANING: Readonly<Record<string, string>> = {
   no_combo_points: "it needs combo points on the target",
   reagents: "a reagent it needs is missing",
   nothing_to_dispel: "the target has nothing it can dispel",
+  equipped_item_class_mainhand: "it needs a fitting weapon in the main hand, and a broken one (durability 0) does not count",
+  equipped_item_class_offhand: "it needs a fitting weapon in the off hand, and a broken one (durability 0) does not count",
+};
+
+/**
+ * The equipment slot a weapon-slot refusal names (`Spell::CheckItems`: no
+ * weapon there, or a broken one, `Item::IsBroken`), and the words for it.
+ */
+const CAST_FAILURE_WEAPON_SLOT: Readonly<Record<string, { slot: number; words: string }>> = {
+  equipped_item_class_mainhand: { slot: 15, words: "main hand" },
+  equipped_item_class_offhand: { slot: 16, words: "off hand" },
 };
 
 /**
@@ -2169,9 +2259,17 @@ function castFailedHint(state: StateCache, cast: PendingCast, reason: string): s
     on = ` on ${name ?? cast.targetGuid}`;
   }
   const meaning = CAST_FAILURE_MEANING[reason];
+  // A weapon-slot refusal with the slot's own item observed broken says
+  // which item: the durability fields are what the client's tooltip reads.
+  const weapon = CAST_FAILURE_WEAPON_SLOT[reason];
+  const worn = weapon === undefined ? undefined : state.inventory.find((i) => i.slot === weapon.slot);
+  const broken =
+    weapon !== undefined && worn?.durability !== undefined && worn.durability.current <= 0
+      ? `; your ${weapon.words} ${worn.name ?? `item ${worn.itemId ?? "?"}`} is broken (0/${worn.durability.max} durability)`
+      : "";
   // The reason itself is the tally line's status (`castSpell <reason>: …`), so
   // the hint says what it means and names nothing twice.
-  return `${label}${on}: ${meaning ?? "the server refused it"}`;
+  return `${label}${on}: ${meaning ?? "the server refused it"}${broken}`;
 }
 
 /** The quest an item's tooltip says it starts, when the tooltip has been observed and says so. */
@@ -3118,10 +3216,13 @@ export type SpiritHealerResult =
       readonly ok: true;
       readonly status: "resurrected";
       /**
-       * Where you are now: the spirit healer resurrects you where you stand, at
-       * the graveyard your spirit was released to, which need not be the one
-       * nearest your corpse. `position` and the zone and subzone names are the
-       * cache's (`state.self`), undefined when unobserved.
+       * Where you are now. The healer resurrects you, and when the graveyard
+       * nearest your corpse is not the one nearest you the server then moves
+       * you to it (`WorldSession::SendSpiritResurrect`, a same-map teleport
+       * whose `MSG_MOVE_TELEPORT_ACK` lands before the alive fields), so this
+       * can be another graveyard than the one whose healer you spoke to.
+       * `position` and the zone and subzone names are the cache's
+       * (`state.self`), undefined when unobserved.
        */
       readonly position: WorldPosition | undefined;
       readonly zone: string | undefined;
@@ -3298,6 +3399,12 @@ export class WrathClient {
     this.events.onAny((event: StreamEvent) => this.state.apply(event));
     this.events.onAny((event: StreamEvent) => this.clientParityQueries(event));
     this.events.onAny((event: StreamEvent) => this.castVerdict(event));
+    // A dungeon portal the server refused a ghost: the move that crossed it
+    // still arrives, so this bodiless packet is the only word of it, and it
+    // reaches the harness block from whichever caller walked there.
+    this.events.on("SMSG_CORPSE_NOT_IN_INSTANCE", () => {
+      this.noteActionHint("portal", "corpse_not_in_instance", corpseNotInInstanceHint(this.state));
+    });
   }
 
   /**
@@ -3624,8 +3731,12 @@ export class WrathClient {
    * that resolves to no position throws here rather than returning a verdict —
    * this is the raw tier, and there is no result object to put an answer in;
    * `moveTo` answers the same case with `status: "unknown_target"`.
+   *
+   * A walk that was dispatched acks with its route's `pathLength` (yards),
+   * and with a `hint` when that route is far longer than the straight line
+   * (`longRouteNote`): a portal 30y away across a cliff can be a 600y walk.
    */
-  moveToAsync(target: MoveTarget, options: { force?: boolean } = {}): Promise<MoveToResponse> {
+  moveToAsync(target: MoveTarget, options: { force?: boolean } = {}): Promise<MoveToAsyncResponse> {
     const resolved = resolveMoveTarget(target, this.state, "moveTo");
     if ("unknown" in resolved) {
       throw new TypeError(
@@ -3640,9 +3751,18 @@ export class WrathClient {
     // The raw tier: no fall estimate stands in for the caller. A `drop`
     // arrives as the event it is, and `force` is the caller's own word.
     const epoch = this.events.epoch;
-    return this.postMoveTo(resolved.point, resolved.guid, options.force === true).then((ack) => {
+    const from = this.state.self.position?.value;
+    return this.postMoveTo(resolved.point, resolved.guid, options.force === true).then(({ ack, etaMs }) => {
       this.watchAsyncMove(ack.moveId, resolved.point, epoch);
-      return ack;
+      const note =
+        from === undefined || ack.pathLength === undefined
+          ? undefined
+          : longRouteNote(resolved.point, distance2d(from, resolved.point), ack.pathLength, etaMs);
+      if (note === undefined) return ack;
+      // Also to the harness block, so a dropped ack still tells the model
+      // (operator, 2026-10-20): once per dispatch, like a refusal.
+      this.noteActionHint("moveToAsync", "long_route", note, resolved.point);
+      return { ...ack, hint: note };
     });
   }
 
@@ -3667,7 +3787,10 @@ export class WrathClient {
         const status = status_(data);
         if (ASYNC_MOVE_UNREPORTED.has(status)) return;
         let recipe = this.moveRecipe(status, point, data);
-        if (status === "drop" && this.state.self.ghost?.value === true && recipe !== undefined) {
+        // Only a fall: a climb (dz > 0) and a step underground (surfaceZ)
+        // are refused forced or not, so fall damage says nothing about them.
+        const fall = data.dz !== undefined && data.dz < 0 && data.surfaceZ === undefined;
+        if (status === "drop" && fall && this.state.self.ghost?.value === true && recipe !== undefined) {
           recipe += " A ghost takes no fall damage.";
         }
         this.noteActionHint("moveToAsync", status, recipe, point);
@@ -3699,12 +3822,21 @@ export class WrathClient {
     return this.state.self.health?.value.current === 0 && this.state.self.ghost?.value !== true;
   }
 
-  /** The `move_to` POST itself; `guid` is the planning hint `resolveMoveTarget` attaches to unit targets. */
-  private postMoveTo(point: MovePoint, guid?: string, force = false): Promise<MoveToResponse> {
+  /**
+   * The `move_to` POST itself; `guid` is the planning hint `resolveMoveTarget`
+   * attaches to unit targets. The ack's `etaMs` (a module that acks after
+   * planning) is lifted off here, as `liftMoveEta` lifts it off the move
+   * events: it is the SDK's own input to a note, never a field a caller reads.
+   */
+  private async postMoveTo(
+    point: MovePoint,
+    guid?: string,
+    force = false,
+  ): Promise<{ ack: MoveToResponse; etaMs: number | undefined }> {
     // Any dispatch supersedes a remembered refusal, whichever call made it:
     // what comes back is the verdict now.
     this.lastMoveRejection = null;
-    return this.request(
+    const ack = await this.request(
       "POST",
       "/action",
       {
@@ -3718,6 +3850,10 @@ export class WrathClient {
       },
       moveToResponseSchema,
     );
+    const raw = ack as Record<string, unknown>;
+    const eta = raw.etaMs;
+    delete raw.etaMs;
+    return { ack, etaMs: typeof eta === "number" && Number.isFinite(eta) && eta > 0 ? eta : undefined };
   }
 
   /**
@@ -4891,7 +5027,9 @@ export class WrathClient {
   /**
    * `CMSG_SPIRIT_HEALER_ACTIVATE` — resurrect at the graveyard's spirit healer
    * when the corpse is unreachable. Costs durability and applies resurrection
-   * sickness. The verdict is read off `SMSG_DEATH_RELEASE_LOC { map: -1 }`,
+   * sickness. The resurrected character is then moved to the graveyard
+   * nearest its corpse when that is not the one nearest it (the result's
+   * `position` says where). The verdict is read off `SMSG_DEATH_RELEASE_LOC { map: -1 }`,
    * which every resurrection sends first. The core drops the packet without a
    * word when the healer is out of interact range, so silence is answered as
    * `unconfirmed` with the distance the cached positions give.
@@ -6052,7 +6190,7 @@ export class WrathClient {
     // Dispatch and wait for the verdict; issued once, and a second time with
     // `force` when the first answer is a `drop` the fall estimate allows.
     const issue = async (force: boolean): Promise<StreamEvent> => {
-      const ack = await this.postMoveTo(point, resolved.guid, force);
+      const { ack } = await this.postMoveTo(point, resolved.guid, force);
       // The match is the moveId within the current session epoch, and the buffer
       // is searched: a result can land while the POST response is still in
       // flight (an immediate `target_off_mesh` does exactly that). No `sinceSeq` bound —
@@ -6134,10 +6272,20 @@ export class WrathClient {
     // (`etaMs`: a swim is slower than the run speed, a mount faster), else by
     // the route's length (`pathLength`) at run speed, else by the straight
     // line: a mine's 165y line was a 660y walk, and the line alone said nothing.
+    // Else, a route far longer than the straight line says both numbers
+    // (`longRouteNote`); the budget note already names both when it fires.
     const noteBudget = (verdictEvent: StreamEvent) => {
-      if (from === undefined || budgetMs === undefined) return;
+      if (from === undefined) return;
       const verdict = verdictEvent.data as MoveResultData;
-      const note = walkBudgetNote(distance2d(from, point), verdict.pathLength, budgetMs, moveEtaMs(verdictEvent));
+      const straight = distance2d(from, point);
+      const eta = moveEtaMs(verdictEvent);
+      const budget = budgetMs === undefined ? undefined : walkBudgetNote(straight, verdict.pathLength, budgetMs, eta);
+      const longRoute = verdict.pathLength === undefined ? undefined : longRouteNote(point, straight, verdict.pathLength, eta);
+      // The long route reaches the harness block once per move whether or not
+      // the result is read (operator, 2026-10-20); the result's hint carries
+      // the budget note instead when that one already names the route.
+      if (longRoute !== undefined) this.noteActionHint("moveTo", "long_route", longRoute, point);
+      const note = budget ?? longRoute;
       if (note !== undefined) extras.push(note);
     };
     let event = await issue(options.force === true);
@@ -6170,8 +6318,20 @@ export class WrathClient {
       z: data.pos.z,
       o: data.pos.o,
     };
-    const common = { moveId: data.moveId, position, seq: event.seq, ts: event.ts } as const;
+    const common = {
+      moveId: data.moveId,
+      position,
+      seq: event.seq,
+      ts: event.ts,
+      ...(data.pathLength !== undefined ? { pathLength: data.pathLength } : {}),
+    } as const;
     if (status === "arrived") {
+      // A portal this walk crossed that refused a ghost: the arrival is the
+      // walk's, and the refusal rides its hint (the harness block has it too).
+      const refused = this.events
+        .recent(500)
+        .some((e) => e.seq > sinceSeq && e.seq <= event.seq && e.opcode === "SMSG_CORPSE_NOT_IN_INSTANCE");
+      if (refused) extras.push(corpseNotInInstanceHint(this.state));
       const aboard = data.onTransport !== undefined ? { onTransport: data.onTransport } : {};
       if (data.meshZ === undefined) {
         const hint = withNotes();

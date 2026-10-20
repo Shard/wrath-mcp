@@ -32,6 +32,11 @@ export interface StubOptions {
    * module answers. Unset, the stub accepts everything (pre-auth shape).
    */
   secret?: string;
+  /**
+   * Extra fields on a `move_to` ack, by the moveId it hands back: the module
+   * acks a dispatched walk with its route's `pathLength` and `etaMs`.
+   */
+  moveToAck?: (moveId: number) => Record<string, unknown>;
 }
 
 export interface CharacterDeleteBody {
@@ -186,7 +191,8 @@ export function startStub(options: StubOptions = {}): StubServer {
           const refused = options.failAction?.(action);
           if (refused) return refused;
           if (action === "move_to") {
-            return json({ ok: true, action, moveId: ++moveIdGen });
+            const moveId = ++moveIdGen;
+            return json({ ok: true, action, moveId, ...(options.moveToAck?.(moveId) ?? {}) });
           }
           if (action === "face") {
             const b = body as { orientation?: number; x?: number; y?: number };
