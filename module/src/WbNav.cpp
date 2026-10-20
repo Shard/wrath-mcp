@@ -381,4 +381,38 @@ namespace WbNav
         }
         return false;
     }
+
+    bool ReachableStartLevel(dtNavMesh const* navMesh, dtNavMeshQuery const* query, dtPolyRef startRef, dtPolyRef endRef,
+        float const* start, dtPolyRef* refOut, float* pointOut, uint32_t* islandPolys)
+    {
+        ExcludePolysFilter const base;
+        std::vector<dtPolyRef> island;
+        if (!startRef || !endRef || !OnIsland(navMesh, base, endRef, startRef, &island))
+            return false;
+        // The core's first start box (CorePolyAt); a level over the start
+        // point is what Detour's nearest-polygon search prefers in it.
+        float const extents[3] = { 3.0f, 5.0f, 3.0f };
+        dtPolyRef ref = 0;
+        float level[3] = { 0.0f, 0.0f, 0.0f };
+        if (!NearestReachable(navMesh, query, endRef, start, extents, &ref, level))
+            return false;
+        float over[3] = { 0.0f, 0.0f, 0.0f };
+        bool posOverPoly = false;
+        if (dtStatusFailed(query->closestPointOnPoly(ref, start, over, &posOverPoly)) || !posOverPoly)
+            return false; // beside the start, not over or under it
+        if (over[1] <= start[1])
+            return false; // a level under the start: a floor no client falls through
+        dtPolyRef const core = CorePolyAt(query, base, over, nullptr);
+        if (!core || std::find(island.begin(), island.end(), core) != island.end())
+            return false;
+        dtMeshTile const* tile = nullptr;
+        dtPoly const* poly = nullptr;
+        if (dtStatusFailed(navMesh->getTileAndPolyByRef(core, &tile, &poly)) || !(poly->flags & WATER_FLAG))
+            return false; // a dry level over the start: a ledge no client climbs
+        *refOut = core;
+        dtVcopy(pointOut, over);
+        if (islandPolys)
+            *islandPolys = uint32_t(island.size());
+        return true;
+    }
 }

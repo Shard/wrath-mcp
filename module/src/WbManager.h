@@ -377,6 +377,14 @@ namespace WrathBench
             float endLiftFrom{0};       // ... from this z (audit only)
             bool hasSnap{false};        // the start was off the mesh and was snapped to the nearest point
             float snapX{0}, snapY{0}, snapZ{0};
+            // The start's own polygon is on a closed island that does not hold
+            // the end, and the route is planned from the reachable water
+            // surface over the start instead (WbNav::ReachableStartLevel), audit
+            // only (op: move_start_level): the start itself, the level's z,
+            // and the island's size. The route still begins at levelFrom.
+            bool hasStartLevel{false};
+            float levelFromX{0}, levelFromY{0}, levelFromZ{0}, levelZ{0};
+            uint32 levelIslandPolys{0};
             // The request's own polygon is on a closed island the start cannot
             // reach (WbNav::OnIsland), audit only (op: move_end_reachable):
             // its size, and whether the walk goes to the reachable mesh

@@ -1025,7 +1025,16 @@ at the top of this document.
   and a route the core runs out on (the Deadmines mine's tunnels are 177
   polygons) is searched again with 16384 nodes, 512 polygons and 256 points
   of 4y — the same route the core would build with room to finish, audited
-  as `op: "move_long_plan"`. `reachedPos` is how far the core's search got,
+  as `op: "move_long_plan"`. Before any of this, a start whose own polygon
+  is on a closed island that does not hold the destination's (fewer than
+  1024 polygons; the Deadmines pool's floor is 6 under the water surface's
+  polygons) is planned from the water surface directly over the start, off
+  that island and within the core's own start box (5y in z), when there is
+  one: the route still begins at the start, in the same column — the swim up
+  a client's character makes — and the drop guard judges its first segment
+  like any other (audited as `op: "move_start_level"`). A dry level over the
+  start, or any level under it, is not taken: that would be climbing a ledge
+  or falling through a floor. `reachedPos` is how far the core's search got,
   so the agent can route around or approach from another side; its z can be
   a level away from the request (a search that ran out on a hillside over a
   tunnel). Nothing moved.
@@ -1658,6 +1667,10 @@ the `collisionHeight` the threshold came from), so the packet
 sequence the "client" sent is fully reconstructable from the audit log.
 A move whose start the mesh does not cover logs `op: "move_start_snap"` with
 `from` (the true position), `to` (the nearest mesh point) and `distance`.
+A move planned from the water surface over its start (the start's own
+polygon on a closed island; `path_incomplete` below) logs
+`op: "move_start_level"` with `from` (the start), `levelZ` (the level's
+height there) and `islandPolys` (the start island's size).
 A move whose endpoint the core's normalization left under the ground logs
 `op: "move_end_z"` with `normZ` (the z the core settled on) and `meshZ` (the
 height of the polygon the path ends on, where the walk ends instead).

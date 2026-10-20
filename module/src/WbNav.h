@@ -41,6 +41,7 @@ namespace WbNav
     constexpr float SMOOTH_SLOP = 0.3f;          // SMOOTH_PATH_SLOP
     constexpr uint32_t CORE_POINT_PATH = 74;     // MAX_POINT_PATH_LENGTH
     constexpr uint16_t PLAYER_FLAGS = 0x01 | 0x02 | 0x08; // NAV_GROUND | NAV_MAGMA | NAV_WATER (CreateFilter, a Player)
+    constexpr uint16_t WATER_FLAG = 0x08;        // NAV_WATER
 
     // The module's planner: the corridor the core's PathGenerator cannot
     // hold (MAX_PATH_LENGTH 74 polygons from a 1024-node search, MMapMgr) —
@@ -113,6 +114,23 @@ namespace WbNav
     // counts them.
     bool NearestReachable(dtNavMesh const* navMesh, dtNavMeshQuery const* query, dtPolyRef startRef,
         float const* point, float const* extents, dtPolyRef* refOut, float* pointOut, uint32_t* islands = nullptr);
+
+    // The start level a move plans from when the polygon the core picks for
+    // the start (`startRef`, CorePolyAt) is on a closed island that does not
+    // hold the end's polygon: the water surface directly over the start
+    // point itself, inside the core's own 3y x 5y start box, that is not on
+    // that island, and on which the core's own pick is not the island again.
+    // A two-level spot: the Deadmines pool past the first boss is a
+    // 6-polygon floor under the water surface's polygons, the floor nearer in
+    // z wherever the character stands, and every route from it ended at the
+    // floor's edge. Only water over the start: a character swims up to its
+    // surface, while a dry level over it is a ledge no client climbs, and
+    // one under it is a floor no client falls through. `pointOut` is the
+    // level's point over the start (Detour order), `refOut` the polygon the
+    // core picks there, `islandPolys` the start island's size. False when
+    // the start's component holds the end, or no such level is there.
+    bool ReachableStartLevel(dtNavMesh const* navMesh, dtNavMeshQuery const* query, dtPolyRef startRef, dtPolyRef endRef,
+        float const* start, dtPolyRef* refOut, float* pointOut, uint32_t* islandPolys);
 }
 
 #endif
