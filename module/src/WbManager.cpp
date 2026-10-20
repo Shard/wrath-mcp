@@ -3455,8 +3455,12 @@ namespace WrathBench
     // names them from AreaTable.dbc, and redraws on every change whether it
     // walked, was teleported or transferred. The server keeps the same pair
     // on the Player from the same terrain data, so reading it is the same
-    // observation. Edge-triggered per session; the first in-world tick counts
-    // as a change so login announces where the character is.
+    // observation. Edge-triggered per session on the map, the instance and
+    // the pair, since a client redraws on a map load whatever the pair reads:
+    // a portal can keep both ids (the Deadmines mine outside and map 36
+    // inside are zone and area 1581 alike), and without the map in the test
+    // the transfer announced nothing. The first in-world tick counts as a
+    // change so login announces where the character is.
     void Manager::TickAreas()
     {
         std::vector<std::shared_ptr<BenchSession>> sessions;
@@ -3475,10 +3479,14 @@ namespace WrathBench
                 continue;
             uint32 zoneId = 0, areaId = 0;
             player->GetZoneAndAreaId(zoneId, areaId);
-            if (zoneId == s->lastZoneId && areaId == s->lastAreaId)
+            uint32 const mapId = player->GetMapId();
+            uint32 const instanceId = player->GetInstanceId();
+            if (zoneId == s->lastZoneId && areaId == s->lastAreaId && mapId == s->lastMapId && instanceId == s->lastInstanceId)
                 continue;
             s->lastZoneId = zoneId;
             s->lastAreaId = areaId;
+            s->lastMapId = mapId;
+            s->lastInstanceId = instanceId;
             Json::Writer w;
             AddAreaFields(w, player);
             EmitEvent(*s, "WB_AREA", 0xFF07, w.Str());

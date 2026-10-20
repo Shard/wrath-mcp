@@ -71,6 +71,21 @@ describe("state: self.map", () => {
     expect(inside.snapshot().self.map?.value.instanceType).toBe("party");
   });
 
+  test("through the Deadmines portal, where zone and area are 1581 on both sides, the map's own WB_AREA names map 36", () => {
+    // The mine outside is "The Deadmines" on map 0 already; the module sends
+    // the transfer's WB_AREA for the map change alone (PROTOCOL.md, WB_AREA).
+    const mine = { ...deadmines, mapId: 0, mapName: "Eastern Kingdoms", instanceType: 0 };
+    const transfer = [frame(10, "WB_AREA", mine), frame(11, "SMSG_TRANSFER_PENDING", { map: 36 }), frame(12, "SMSG_NEW_WORLD", { map: 36, x: -16.4, y: -383.07, z: 61.78, o: 0 })];
+    const inside = replay([...transfer, frame(13, "WB_AREA", deadmines)]);
+    expect(inside.self.map?.value).toEqual({ id: 36, name: "Deadmines", instanceType: "party" });
+    expect(inside.self.zone?.value).toEqual({ id: 1581, name: "The Deadmines" });
+    // A module that tested the pair alone sent nothing after the transfer:
+    // the map id from SMSG_NEW_WORLD, and no name or instance type for it.
+    const before = replay(transfer);
+    expect(before.self.position?.value.map).toBe(36);
+    expect(before.self.map).toBeUndefined();
+  });
+
   test("a map change forgets the old map's name until the new map's WB_AREA", () => {
     const between = replay([
       frame(10, "WB_AREA", westfall),

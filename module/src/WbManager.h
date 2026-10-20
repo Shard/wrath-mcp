@@ -228,10 +228,12 @@ namespace WrathBench
         bool corpseQueried{false};
 
         // Zone/area edge detection (world thread only): the ids last announced
-        // as WB_AREA, sentinel until the first in-world tick so login emits one.
-        // See TickAreas.
+        // as WB_AREA, and the map and instance they were on, sentinel until the
+        // first in-world tick so login emits one. See TickAreas.
         uint32 lastZoneId{0xFFFFFFFF};
         uint32 lastAreaId{0xFFFFFFFF};
+        uint32 lastMapId{0xFFFFFFFF};
+        uint32 lastInstanceId{0xFFFFFFFF};
 
         // Client-side object cache mirror, fed by the update-object tap. Needed
         // because UPDATETYPE_VALUES blocks carry no object type (a real client
