@@ -1582,6 +1582,65 @@ namespace WrathBench
         return pose;
     }
 
+    // How finely WalkEtaMs classifies a route: one WaterPoseAt per this many
+    // yards of polyline (at least one per segment), at the middle of each
+    // stretch. TickMover reclassifies every tick, so a stretch's pace can be
+    // off by at most half a stretch either side of a shoreline.
+    static constexpr float ETA_SAMPLE_YARDS = 5.0f;
+
+    struct WalkEta
+    {
+        uint64_t ms{0};      // 0 when no speed could be read
+        float swimYards{0};  // the stretches classified as swimming
+        uint32 samples{0};   // WaterPoseAt calls made
+    };
+
+    // How long TickMover will take to walk `points`, reported, not modelled:
+    // each stretch at the speed the walker drives it at, GetSpeed(MOVE_SWIM)
+    // where WaterPoseAt (at the polyline's own z, as PlaceMover passes it)
+    // says the body swims and GetSpeed(MOVE_RUN) everywhere else, wading
+    // included. The speeds are read once, now, so a mount, a ghost's speed or
+    // a slow is in the estimate as it is in the walk's first step; a speed
+    // that changes mid-walk is not. `dry` skips the water test for a route the
+    // walker never swims (a transport leg: PlaceMover gives a deck no water).
+    // Segment lengths are 3D, as `pathLength`. World thread.
+    static WalkEta WalkEtaMs(Player* player, std::vector<WbVec> const& points, bool dry)
+    {
+        WalkEta eta;
+        float const run = player->GetSpeed(MOVE_RUN);
+        float const swim = player->GetSpeed(MOVE_SWIM);
+        if (!(run > 0.01f) || !(swim > 0.01f))
+            return eta;
+        double seconds = 0.0;
+        for (size_t i = 1; i < points.size(); ++i)
+        {
+            WbVec const& a = points[i - 1];
+            WbVec const& b = points[i];
+            float const sx = b.x - a.x, sy = b.y - a.y, sz = b.z - a.z;
+            float const len = std::sqrt(sx * sx + sy * sy + sz * sz);
+            if (len <= 0.0001f)
+                continue;
+            if (dry)
+            {
+                seconds += len / run;
+                continue;
+            }
+            uint32 const n = std::max<uint32>(1, uint32(std::ceil(len / ETA_SAMPLE_YARDS)));
+            float const step = len / float(n);
+            for (uint32 k = 0; k < n; ++k)
+            {
+                float const t = (float(k) + 0.5f) / float(n);
+                bool const swimming = WaterPoseAt(player, a.x + sx * t, a.y + sy * t, a.z + sz * t).swimming;
+                ++eta.samples;
+                seconds += step / (swimming ? swim : run);
+                if (swimming)
+                    eta.swimYards += step;
+            }
+        }
+        eta.ms = uint64_t(std::llround(seconds * 1000.0));
+        return eta;
+    }
+
     // Does the navmesh have a tile loaded under this point? Mirrors
     // PathGenerator::HaveTile, which is private; a missing tile is the case the
     // core folds into PATHFIND_NORMAL|PATHFIND_NOT_USING_PATH (a straight-line
@@ -2339,8 +2398,13 @@ namespace WrathBench
         Json::Writer w;
         w.Add("moveId", m.moveId).Add("status", status);
         if (m.pathLength > 0.0f)
+        {
             w.Add("pathLength", (double)m.pathLength);
+            if (m.etaMs > 0)
+                w.Add("etaMs", m.etaMs);
+        }
         m.pathLength = 0.0f;
+        m.etaMs = 0;
         // Server-confirmed position, when the session is still live: this is the
         // ground truth that the synthesized movement was actually applied.
         Player* player = (s.ws && sWorldSessionMgr->FindSession(s.accountId) == s.ws) ? s.ws->GetPlayer() : nullptr;
@@ -2444,6 +2508,7 @@ namespace WrathBench
         // go through the mesh and fail with the honest start_off_mesh /
         // target_off_mesh, whose hints say to board or disembark first.
         PathResolve r;
+        bool transportLeg = false; // the straight leg onto or off a transport: WalkEtaMs runs it dry
         {
             Map* map = player->GetMap();
             Transport* startT = player->GetTransport();
@@ -2452,6 +2517,7 @@ namespace WrathBench
             Transport* targetT = FindTransportAt(map, x, y, z);
             if ((startT || targetT) && player->GetExactDist2d(x, y) <= 30.0f)
             {
+                transportLeg = true;
                 bool leaving = startT != nullptr && !targetT;
                 float endZ = z;
                 // A leg that leaves the transport ends on ordinary ground, and
@@ -2586,6 +2652,22 @@ namespace WrathBench
         for (size_t i = 1; i < m.points.size(); ++i)
             m.pathLength += std::sqrt(std::pow(m.points[i].x - m.points[i - 1].x, 2.0f)
                 + std::pow(m.points[i].y - m.points[i - 1].y, 2.0f) + std::pow(m.points[i].z - m.points[i - 1].z, 2.0f));
+        // The same route in time, at the walker's own paces (WalkEtaMs), so a
+        // caller judges a swim or a mounted walk by how long it takes rather
+        // than by a run speed it assumes. Its cost is in the audit row: one
+        // liquid query per ETA_SAMPLE_YARDS of route, on this thread.
+        {
+            auto const t0 = std::chrono::steady_clock::now();
+            WalkEta const eta = WalkEtaMs(player, m.points, transportLeg);
+            int64_t const costUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            m.etaMs = eta.ms;
+            Audit(*s, "action", Json::Writer().Add("op", "move_eta").Add("moveId", moveId)
+                .Add("etaMs", eta.ms).Add("pathLength", (double)m.pathLength)
+                .Add("swimYards", (double)eta.swimYards).Add("samples", eta.samples).Add("costUs", costUs)
+                .Add("runSpeed", (double)player->GetSpeed(MOVE_RUN)).Add("swimSpeed", (double)player->GetSpeed(MOVE_SWIM))
+                .Str());
+        }
         m.seg = 0;
         m.segDone = 0.0f;
         m.lastMs = now;
@@ -4041,6 +4123,8 @@ namespace WrathBench
             w.Add("moveId", m.moveId);
             w.Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO));
             w.Add("pathLength", (double)m.pathLength);
+            if (m.etaMs > 0)
+                w.Add("etaMs", m.etaMs);
             EmitEvent(s, "WB_MOVE_PROGRESS", 0xFF02, w.Str());
         }
     }

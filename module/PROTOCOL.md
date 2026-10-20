@@ -407,6 +407,21 @@ spell says so), and swimming-only checks apply. Outside a move the flag on a
 (`Player::IsInWater`); a move starts from that record and sends the transition
 first if the character's position now says otherwise.
 
+Walk time. At dispatch the module adds up how long its own walker will take
+over the route, `etaMs`, reported beside `pathLength` on `WB_MOVE_PROGRESS`
+and `WB_MOVE_RESULT`, so a caller can judge a move by time rather than by
+yards at a run speed it assumes: a swim is slower than a run, a mount or a
+ghost faster. Each stretch counts at the speed the walker will drive it at,
+`GetSpeed(MOVE_SWIM)` where the water test above says the body swims and
+`GetSpeed(MOVE_RUN)` everywhere else, wading and transport legs included;
+both speeds are read once, at dispatch, so whatever the server applies to
+them then (a mount, a ghost's speed, a slow) is in the estimate, and a change
+mid-walk is not. The water test runs once per 5y of route, at the middle of
+each stretch and at the route's own z, as the walker passes it, so a
+shoreline is placed to within half a stretch. This is the walker reporting its
+own plan, not a game rule; the 3s confirmation after the last step is not in
+it.
+
 Success `200` (means "queued and pathing", not "arrived"):
 ```json
 { "ok": true, "action": "move_to", "moveId": 1 }
@@ -912,8 +927,8 @@ session's own identity). Their `opcodeId`s are outside the real opcode range.
 
 | opcode | id | `data` fields |
 |---|---|---|
-| `WB_MOVE_PROGRESS` | 0xFF02 | `{ "moveId": <number>, "pos": { "x","y","z","o" }, "pathLength": <f> }` — at most 1/s while moving; `pathLength` is the length in yards of the route the move walks (the resolved polyline, 3D), the same on every event of the move |
-| `WB_MOVE_RESULT` | 0xFF01 | `{ "moveId": <number>, "status": <str>, "pos": { "x","y","z","o" }, "meshZ": <f?>, "reachedPos": { "x","y","z" }? }` — `meshZ` only on `arrived` when the mesh z differed from the request; `reachedPos` on `path_incomplete` and `drop`; `"pathLength": <f>` on the verdict of any move that was dispatched and walked (a refusal at planning has none), the route's length in yards as on `WB_MOVE_PROGRESS`; `"dz": <f>, "target": { "x","y","z" }` only on `drop`, plus `"safeFall": <u32>` when the character's own fall-height reduction (`SPELL_AURA_SAFE_FALL`, the client's buff frame) is non-zero, and `"surfaceZ": <f>` only when the step's foot lies under the ground surface at its x,y (the step is then refused forced or not); `"nearest": { "x","y","z" } | null` only on `target_off_mesh` (the walkable mesh point nearest the request within 20y, or `null` when none is); `"onTransport": { "guid": <guid-string>, "entry": <u32> }` when the character ended the move aboard a transport |
+| `WB_MOVE_PROGRESS` | 0xFF02 | `{ "moveId": <number>, "pos": { "x","y","z","o" }, "pathLength": <f>, "etaMs": <u64> }` — at most 1/s while moving; `pathLength` is the length in yards of the route the move walks (the resolved polyline, 3D), and `etaMs` how long the module's walker takes over it at the speeds it read at dispatch (move_to, "Walk time"), both the same on every event of the move; `etaMs` is absent when no speed could be read |
+| `WB_MOVE_RESULT` | 0xFF01 | `{ "moveId": <number>, "status": <str>, "pos": { "x","y","z","o" }, "meshZ": <f?>, "reachedPos": { "x","y","z" }? }` — `meshZ` only on `arrived` when the mesh z differed from the request; `reachedPos` on `path_incomplete` and `drop`; `"pathLength": <f>` and `"etaMs": <u64>` on the verdict of any move that was dispatched and walked (a refusal at planning has neither), the route's length in yards and its walk time as on `WB_MOVE_PROGRESS`; `"dz": <f>, "target": { "x","y","z" }` only on `drop`, plus `"safeFall": <u32>` when the character's own fall-height reduction (`SPELL_AURA_SAFE_FALL`, the client's buff frame) is non-zero, and `"surfaceZ": <f>` only when the step's foot lies under the ground surface at its x,y (the step is then refused forced or not); `"nearest": { "x","y","z" } | null` only on `target_off_mesh` (the walkable mesh point nearest the request within 20y, or `null` when none is); `"onTransport": { "guid": <guid-string>, "entry": <u32> }` when the character ended the move aboard a transport |
 | `WB_RIDE_PROGRESS` | 0xFF05 | `{ "transportGuid": <guid-string>, "transportEntry": <u32>, "pos": { "x","y","z","o" } }` — at most 1/s while the character rides a transport and is not walking; the server-side position the transport carried it to |
 | `WB_TRANSPORT_PROGRESS` | 0xFF06 | `{ "guid": <guid-string>, "entry": <u32>, "pos": { "x","y","z","o" }, "progressMs": <u32>, "periodMs": <u32?>, "docked": <bool?> }` — at most 1/s per session, one per transport on the character's map whose create block the session has received: the car's current position on its `TransportAnimation.dbc` path (what a client animates locally from `pathProgress`), the clock and period, and `docked` when the keyframe segment the clock is on has no displacement (the car is dwelling at a platform; absent for transports without an animation path) |
 | `WB_AREATRIGGER` | 0xFF04 | `{ "triggerId": <u32>, "moveId": <number>, "pos": { "x","y","z","o" } }` — the character entered an `AreaTrigger.dbc` volume and `CMSG_AREATRIGGER` was sent for it (see below); `moveId` is the `move_to` that crossed into it, 0 when no move did (a taxi landing, a transport carrying the character, a teleport's arrival) |
@@ -1620,4 +1635,8 @@ Each `move_to` that reaches the mesh also logs one `op: "move_path"` record at
 dispatch — `moveId`, `status` (`"ok"` when the walk was dispatched, else the
 `WB_MOVE_RESULT` status), `pointCount`, and `points` (the resolved polyline,
 capped at 64 points with `truncated: true` when the cap bit) — so a route the
-mesh chose is read from the log, not reconstructed from heartbeats.
+mesh chose is read from the log, not reconstructed from heartbeats. Beside it,
+one `op: "move_eta"` record for each dispatched walk: `moveId`, `etaMs`,
+`pathLength`, `swimYards` (the stretches the walk-time estimate counted as
+swum), `samples` (water tests made), `costUs` (the estimate's own cost on the
+world thread, in microseconds), and the `runSpeed` and `swimSpeed` it read.

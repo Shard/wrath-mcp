@@ -107,6 +107,7 @@ import {
   EventStream,
   EventTimeoutError,
   type EventStreamOptions,
+  moveEtaMs,
   type StreamEvent,
   type WaitForOptions,
 } from "./events";
@@ -828,7 +829,10 @@ export interface MovePoint {
  */
 export type MoveTarget = MovePoint | GuidOrUnit;
 
-/** Base run speed in yards per second, 3.3.5a. Used only for the ETA hint. */
+/**
+ * Base run speed in yards per second, 3.3.5a. The ETA hints' fallback when the
+ * module has not said how long its walk takes (`etaMs`, an older module).
+ */
 const RUN_SPEED_YPS = 7;
 
 /**
@@ -1375,34 +1379,54 @@ function fmtXY(p: { x: number; y: number }): string {
  * or abandoned `moveTo` uses, and the ones `killTarget` keeps for an approach
  * that ran out its clock.
  */
-function walkProgress(from: Point3 | undefined, at: Point3 | undefined, point: { x: number; y: number }, routeYards?: number): string {
+function walkProgress(
+  from: Point3 | undefined,
+  at: Point3 | undefined,
+  point: { x: number; y: number },
+  routeYards?: number,
+  etaMs?: number,
+): string {
   const covered = at !== undefined && from !== undefined ? distance2d(from, at) : undefined;
   const remaining = at !== undefined ? distance2d(at, point) : undefined;
   const route =
     routeYards === undefined
       ? ""
-      : ` in a straight line, on a route of ~${Math.round(routeYards)}y (about ${Math.round(routeYards / RUN_SPEED_YPS)}s at ${RUN_SPEED_YPS}yd/s)`;
+      : ` in a straight line, on a route of ~${Math.round(routeYards)}y (${
+          etaMs !== undefined
+            ? `about ${Math.round(etaMs / 1000)}s at the character's own pace`
+            : `about ${Math.round(routeYards / RUN_SPEED_YPS)}s at ${RUN_SPEED_YPS}yd/s`
+        })`;
   return covered !== undefined && remaining !== undefined
     ? `~${Math.round(covered)}y covered, ~${Math.round(remaining)}y still to go to (${fmtXY(point)})${route}`
     : `no position was observed for it (target (${fmtXY(point)}))${route}`;
 }
 
 /**
- * The note on a move longer than the caller's remaining budget: judged by
- * the route the module walked (`pathLength`, yards) when it is known, else by
- * the straight line; undefined when the walk fits. It never changes or caps
- * the move, only says that awaiting it does not fit one snippet.
+ * The note on a move longer than the caller's remaining budget: judged by how
+ * long the module's walker takes over its route (`etaMs`: swim speed in deep
+ * water, run speed elsewhere, a mount's or a ghost's speed included) when it
+ * says so, else by the route's length (`pathLength`, yards) at the base run
+ * speed, else by the straight line; undefined when the walk fits. It never
+ * changes or caps the move, only says that awaiting it does not fit one
+ * snippet. The estimate is the SDK's own input: the note states a time, never
+ * the field.
  */
-export function walkBudgetNote(straightYards: number, routeYards: number | undefined, budgetMs: number): string | undefined {
+export function walkBudgetNote(
+  straightYards: number,
+  routeYards: number | undefined,
+  budgetMs: number,
+  etaMs?: number,
+): string | undefined {
   const yards = routeYards ?? straightYards;
-  const walkMs = (yards / RUN_SPEED_YPS) * 1000;
+  const walkMs = etaMs ?? (yards / RUN_SPEED_YPS) * 1000;
   if (walkMs <= budgetMs) return undefined;
   const what =
     routeYards === undefined
       ? `this move is ~${Math.round(straightYards)}y in a straight line`
       : `this move's route is ~${Math.round(routeYards)}y (~${Math.round(straightYards)}y in a straight line)`;
+  const pace = etaMs !== undefined ? "at the character's own pace" : `at a base run speed of ${RUN_SPEED_YPS}yd/s`;
   return (
-    `${what} — about ${Math.round(walkMs / 1000)}s at a base run speed of ${RUN_SPEED_YPS}yd/s, and the caller ` +
+    `${what} — about ${Math.round(walkMs / 1000)}s ${pace}, and the caller ` +
     `had ~${Math.round(budgetMs / 1000)}s of its budget left when it was issued. Awaiting a move this long does ` +
     `not fit one snippet: dispatch it with sdk.moveToAsync(target) or from a background routine, then poll ` +
     `state.self.position.`
@@ -5720,9 +5744,14 @@ export class WrathClient {
         const progressed = this.events
           .recent(500)
           .filter((e) => e.seq > sinceSeq && isEvent(e, "WB_MOVE_PROGRESS") && !isDecodeError(e.data))
-          .map((e) => e.data as MoveProgressData)
-          .findLast((d) => d.moveId === ack.moveId);
-        const progress = walkProgress(from, this.state.self.position?.value, point, progressed?.pathLength);
+          .findLast((e) => (e.data as MoveProgressData).moveId === ack.moveId);
+        const progress = walkProgress(
+          from,
+          this.state.self.position?.value,
+          point,
+          (progressed?.data as MoveProgressData | undefined)?.pathLength,
+          moveEtaMs(progressed),
+        );
         if (err instanceof EventTimeoutError) {
           // The timeout is not "the move failed": the character is still walking
           // and the verdict is still coming. Saying so stops the model from
@@ -5755,12 +5784,14 @@ export class WrathClient {
       }
       return event;
     };
-    // The budget note, judged by the route the module walked when the
-    // verdict carries its length (`pathLength`), else by the straight line:
-    // a mine's 165y line was a 660y walk, and the line alone said nothing.
-    const noteBudget = (verdict: MoveResultData) => {
+    // The budget note, judged by the walk's time when the module says it
+    // (`etaMs`: a swim is slower than the run speed, a mount faster), else by
+    // the route's length (`pathLength`) at run speed, else by the straight
+    // line: a mine's 165y line was a 660y walk, and the line alone said nothing.
+    const noteBudget = (verdictEvent: StreamEvent) => {
       if (from === undefined || budgetMs === undefined) return;
-      const note = walkBudgetNote(distance2d(from, point), verdict.pathLength, budgetMs);
+      const verdict = verdictEvent.data as MoveResultData;
+      const note = walkBudgetNote(distance2d(from, point), verdict.pathLength, budgetMs, moveEtaMs(verdictEvent));
       if (note !== undefined) extras.push(note);
     };
     let event = await issue(options.force === true);
@@ -5779,7 +5810,7 @@ export class WrathClient {
         data = event.data as MoveResultData;
       }
     }
-    noteBudget(data);
+    noteBudget(event);
     const status: MoveStatus = data.status;
     const position: UnitPosition = {
       x: data.pos.x,

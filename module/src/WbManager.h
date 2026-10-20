@@ -121,6 +121,7 @@ namespace WrathBench
         uint64_t moveId{0};
         std::vector<WbVec> points;  // resolved path, points[0] = start
         float pathLength{0};        // yards along `points`, set at dispatch (WB_MOVE_PROGRESS, WB_MOVE_RESULT)
+        uint64_t etaMs{0};          // the walker's own time over `points` at dispatch-time speeds (WB_MOVE_PROGRESS, WB_MOVE_RESULT)
         size_t seg{0};              // moving from points[seg] to points[seg+1]
         float segDone{0};           // distance covered on the current segment
         int64_t lastMs{0};          // last tick timestamp

@@ -27,6 +27,31 @@ export const STREAM_GAP = "stream_gap";
 /** Opcode of a frame the SDK could not read at all. */
 export const STREAM_ERROR = "stream_error";
 
+/**
+ * The module's walk-time estimate for a move, `etaMs` on `WB_MOVE_PROGRESS` and
+ * `WB_MOVE_RESULT` (module/PROTOCOL.md, move_to, "Walk time"), lifted off the
+ * event as it is ingested and kept here against the event object. It is the
+ * SDK's own input to `moveTo`'s budget note and nothing else: no event the
+ * buffer, a listener, a wait or `recent()` hands out carries it, no schema
+ * types it, and `moveEtaMs` is not exported from the package.
+ */
+const moveEtas = new WeakMap<object, number>();
+const ETA_OPCODES: ReadonlySet<string> = new Set(["WB_MOVE_PROGRESS", "WB_MOVE_RESULT"]);
+
+function liftMoveEta(event: StreamEvent): void {
+  if (!ETA_OPCODES.has(event.opcode)) return;
+  const data = event.data as Record<string, unknown> | null | undefined;
+  if (data === null || typeof data !== "object" || !("etaMs" in data)) return;
+  const eta = data.etaMs;
+  delete data.etaMs;
+  if (typeof eta === "number" && Number.isFinite(eta) && eta > 0) moveEtas.set(event, eta);
+}
+
+/** The walk-time estimate (ms) the module put on this move event, if it put one. SDK-internal. */
+export function moveEtaMs(event: StreamEvent | undefined): number | undefined {
+  return event === undefined ? undefined : moveEtas.get(event);
+}
+
 const STREAM_GAP_ID = -1;
 const STREAM_ERROR_ID = -2;
 
@@ -533,6 +558,7 @@ export class EventStream implements AsyncIterable<StreamEvent> {
       return;
     }
     const event = parsed.event;
+    liftMoveEta(event);
 
     if (!this.sawAnyEvent || event.seq >= this.expectedSeq) {
       if (event.seq > this.expectedSeq) {
