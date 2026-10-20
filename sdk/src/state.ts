@@ -233,8 +233,9 @@ export interface CharacterSummary {
  * One chat line as the module decoded it. `senderName` is the packet's own
  * name where its layout carries one — creature speech (`type` 12–16, 41–42:
  * say/yell/emote/whisper from an NPC) and foreign-language whispers — and
- * otherwise, on `state.chat`, the name query's answer for the sender
- * (`state.nameOf(senderGuid)`) once one has arrived. `type` 9
+ * otherwise, on `state.chat` and to `waitForChat`, the name query's answer
+ * for the sender (`state.nameOf(senderGuid)`) once one has arrived, or a
+ * party member's name from the group roster before it has. `type` 9
  * (`WHISPER_INFORM`) is the server's echo of our own whisper, and the core
  * puts the *recipient* in the sender's place: its `senderGuid` and
  * `senderName` name who it went to. `channelName` rides channel lines
@@ -1816,11 +1817,20 @@ export class StateCache {
    * is made when the line is read rather than when it was folded.
    */
   private namedChat(): ChatEntry[] {
-    return this.chatBuf.map((c) => {
-      if (c.senderName !== undefined) return c;
-      const name = this.nameOf(c.senderGuid);
-      return name === undefined ? c : { ...c, senderName: name };
-    });
+    return this.chatBuf.map((c) => this.namedChatEntry(c));
+  }
+
+  /**
+   * One chat line with its sender named: the packet's own name, else the
+   * name query's answer, else — for a party member whose name query has not
+   * answered yet (party chat at a cold start) — the name `SMSG_GROUP_LIST`
+   * gave that member. `waitForChat` reads lines through this too, so a
+   * predicate sees the same `senderName` `state.chat` shows.
+   */
+  namedChatEntry(c: ChatEntry): ChatEntry {
+    if (c.senderName !== undefined) return c;
+    const name = this.nameOf(c.senderGuid) ?? this.groupState?.members.find((m) => m.guid === c.senderGuid)?.name;
+    return name === undefined ? c : { ...c, senderName: name };
   }
 
   /** Client-visible notifications (the game-error channel), oldest first. */

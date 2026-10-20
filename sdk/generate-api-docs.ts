@@ -167,6 +167,7 @@ const CLIENT_INTERNAL = new Set([
   "lease",
   "releaseLease",
   "noteActionHint",
+  "rewordActionHint",
   "drainActionHints",
   "request",
   "postMoveTo",
@@ -176,10 +177,12 @@ const CLIENT_INTERNAL = new Set([
   "trackedCast",
   "dispatchCast",
   "castVerdict",
+  "ownMoveSince",
   "recallMoveRejection",
   "waitOwnTeleportAck",
   "reclaimRefusal",
   "awaitAliveFields",
+  "awaitAreaAfter",
   "reclaimReadyAt",
   "resolveGossipOption",
   "petGuidOrRefuse",
@@ -289,6 +292,7 @@ const STATE_ROWS: readonly Row[] = [
  */
 const STATE_INTERNAL = new Set([
   "namedChat",
+  "namedChatEntry",
   "addAchievement",
   "closeRoll",
   "mailboxOpened",
