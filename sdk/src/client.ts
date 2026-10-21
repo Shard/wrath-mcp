@@ -494,6 +494,8 @@ function resolveMoveTarget(target: unknown, state: StateCache, method: string): 
   // outside the mesh's poly-search box while the ground under it is walkable.
   // With `guid` the module resolves z to the ground at x,y first (PROTOCOL.md
   // move_to); the request still walks to x,y, never to wherever the guid is.
+  // Where the unit is now (along its spline, if it is moving), not where the
+  // spline ends: a mob chasing us has us as its destination.
   const obj = state.nearby.get(key);
   const seen = obj === undefined ? undefined : pointOf(obj)?.value;
   if (seen !== undefined) return { point: { x: seen.x, y: seen.y, z: seen.z }, guid: key };
@@ -7479,6 +7481,10 @@ export class WrathClient {
         rearmWanted = true;
       });
 
+      // Where the target is now, along its spline when it is moving: never the
+      // spline's destination, which for a mob chasing us is ourselves — that
+      // read melee range as reached and skipped the approach, and faced us at
+      // our own position.
       const aimAt = (): Point3 | undefined => {
         const obj = this.state.nearby.get(key);
         return obj === undefined ? undefined : pointOf(obj)?.value;

@@ -44,6 +44,7 @@ import {
   loginSequence,
   lootRelease,
   lootResponse,
+  monsterMove,
   moveProgress,
   moveResult,
   newWorld,
@@ -1706,6 +1707,18 @@ const questWorld = () =>
   frames([...loginSequence, selfCreate, creatureCreate, creatureQuery, selfArrived(20, { x: -1202, y: 980, z: 42 })]);
 const chestWorld = () => frames([...loginSequence, selfCreate, chestCreate]);
 
+/**
+ * The fixture creature launched just now on a spline toward `self` (a mob
+ * chasing us), over an hour: for a whole test it is still at its start, while
+ * the spline's destination is our own position.
+ */
+const chaseFrom = (start: { x: number; y: number; z: number }, self: { x: number; y: number; z: number }, seq: number) => ({
+  ...monsterMove,
+  seq,
+  ts: Date.now(),
+  data: { ...monsterMove.data, pos: start, destination: { x: self.x, y: self.y, z: self.z }, durationMs: 3_600_000 },
+});
+
 describe("client: killTarget", () => {
   test("targets, faces, swings, and settles when the target's health hits zero", async () => {
     const stub = startStub({ onConnect: () => combatWorld() });
@@ -1931,6 +1944,38 @@ describe("client: killTarget", () => {
     stub.push(JSON.stringify(moveResult("arrived", 1, 68)));
     const attackAt = await untilAction(stub, "attack_start", moveAt);
     expect(attackAt).toBeGreaterThan(moveAt);
+    stub.push(JSON.stringify(creatureHealth(0, 69)));
+    expect((await fight).ok).toBe(true);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a mob chasing us is approached and faced where it is, not at its destination (ourselves)", async () => {
+    // A chaser's spline ends on us, so aiming at the destination measured
+    // 0y, skipped the approach and faced our own feet.
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const self = client.state.self.position!.value;
+    const start = { x: -1200, y: 980, z: 42 };
+    stub.push(JSON.stringify(chaseFrom(start, self, 60)));
+    await Bun.sleep(20);
+    const fight = client.killTarget(CREATURE_GUID, {
+      timeout: 5000,
+      pollIntervalMs: 10,
+      reapproachIntervalMs: 60_000,
+      meleeRange: 5,
+    });
+    const moveAt = await untilAction(stub, "move_to");
+    const walk = stub.actions[moveAt] as unknown as { x: number; y: number };
+    expect(Math.hypot(walk.x - start.x, walk.y - start.y)).toBeLessThan(0.5);
+    stub.push(JSON.stringify(moveResult("arrived", 1, 68)));
+    const attackAt = await untilAction(stub, "attack_start", moveAt);
+    const faced = stub.actions.slice(moveAt, attackAt).filter((a) => a.action === "face") as unknown as {
+      x: number;
+      y: number;
+    }[];
+    expect(faced.length).toBeGreaterThan(0);
+    for (const f of faced) expect(Math.hypot(f.x - start.x, f.y - start.y)).toBeLessThan(0.5);
     stub.push(JSON.stringify(creatureHealth(0, 69)));
     expect((await fight).ok).toBe(true);
     client.close();
@@ -4641,6 +4686,25 @@ describe("client: moveTo target resolution", () => {
     stub.push(JSON.stringify(moveResult("arrived", 2, 31)));
     expect((await byGuid).ok).toBe(true);
 
+    client.close();
+    await stub.stop();
+  });
+
+  test("a unit on a spline resolves to where it is along it, not to the spline's end", async () => {
+    // A mob chasing us has us as its destination: walking there is no walk.
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const self = client.state.self.position!.value;
+    const start = { x: -1200, y: 980, z: 42 };
+    stub.push(JSON.stringify(chaseFrom(start, self, 60)));
+    await Bun.sleep(20);
+    const walk = client.moveTo(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "move_to");
+    const to = movePos(stub);
+    expect(Math.hypot(to.x - start.x, to.y - start.y)).toBeLessThan(0.5);
+    expect(Math.hypot(to.x - self.x, to.y - self.y)).toBeGreaterThan(30);
+    stub.push(JSON.stringify(moveResult("arrived", 1, 61)));
+    expect((await walk).ok).toBe(true);
     client.close();
     await stub.stop();
   });

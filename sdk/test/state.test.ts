@@ -979,23 +979,98 @@ describe("state cache: auras and creature movement", () => {
     expect(cache.aurasOf(CREATURE_GUID)).toEqual([]);
   });
 
-  test("monster move is served as destination and duration, and nothing else", () => {
+  test("monster move is served as start, destination and duration, and nothing else", () => {
     const cache = withWorld([monsterMove]);
     const obj = cache.nearby.get(CREATURE_GUID);
+    expect(obj?.motion?.value.position).toEqual({ x: -1210.0, y: 985.0, z: 42.0 });
     expect(obj?.motion?.value.durationMs).toBe(2000);
+    // Where it is going stays readable on the raw object.
     expect(obj?.motion?.value.destination).toEqual({ x: -1190.0, y: 970.0, z: 42.0 });
-    // Where to walk to reach it: the destination while it is in motion.
-    expect(pointOf(obj!)?.value).toEqual({ x: -1190.0, y: 970.0, z: 42.0 });
   });
 
-  test("a stopped creature is where it stopped", () => {
-    const cache = withWorld([monsterMove, monsterStopped]);
-    expect(pointOf(cache.nearby.get(CREATURE_GUID)!)?.value).toEqual({ x: -1195.0, y: 972.0, z: 42.0 });
+  // monsterMove: (-1210, 985, 42) -> (-1190, 970, 42) over 2000 ms, launched at its ts.
+  const launched = monsterMove.ts;
+
+  test("mid-spline, a creature is along the line by the time elapsed", () => {
+    const obj = withWorld([monsterMove]).nearby.get(CREATURE_GUID)!;
+    const p = pointOf(obj, launched + 500);
+    expect(p?.value).toEqual({ x: -1205.0, y: 981.25, z: 42.0 });
+    // Stamped with the packet that said so, not with the clock it was read at.
+    expect(p?.seq).toBe(monsterMove.seq);
+    expect(p?.ts).toBe(launched);
+    expect(pointOf(obj, launched + 1000)?.value).toEqual({ x: -1200.0, y: 977.5, z: 42.0 });
+  });
+
+  test("at launch, or on a clock behind the packet's stamp, it is at the start", () => {
+    const obj = withWorld([monsterMove]).nearby.get(CREATURE_GUID)!;
+    expect(pointOf(obj, launched)?.value).toEqual({ x: -1210.0, y: 985.0, z: 42.0 });
+    expect(pointOf(obj, launched - 250)?.value).toEqual({ x: -1210.0, y: 985.0, z: 42.0 });
+  });
+
+  test("past the duration, it reads at the destination", () => {
+    const obj = withWorld([monsterMove]).nearby.get(CREATURE_GUID)!;
+    expect(pointOf(obj, launched + 2000)?.value).toEqual({ x: -1190.0, y: 970.0, z: 42.0 });
+    expect(pointOf(obj, launched + 60_000)?.value).toEqual({ x: -1190.0, y: 970.0, z: 42.0 });
+  });
+
+  test("a chaser re-launched every 11 ms from the same start reads at that start, not on the player", () => {
+    // A mob stuck server-side: every relaunch starts from the same spot and
+    // heads for the player it chases. A client shows it running in place.
+    const player = { x: -1180.0, y: 960.0, z: 42.0 };
+    const relaunches = Array.from({ length: 20 }, (_, i) => ({
+      ...monsterMove,
+      seq: 100 + i,
+      ts: launched + i * 11,
+      data: { ...monsterMove.data, destination: player, durationMs: 3500 },
+    }));
+    const obj = withWorld(relaunches).nearby.get(CREATURE_GUID)!;
+    const last = launched + 19 * 11;
+    expect(obj.motion?.value.destination).toEqual(player);
+    const p = pointOf(obj, last + 11)!.value;
+    // 11 ms into a 3.5 s spline of ~39 y: about an eighth of a yard off the start.
+    expect(Math.hypot(p.x - -1210.0, p.y - 985.0)).toBeLessThan(0.2);
+    expect(Math.hypot(p.x - player.x, p.y - player.y)).toBeGreaterThan(38.5);
+  });
+
+  test("a stopped creature is where it stopped, whatever the clock", () => {
+    const obj = withWorld([monsterMove, monsterStopped]).nearby.get(CREATURE_GUID)!;
+    for (const now of [monsterStopped.ts, monsterStopped.ts + 500, monsterStopped.ts + 60_000]) {
+      expect(pointOf(obj, now)?.value).toEqual({ x: -1195.0, y: 972.0, z: 42.0 });
+    }
+  });
+
+  test("a spline with no duration reads at its destination, and one with no destination at its start", () => {
+    const zero = { ...monsterMove, data: { ...monsterMove.data, durationMs: 0 } };
+    expect(pointOf(withWorld([zero]).nearby.get(CREATURE_GUID)!, launched)?.value).toEqual({ x: -1190.0, y: 970.0, z: 42.0 });
+    const { destination: _, ...noDestination } = monsterMove.data;
+    const bare = { ...monsterMove, data: noDestination };
+    expect(pointOf(withWorld([bare]).nearby.get(CREATURE_GUID)!, launched + 500)?.value).toEqual({ x: -1210.0, y: 985.0, z: 42.0 });
   });
 
   test("an oriented position newer than the spline still wins", () => {
     const cache = withWorld([monsterMove, { ...creatureMove, seq: 60 }]);
-    expect(pointOf(cache.nearby.get(CREATURE_GUID)!)?.value).toEqual({ x: -1210.0, y: 985.0, z: 42.0 });
+    expect(pointOf(cache.nearby.get(CREATURE_GUID)!, launched + 500)?.value).toEqual({ x: -1210.0, y: 985.0, z: 42.0 });
+  });
+
+  test("units() and closest() report a chaser where it is now, not on top of us", () => {
+    const self = withWorld([]).self.position!.value;
+    const start = { x: self.x + 30, y: self.y, z: self.z };
+    // Launched just now toward us, over an hour: for the whole test it is at
+    // its start, 30 y off, while its destination is our own position.
+    const chase = {
+      ...monsterMove,
+      seq: 100,
+      ts: Date.now(),
+      data: { ...monsterMove.data, pos: start, destination: { x: self.x, y: self.y, z: self.z }, durationMs: 3_600_000 },
+    };
+    const cache = withWorld([chase]);
+    const row = cache.units().find((u) => u.guid === CREATURE_GUID)!;
+    expect(row.distance!).toBeGreaterThan(29.5);
+    expect(row.x!).toBeGreaterThan(self.x + 29.5);
+    const near = cache.closest({ entry: CREATURE_ENTRY })!;
+    expect(near.guid).toBe(CREATURE_GUID);
+    expect(near.distance!).toBeGreaterThan(29.5);
+    expect(cache.units({ maxDistance: 10 }).some((u) => u.guid === CREATURE_GUID)).toBe(false);
   });
 });
 

@@ -484,10 +484,17 @@ fields, and this is where they are folded.
   with the amount filled in. A template that says `stats: []` can still be a
   stat-bearing item in hand. `randomPropertyOf(obj)` is the same reading over
   a raw nearby object.
-- `pointOf(obj)` answers "where do I walk to reach it" from the freshest of
-  two independent sources: an oriented position (update blocks, `MSG_MOVE_*`)
-  or `SMSG_MONSTER_MOVE`'s destination, which is what a player reads off a
-  moving creature's animation.
+- `pointOf(obj, now?)` answers "where is it now" from the freshest of two
+  independent sources: an oriented position (update blocks, `MSG_MOVE_*`) or
+  an `SMSG_MONSTER_MOVE` spline. A spline is read the way a client draws it:
+  from its start toward its destination by the time elapsed since the packet
+  arrived over its duration, in a straight line (the module drops the path
+  points), held at the destination once the duration has run. A creature
+  re-launched over and over from one spot, as a stuck chaser is, reads at
+  that spot. Where it is going stays on the raw object,
+  `obj.motion.value.destination`; for a mob chasing us that is ourselves,
+  which is why `units()`, `closest()`, `moveTo(unit)` and `killTarget` all
+  read the current point.
 
 The queries (`nearbyUnits`, `creaturesByEntry`, `closest`) are pure reads.
 `closest` returns `undefined` when we have no position of our own, rather than

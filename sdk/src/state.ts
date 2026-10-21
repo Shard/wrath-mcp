@@ -254,7 +254,7 @@ export interface Point3 {
 /**
  * A creature's movement as a player perceives it: where the spline
  * started, where it is heading, how long it takes. No path points: the module
- * consumes them.
+ * consumes them. `pointOf` reads where along it the unit is at a given time.
  */
 export interface Motion {
   readonly position: Point3;
@@ -4059,8 +4059,9 @@ export class StateCache {
    * emptier than it is.
    *
    * Positions come from `pointOf`, the same resolution `closest()` uses, so a
-   * creature mid-spline reports where it is heading. `distance` is `undefined`
-   * when either side has no known position.
+   * creature mid-spline reports where it is along that spline now, as a client
+   * draws it (where it is going is `motion.value.destination` on the raw
+   * object). `distance` is `undefined` when either side has no known position.
    *
    * No match returns `[]`, never `undefined` and never an error: nothing in
    * view matching is an answer. (`closest()` answers the same question with
@@ -4069,11 +4070,13 @@ export class StateCache {
   units(filter?: UnitFilter): UnitView[] {
     const f = normalizeUnitFilter(filter);
     const from = this.self.position?.value;
+    // One clock for the whole scan, so every row is read at the same instant.
+    const now = Date.now();
     const out: UnitView[] = [];
     const superseded = supersededCorpses(this.nearby.values());
     for (const obj of this.nearby.values()) {
       if (superseded.has(obj.guid)) continue;
-      const view = toUnitView(obj, from, this.creatures);
+      const view = toUnitView(obj, from, this.creatures, now);
       if (view === undefined) continue;
 
       if (!passesUnitFilter(view, obj, f)) continue;
@@ -4157,15 +4160,17 @@ export class StateCache {
 
     let best: UnitView | undefined;
     let bestD2 = Infinity;
+    // One clock for the ordering and the rows, so they cannot disagree.
+    const now = Date.now();
     const superseded = supersededCorpses(this.nearby.values());
     for (const obj of this.nearby.values()) {
       if (superseded.has(obj.guid)) continue;
-      const p = pointOf(obj)?.value;
+      const p = pointOf(obj, now)?.value;
       if (!p) continue;
       if (predicate && !predicate(obj)) continue;
       // The answer is a `units()` row, so what `units()` leaves out — items
       // and containers, our own inventory — is never an answer here either.
-      const view = toUnitView(obj, from, this.creatures);
+      const view = toUnitView(obj, from, this.creatures, now);
       if (view === undefined) continue;
       if (criteria && !passesUnitFilter(view, obj, criteria)) continue;
       const d2 = (p.x - from.x) ** 2 + (p.y - from.y) ** 2 + (p.z - from.z) ** 2;
@@ -4725,17 +4730,19 @@ export class StateCache {
  * One `NearbyObject` as `units()` reports it, or `undefined` when the object is
  * not in the world view at all (our own items and bags). `from` is our own last
  * observed position; without it `distance`/`x`/`y`/`z` stay unobserved.
+ * `now` is the clock `pointOf` reads a spline by.
  */
 function toUnitView(
   obj: NearbyObject,
   from: UnitPosition | undefined,
   creatures: ReadonlyMap<number, Observed<CreatureInfo>>,
+  now: number,
 ): UnitView | undefined {
   const type = obj.objectType?.value;
   if (type === "item" || type === "container") return undefined;
   // Bones are scenery to a client, not a corpse: no row.
   if (type === "corpse" && isBones(obj)) return undefined;
-  const point = pointOf(obj)?.value;
+  const point = pointOf(obj, now)?.value;
   const distance =
     from && point
       ? Math.round(Math.hypot(point.x - from.x, point.y - from.y, point.z - from.z) * 100) / 100
@@ -5251,27 +5258,54 @@ const BAG_FIRST_SLOT = 19;
 const BAG_LAST_SLOT = 22;
 
 /**
- * Where an object is, from the freshest thing that said so.
+ * Where an object is at `now` (default: the wall clock), from the freshest
+ * thing that said so.
  *
  * Two independent sources with different shapes: `MSG_MOVE_*`/update blocks
  * give an oriented position, `SMSG_MONSTER_MOVE` gives a spline start plus a
- * destination and no orientation. For a creature that is mid-spline the
- * destination is the better answer to "where do I walk to reach it", which is
- * what a player reads off the animation, so it wins within one motion
- * observation. Returns `undefined` rather than guessing when nothing said.
+ * destination and a duration, and no orientation. A client starts the spline
+ * when the packet arrives and draws the unit along it by elapsed time, so a
+ * creature mid-spline is read the same way: `now - ts` into `durationMs`, on
+ * the straight line from start to destination (the module drops the path
+ * points, so a bend in the route is not followed), held at the start before
+ * `ts` and at the destination once the duration has run. `ts` is the module's
+ * stamp of the packet's arrival — the parked client's own receipt time. A
+ * creature re-launched every few milliseconds from the same start, as a stuck
+ * chaser is, reads at that start, the way a client shows it running in place.
+ * Where it is going stays readable as `obj.motion.value.destination`.
+ *
+ * A stop reads where it stopped; a spline with no destination reads at its
+ * start, and one with no duration (or zero) at its destination, since there is
+ * no clock to read it by. The answer carries the source's own `seq`/`ts`.
+ * Returns `undefined` rather than guessing when nothing said.
  */
-export function pointOf(obj: NearbyObject): Observed<Point3> | undefined {
+export function pointOf(obj: NearbyObject, now: number = Date.now()): Observed<Point3> | undefined {
   const pos = obj.position;
   const motion = obj.motion;
   if (motion && (!pos || motion.seq >= pos.seq)) {
-    const m = motion.value;
-    const p = m.stopped ? m.position : (m.destination ?? m.position);
-    return { value: p, seq: motion.seq, ts: motion.ts };
+    return { value: splinePoint(motion.value, now - motion.ts), seq: motion.seq, ts: motion.ts };
   }
   if (!pos) return undefined;
   return { value: { x: pos.value.x, y: pos.value.y, z: pos.value.z }, seq: pos.seq, ts: pos.ts };
 }
 
+
+/** Where a spline puts a unit `elapsedMs` after it was launched: see `pointOf`. */
+function splinePoint(m: Motion, elapsedMs: number): Point3 {
+  const start = m.position;
+  const end = m.destination;
+  if (m.stopped || end === undefined) return start;
+  const duration = m.durationMs;
+  if (duration === undefined || duration <= 0) return end;
+  const t = elapsedMs / duration;
+  if (!(t > 0)) return start;
+  if (t >= 1) return end;
+  return {
+    x: start.x + t * (end.x - start.x),
+    y: start.y + t * (end.y - start.y),
+    z: start.z + t * (end.z - start.z),
+  };
+}
 
 /**
  * Wrong reads of the XP bar, made loud.
