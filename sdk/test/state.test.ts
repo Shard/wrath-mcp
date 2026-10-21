@@ -1383,12 +1383,15 @@ describe("state.units(): the flat scan helper", () => {
     expect(c.units({ type: "unit" }).map((r) => r.guid)).not.toContain(OBJECT_GUID);
   });
 
-  test("alive: true drops only the known dead; alive: false needs the observation", () => {
+  test("alive: true and alive: false both need the observation", () => {
     const c = cache();
     const alive = c.units({ alive: true }).map((r) => r.guid);
     expect(alive).not.toContain(DEAD_GUID);
-    // Health never observed is not evidence of death — the footgun this exists to kill.
-    expect(alive).toContain(GHOST_GUID);
+    // Neither alive nor dead is known of a unit whose health was never seen,
+    // nor of a game object, which has none.
+    expect(alive).not.toContain(GHOST_GUID);
+    expect(alive).not.toContain(OBJECT_GUID);
+    expect(alive).toContain(FAR_GUID);
     expect(c.units({ alive: false }).map((r) => r.guid)).toEqual([DEAD_GUID]);
   });
 

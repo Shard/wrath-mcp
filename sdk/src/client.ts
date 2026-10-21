@@ -117,6 +117,8 @@ import {
   npcRolesOf,
   partyResultText,
   isQuestGiverMarkerInput,
+  chatMessageAsShown,
+  PLAYER_FLAGS_GHOST,
   pointOf,
   questGiverStatusName,
   StateCache,
@@ -815,12 +817,22 @@ export interface ConnectOptions {
    * (explain, do not cap). Undefined means no budget is known.
    */
   deadline?: number | (() => number | undefined);
+  /**
+   * Who is calling, as an id the caller assigns, consulted per call the way
+   * `signal` is and recorded on each `ActionHint` as `origin`. The runner
+   * passes the id of the snippet whose code is running (a routine an earlier
+   * snippet launched keeps that snippet's id), so a hint drained under a later
+   * snippet can say whose code raised it. Undefined means no origin.
+   */
+  origin?: () => number | undefined;
 }
 
 export interface WaitForChatOptions {
   /** How long to wait, in ms. Default 10000. */
   timeout?: number;
+  /** Only consider lines with `seq >= sinceSeq`. */
   sinceSeq?: number;
+  /** Match lines already received first. Default true; `false` waits for a new line only. */
   includeBuffered?: boolean;
 }
 
@@ -1309,9 +1321,11 @@ export interface ActionHint {
   point?: { x: number; y: number; z: number };
   /** When that most recent failure was recorded (epoch ms). */
   ts: number;
+  /** The `origin` the client was given for the code that made the call, when it was given one. */
+  origin?: number;
 }
 
-/** Distinct (action, status) pairs kept between drains. A guard, never reached in practice. */
+/** Distinct (action, status, origin) triples kept between drains. A guard, never reached in practice. */
 const ACTION_HINT_MAX_KEYS = 32;
 
 /**
@@ -2221,6 +2235,8 @@ interface PendingCast {
   readonly sinceSeq: number | undefined;
   /** When it was dispatched (epoch ms): a move sent after this is one the cast was standing through. */
   readonly sentAt: number;
+  /** The caller's `origin` at the dispatch: the verdict arrives on the event stream, outside the caller's context. */
+  readonly origin: number | undefined;
   /** When the watch lapses (epoch ms); a cast that starts pushes it out by its cast time. */
   expiresAt: number;
 }
@@ -2242,6 +2258,13 @@ const CAST_VERDICT_MS = 3000;
 const CAST_DEATH_WINDOW_MS = 300;
 
 /**
+ * How long a completed transfer waits for the WB_AREA that names the new map,
+ * in ms. The module sends it on its next tick after `SMSG_NEW_WORLD`; this
+ * only bounds a module that does not.
+ */
+const TRANSFER_MAP_NAME_MS = 1_000;
+
+/**
  * What a cast failure means, in a few words, for the reasons runs hit. A
  * reason not listed is named and nothing more is said.
  */
@@ -2256,7 +2279,10 @@ const CAST_FAILURE_MEANING: Readonly<Record<string, string>> = {
   moving: "you were moving, and a cast with a cast time needs you standing still",
   not_ready: "its cooldown, or the global cooldown, is still running",
   spell_in_progress: "another cast was still in progress",
-  bad_targets: "the target is not a valid target for this spell",
+  bad_targets:
+    "this spell cannot take that target: commonly it is dead, it is a friend and the spell hits only enemies " +
+    "(or an enemy, and the spell is a friendly one), or there is none and the spell needs one",
+  no_target: "you gave no target and have none selected, and this spell needs one; pass one",
   bad_implicit_targets: "it has no valid target; pass one",
   targets_dead: "the target is dead",
   target_not_dead: "the target is not dead",
@@ -2291,6 +2317,7 @@ const CAST_FAILURE_WEAPON_SLOT: Readonly<Record<string, { slot: number; words: s
  * background routine says which cast it was.
  */
 function castFailedHint(state: StateCache, cast: PendingCast, reason: string, cause: string = reason): string {
+  if (cause === "bad_targets") cause = badTargetsCause(state, cast);
   const spell = state.spell(cast.spellId)?.name;
   const label = spell === undefined ? `spell ${cast.spellId}` : `${spell} (${cast.spellId})`;
   let on = "";
@@ -2311,6 +2338,21 @@ function castFailedHint(state: StateCache, cast: PendingCast, reason: string, ca
   // The reason itself is the tally line's status (`castSpell <reason>: …`), so
   // the hint says what it means and names nothing twice.
   return `${label}${on}: ${meaning ?? "the server refused it"}${broken}`;
+}
+
+/**
+ * Which `bad_targets` case the cache can tell apart: a target observed dead
+ * (a body, or a player's ghost), or no target at all. The spell's own side
+ * (friendly or hostile only) is Spell.dbc knowledge nothing serves, so any
+ * other case keeps the list of common ones.
+ */
+function badTargetsCause(state: StateCache, cast: PendingCast): string {
+  const guid = cast.targetGuid === undefined ? state.self.targetGuid?.value : guidKey(cast.targetGuid);
+  if (guid === undefined || guid === "0") return "no_target";
+  const unit = state.nearby.get(guid);
+  const health = unit?.fields.get("health")?.value;
+  const ghost = ((unit?.fields.get("playerFlags")?.value ?? 0) & PLAYER_FLAGS_GHOST) !== 0;
+  return health === 0 || ghost ? "targets_dead" : "bad_targets";
 }
 
 /** The quest an item's tooltip says it starts, when the tooltip has been observed and says so. */
@@ -3490,8 +3532,9 @@ export class WrathClient {
   private readonly requestTimeoutMs: number;
   private readonly defaultSignal: (() => AbortSignal | undefined) | undefined;
   private readonly deadlineAt: (() => number | undefined) | undefined;
+  private readonly originOf: (() => number | undefined) | undefined;
 
-  /** Hint-bearing failures since the last drain, by `action:status`. See `ActionHint`. */
+  /** Hint-bearing failures since the last drain, by `action:status:origin`. See `ActionHint`. */
   private readonly actionHints = new Map<string, ActionHint>();
 
   /** `castSpell` casts awaiting the server's first word, by spell id (`castVerdict`). */
@@ -3541,6 +3584,7 @@ export class WrathClient {
     this.defaultSignal = sig === undefined ? undefined : typeof sig === "function" ? sig : () => sig;
     const dl = options.deadline;
     this.deadlineAt = dl === undefined ? undefined : typeof dl === "function" ? dl : () => dl;
+    this.originOf = options.origin;
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
     this.#fetchImpl = options.fetchImpl ?? fetch;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
@@ -3581,7 +3625,7 @@ export class WrathClient {
     // still arrives, so this bodiless packet is the only word of it, and it
     // reaches the harness block from whichever caller walked there.
     this.events.on("SMSG_CORPSE_NOT_IN_INSTANCE", () => {
-      this.noteActionHint("portal", "corpse_not_in_instance", corpseNotInInstanceHint(this.state));
+      this.tallyActionHint(undefined, "portal", "corpse_not_in_instance", corpseNotInInstanceHint(this.state));
     });
   }
 
@@ -3636,10 +3680,27 @@ export class WrathClient {
    * Record a hint-bearing failure for the harness to deliver. Only the status
    * recipe is kept, not the call-specific notes `withNotes` folds in (a budget
    * or timeout remark is already in the result and would vary per call).
+   * Called on the caller's own path, so the caller's `origin` is current.
    */
   private noteActionHint(action: string, status: string, hint: string | undefined, point?: { x: number; y: number; z: number }): void {
+    this.tallyActionHint(this.originOf?.(), action, status, hint, point);
+  }
+
+  /**
+   * `noteActionHint` with the origin given: for a failure the event stream
+   * reports, whose handler runs in no caller's context. A routine's failures
+   * and the current snippet's are tallied apart, so each line can say whose
+   * code it was.
+   */
+  private tallyActionHint(
+    origin: number | undefined,
+    action: string,
+    status: string,
+    hint: string | undefined,
+    point?: { x: number; y: number; z: number },
+  ): void {
     if (hint === undefined || hint.length === 0) return;
-    const key = `${action}:${status}`;
+    const key = `${action}:${status}:${origin ?? ""}`;
     const prev = this.actionHints.get(key);
     if (prev === undefined && this.actionHints.size >= ACTION_HINT_MAX_KEYS) return;
     this.actionHints.set(key, {
@@ -3649,6 +3710,7 @@ export class WrathClient {
       hint,
       ...(point !== undefined ? { point: { x: point.x, y: point.y, z: point.z } } : {}),
       ts: Date.now(),
+      ...(origin !== undefined ? { origin } : {}),
     });
   }
 
@@ -3657,9 +3719,10 @@ export class WrathClient {
    * count alone: a later observation that says more about the same failure.
    * Nothing is added once it has been drained.
    */
-  private rewordActionHint(action: string, status: string, hint: string): void {
-    const prev = this.actionHints.get(`${action}:${status}`);
-    if (prev !== undefined) this.actionHints.set(`${action}:${status}`, { ...prev, hint });
+  private rewordActionHint(origin: number | undefined, action: string, status: string, hint: string): void {
+    const key = `${action}:${status}:${origin ?? ""}`;
+    const prev = this.actionHints.get(key);
+    if (prev !== undefined) this.actionHints.set(key, { ...prev, hint });
   }
 
   /**
@@ -4203,6 +4266,7 @@ export class WrathClient {
       sinceSeq: this.events.recent(1)[0]?.seq,
       sentAt: Date.now(),
       expiresAt: Date.now() + CAST_VERDICT_MS,
+      origin: this.originOf?.(),
     };
     this.pendingCasts.set(spellId, cast);
     try {
@@ -4231,11 +4295,16 @@ export class WrathClient {
     const self = this.state.self.guid;
     const driving = self !== undefined && [...this.state.nearby.values()].some((o) => o.charmedByGuid?.value === self);
     if (book.length > 0 && this.state.spell(spellId) === undefined && !atObject && !driving) {
+      // Another rank of it may be what the book holds: the core keeps only
+      // the highest rank of most spells active (Player::addSpell), and only
+      // active ranks are served. Said, never cast in its place.
+      const held = this.state.heldRanksOf(spellId);
+      const rank = held.length === 0 ? "" : ` ${held[0]!.name} is in your spellbook as ${held.map((s) => s.spellId).join(" or ")}.`;
       return {
         status: "not_known",
         hint:
           `spell ${spellId} is not in your spellbook (state.spells()), and the server ignores a spell you do not know ` +
-          "without a word; nothing was sent. Cast one of the ids state.spells() lists.",
+          `without a word; nothing was sent. Cast one of the ids state.spells() lists.${rank}`,
       };
     }
     return undefined;
@@ -4290,7 +4359,7 @@ export class WrathClient {
     this.pendingCasts.delete(failed.spellId);
     const status = failed.reason ?? `code_${failed.result}`;
     if (status !== "interrupted") {
-      this.noteActionHint("castSpell", status, castFailedHint(this.state, cast, status));
+      this.tallyActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status));
       return;
     }
     // An interrupt has two causes this client can tell apart from the rest:
@@ -4299,21 +4368,21 @@ export class WrathClient {
     // inside, so health 0 lands just after the failure. Each is said with
     // the meaning of the refusal it amounts to.
     if (this.ownMoveSince(cast.sentAt)) {
-      this.noteActionHint("castSpell", status, castFailedHint(this.state, cast, status, "moving"));
+      this.tallyActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status, "moving"));
       return;
     }
     const dead = (): boolean => this.state.self.health?.value.current === 0 || this.state.self.ghost?.value === true;
     if (dead()) {
-      this.noteActionHint("castSpell", status, castFailedHint(this.state, cast, status, "caster_dead"));
+      this.tallyActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status, "caster_dead"));
       return;
     }
     // Noted now, so a drain in between still carries it, and reworded in
     // place (the count unchanged) if the death follows.
-    this.noteActionHint("castSpell", status, castFailedHint(this.state, cast, status));
+    this.tallyActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status));
     this.events
       .waitFor(() => dead(), { timeout: CAST_DEATH_WINDOW_MS, includeBuffered: false, description: "own death after an interrupt" })
       .then(
-        () => this.rewordActionHint("castSpell", status, castFailedHint(this.state, cast, status, "caster_dead")),
+        () => this.rewordActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status, "caster_dead")),
         () => {},
       );
   }
@@ -4338,8 +4407,8 @@ export class WrathClient {
     const yards = sameMap ? distance2d(prev.pos, now.value) : undefined;
     if (yards !== undefined && yards <= OWN_JUMP_YARDS) return;
     const line = (): string => ownJumpNote(this.state, now.value, yards);
-    this.noteActionHint("position", "moved", line());
-    void this.awaitAreaAfter(event.seq, Date.now() + AREA_AFTER_PORT_MS).then(() => this.rewordActionHint("position", "moved", line()));
+    this.tallyActionHint(undefined, "position", "moved", line());
+    void this.awaitAreaAfter(event.seq, Date.now() + AREA_AFTER_PORT_MS).then(() => this.rewordActionHint(undefined, "position", "moved", line()));
   }
 
   /**
@@ -5278,7 +5347,7 @@ export class WrathClient {
         hint:
           `your corpse is inside the dungeon on map ${corpse.instanceMap}, which a reclaim can't reach from ` +
           `${pos === undefined ? "outside it" : `map ${pos.map}`} — as a ghost, walk into that dungeon's portal and you ` +
-          "come back to life inside (half health, no sickness); " +
+          "come back to life at its entrance (half health, no sickness); " +
           `state.self.corpse.value is the server's entrance marker, not the portal itself, ${healerOption}`,
       };
     }
@@ -6558,7 +6627,10 @@ export class WrathClient {
   /**
    * Wait for a chat line. `match` is either an exact message string or a
    * predicate over the decoded entry. Searches events already received before
-   * waiting, so it is safe to call after the action has been acked.
+   * waiting, so it is safe to call after the action has been acked — and an
+   * old line that matches answers at once (two members of the 2026-10-20
+   * party got a stale line back in 1ms). `{ includeBuffered: false }` waits
+   * for a new line only.
    *
    * The predicate sees, and the call returns, the entry as `state.chat` shows
    * it: a player sender named by the name query's answer or the group roster
@@ -7022,7 +7094,8 @@ export class WrathClient {
    * Wait for a map transfer to complete, with a typed verdict.
    *
    * Resolves on `SMSG_NEW_WORLD` (the server's announcement of the new map
-   * and arrival point, already folded into `state.self.position`), or on
+   * and arrival point, already folded into `state.self.position`) once the
+   * WB_AREA after it has named the map in `state.self.map`, or on
    * `SMSG_TRANSFER_ABORTED`; a deadline with a transfer pending is `waiting`,
    * a deadline with no transfer announced at all is `no_transfer`, and an
    * arrival on a map other than `expectMap` is `wrong_map`. Never sleeps.
@@ -7089,6 +7162,16 @@ export class WrathClient {
         hint: `the transfer landed on map ${d.map}, not the expected ${options.expectMap}; state.self.position reflects map ${d.map}.`,
       };
     }
+    // `SMSG_NEW_WORLD` carries the map's id only, so it leaves `state.self.map`
+    // unset until the module's WB_AREA names the new map a tick later. The
+    // verdict waits for it, so a caller reading the map on return finds it
+    // (the 2026-10-20 party: a TypeError 3ms ahead of the WB_AREA). A module
+    // that never names the map costs the bound, never the verdict.
+    await this.waitForState(() => (this.state.self.map?.value.id === d.map ? true : undefined), TRANSFER_MAP_NAME_MS).catch(
+      (err: unknown) => {
+        if (!(err instanceof EventTimeoutError)) throw err;
+      },
+    );
     return { ok: true, status: "transferred", to, seq: event.seq, ts: event.ts };
   }
 
@@ -8676,7 +8759,7 @@ function toChatEntry(seq: number, ts: number, d: ChatFields): ChatEntry {
     ...(d.receiverGuid !== undefined ? { receiverGuid: d.receiverGuid } : {}),
     ...(d.receiverName !== undefined ? { receiverName: d.receiverName } : {}),
     ...(d.channelName !== undefined ? { channelName: d.channelName } : {}),
-    message: d.message,
+    message: chatMessageAsShown(d.type, d.message, d.senderName),
     chatTag: d.chatTag,
     ...(d.achievementId !== undefined ? { achievementId: d.achievementId } : {}),
   };

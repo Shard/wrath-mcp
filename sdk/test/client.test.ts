@@ -4457,7 +4457,7 @@ describe("client: reclaimCorpse owns the delay and answers with a verdict", () =
     expect(result.corpse).toEqual({ map: 0, x: -1100.5, y: 1600.25, z: 50.5, source: "corpse_query", instanceMap: 36 });
     expect(result.hint).toStartWith(
       "your corpse is inside the dungeon on map 36, which a reclaim can't reach from map 0 — as a ghost, walk into " +
-        "that dungeon's portal and you come back to life inside (half health, no sickness); " +
+        "that dungeon's portal and you come back to life at its entrance (half health, no sickness); " +
         "state.self.corpse.value is the server's entrance marker, not the portal itself, or spiritHealerActivate(guid)",
     );
     expect(result.hint).not.toContain("39y");

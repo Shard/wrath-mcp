@@ -20,6 +20,13 @@ export interface ActionHintNote {
   hint: string;
   point?: { x: number; y: number; z: number };
   ts: number;
+  /**
+   * Raised by code from an earlier snippet than the one this result is for (a
+   * routine it launched, or a late verdict on its own call): that snippet's
+   * opening code, whitespace folded and cut short; `""` when it is no longer
+   * known. Absent for the current snippet's own hints and for world events.
+   */
+  from?: string;
 }
 
 /**

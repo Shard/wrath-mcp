@@ -95,7 +95,7 @@ const CLIENT_HELPERS: readonly Row[] = [
   { name: "lootRoll", sig: "lootRoll(itemNameOrIdOrRollGuid, choice: \"need\" | \"greed\" | \"pass\" | \"disenchant\", options?): Promise<LootRollResult>", purpose: "Vote on an open roll frame from state.pendingRolls() (by the item's name — exact, else a unique substring — its id, or the roll guid); rolled carries the number rolled, while no_pending_roll / ambiguous_roll / roll_not_allowed mean nothing was sent. The winner arrives as SMSG_LOOT_ROLL_WON." },
   { name: "readItem", sig: "readItem(bagOrName: number | string, slot?, options?): Promise<ReadItemResult>", purpose: "Read a carried book or letter (bag/slot as state.bag() lists it, or its name) and return its pages and text; no_item / not_readable mean nothing to read. The pages stay in state.itemTexts()." },
   { name: "bankWithdraw", sig: "bankWithdraw(bagOrName: number | string, slot?, options?): Promise<BankMoveResult>", purpose: "Take an item out of the bank (bag/slot as state.bank() lists it, or its name) into the bags; returns where it landed in state.bag(), refused, or no_bank / no_item." },
-  { name: "waitForChat", sig: "waitForChat(match: string | (entry) => boolean, options?): Promise<ChatEntry>", purpose: "Wait for a chat line matching a string or predicate. The predicate sees, and the call returns, the line as state.chat shows it: senderName is the player's name once a name query has answered, or a party member's name from the group roster before it has." },
+  { name: "waitForChat", sig: "waitForChat(match: string | (entry) => boolean, options?): Promise<ChatEntry>", purpose: "Wait for a chat line matching a string or predicate. A matching line already received answers at once; pass { includeBuffered: false } to wait for a new one. The predicate sees, and the call returns, the line as state.chat shows it: senderName is the player's name once a name query has answered, or a party member's name from the group roster before it has." },
   { name: "waitForNearby", sig: "waitForNearby(predicate: (obj) => boolean, options?): Promise<NearbyObject>", purpose: "Wait until an object in view satisfies the predicate." },
   { name: "waitForTransfer", sig: "waitForTransfer({ timeout?: ms, sinceSeq?, expectMap? }): Promise<TransferResult>", purpose: "Wait for a map transfer's server verdict: transferred (SMSG_NEW_WORLD) / aborted / waiting / no_transfer / wrong_map. moveTo already does this when a portal takes the character." },
   { name: "waitForQuestObjective", sig: "waitForQuestObjective(questId, options?): Promise<QuestLogEntry>", purpose: "Wait until the quest log marks a quest's objectives complete." },
@@ -167,6 +167,7 @@ const CLIENT_INTERNAL = new Set([
   "lease",
   "releaseLease",
   "noteActionHint",
+  "tallyActionHint",
   "rewordActionHint",
   "drainActionHints",
   "request",
@@ -237,7 +238,7 @@ const CLIENT_INTERNAL = new Set([
  * unobserved, never zero.
  */
 const STATE_ROWS: readonly Row[] = [
-  { name: "units", sig: "state.units(filter?: UnitFilter): UnitView[]", purpose: "Scan nearby objects, nearest first; filter by entry, name (string | RegExp), type, alive, maxDistance, npc (true keeps NPCs with any npc flag, false drops them — a filter key only: rows carry roles, never an npc field), role (an NPC role word or a list: \"questGiver\", \"vendor\", \"repair\", \"trainer\", \"flightMaster\", \"innkeeper\", \"spiritHealer\", \"banker\", \"auctioneer\", …), questGiver (the observed marker name: \"available\" offers a quest, \"reward\" takes a turn-in now, \"incomplete\" ends a quest not yet done; true means any marker but \"none\"). Rows carry roles (the NPC's role words from its npc flags — what it is for, never what to do; empty for non-NPCs) and questGiver / questGiverStatus; game objects are named (\"Mailbox\", \"Subway\") and carry goType (door, chest, mailbox, transport, …), and a transport carries docked (true while the car sits at a platform)." },
+  { name: "units", sig: "state.units(filter?: UnitFilter): UnitView[]", purpose: "Scan nearby objects, nearest first; filter by entry, name (string | RegExp), type, alive (true: a unit or player whose health was seen above 0; false: one whose health was seen at 0), maxDistance, npc (true keeps NPCs with any npc flag, false drops them — a filter key only: rows carry roles, never an npc field), role (an NPC role word or a list: \"questGiver\", \"vendor\", \"repair\", \"trainer\", \"flightMaster\", \"innkeeper\", \"spiritHealer\", \"banker\", \"auctioneer\", …), questGiver (the observed marker name: \"available\" offers a quest, \"reward\" takes a turn-in now, \"incomplete\" ends a quest not yet done; true means any marker but \"none\"). Rows carry roles (the NPC's role words from its npc flags — what it is for, never what to do; empty for non-NPCs) and questGiver / questGiverStatus; creatures carry rank (normal, elite, rareelite, worldboss or rare) once their query has answered; a player's corpse is a row of type \"corpse\" with dead: true; game objects are named (\"Mailbox\", \"Subway\") and carry goType (door, chest, mailbox, transport, …), and a transport carries docked (true while the car sits at a platform)." },
   {
     name: "closest",
     sig: "state.closest(filter?): UnitView | undefined",
@@ -294,6 +295,7 @@ const STATE_ROWS: readonly Row[] = [
  * the prototype, so they are described in prose in the state section, not here.
  */
 const STATE_INTERNAL = new Set([
+  "heldRanksOf",
   "namedChat",
   "namedChatEntry",
   "addAchievement",

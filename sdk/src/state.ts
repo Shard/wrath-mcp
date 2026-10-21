@@ -162,7 +162,7 @@ const PLAYER_FLAGS_RESTING = 0x0000_0020;
  * the same `playerFlags` integer; a ghost's health is 1, so health alone
  * cannot tell one from the living.
  */
-const PLAYER_FLAGS_GHOST = 0x0000_0010;
+export const PLAYER_FLAGS_GHOST = 0x0000_0010;
 
 /**
  * `MEMBER_STATUS_*` (AzerothCore `Group.h`), the status word of
@@ -280,8 +280,10 @@ export interface CharacterSummary {
  * puts the *recipient* in the sender's place: its `senderGuid` and
  * `senderName` name who it went to. `channelName` rides channel lines
  * (`type` 17), `achievementId` the achievement broadcast (`type` 48/49, whose
- * `message` is the client's raw `%s`/`$a` template); a creature emote's
- * `message` is the same kind of template, `%s` standing for the sender.
+ * `message` is the client's raw `%s`/`$a` template). Creature speech's
+ * `message` is filled in as a client fills it: the wire's `%s attempts to run
+ * away in fear!` reads `Defias Miner attempts to run away in fear!`, the
+ * sender's own name in place of every `%s` (`chatMessageAsShown`).
  */
 export interface ChatEntry {
   readonly seq: number;
@@ -296,6 +298,20 @@ export interface ChatEntry {
   readonly message: string;
   readonly chatTag: number;
   readonly achievementId?: number;
+}
+
+/** Creature speech: say, party, yell, whisper, emote (12–16) and the raid-boss emote and whisper (41–42). */
+const CREATURE_CHAT_TYPES: ReadonlySet<number> = new Set([12, 13, 14, 15, 16, 41, 42]);
+
+/**
+ * A chat line's text as a client prints it. Creature speech is a template
+ * whose `%s` is the speaker (`%s attempts to run away in fear!`), which a
+ * client fills with the name the packet carries; every other line is the
+ * text as sent.
+ */
+export function chatMessageAsShown(type: number, message: string, senderName: string | undefined): string {
+  if (senderName === undefined || !CREATURE_CHAT_TYPES.has(type)) return message;
+  return message.replaceAll("%s", senderName);
 }
 
 export interface NotificationEntry {
@@ -1073,7 +1089,20 @@ export interface CreatureInfo {
   readonly name: string;
   readonly subname: string | undefined;
   readonly type: number | undefined;
+  /** The core's `CreatureEliteType` value; `creatureRankName` names it. */
   readonly rank: number | undefined;
+}
+
+/**
+ * The core's `CreatureEliteType` enum (SharedDefines.h, 3.3.5a), by value: the
+ * classification a client draws as the portrait's dragon. A value outside the
+ * enum reads as `unknown`.
+ */
+export const CREATURE_RANK_NAMES = ["normal", "elite", "rareelite", "worldboss", "rare"] as const;
+export type CreatureRankName = (typeof CREATURE_RANK_NAMES)[number] | "unknown";
+
+export function creatureRankName(rank: number): CreatureRankName {
+  return CREATURE_RANK_NAMES[rank] ?? "unknown";
 }
 
 /** A game object template as `SMSG_GAMEOBJECT_QUERY_RESPONSE` describes it. */
@@ -1307,7 +1336,12 @@ export interface UnitView {
   readonly level: number | undefined;
   readonly health: number | undefined;
   readonly maxHealth: number | undefined;
-  /** `true` only when health was observed *and* is 0. Unobserved stays undefined. */
+  /**
+   * `true` when health was observed *and* is 0, and on every `corpse` (a
+   * player's body or bones, which is dead by what it is). Unobserved stays
+   * undefined, and so does anything with no health to observe (a game object,
+   * a spell's ground effect).
+   */
   readonly dead: boolean | undefined;
   /** Straight-line yards from our own last observed position. */
   readonly distance: number | undefined;
@@ -1318,6 +1352,13 @@ export interface UnitView {
   readonly targetGuid: GuidKey | undefined;
   /** Its master, for a pet, totem or other summon (`UNIT_FIELD_SUMMONEDBY` / `CREATEDBY`); a corpse's player (`CORPSE_FIELD_OWNER`); undefined otherwise. */
   readonly ownerGuid: GuidKey | undefined;
+  /**
+   * Creatures only: `normal`, `elite`, `rareelite`, `worldboss` or `rare`, from
+   * the creature query's answer (`SMSG_CREATURE_QUERY_RESPONSE`) — what the
+   * client draws as the elite dragon round the portrait. Undefined for players
+   * and game objects, and until the query has answered.
+   */
+  readonly rank: CreatureRankName | undefined;
   /**
    * The questgiver marker the client shows over this object, named:
    * `available` (`!`), `reward` (`?` — a quest it ends is ready to turn in),
@@ -1487,8 +1528,13 @@ export interface UnitFilter {
    * and the results stay in nearest-first order.
    */
   name?: string | RegExp;
-  type?: "unit" | "player" | "gameObject";
-  /** `true` drops the known-dead; `false` keeps only them. Unknown health passes `true`. */
+  type?: "unit" | "player" | "gameObject" | "corpse";
+  /**
+   * `true` keeps units and players whose health was observed above 0; `false`
+   * those whose health was observed at 0. Anything whose health is
+   * unobserved, or that has none, passes neither; a player's corpse is
+   * `type: "corpse"`.
+   */
   alive?: boolean;
   /** Yards. Objects with no known distance are dropped: the criterion cannot be evaluated. */
   maxDistance?: number;
@@ -1765,6 +1811,14 @@ export class StateCache {
    * served the book: empty means unobserved, not "knows nothing".
    */
   private readonly spellBook = new Map<number, KnownSpell>();
+
+  /**
+   * spellId -> its Spell.dbc name, for every id a spellbook packet has named:
+   * the rows themselves and the old rank `SMSG_SUPERCEDED_SPELL` replaced
+   * (which shares its successor's name). Never pruned: a name stays true of
+   * its id after the rank leaves the book. `heldRanksOf` reads it.
+   */
+  private readonly spellNamesSeen = new Map<number, string>();
 
   /** spellId -> the last cooldown announcement for it. See `cooldowns()`. */
   private readonly cooldownMap = new Map<number, SpellCooldown>();
@@ -2291,6 +2345,17 @@ export class StateCache {
   /** One spellbook row by id, or `undefined` when the character does not know it. */
   spell(spellId: number): KnownSpell | undefined {
     return this.spellBook.get(spellId);
+  }
+
+  /**
+   * The spellbook rows that are another rank of `spellId`: those sharing the
+   * name a spellbook packet once gave that id. Empty when no packet has named
+   * it — the cache never guesses a rank chain it was not shown.
+   */
+  heldRanksOf(spellId: number): KnownSpell[] {
+    const name = this.spellNamesSeen.get(spellId);
+    if (name === undefined) return [];
+    return this.spells().filter((s) => s.spellId !== spellId && s.name === name);
   }
 
   /**
@@ -3101,6 +3166,7 @@ export class StateCache {
         this.spellBook.clear();
         for (const row of d.spells) {
           this.spellBook.set(row.spellId, { spellId: row.spellId, rank: row.rank, name: row.name, seq: event.seq, ts: event.ts });
+          if (row.name !== undefined) this.spellNamesSeen.set(row.spellId, row.name);
         }
         for (const cd of d.cooldowns) {
           const infinite = cd.categoryCooldownMs === 0x80000000;
@@ -3118,6 +3184,7 @@ export class StateCache {
       case "SMSG_LEARNED_SPELL": {
         const d = event.data as LearnedSpellData;
         this.spellBook.set(d.spellId, { spellId: d.spellId, rank: d.rank, name: d.name, seq: event.seq, ts: event.ts });
+        if (d.name !== undefined) this.spellNamesSeen.set(d.spellId, d.name);
         return;
       }
       case "SMSG_REMOVED_SPELL": {
@@ -3129,6 +3196,10 @@ export class StateCache {
         const d = event.data as SupersededSpellData;
         this.spellBook.delete(d.supersededSpellId);
         this.spellBook.set(d.spellId, { spellId: d.spellId, rank: d.rank, name: d.name, seq: event.seq, ts: event.ts });
+        if (d.name !== undefined) {
+          this.spellNamesSeen.set(d.spellId, d.name);
+          this.spellNamesSeen.set(d.supersededSpellId, d.name);
+        }
         return;
       }
       case "SMSG_SPELL_COOLDOWN": {
@@ -3692,7 +3763,7 @@ export class StateCache {
           ...(d.receiverGuid !== undefined ? { receiverGuid: d.receiverGuid } : {}),
           ...(d.receiverName !== undefined ? { receiverName: d.receiverName } : {}),
           ...(d.channelName !== undefined ? { channelName: d.channelName } : {}),
-          message: d.message,
+          message: chatMessageAsShown(d.type, d.message, d.senderName),
           chatTag: d.chatTag,
           ...(d.achievementId !== undefined ? { achievementId: d.achievementId } : {}),
         });
@@ -3880,7 +3951,7 @@ export class StateCache {
     const from = this.self.position?.value;
     const out: UnitView[] = [];
     for (const obj of this.nearby.values()) {
-      const view = toUnitView(obj, from);
+      const view = toUnitView(obj, from, this.creatures);
       if (view === undefined) continue;
 
       if (!passesUnitFilter(view, obj, f)) continue;
@@ -3970,7 +4041,7 @@ export class StateCache {
       if (predicate && !predicate(obj)) continue;
       // The answer is a `units()` row, so what `units()` leaves out — items
       // and containers, our own inventory — is never an answer here either.
-      const view = toUnitView(obj, from);
+      const view = toUnitView(obj, from, this.creatures);
       if (view === undefined) continue;
       if (criteria && !passesUnitFilter(view, obj, criteria)) continue;
       const d2 = (p.x - from.x) ** 2 + (p.y - from.y) ** 2 + (p.z - from.z) ** 2;
@@ -4072,7 +4143,7 @@ export class StateCache {
           ts,
         };
       }
-      this.mergeFields(obj, block.fields, seq, ts);
+      this.mergeFields(obj, createdFields(block), seq, ts);
       this.joinName(obj);
     });
   }
@@ -4531,7 +4602,11 @@ export class StateCache {
  * not in the world view at all (our own items and bags). `from` is our own last
  * observed position; without it `distance`/`x`/`y`/`z` stay unobserved.
  */
-function toUnitView(obj: NearbyObject, from: UnitPosition | undefined): UnitView | undefined {
+function toUnitView(
+  obj: NearbyObject,
+  from: UnitPosition | undefined,
+  creatures: ReadonlyMap<number, Observed<CreatureInfo>>,
+): UnitView | undefined {
   const type = obj.objectType?.value;
   if (type === "item" || type === "container") return undefined;
   const point = pointOf(obj)?.value;
@@ -4549,19 +4624,46 @@ function toUnitView(obj: NearbyObject, from: UnitPosition | undefined): UnitView
     level: obj.level?.value,
     health,
     maxHealth: obj.fields.get("maxHealth")?.value,
-    dead: health === undefined ? undefined : health === 0,
+    dead: type === "corpse" ? true : health === undefined ? undefined : health === 0,
     distance,
     x: point?.x,
     y: point?.y,
     z: point?.z,
     targetGuid: target === undefined || target === "0" ? undefined : target,
     ownerGuid: obj.ownerGuid?.value,
+    rank: rankOf(obj, creatures),
     questGiver: obj.questGiver === undefined ? undefined : questGiverStatusName(obj.questGiver.value),
     questGiverStatus: obj.questGiver?.value,
     roles: npcRolesOf(obj.fields.get("npcFlags")?.value),
     goType: goTypeOf(obj),
     docked: obj.transport?.value.docked,
   };
+}
+
+/**
+ * A create block's fields as the client reads them. The core's create mask
+ * carries only the non-zero fields (`Object::BuildValuesUpdate`) and a client
+ * starts every field at zero, so a unit's create that states its `maxHealth`
+ * and no `health` is a unit at 0 health: a creature that came into view
+ * already dead. Stated, so an object re-entering view dead does not keep the
+ * health it left with.
+ */
+function createdFields(block: CreateBlock): UpdateFields | undefined {
+  const fields = block.fields;
+  if (block.objectType !== "unit" && block.objectType !== "player") return fields;
+  if (fields === undefined || !("maxHealth" in fields) || "health" in fields) return fields;
+  return { ...fields, health: 0 };
+}
+
+/**
+ * A creature's rank from its template's query answer. Only a unit's: a game
+ * object's entry is a different table's id and may collide with a creature's.
+ */
+function rankOf(obj: NearbyObject, creatures: ReadonlyMap<number, Observed<CreatureInfo>>): CreatureRankName | undefined {
+  const entry = obj.entry?.value;
+  if (obj.objectType?.value !== "unit" || entry === undefined) return undefined;
+  const rank = creatures.get(entry)?.value.rank;
+  return rank === undefined ? undefined : creatureRankName(rank);
 }
 
 /**
@@ -4594,11 +4696,14 @@ function passesUnitFilter(view: UnitView, obj: NearbyObject, f: NormalizedUnitFi
     }
   }
   if (f.type !== undefined && view.type !== f.type) return false;
-  // Asymmetric on purpose: `alive: true` excludes only the *known* dead, so a
-  // unit whose health we have never seen still shows up. `alive: false` is a
-  // positive claim and needs the observation.
-  if (f.alive === true && view.dead === true) return false;
-  if (f.alive === false && view.dead !== true) return false;
+  // Both are positive claims about a unit or player and need the
+  // observation: `alive: true` is health seen above 0, so a corpse, a game
+  // object or a spell's ground effect (none has health) never passes it, and
+  // `alive: false` is health seen at 0. A player's corpse is dead too, but it
+  // is not what a loot scan over `alive: false` is looking for, so it is
+  // reached with `type: "corpse"` instead.
+  if (f.alive === true && view.dead !== false) return false;
+  if (f.alive === false && (view.dead !== true || view.type === "corpse")) return false;
   if (f.maxDistance !== undefined && (view.distance === undefined || view.distance > f.maxDistance)) {
     return false;
   }
@@ -4648,7 +4753,7 @@ const UNIT_FILTER_KEY_HINTS: Readonly<Record<string, string>> = {
   level: "level is not a criterion — each returned row carries .level; filter the array yourself",
   hostile: "hostility is not observed as a filter criterion; read each row's fields instead",
 };
-const UNIT_FILTER_TYPES = ["unit", "player", "gameObject"] as const;
+const UNIT_FILTER_TYPES = ["unit", "player", "gameObject", "corpse"] as const;
 
 /**
  * How a `name` criterion is matched, resolved once at normalization. `text`
