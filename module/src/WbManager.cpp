@@ -5177,7 +5177,7 @@ namespace WrathBench
     };
     struct PendingGuids
     {
-        GuidHalves target, summonedBy, createdBy, charmedBy;
+        GuidHalves target, summonedBy, createdBy, charmedBy, corpseOwner;
     };
 
     // An item's random property (ITEM_FIELD_RANDOM_PROPERTIES_ID, PUBLIC):
@@ -5415,6 +5415,14 @@ namespace WrathBench
                 }
             }
         }
+        else if (typeId == TYPEID_CORPSE)
+        {
+            // Whose corpse this is (CORPSE_FIELD_OWNER, PUBLIC; bones keep
+            // it too, Map::ConvertCorpseToBones): the guid a client
+            // name-queries to label "<name>'s corpse".
+            if (index == CORPSE_FIELD_OWNER)     { g.corpseOwner.lo = v; g.corpseOwner.hasLo = true; return true; }
+            if (index == CORPSE_FIELD_OWNER + 1) { g.corpseOwner.hi = v; g.corpseOwner.hasHi = true; return true; }
+        }
         else if (typeId == TYPEID_GAMEOBJECT)
         {
             switch (index)
@@ -5440,7 +5448,8 @@ namespace WrathBench
             f.AddGuid(key, uint64_t(h.lo) | (uint64_t(h.hi) << 32));
     }
 
-    static std::string DecodeValuesBlock(WorldPacket& p, uint8 typeId, uint32* entryOut, uint32* petNumberOut = nullptr)
+    static std::string DecodeValuesBlock(WorldPacket& p, uint8 typeId, uint32* entryOut, uint32* petNumberOut = nullptr,
+        uint64_t* corpseOwnerOut = nullptr)
     {
         uint8 blockCount; p >> blockCount;
         uint32 mask[64]; // m_valuesCount caps far below 64*32 fields
@@ -5464,6 +5473,9 @@ namespace WrathBench
         AddPendingGuid(f, "summonedByGuid", g.summonedBy);
         AddPendingGuid(f, "createdByGuid", g.createdBy);
         AddPendingGuid(f, "charmedByGuid", g.charmedBy);
+        AddPendingGuid(f, "corpseOwnerGuid", g.corpseOwner);
+        if (corpseOwnerOut && (g.corpseOwner.hasLo || g.corpseOwner.hasHi))
+            *corpseOwnerOut = uint64_t(g.corpseOwner.lo) | (uint64_t(g.corpseOwner.hi) << 32);
         return f.Str();
     }
 
@@ -5524,7 +5536,8 @@ namespace WrathBench
                          .Add("objectType", TypeIdName(typeId));
                         DecodeMovementBlockUpd(p, o);
                         uint32 entry = 0, petNumber = 0;
-                        std::string fields = DecodeValuesBlock(p, typeId, &entry, &petNumber);
+                        uint64_t corpseOwner = 0;
+                        std::string fields = DecodeValuesBlock(p, typeId, &entry, &petNumber, &corpseOwner);
                         o.Raw("fields", fields);
                         {
                             std::lock_guard<std::mutex> lock(s.objMutex);
@@ -5537,6 +5550,11 @@ namespace WrathBench
                                 gameObjectQueries.emplace_back(entry, guid);
                             if (typeId == TYPEID_PLAYER && s.queriedNames.insert(guid).second)
                                 nameQueries.push_back(guid);
+                            // A corpse's owner may never have been in view
+                            // (released and gone before we arrived): the
+                            // client asks its name off the corpse, as here.
+                            if (typeId == TYPEID_CORPSE && corpseOwner && s.queriedNames.insert(corpseOwner).second)
+                                nameQueries.push_back(corpseOwner);
                             if ((typeId == TYPEID_ITEM || typeId == TYPEID_CONTAINER)
                                 && entry && s.queriedItems.insert(entry).second)
                                 itemQueries.push_back(entry);
@@ -6144,6 +6162,69 @@ namespace WrathBench
                     }
                     w.AddGuid("targetGuid", (uint64_t)target).AddGuid("casterGuid", (uint64_t)caster)
                      .Add("spellId", spellId).Add("auraType", auraType).Add("amount", amount);
+                    break;
+                }
+                // The combat log's direct spell lines: what a client prints as
+                // "X's Fireball hits you for 54 Fire damage". All three are
+                // sent to every client in range (SendMessageToSet), the
+                // reflect form of the damage log to the reflector alone.
+                case SMSG_SPELLNONMELEEDAMAGELOG:
+                {
+                    // Unit::SendSpellNonMeleeDamageLog / SendSpellNonMeleeReflectLog:
+                    // target packGUID, caster packGUID, u32 spell, u32 damage,
+                    // u32 overkill, u8 school mask, u32 absorb, u32 resist,
+                    // u8 physicalLog, u8 unused, u32 blocked, u32 hitInfo
+                    // (SpellHitType), u8 debug flag. The debug rolls the flag
+                    // would introduce are commented out in the builder at the
+                    // pinned commit, so the flag is the last byte read.
+                    name = "SMSG_SPELLNONMELEEDAMAGELOG";
+                    uint64 target = 0, caster = 0;
+                    p.readPackGUID(target);
+                    p.readPackGUID(caster);
+                    uint32 spellId, damage, overkill; p >> spellId >> damage >> overkill;
+                    uint8 schoolMask; p >> schoolMask;
+                    uint32 absorb, resist; p >> absorb >> resist;
+                    uint8 physicalLog, unused; p >> physicalLog >> unused;
+                    uint32 blocked, hitInfo; p >> blocked >> hitInfo;
+                    uint8 debug; p >> debug;
+                    w.AddGuid("targetGuid", (uint64_t)target).AddGuid("casterGuid", (uint64_t)caster)
+                     .Add("spellId", spellId);
+                    AddSpellFields(w, spellId);
+                    w.Add("damage", damage).Add("overkill", overkill).Add("schoolMask", (uint32)schoolMask)
+                     .Add("absorb", absorb).Add("resist", resist).Add("blocked", blocked)
+                     .Add("hitInfo", hitInfo).Add("crit", (hitInfo & SPELL_HIT_TYPE_CRIT) != 0);
+                    break;
+                }
+                case SMSG_SPELLHEALLOG:
+                {
+                    // Unit::SendHealSpellLog: target packGUID, healer packGUID,
+                    // u32 spell, u32 heal, u32 overheal, u32 absorb, u8 crit,
+                    // u8 unused.
+                    name = "SMSG_SPELLHEALLOG";
+                    uint64 target = 0, caster = 0;
+                    p.readPackGUID(target);
+                    p.readPackGUID(caster);
+                    uint32 spellId, amount, overheal, absorb; p >> spellId >> amount >> overheal >> absorb;
+                    uint8 crit, unused; p >> crit >> unused;
+                    w.AddGuid("targetGuid", (uint64_t)target).AddGuid("casterGuid", (uint64_t)caster)
+                     .Add("spellId", spellId);
+                    AddSpellFields(w, spellId);
+                    w.Add("amount", amount).Add("overheal", overheal).Add("absorb", absorb).Add("crit", crit != 0);
+                    break;
+                }
+                case SMSG_SPELLENERGIZELOG:
+                {
+                    // Unit::SendEnergizeSpellLog: target packGUID, caster
+                    // packGUID, u32 spell, u32 power type, u32 amount.
+                    name = "SMSG_SPELLENERGIZELOG";
+                    uint64 target = 0, caster = 0;
+                    p.readPackGUID(target);
+                    p.readPackGUID(caster);
+                    uint32 spellId, powerType, amount; p >> spellId >> powerType >> amount;
+                    w.AddGuid("targetGuid", (uint64_t)target).AddGuid("casterGuid", (uint64_t)caster)
+                     .Add("spellId", spellId);
+                    AddSpellFields(w, spellId);
+                    w.Add("powerType", powerType).Add("amount", amount);
                     break;
                 }
                 case SMSG_AURA_UPDATE:

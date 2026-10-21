@@ -930,6 +930,11 @@ not need it, docs/CONTRACTS.md):
   data, not a new tap)
 - game objects: `goDisplayId`, `goFlags`, `goFaction`, `goLevel`, `goState`,
   `goType`
+- corpses: `corpseOwnerGuid` (CORPSE_FIELD_OWNER, PUBLIC, as a guid string:
+  the player whose corpse or bones this is — a client labels it "<name>'s
+  corpse" from the owner's name). On a corpse's `create` with an owner not yet
+  name-queried this session the module issues the `CMSG_NAME_QUERY` a client
+  does, so an owner who was never in view is named too
 
 Values are the raw client-visible integers from the update stream (health is
 whatever the server sends a client — no extra precision is added). A `values`
@@ -1232,6 +1237,9 @@ Combat:
 | `SMSG_CAST_FAILED` | 0x130 | `{ "spellId", "result": <u8> }` (SpellCastResult code) |
 | `SMSG_SPELL_FAILURE` | 0x133 | `{ "casterGuid", "spellId", "result": <u8> }` |
 | `SMSG_PERIODICAURALOG` | 0x24E | compact: `{ "targetGuid", "casterGuid", "spellId", "auraType": <u32>, "amount" }` |
+| `SMSG_SPELLNONMELEEDAMAGELOG` | 0x250 | `{ "targetGuid", "casterGuid", "spellId", "rank"?, "name"?, "damage", "overkill", "schoolMask": <u8>, "absorb", "resist", "blocked", "hitInfo": <u32>, "crit": <bool> }` — one direct spell hit (`Unit::SendSpellNonMeleeDamageLog`, and the reflect form `SendSpellNonMeleeReflectLog`); `schoolMask` is the `SpellSchoolMask` bit set (1 physical, 2 holy, 4 fire, 8 nature, 16 frost, 32 shadow, 64 arcane), `hitInfo` the raw `SpellHitType` and `crit` its `SPELL_HIT_TYPE_CRIT` bit; `physicalLog`, the unused byte and the debug flag are consumed |
+| `SMSG_SPELLHEALLOG` | 0x150 | `{ "targetGuid", "casterGuid", "spellId", "rank"?, "name"?, "amount", "overheal", "absorb", "crit": <bool> }` — one direct heal (`Unit::SendHealSpellLog`); `amount` is the whole heal, `overheal` the part past full health |
+| `SMSG_SPELLENERGIZELOG` | 0x151 | `{ "targetGuid", "casterGuid", "spellId", "rank"?, "name"?, "powerType": <u32>, "amount" }` — one power gain from a spell (`Unit::SendEnergizeSpellLog`); `powerType` 0 mana, 1 rage, 2 focus, 3 energy, 4 happiness, 5 runes, 6 runic power |
 | `SMSG_AURA_UPDATE` | 0x496 | `{ "targetGuid", "auras": [<aura>] }` |
 | `SMSG_AURA_UPDATE_ALL` | 0x495 | same shape, full visible-aura list |
 
@@ -1242,6 +1250,16 @@ Durations are in ms and present only when the aura shows one (`flags & 0x20`);
 `duration` is what was left when the packet was sent. `name` is the client's
 Spell.dbc name for the id, the one its buff frame shows (client-cache
 knowledge, as on the spellbook rows); absent when the core has no name for it.
+
+Spell combat log. `SMSG_SPELLNONMELEEDAMAGELOG`, `SMSG_SPELLHEALLOG` and
+`SMSG_SPELLENERGIZELOG` are the combat-log lines a client prints for a direct
+spell hit, heal or power gain; the core sends each to every client in range
+(`SendMessageToSet`), so a session sees the spell fights around it, not only
+its own. Both guids precede the spell id with the *target first*, unlike the
+melee log. `rank` and `name` are the client's Spell.dbc reading of the id,
+as on the spellbook rows (`AddSpellFields`), absent when the core has no
+entry for it. Field names follow the melee log's (`absorb`, `resist`,
+`blocked`). Periodic ticks stay on `SMSG_PERIODICAURALOG`.
 
 Swing errors. `SMSG_ATTACKSWING_NOTINRANGE` and `SMSG_ATTACKSWING_BADFACING`
 are the two packets a client shows as on-screen errors while auto-attack is

@@ -579,6 +579,8 @@ export const updateFieldsSchema = z.looseObject({
   createdByGuid: guidSchema.optional(),
   charmedByGuid: guidSchema.optional(),
   petNumber: z.number().optional(),
+  /** Corpses: the player whose corpse or bones this is (`CORPSE_FIELD_OWNER`). */
+  corpseOwnerGuid: guidSchema.optional(),
   race: z.number().optional(),
   class: z.number().optional(),
   gender: z.number().optional(),
@@ -986,6 +988,57 @@ export const periodicAuraLogDataSchema = z.looseObject({
   amount: z.number(),
 });
 export type PeriodicAuraLogData = z.infer<typeof periodicAuraLogDataSchema>;
+
+/**
+ * One direct spell hit, the combat-log line a client prints for it. The core
+ * sends it to every client in range, so it names fights around us as well as
+ * our own. `schoolMask` is the `SpellSchoolMask` bit set (1 physical, 2 holy,
+ * 4 fire, 8 nature, 16 frost, 32 shadow, 64 arcane); `crit` is the
+ * `SPELL_HIT_TYPE_CRIT` bit of the raw `hitInfo`. `rank`/`name` are the
+ * client's Spell.dbc reading of `spellId`, absent when the core has none.
+ */
+export const spellNonMeleeDamageLogDataSchema = z.looseObject({
+  targetGuid: guidSchema,
+  casterGuid: guidSchema,
+  spellId: z.number(),
+  rank: z.number().optional(),
+  name: z.string().optional(),
+  damage: z.number(),
+  overkill: z.number(),
+  schoolMask: z.number(),
+  absorb: z.number(),
+  resist: z.number(),
+  blocked: z.number(),
+  hitInfo: z.number(),
+  crit: z.boolean(),
+});
+export type SpellNonMeleeDamageLogData = z.infer<typeof spellNonMeleeDamageLogDataSchema>;
+
+/** One direct heal: `amount` is the whole heal, `overheal` the part past full health. */
+export const spellHealLogDataSchema = z.looseObject({
+  targetGuid: guidSchema,
+  casterGuid: guidSchema,
+  spellId: z.number(),
+  rank: z.number().optional(),
+  name: z.string().optional(),
+  amount: z.number(),
+  overheal: z.number(),
+  absorb: z.number(),
+  crit: z.boolean(),
+});
+export type SpellHealLogData = z.infer<typeof spellHealLogDataSchema>;
+
+/** One power gain from a spell; `powerType` 0 mana, 1 rage, 2 focus, 3 energy, 4 happiness, 5 runes, 6 runic power. */
+export const spellEnergizeLogDataSchema = z.looseObject({
+  targetGuid: guidSchema,
+  casterGuid: guidSchema,
+  spellId: z.number(),
+  rank: z.number().optional(),
+  name: z.string().optional(),
+  powerType: z.number(),
+  amount: z.number(),
+});
+export type SpellEnergizeLogData = z.infer<typeof spellEnergizeLogDataSchema>;
 
 /**
  * One visible aura slot. `spellId: 0` means the slot was cleared, and then the
@@ -1765,6 +1818,9 @@ export const eventDataSchemas = {
   SMSG_CAST_FAILED: castFailedDataSchema,
   SMSG_SPELL_FAILURE: spellFailureDataSchema,
   SMSG_PERIODICAURALOG: periodicAuraLogDataSchema,
+  SMSG_SPELLNONMELEEDAMAGELOG: spellNonMeleeDamageLogDataSchema,
+  SMSG_SPELLHEALLOG: spellHealLogDataSchema,
+  SMSG_SPELLENERGIZELOG: spellEnergizeLogDataSchema,
   SMSG_AURA_UPDATE: auraUpdateDataSchema,
   SMSG_AURA_UPDATE_ALL: auraUpdateDataSchema,
   // progress

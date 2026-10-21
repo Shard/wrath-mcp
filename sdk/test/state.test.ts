@@ -74,6 +74,7 @@ import {
   creatureOutOfRange,
   creatureQuery,
   creatureValues,
+  corpseCreate,
   corpseQuery,
   corpseReclaimDelay,
   deathReleaseCleared,
@@ -3312,5 +3313,40 @@ describe("pets, group, mail, bank, trade", () => {
     expect(t.mine).toMatchObject({ money: 0, items: [] });
     fold(frame(74, "SMSG_TRADE_STATUS", { status: 3 }));
     expect(cache.trade()).toMatchObject({ open: false, statusText: "trade canceled", mine: undefined, theirs: undefined });
+  });
+});
+
+describe("a corpse's owner", () => {
+  const CORPSE_GUID = "17365880163140699999";
+  const OWNER_GUID = "42";
+  test("CORPSE_FIELD_OWNER folds into the corpse's ownerGuid, and the owner's name query names the player", () => {
+    const cache = StateCache.replay(
+      toEvents([
+        ...loginSequence,
+        corpseCreate(CORPSE_GUID, OWNER_GUID, 20),
+        { seq: 21, opcode: "SMSG_NAME_QUERY_RESPONSE", opcodeId: 0x051, ts: 1_700_000_000_021, data: { guid: OWNER_GUID, found: true, name: "Healpartyc" } },
+      ]),
+      { seed: SEED },
+    );
+    const corpse = cache.nearby.get(CORPSE_GUID);
+    expect(corpse?.objectType?.value).toBe("corpse");
+    expect(corpse?.ownerGuid?.value).toBe(OWNER_GUID);
+    // The string field is the owner, not a text the cache keeps beside ids.
+    expect(corpse?.texts.size).toBe(0);
+    const row = cache.units().find((u) => u.guid === CORPSE_GUID);
+    expect(row).toMatchObject({ guid: CORPSE_GUID, type: "corpse", ownerGuid: OWNER_GUID });
+    expect(cache.nameOf(OWNER_GUID)).toBe("Healpartyc");
+  });
+
+  test("our own corpse names us as owner and is no pet: pet() and the unit rows' type keep it apart", () => {
+    const cache = StateCache.replay(toEvents([...loginSequence, corpseCreate(CORPSE_GUID, SELF_GUID, 20)]), { seed: SEED });
+    expect(cache.nearby.get(CORPSE_GUID)?.ownerGuid?.value).toBe(SELF_GUID);
+    expect(cache.pet()).toBeUndefined();
+    expect(cache.units({ type: "unit" }).some((u) => u.guid === CORPSE_GUID)).toBe(false);
+  });
+
+  test("an unset owner (\"0\") reads as undefined", () => {
+    const cache = StateCache.replay(toEvents([...loginSequence, corpseCreate(CORPSE_GUID, "0", 20)]), { seed: SEED });
+    expect(cache.nearby.get(CORPSE_GUID)?.ownerGuid).toBeUndefined();
   });
 });

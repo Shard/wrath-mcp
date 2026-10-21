@@ -250,7 +250,8 @@ export interface EvalResultMsg {
 
 /**
  * The events a turn's context is built from: the last N events that are not
- * ambient movement (`CONTEXT_POLICY.EVENT_WINDOW_EXCLUDE`), oldest first, and
+ * ambient movement (`CONTEXT_POLICY.EVENT_WINDOW_EXCLUDE`) nor a bystander's
+ * spell combat-log line (`spellLogShown`, not counted as ambient), oldest first, and
  * how many ambient events arrived in the span they cover — from the oldest
  * one returned to now, or since the child started when every non-ambient
  * event it has seen is in the list.
@@ -267,6 +268,19 @@ export interface EventSummary {
   /** JSON-safe, depth-limited data. */
   data: unknown;
   schemaError?: string | undefined;
+  /**
+   * The combat-log sentence for a direct spell hit, heal or power gain
+   * (`spellLogNote` in context.ts), resolved in the child as the event
+   * arrived, while the units it names were still in view. Absent on every
+   * other event.
+   */
+  note?: string | undefined;
+  /**
+   * A spell combat-log line that involves neither us nor a party member's
+   * damage taken (`spellLogShown`): kept off the event window, shown on the
+   * raw stream.
+   */
+  bystander?: true | undefined;
 }
 
 // child -> host

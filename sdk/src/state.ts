@@ -1256,8 +1256,9 @@ export interface NearbyObject extends UnitFieldsState {
   targetGuid: Observed<GuidKey> | undefined;
   /**
    * The master of a summoned or created unit (`UNIT_FIELD_SUMMONEDBY`, else
-   * `UNIT_FIELD_CREATEDBY`): a pet's owner, a totem's shaman. `"0"` reads as
-   * undefined.
+   * `UNIT_FIELD_CREATEDBY`): a pet's owner, a totem's shaman. On a corpse,
+   * the player it belongs to (`CORPSE_FIELD_OWNER`, bones included). `"0"`
+   * reads as undefined.
    */
   ownerGuid: Observed<GuidKey> | undefined;
   /** Who mind-controls this unit (`UNIT_FIELD_CHARMEDBY`), when observed. */
@@ -1315,7 +1316,7 @@ export interface UnitView {
   readonly z: number | undefined;
   /** What it is targeting, when observed. `"0"` (no target) reads as undefined. */
   readonly targetGuid: GuidKey | undefined;
-  /** Its master, for a pet, totem or other summon (`UNIT_FIELD_SUMMONEDBY` / `CREATEDBY`); undefined otherwise. */
+  /** Its master, for a pet, totem or other summon (`UNIT_FIELD_SUMMONEDBY` / `CREATEDBY`); a corpse's player (`CORPSE_FIELD_OWNER`); undefined otherwise. */
   readonly ownerGuid: GuidKey | undefined;
   /**
    * The questgiver marker the client shows over this object, named:
@@ -4304,10 +4305,15 @@ export class StateCache {
       }
       // Owner guids: joined u64 halves the module serves as guid
       // strings. SUMMONEDBY is the pet's master; CREATEDBY is the fallback
-      // the client draws the same conclusion from.
+      // the client draws the same conclusion from; a corpse's owner is the
+      // player whose name it is labelled with.
       if (typeof raw === "string" && target !== this.self && "ownerGuid" in target) {
         const obj = target as NearbyObject;
-        if (key === "summonedByGuid" || (key === "createdByGuid" && obj.ownerGuid?.value === undefined)) {
+        if (
+          key === "summonedByGuid" ||
+          key === "corpseOwnerGuid" ||
+          (key === "createdByGuid" && obj.ownerGuid?.value === undefined)
+        ) {
           obj.ownerGuid = raw === "0" ? undefined : { value: raw, seq, ts };
         } else if (key === "charmedByGuid") {
           obj.charmedByGuid = raw === "0" ? undefined : { value: raw, seq, ts };

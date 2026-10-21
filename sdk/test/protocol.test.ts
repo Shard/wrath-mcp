@@ -36,6 +36,10 @@ import {
   malformedChat,
   moveResult,
   sessionResponseFixture,
+  SELF_GUID,
+  spellDamage,
+  spellEnergize,
+  spellHeal,
   swingError,
   undecodableChat,
 } from "./fixtures";
@@ -130,6 +134,9 @@ describe("event frames", () => {
       "SMSG_CAST_FAILED",
       "SMSG_SPELL_FAILURE",
       "SMSG_PERIODICAURALOG",
+      "SMSG_SPELLNONMELEEDAMAGELOG",
+      "SMSG_SPELLHEALLOG",
+      "SMSG_SPELLENERGIZELOG",
       "SMSG_AURA_UPDATE",
       "SMSG_AURA_UPDATE_ALL",
       "SMSG_LOG_XPGAIN",
@@ -393,6 +400,43 @@ describe("event frames", () => {
     // whitelist; were one to arrive it would still stream, as an UnknownEvent.
     expect(isKnownOpcode("SMSG_ATTACKSWING_DEADTARGET")).toBe(false);
     expect(isKnownOpcode("SMSG_ATTACKSWING_CANT_ATTACK")).toBe(false);
+  });
+
+  test("the spell combat log decodes: damage, heal and energize, target first", () => {
+    // PROTOCOL.md "Spell combat log": both guids as exact strings, the spell's
+    // Spell.dbc rank and name beside its id, the melee log's field names.
+    const dmg = parseEventFrame(JSON.stringify(spellDamage(CREATURE_GUID, SELF_GUID, 80, { crit: true, hitInfo: 2, absorb: 12 })));
+    if (!dmg.ok || !isEvent(dmg.event, "SMSG_SPELLNONMELEEDAMAGELOG")) throw new Error("a damage log must parse as known");
+    expect(dmg.event.opcodeId).toBe(0x250);
+    expect(dmg.event.data).toMatchObject({
+      targetGuid: SELF_GUID,
+      casterGuid: CREATURE_GUID,
+      spellId: 9001,
+      name: "Test Bolt",
+      damage: 54,
+      schoolMask: 4,
+      absorb: 12,
+      crit: true,
+    });
+    const heal = parseEventFrame(JSON.stringify(spellHeal(SELF_GUID, SELF_GUID, 81, { overheal: 30 })));
+    if (!heal.ok || !isEvent(heal.event, "SMSG_SPELLHEALLOG")) throw new Error("a heal log must parse as known");
+    expect(heal.event.data).toMatchObject({ amount: 120, overheal: 30, absorb: 0, crit: false });
+    const gain = parseEventFrame(JSON.stringify(spellEnergize(SELF_GUID, SELF_GUID, 82)));
+    if (!gain.ok || !isEvent(gain.event, "SMSG_SPELLENERGIZELOG")) throw new Error("an energize log must parse as known");
+    expect(gain.event.data).toMatchObject({ powerType: 1, amount: 10 });
+    // A spell the core has no entry for comes without rank and name.
+    const bare = spellDamage(CREATURE_GUID, SELF_GUID, 83) as { data: Record<string, unknown> };
+    delete bare.data["rank"];
+    delete bare.data["name"];
+    const unnamed = parseEventFrame(JSON.stringify(bare));
+    if (!unnamed.ok) throw new Error("frame should parse");
+    expect(isEvent(unnamed.event, "SMSG_SPELLNONMELEEDAMAGELOG")).toBe(true);
+    // A damage log missing a wire field keeps the event, flagged.
+    const broken = spellDamage(CREATURE_GUID, SELF_GUID, 84) as { data: Record<string, unknown> };
+    delete broken.data["damage"];
+    const flagged = parseEventFrame(JSON.stringify(broken));
+    if (!flagged.ok) throw new Error("frame should parse");
+    expect((flagged.event as { schemaError?: string }).schemaError).toBeDefined();
   });
 
   test("a swing error whose payload is not an object keeps the event, flagged", () => {

@@ -988,6 +988,101 @@ export function swing(attackerGuid: string, victimGuid: string, seq: number): un
 }
 
 /**
+ * One direct spell hit as the module forwards `SMSG_SPELLNONMELEEDAMAGELOG`
+ * (PROTOCOL.md, "Spell combat log"): target first, then caster, the spell's
+ * Spell.dbc rank and name beside its id. The name is the fixture's own.
+ */
+export function spellDamage(
+  casterGuid: string,
+  targetGuid: string,
+  seq: number,
+  over: Record<string, unknown> = {},
+): unknown {
+  return {
+    seq,
+    opcode: "SMSG_SPELLNONMELEEDAMAGELOG",
+    opcodeId: 0x250,
+    ts: 1_700_000_000_000 + seq,
+    data: {
+      targetGuid,
+      casterGuid,
+      spellId: 9001,
+      rank: 1,
+      name: "Test Bolt",
+      damage: 54,
+      overkill: 0,
+      schoolMask: 4,
+      absorb: 0,
+      resist: 0,
+      blocked: 0,
+      hitInfo: 0,
+      crit: false,
+      ...over,
+    },
+  };
+}
+
+/** One direct heal as the module forwards `SMSG_SPELLHEALLOG`. */
+export function spellHeal(
+  casterGuid: string,
+  targetGuid: string,
+  seq: number,
+  over: Record<string, unknown> = {},
+): unknown {
+  return {
+    seq,
+    opcode: "SMSG_SPELLHEALLOG",
+    opcodeId: 0x150,
+    ts: 1_700_000_000_000 + seq,
+    data: {
+      targetGuid,
+      casterGuid,
+      spellId: 9002,
+      rank: 1,
+      name: "Test Mend",
+      amount: 120,
+      overheal: 0,
+      absorb: 0,
+      crit: false,
+      ...over,
+    },
+  };
+}
+
+/** One power gain as the module forwards `SMSG_SPELLENERGIZELOG`. */
+export function spellEnergize(casterGuid: string, targetGuid: string, seq: number, over: Record<string, unknown> = {}): unknown {
+  return {
+    seq,
+    opcode: "SMSG_SPELLENERGIZELOG",
+    opcodeId: 0x151,
+    ts: 1_700_000_000_000 + seq,
+    data: { targetGuid, casterGuid, spellId: 9003, rank: 1, name: "Test Surge", powerType: 1, amount: 10, ...over },
+  };
+}
+
+/** A player's corpse entering view, with its owner (`CORPSE_FIELD_OWNER`). */
+export function corpseCreate(corpseGuid: string, ownerGuid: string, seq: number): unknown {
+  return {
+    seq,
+    opcode: "SMSG_UPDATE_OBJECT",
+    opcodeId: 0x0a9,
+    ts: 1_700_000_000_000 + seq,
+    data: {
+      blocks: 1,
+      objects: [
+        {
+          update: "create",
+          guid: corpseGuid,
+          objectType: "corpse",
+          pos: { x: -8940, y: -130, z: 83.5, o: 0 },
+          fields: { scale: 1, corpseOwnerGuid: ownerGuid },
+        },
+      ],
+    },
+  };
+}
+
+/**
  * The server cancelling an auto-attack. `attackerDead: false` with a live
  * victim is the mid-fight cancel the SDK re-arms from.
  */
