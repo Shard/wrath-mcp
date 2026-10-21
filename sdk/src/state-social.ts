@@ -255,10 +255,18 @@ export interface BankContents {
 // ---------------------------------------------------------------- trade
 
 /**
- * The trade window: the last `SMSG_TRADE_STATUS`
- * (`tradeStatusText` names it) and both sides of the window from
- * `SMSG_TRADE_STATUS_EXTENDED`. `open` is true from the window opening until
- * a cancel, a completion or a close. `undefined` until any trade packet.
+ * The trade window: the last `SMSG_TRADE_STATUS` (`tradeStatusText` names
+ * it), who the window is with, and both sides. `theirs` is the other
+ * trader's side as `SMSG_TRADE_STATUS_EXTENDED` shows it; `mine` is what this
+ * character placed through its own raw `CMSG_SET_TRADE_ITEM` /
+ * `CMSG_CLEAR_TRADE_ITEM` / `CMSG_SET_TRADE_GOLD`, which the core never
+ * echoes back. `traderGuid` is the begin's proposer, or the player this
+ * character's own `CMSG_INITIATE_TRADE` named: the core answers a successful
+ * initiate with nothing. `open` is true from the window opening (status 2,
+ * both sides empty) until a cancel, a completion or another close, which
+ * empties both sides and keeps the trader named. A refusal with no window
+ * (0 busy: that player is already in a trade, pending or open, or is you)
+ * names the player asked. `undefined` until any trade packet.
  */
 export interface TradeState {
   readonly status: number;
@@ -318,14 +326,14 @@ const MAIL_RESULT_TEXT: Readonly<Record<number, string>> = {
 };
 
 const TRADE_STATUS_TEXT: Readonly<Record<number, string>> = {
-  0: "busy",
+  0: "busy: that player is already in a trade",
   1: "begin trade",
   2: "window open",
   3: "trade canceled",
-  4: "trade accepted",
+  4: "the other side accepted",
   5: "busy",
   6: "no target",
-  7: "back to trade",
+  7: "back to trade: an accept was cleared",
   8: "trade complete",
   9: "trade rejected",
   10: "target too far away",

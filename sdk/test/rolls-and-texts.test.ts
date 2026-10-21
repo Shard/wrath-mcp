@@ -235,7 +235,8 @@ describe("client: lootRoll", () => {
     expect(await client.lootRoll(ROLL_GUID, "need")).toMatchObject({ ok: false, status: "roll_not_allowed" });
     expect(await client.lootRoll("Thunderfury", "pass")).toMatchObject({ ok: false, status: "no_pending_roll" });
     expect(stub.actions.some((a) => a.action === "raw")).toBe(false);
-    expect(client.drainActionHints().map((h) => h.status).sort()).toEqual(["ambiguous_roll", "no_pending_roll", "roll_not_allowed"]);
+    // "open" is the frames opening, tallied for the harness block whoever looks.
+    expect(client.drainActionHints().map((h) => h.status).sort()).toEqual(["ambiguous_roll", "no_pending_roll", "open", "roll_not_allowed"]);
     const passed = client.lootRoll(OTHER_ROLL_GUID, "pass");
     const at = await untilAction(stub, "raw");
     expect(stub.actions[at]).toMatchObject({ opcode: "CMSG_LOOT_ROLL", payload: guidHex(OTHER_ROLL_GUID) + u32Hex(2) + "00" });

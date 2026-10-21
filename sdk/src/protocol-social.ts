@@ -371,7 +371,13 @@ export const lootStartRollDataSchema = z.looseObject({
 });
 export type LootStartRollData = z.infer<typeof lootStartRollDataSchema>;
 
-/** `SMSG_LOOT_ROLL`: one counted vote. `roll` 1-100, or 128 for a pass; `rollType` 0 pass, 1 need, 2 greed, 3 disenchant. */
+/**
+ * `SMSG_LOOT_ROLL`: one counted vote. `roll` 1-100, or 128 for a pass; `rollType` 0 pass, 1 need, 2 greed, 3 disenchant.
+ * `rollGuid` is "0" on every counted vote: the core writes `ObjectGuid::Empty`
+ * there (`Group::CountRollVote` / `CountTheRoll`), and only the automatic pass
+ * at the roll's start carries the item's guid. `slot` and `itemId` name the
+ * roll, as they do for the client.
+ */
 export const lootRollDataSchema = z.looseObject({
   rollGuid: guidSchema,
   slot: z.number(),
@@ -383,7 +389,7 @@ export const lootRollDataSchema = z.looseObject({
 });
 export type LootRollData = z.infer<typeof lootRollDataSchema>;
 
-/** `SMSG_LOOT_ROLL_WON`: the roll is decided; the item goes to `winnerGuid`. */
+/** `SMSG_LOOT_ROLL_WON`: the roll is decided; the item goes to `winnerGuid`. `rollGuid` is always "0" (`Group::CountTheRoll`); `slot` and `itemId` name the roll. */
 export const lootRollWonDataSchema = z.looseObject({
   rollGuid: guidSchema,
   slot: z.number(),

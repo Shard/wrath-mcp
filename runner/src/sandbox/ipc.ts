@@ -22,9 +22,10 @@ export interface ActionHintNote {
   ts: number;
   /**
    * Raised by code from an earlier snippet than the one this result is for (a
-   * routine it launched, or a late verdict on its own call): that snippet's
-   * opening code, whitespace folded and cut short; `""` when it is no longer
-   * known. Absent for the current snippet's own hints and for world events.
+   * routine it launched, or a late verdict on its own call): the routine
+   * that made the call (`call-site.ts`), else that snippet's opening code,
+   * whitespace folded and cut short; `""` when neither is known any more.
+   * Absent for the current snippet's own hints and for world events.
    */
   from?: string;
 }

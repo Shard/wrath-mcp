@@ -126,7 +126,7 @@ describe("moveTo: a climb refused at the character's own feet reads as any drop 
     expect(r.hint).toEndWith("find the ramp/stairs.");
     client.drainActionHints();
     const ack = await client.moveToAsync({ x: -1200, y: 950, z: 40 });
-    push(stub, moveResult(91, ack.moveId, { dz: 46.08, reachedPos: { x: -1234.5, y: 987.25, z: 42.125 } }));
+    push(stub, moveResult(91, ack.moveId!, { dz: 46.08, reachedPos: { x: -1234.5, y: 987.25, z: 42.125 } }));
     await client.events.waitFor((e) => e.seq === 91, { timeout: 2000 });
     await Bun.sleep(5);
     const [drop] = client.drainActionHints();

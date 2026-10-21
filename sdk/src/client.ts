@@ -1613,11 +1613,13 @@ export function longRouteNote(
  * the ack resolved and it is a refusal (`too_far`, `drop`, `target_off_mesh`,
  * …), that verdict: `ok: false` with its `status` and the same hint the
  * harness block carries. Nothing moved; `moveId` names the `WB_MOVE_RESULT`
- * it came from.
+ * it came from. A move refused before anything was sent (`dead`,
+ * `unknown_target`) answers as `moveTo` does, with no `moveId`.
  */
 export type MoveToAsyncResponse =
   | (MoveToResponse & { readonly hint?: string })
-  | { readonly ok: false; readonly action: string; readonly moveId: number; readonly status: string; readonly hint?: string };
+  | { readonly ok: false; readonly action: string; readonly moveId: number; readonly status: string; readonly hint?: string }
+  | { readonly ok: false; readonly status: "dead" | "unknown_target"; readonly hint: string; readonly action?: undefined; readonly moveId?: undefined };
 
 export interface WaitForTransferOptions {
   /** How long to wait for `SMSG_NEW_WORLD`, in ms. Default 15000: a far teleport is a few server ticks. */
@@ -2041,6 +2043,34 @@ const CHEST_OPEN_SPELLS: readonly number[] = [6478, 3365, 6247, 6477];
 const SPELL_FAILED_BAD_TARGETS = 12;
 /** Loot slot types the auto-loot sequence stores: ALLOW_LOOT (0) and OWNER (4). */
 const isStorableSlot = (i: { slotType: number }): boolean => i.slotType === 0 || i.slotType === 4;
+/** The raw trade opcodes whose effect a client's own window shows and no packet echoes (`StateCache.tradeSent`). */
+const TRADE_OWN_OPCODES: ReadonlySet<string> = new Set(["CMSG_INITIATE_TRADE", "CMSG_SET_TRADE_ITEM", "CMSG_CLEAR_TRADE_ITEM", "CMSG_SET_TRADE_GOLD"]);
+/** `LOOT_SLOT_TYPE_ROLL_ONGOING`: the slot is up for a group roll and cannot be looted until it ends. */
+const LOOT_SLOT_ROLL_ONGOING = 1;
+
+/**
+ * The open roll frames in a sentence, with the vote's call shape: a roll the
+ * server opened is otherwise one `slotType: 1` in a loot window and a row in
+ * `state.pendingRolls()`, and four of five party members never found either
+ * (the 2026-10-21 Deadmines party: the mage voted through raw
+ * `CMSG_LOOT_ROLL`). The seconds left are as of `now`; the deadline is the
+ * frame's own. An unvoted frame passes at its deadline: the core counts only
+ * need and greed votes (`Group::CountTheRoll`, "who didn't vote ... he will
+ * pass").
+ */
+function openRollsHint(rolls: readonly PendingRoll[], now: number): string {
+  const rows = rolls.map(
+    (r) => `${JSON.stringify(r.name ?? `item ${r.itemId}`)} (${r.allowed.join("/")}, ${Math.max(0, Math.round((r.deadline - now) / 1000))}s left)`,
+  );
+  // The call names no button: which one to press is the model's to choose.
+  const first = rolls[0]!;
+  const which = first.name === undefined ? String(first.itemId) : JSON.stringify(first.name);
+  return (
+    `${rolls.length === 1 ? "a group loot roll is open on" : `${rolls.length} group loot rolls are open on`} ${rows.join(", ")}: ` +
+    `vote with await sdk.lootRoll(${which}, choice), choice one of the buttons listed. ` +
+    `state.pendingRolls() holds each frame and its deadline; a frame left unvoted at its deadline counts as a pass`
+  );
+}
 
 /** `interact(guid)` on a chest: the opcode would be dropped, so it is refused with the way that works. */
 export type InteractResult = ActionResponse | { readonly ok: false; readonly status: "chest"; readonly hint: string };
@@ -2102,6 +2132,8 @@ export type LootResult =
       readonly items: readonly StoredLootItem[];
       /** What the window showed, including anything that was not stored. */
       readonly window: readonly LootItemData[];
+      /** When a window slot is up for a group roll (`slotType` 1): the open roll frames and how to vote on them. */
+      readonly hint?: string;
     }
   | { readonly ok: false; readonly status: "empty"; readonly gold: 0; readonly items: readonly [] }
   | {
@@ -2120,6 +2152,7 @@ export type LootResult =
       readonly gold: number;
       readonly items: readonly [];
       readonly window: readonly LootItemData[];
+      readonly hint?: string;
     }
   | {
       /** The server refused to open a window: `SMSG_LOOT_RESPONSE` in its error form. */
@@ -2332,6 +2365,35 @@ const CAST_FAILURE_MEANING: Readonly<Record<string, string>> = {
   nothing_to_dispel: "the target has nothing it can dispel",
   equipped_item_class_mainhand: "it needs a fitting weapon in the main hand, and a broken one (durability 0) does not count",
   equipped_item_class_offhand: "it needs a fitting weapon in the off hand, and a broken one (durability 0) does not count",
+  // What the client's own error line says for the rest the runs hit, or
+  // could: the 2026-10-21 party read "the server refused it" for 132
+  // Revenges that wanted a dodge, block or parry first. The stance a spell
+  // needs is its Spell.dbc Stances mask, which nothing serves, so
+  // only_shapeshift says no more than that the form is wrong.
+  caster_aurastate: "needs a state first (e.g. after a dodge, parry or block)",
+  target_aurastate: "the target is not in the state this spell needs (e.g. low enough health)",
+  only_shapeshift: "needs a different stance or form",
+  not_shapeshift: "it cannot be cast in your current stance or form",
+  no_items_while_shapeshifted: "items cannot be used in your current form",
+  equipped_item_class: "it needs a fitting item equipped (a weapon type, or a shield), and a broken one (durability 0) does not count",
+  equipped_item: "it needs a particular item equipped",
+  affecting_combat: "it cannot be cast while you are in combat",
+  not_standing: "you must be standing (you are sitting)",
+  only_stealthed: "it needs you to be stealthed",
+  only_outdoors: "it can only be cast outdoors",
+  only_indoors: "it can only be cast indoors",
+  not_mounted: "you are mounted",
+  only_mounted: "you must be mounted",
+  fleeing: "you are fleeing (feared) and cannot act",
+  confused: "you are confused",
+  charmed: "you are charmed",
+  immune: "the target is immune to it",
+  item_not_ready: "the item's cooldown is still running",
+  too_many_of_item: "you already carry as many of the item it makes as you may",
+  requires_spell_focus: "it needs a particular object nearby (a forge, an anvil, a campfire, …)",
+  target_not_in_party: "the target is not in your party",
+  level_requirement: "your level is too low for it",
+  no_pet: "you have no pet",
 };
 
 /**
@@ -2348,7 +2410,7 @@ const CAST_FAILURE_WEAPON_SLOT: Readonly<Record<string, { slot: number; words: s
  * and its target by name where the cache has them, so a failure raised in a
  * background routine says which cast it was.
  */
-function castFailedHint(state: StateCache, cast: PendingCast, reason: string, cause: string = reason): string {
+function castFailedHint(state: StateCache, cast: PendingCast, reason: string, cause: string = reason, casting?: string): string {
   if (cause === "bad_targets") cause = badTargetsCause(state, cast);
   const spell = state.spell(cast.spellId)?.name;
   const label = spell === undefined ? `spell ${cast.spellId}` : `${spell} (${cast.spellId})`;
@@ -2358,7 +2420,15 @@ function castFailedHint(state: StateCache, cast: PendingCast, reason: string, ca
     const name = state.nearby.get(key)?.name?.value ?? state.nameOf(key);
     on = ` on ${name ?? cast.targetGuid}`;
   }
-  const meaning = CAST_FAILURE_MEANING[cause];
+  // Our own cast still running says more than either refusal's own words:
+  // the 2026-10-21 mage's routine sent a cast 11 ms after the last one and
+  // read not_ready as a cooldown.
+  const meaning =
+    casting !== undefined && cause === "not_ready"
+      ? `you are still casting ${casting}; ${CAST_FAILURE_MEANING.not_ready}`
+      : casting !== undefined && cause === "interrupted"
+        ? `you were still casting ${casting} when your next cast went out, and that cancelled it; cast again once state.self.casting is clear`
+        : CAST_FAILURE_MEANING[cause];
   // A weapon-slot refusal with the slot's own item observed broken says
   // which item: the durability fields are what the client's tooltip reads.
   const weapon = CAST_FAILURE_WEAPON_SLOT[reason];
@@ -2370,6 +2440,17 @@ function castFailedHint(state: StateCache, cast: PendingCast, reason: string, ca
   // The reason itself is the tally line's status (`castSpell <reason>: …`), so
   // the hint says what it means and names nothing twice.
   return `${label}${on}: ${meaning ?? "the server refused it"}${broken}`;
+}
+
+/**
+ * Our own cast in progress at `now` (`state.self.casting`), named with its
+ * time left, e.g. "Frostbolt (7322), 0.6s left"; undefined when none is.
+ */
+function castInProgress(state: StateCache, now: number): string | undefined {
+  const c = state.self.casting?.value;
+  if (c === undefined || c.endsAt <= now) return undefined;
+  const label = c.name === undefined ? `spell ${c.spellId}` : `${c.name} (${c.spellId})`;
+  return `${label}, ${((c.endsAt - now) / 1000).toFixed(1)}s left`;
 }
 
 /**
@@ -3571,6 +3652,8 @@ export class WrathClient {
 
   /** `castSpell` casts awaiting the server's first word, by spell id (`castVerdict`). */
   private readonly pendingCasts = new Map<number, PendingCast>();
+  /** The stream position at our last `cast_spell` dispatch: a cast sent after the one on the bar began (`castVerdict`). */
+  private lastCastSeq = -1;
 
   /**
    * The last `move_to` this client sent: when, and its moveId once acked. With
@@ -3658,6 +3741,14 @@ export class WrathClient {
     // reaches the harness block from whichever caller walked there.
     this.events.on("SMSG_CORPSE_NOT_IN_INSTANCE", () => {
       this.tallyActionHint(undefined, "portal", "corpse_not_in_instance", corpseNotInInstanceHint(this.state));
+    });
+    // A roll frame opening is a client's popup: it reaches the harness block
+    // whoever is looking, rebuilt from every open frame, since one tally
+    // line holds one hint.
+    this.events.on("SMSG_LOOT_START_ROLL", (e) => {
+      if (isDecodeError(e.data)) return;
+      const open = this.state.pendingRolls(e.ts);
+      if (open.length > 0) this.tallyActionHint(undefined, "lootRoll", "open", openRollsHint(open, e.ts));
     });
   }
 
@@ -4010,10 +4101,12 @@ export class WrathClient {
    * but this is the call for a walk longer than the caller's own time budget:
    * dispatch here, then watch `WB_MOVE_RESULT` (or `state.self.position`).
    *
-   * Takes the same targets `moveTo` does: a point, a unit, or a guid. A target
-   * that resolves to no position throws here rather than returning a verdict —
-   * this is the raw tier, and there is no result object to put an answer in;
-   * `moveTo` answers the same case with `status: "unknown_target"`.
+   * Takes the same targets `moveTo` does: a point, a unit, or a guid. The
+   * refusals `moveTo` answers before sending anything are answered here the
+   * same way, as values: a target that resolves to no position is
+   * `{ ok: false, status: "unknown_target", hint }`, and a corpse is
+   * `{ ok: false, status: "dead", hint }` (a rejection here once surfaced in a
+   * background routine as the sandbox's fatal-error line).
    *
    * A walk that was dispatched acks with its route's `pathLength` (yards),
    * and with a `hint` when that route is far longer than the straight line
@@ -4022,19 +4115,20 @@ export class WrathClient {
   moveToAsync(target: MoveTarget, options: { force?: boolean } = {}): Promise<MoveToAsyncResponse> {
     const resolved = resolveMoveTarget(target, this.state, "moveTo");
     if ("unknown" in resolved) {
-      throw new TypeError(
-        `${resolved.unknown} (moveTo(target) answers this case with { ok: false, status: "unknown_target" } ` +
-          `instead of throwing.)`,
-      );
+      this.noteActionHint("moveToAsync", "unknown_target", resolved.unknown);
+      return Promise.resolve({ ok: false, status: "unknown_target", hint: resolved.unknown });
     }
     if (this.isCorpse()) {
       this.noteActionHint("moveToAsync", "dead", DEAD_MOVE_HINT);
-      return Promise.reject(new Error(`moveToAsync: ${DEAD_MOVE_HINT}`));
+      return Promise.resolve({ ok: false, status: "dead", hint: DEAD_MOVE_HINT });
     }
     // The raw tier: no fall estimate stands in for the caller. A `drop`
     // arrives as the event it is, and `force` is the caller's own word.
     const epoch = this.events.epoch;
     const from = this.state.self.position?.value;
+    // Taken on the caller's own path: the verdict and the long-route note are
+    // tallied from promise callbacks, where no caller is on the stack.
+    const origin = this.originOf?.();
     // A refusal at planning (`too_far`, `drop`, …) can land before the ack
     // resolves, in the same millisecond: latched from before the POST, so the
     // reply can carry it instead of an ok that the event contradicts.
@@ -4046,7 +4140,7 @@ export class WrathClient {
     });
     return this.postMoveTo(resolved.point, resolved.guid, options.force === true)
       .then(async ({ ack, etaMs }): Promise<MoveToAsyncResponse> => {
-        this.watchAsyncMove(ack.moveId, resolved.point, epoch);
+        this.watchAsyncMove(ack.moveId, resolved.point, epoch, origin);
         // The ack and the event travel on different sockets, so the refusal
         // can also land just after the ack. An ack with no route length is
         // a move the module did not dispatch (PROTOCOL.md: a refusal at
@@ -4076,7 +4170,7 @@ export class WrathClient {
         if (note === undefined) return ack;
         // Also to the harness block, so a dropped ack still tells the model
         // (operator, 2026-10-20): once per dispatch, like a refusal.
-        this.noteActionHint("moveToAsync", "long_route", note, resolved.point);
+        this.tallyActionHint(origin, "moveToAsync", "long_route", note, resolved.point);
         return { ...ack, hint: note };
       })
       .finally(offEarly);
@@ -4092,7 +4186,7 @@ export class WrathClient {
    * land before the ack); unwatched after the verdict or `moveTo`'s own
    * default wait.
    */
-  private watchAsyncMove(moveId: number, point: MovePoint, epoch: number): void {
+  private watchAsyncMove(moveId: number, point: MovePoint, epoch: number, origin: number | undefined): void {
     this.events
       .waitFor(
         (e) => isEvent(e, "WB_MOVE_RESULT") && !isDecodeError(e.data) && (e.data as MoveResultData).moveId === moveId,
@@ -4102,7 +4196,7 @@ export class WrathClient {
         const data = event.data as MoveResultData;
         const status = status_(data);
         if (ASYNC_MOVE_UNREPORTED.has(status)) return;
-        this.noteActionHint("moveToAsync", status, this.asyncMoveRecipe(status, point, data), point);
+        this.tallyActionHint(origin, "moveToAsync", status, this.asyncMoveRecipe(status, point, data), point);
       })
       .catch(() => {});
   }
@@ -4301,6 +4395,7 @@ export class WrathClient {
       origin: this.originOf?.(),
     };
     this.pendingCasts.set(spellId, cast);
+    this.lastCastSeq = cast.sinceSeq ?? -1;
     try {
       return await this.dispatchCast(spellId, targetGuid);
     } catch (err) {
@@ -4390,8 +4485,25 @@ export class WrathClient {
     if (cast === undefined) return;
     this.pendingCasts.delete(failed.spellId);
     const status = failed.reason ?? `code_${failed.result}`;
+    // The cast bar as the failure found it: a refusal leaves a running cast
+    // standing, and the interrupt's own SMSG_SPELL_FAILURE, which clears it,
+    // follows this SMSG_CAST_FAILED.
+    const casting = castInProgress(this.state, event.ts);
+    if (status === "not_ready" && casting !== undefined) {
+      this.tallyActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status, status, casting));
+      return;
+    }
     if (status !== "interrupted") {
       this.tallyActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status));
+      return;
+    }
+    // Interrupted by our own next cast: the module sends castCount 0, so the
+    // core's spell_in_progress refusal never fires and a cast sent while
+    // another runs cancels it (Spell::prepare). Told when the interrupted
+    // spell is the one on the bar and a cast of ours went out after it began.
+    const bar = this.state.self.casting;
+    if (casting !== undefined && bar?.value.spellId === failed.spellId && this.lastCastSeq >= bar.seq) {
+      this.tallyActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status, status, casting));
       return;
     }
     // An interrupt has two causes this client can tell apart from the rest:
@@ -6495,17 +6607,24 @@ export class WrathClient {
       );
     }
     const hexPayload = encodeRawPayload(body.data);
+    // The trade window's own half (`state.tradeSent`): whom an initiate asked,
+    // before the send, as a refusal can beat the ack; what was placed, after.
+    const trade = TRADE_OWN_OPCODES.has(op.data);
+    if (trade && op.data === "CMSG_INITIATE_TRADE") this.state.tradeSent(op.data, hexPayload);
     return this.request(
       "POST",
       "/action",
       { token: this.token, action: "raw", opcode: op.data, payload: hexPayload },
       actionResponseSchema,
-    ).then((ack) => ({
-      ...ack,
-      opcode: op.data,
-      payload: hexPayload,
-      ...(named.resolved.length > 0 ? { resolved: named.resolved } : {}),
-    }));
+    ).then((ack) => {
+      if (trade && op.data !== "CMSG_INITIATE_TRADE") this.state.tradeSent(op.data, hexPayload);
+      return {
+        ...ack,
+        opcode: op.data,
+        payload: hexPayload,
+        ...(named.resolved.length > 0 ? { resolved: named.resolved } : {}),
+      };
+    });
   }
 
   /**
@@ -7661,10 +7780,16 @@ export class WrathClient {
             break; // grace expired: report what was confirmed, nothing more
           }
         }
+        // A slot up for a group roll is shown and never stored: the roll is
+        // the way to it, so the answer says one is open and how to vote.
+        const rolling = window.items.filter((i) => i.slotType === LOOT_SLOT_ROLL_ONGOING);
+        const now = this.state.lastTs;
+        const frames = this.state.pendingRolls(now).filter((r) => rolling.some((i) => i.slot === r.slot && i.itemId === r.itemId));
+        const roll = frames.length > 0 ? { hint: openRollsHint(frames, now) } : {};
         if (expected > 0 && stored.length === 0) {
-          return { ok: false, status: "none_stored", gold: window.gold, items: [], window: window.items };
+          return { ok: false, status: "none_stored", gold: window.gold, items: [], window: window.items, ...roll };
         }
-        return { ok: true, status: "looted", gold: window.gold, items: stored, window: window.items };
+        return { ok: true, status: "looted", gold: window.gold, items: stored, window: window.items, ...roll };
       } finally {
         offPush();
       }

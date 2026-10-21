@@ -194,7 +194,7 @@ describe("moveToAsync: a ghost's climb is not told fall damage is free", () => {
     const client = await inWorld(stub);
     await folded(client, "SMSG_UPDATE_OBJECT", 20);
     const ack = await client.moveToAsync({ x: -1207.8, y: 981.15, z: 60.1 });
-    push(stub, result(90, ack.moveId, "drop", { dz: 3.31, reachedPos: { x: -1207.8, y: 981.15, z: 60.1 } }));
+    push(stub, result(90, ack.moveId!, "drop", { dz: 3.31, reachedPos: { x: -1207.8, y: 981.15, z: 60.1 } }));
     await folded(client, "WB_MOVE_RESULT", 90);
     await Bun.sleep(5);
     const [drop] = client.drainActionHints();

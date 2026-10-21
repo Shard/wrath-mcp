@@ -4658,9 +4658,9 @@ describe("client: moveTo target resolution", () => {
     // Nothing was dispatched: there was nowhere to walk.
     expect(stub.actions.filter((a) => a.action === "move_to")).toHaveLength(0);
 
-    // The raw tier has no result object to answer in, so it throws — and says
-    // which call does answer.
-    expect(() => client.moveToAsync("123456789")).toThrow(/unknown_target/);
+    // moveToAsync answers the same refusal the same way, with nothing sent.
+    expect(await client.moveToAsync("123456789")).toEqual({ ok: false, status: "unknown_target", hint: result.hint as string });
+    expect(stub.actions.filter((a) => a.action === "move_to")).toHaveLength(0);
     // A point is untouched by any of this.
     const walk = client.moveTo({ x: 1, y: 2, z: 3 }, { timeout: 2000 });
     await untilAction(stub, "move_to");

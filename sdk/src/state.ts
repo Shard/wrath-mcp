@@ -86,6 +86,9 @@ import {
   type MonsterMoveData,
   type RemovedSpellData,
   type SpellCooldownData,
+  type SpellFailureData,
+  type SpellGoData,
+  type SpellStartData,
   type SupersededSpellData,
   type TalentsInfoData,
   type AchievementEarnedData,
@@ -563,6 +566,17 @@ export interface SelfState extends UnitFieldsState {
    * `undefined` until a block has carried `playerFlags` at all.
    */
   resting: Observed<boolean> | undefined;
+  /**
+   * Our own cast in progress, as the client's cast bar shows it: set by an
+   * own `SMSG_SPELL_START` with a cast time, `endsAt` being that packet's
+   * `ts` plus the cast time (wall-clock ms like `taxiEta.landsAt`), and
+   * cleared by the same spell's own `SMSG_SPELL_GO` (it went off) or
+   * `SMSG_SPELL_FAILURE` (it was interrupted). A refusal (`SMSG_CAST_FAILED`)
+   * of a second cast leaves the running one standing, as it does on the
+   * server. An instant cast never sets it, and a channel does not either: the
+   * channel packets (`MSG_CHANNEL_START` / `MSG_CHANNEL_UPDATE`) are not served.
+   */
+  casting: Observed<{ readonly spellId: number; readonly name: string | undefined; readonly endsAt: number }> | undefined;
   /**
    * `PLAYER_FLAGS_GHOST` on our own `playerFlags`: true while the released
    * spirit walks as a ghost, from the release until the resurrect. A ghost's
@@ -1664,6 +1678,7 @@ export class StateCache {
     taxiFlight: undefined,
     taxiEta: undefined,
     resting: undefined,
+    casting: undefined,
     ghost: undefined,
     taxiReply: undefined,
     bindPoint: undefined,
@@ -1808,6 +1823,13 @@ export class StateCache {
   private bankGuid: { readonly value: GuidKey; readonly seq: number; readonly ts: number } | undefined;
 
   private tradeState: TradeState | undefined;
+  /**
+   * Who our own `CMSG_INITIATE_TRADE` asked, until the window opens or the
+   * server refuses: the server answers the initiator nothing on success (the
+   * begin goes to the other side alone), so this is the only word of who the
+   * window is with, as it is a client's.
+   */
+  private tradeProposal: GuidKey | undefined;
 
   // ----------------------------------------------------------------------- spellbook
 
@@ -2664,6 +2686,87 @@ export class StateCache {
     return { ...t, mine: side(t.mine), theirs: side(t.theirs) };
   }
 
+  /**
+   * One `SMSG_TRADE_STATUS`, read as a client's trade window reads it
+   * (TradeHandler, TradeData at the pinned core):
+   *
+   *   - 1 (begin trade) is a proposal to us from `traderGuid`; no window yet.
+   *   - 2 (window open) opens it, with both sides empty, for whoever proposed:
+   *     the begin's trader, or the player our own initiate named.
+   *   - 4 (the other side accepted), 7 (back to trade: an accept was cleared)
+   *     and the notices the core sends without ending the trade (10 too far
+   *     and 12 an inventory error at an accept, 22/23 a slot refused) leave
+   *     an open window open.
+   *   - Anything else with a window open closes it — 3 canceled, 8
+   *     complete, 0 the other side busy — and empties both sides; the
+   *     trader stays named.
+   *   - Anything else with no window open is a refusal of our own initiate
+   *     (0 busy: the target is already in a trade, or is us), named with the
+   *     player it asked.
+   */
+  private foldTradeStatus(status: number, traderGuid: GuidKey | undefined, seq: number, ts: number): void {
+    const prev = this.tradeState;
+    const wasOpen = prev?.open === true;
+    const statusText = tradeStatusText(status);
+    const proposedToUs = prev !== undefined && !wasOpen && prev.status === 1 ? prev.traderGuid : undefined;
+    if (status === 1) {
+      this.tradeState = { status, statusText, open: false, traderGuid, mine: undefined, theirs: undefined, seq, ts };
+      return;
+    }
+    if (status === 2) {
+      const trader = proposedToUs ?? this.tradeProposal ?? prev?.traderGuid;
+      this.tradeProposal = undefined;
+      this.tradeState = { status, statusText, open: true, traderGuid: trader, mine: emptyTradeSide(seq), theirs: emptyTradeSide(seq), seq, ts };
+      return;
+    }
+    if (wasOpen) {
+      const open = TRADE_WINDOW_NOTICES.has(status);
+      this.tradeState = open
+        ? { ...prev, status, statusText, open, seq, ts }
+        : { ...prev, status, statusText, open, mine: undefined, theirs: undefined, seq, ts };
+      return;
+    }
+    const trader = this.tradeProposal ?? proposedToUs;
+    this.tradeProposal = undefined;
+    this.tradeState = { status, statusText, open: false, traderGuid: trader, mine: undefined, theirs: undefined, seq, ts };
+  }
+
+  /**
+   * Fold one of our own trade opcodes, sent through `raw`, the way a client's
+   * window shows what its own player did: the core echoes neither an item or
+   * gold placed on our side (`TradeData::Update` goes to the other trader)
+   * nor whom an initiate asked. `CMSG_INITIATE_TRADE` (u64 guid) is recorded
+   * before the send, since a refusal can land before the ack; the item and
+   * gold opcodes after it, on an open window. An item is the `state.bag()`
+   * row at the wire's own bag/slot.
+   */
+  tradeSent(opcode: string, payloadHex: string): void {
+    const bytes = Uint8Array.from(Buffer.from(payloadHex, "hex"));
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (opcode === "CMSG_INITIATE_TRADE") {
+      if (bytes.length >= 8) this.tradeProposal = formatGuid(view.getBigUint64(0, true));
+      return;
+    }
+    const t = this.tradeState;
+    if (t === undefined || !t.open) return;
+    const mine = t.mine ?? emptyTradeSide(this.lastSeq);
+    let next: TradeSide | undefined;
+    if (opcode === "CMSG_SET_TRADE_ITEM" && bytes.length >= 3) {
+      const [tradeSlot, bag, slot] = [bytes[0]!, bytes[1]!, bytes[2]!];
+      const row = this.bag().items.find((i) => i.bag === bag && i.slot === slot);
+      if (row?.itemId === undefined) return;
+      const items = mine.items.filter((i) => i.slot !== tradeSlot);
+      items.push({ slot: tradeSlot, itemId: row.itemId, name: undefined, count: row.count ?? 1 });
+      items.sort((a, b) => a.slot - b.slot);
+      next = { money: mine.money, items, seq: this.lastSeq };
+    } else if (opcode === "CMSG_CLEAR_TRADE_ITEM" && bytes.length >= 1) {
+      next = { money: mine.money, items: mine.items.filter((i) => i.slot !== bytes[0]), seq: this.lastSeq };
+    } else if (opcode === "CMSG_SET_TRADE_GOLD" && bytes.length >= 4) {
+      next = { money: view.getUint32(0, true), items: mine.items, seq: this.lastSeq };
+    }
+    if (next !== undefined) this.tradeState = { ...t, mine: next };
+  }
+
   // ---------------------- group, mail, pets, loot rolls folders
 
   private foldGroupList(d: GroupListData, seq: number, ts: number): void {
@@ -3036,6 +3139,7 @@ export class StateCache {
           this.questExplored.clear();
           // A fresh login has no dialog open: an old session's offer is gone.
           this.resurrectOffer = undefined;
+          this.self.casting = undefined;
         }
         // The new map's name arrives on its WB_AREA; until then only the id
         // (position.map) is known, so the old map's name is not kept.
@@ -3207,6 +3311,19 @@ export class StateCache {
           this.spellNamesSeen.set(d.spellId, d.name);
           this.spellNamesSeen.set(d.supersededSpellId, d.name);
         }
+        return;
+      }
+      case "SMSG_SPELL_START": {
+        const d = event.data as SpellStartData;
+        if (!this.isSelfGuid(d.casterGuid) || d.castTimeMs <= 0) return;
+        const name = this.spellBook.get(d.spellId)?.name ?? this.spellNamesSeen.get(d.spellId);
+        this.self.casting = { value: { spellId: d.spellId, name, endsAt: event.ts + d.castTimeMs }, seq: event.seq, ts: event.ts };
+        return;
+      }
+      case "SMSG_SPELL_GO":
+      case "SMSG_SPELL_FAILURE": {
+        const d = event.data as SpellGoData | SpellFailureData;
+        if (this.isSelfGuid(d.casterGuid) && this.self.casting?.value.spellId === d.spellId) this.self.casting = undefined;
         return;
       }
       case "SMSG_SPELL_COOLDOWN": {
@@ -3446,25 +3563,19 @@ export class StateCache {
       }
       case "SMSG_TRADE_STATUS": {
         const d = event.data as TradeStatusData;
-        const prev = this.tradeState;
-        // 1 begin (the other side proposed), 2 the window opened, 7 back to
-        // trade; everything else ends or refuses it.
-        const open = d.status === 2 || d.status === 7 || d.status === 4 || (d.status === 1 && (prev?.open ?? false));
-        this.tradeState = {
-          status: d.status,
-          statusText: tradeStatusText(d.status),
-          open,
-          traderGuid: d.traderGuid ?? (open ? prev?.traderGuid : undefined),
-          mine: open ? prev?.mine : undefined,
-          theirs: open ? prev?.theirs : undefined,
-          seq: event.seq,
-          ts: event.ts,
-        };
+        this.foldTradeStatus(d.status, d.traderGuid, event.seq, event.ts);
         return;
       }
       case "SMSG_TRADE_STATUS_EXTENDED": {
+        // One side of the window as the server holds it. The core sends it to
+        // the other trader on every change (`TradeData::Update`), so it is
+        // `theirs` in practice; our own side comes back only for an enchant
+        // spell, and is otherwise what we placed (`tradeSent`).
         const d = event.data as TradeStatusExtendedData;
-        const prev = this.tradeState ?? { status: 2, statusText: tradeStatusText(2), open: true, traderGuid: undefined, mine: undefined, theirs: undefined, seq: event.seq, ts: event.ts };
+        const prev = this.tradeState ?? {
+          status: 2, statusText: tradeStatusText(2), open: true, traderGuid: this.tradeProposal,
+          mine: emptyTradeSide(event.seq), theirs: emptyTradeSide(event.seq), seq: event.seq, ts: event.ts,
+        };
         const side: TradeSide = { money: d.money, items: d.items.map((it) => ({ slot: it.slot, itemId: it.itemId, name: undefined, count: it.count })), seq: event.seq };
         this.tradeState = { ...prev, open: true, mine: d.theirs ? prev.mine : side, theirs: d.theirs ? side : prev.theirs, seq: event.seq, ts: event.ts };
         return;
@@ -5124,6 +5235,17 @@ const BANK_BAG_FIRST_SLOT = 67;
 const BANK_BAG_LAST_SLOT = 73;
 /** `INVENTORY_SLOT_BAG_0` on the wire: the bag id the item actions take for the backpack. */
 const BACKPACK_BAG = 255;
+
+/**
+ * `SMSG_TRADE_STATUS` codes the core sends inside an open trade without
+ * ending it: 4 the other side accepted, 7 back to trade, and the accept's own
+ * refusals that only clear the accept — 10 too far, 12 an inventory error —
+ * with 22/23, a slot the server would not take.
+ */
+const TRADE_WINDOW_NOTICES: ReadonlySet<number> = new Set([4, 7, 10, 12, 22, 23]);
+
+/** A trade side with nothing on it: what a window shows as it opens. */
+const emptyTradeSide = (seq: number): TradeSide => ({ money: 0, items: [], seq });
 /** Worn-bag equipment slots (`INVENTORY_SLOT_BAG_START..END`): the bag ids the item actions take for them. */
 const BAG_FIRST_SLOT = 19;
 const BAG_LAST_SLOT = 22;
