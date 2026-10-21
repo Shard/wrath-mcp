@@ -3189,7 +3189,7 @@ describe("pets, group, mail, bank, trade", () => {
       }),
     );
     expect(cache.group()).toMatchObject({ inGroup: true, leaderGuid: "9", leaderName: "Ordrick", leader: false, pendingInvite: undefined, lootMethod: 0 });
-    expect(cache.group()!.members).toEqual([{ guid: "9", name: "Ordrick", online: true, subGroup: 0, assistant: false, leader: true }]);
+    expect(cache.group()!.members).toEqual([{ guid: "9", name: "Ordrick", online: true, subGroup: 0, assistant: false, leader: true, inView: false, stats: undefined }]);
     fold(frame(22, "SMSG_GROUP_SET_LEADER", { name: "Fenwick" }));
     expect(cache.group()).toMatchObject({ leader: true, leaderName: "Fenwick", leaderGuid: SELF_GUID });
     expect(cache.group()!.members[0]!.leader).toBe(false);

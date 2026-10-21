@@ -266,7 +266,7 @@ const STATE_ROWS: readonly Row[] = [
   { name: "reputationWith", sig: "state.reputationWith(factionIdOrName): ReputationEntry | undefined", purpose: "One reputation row by faction id or name; undefined when there is none or the name is ambiguous." },
   { name: "pet", sig: "state.pet(): PetState | undefined", purpose: "The pet frame: { guid, name, creatureName, level, health, maxHealth, power, maxPower, dead, inView, reaction: \"passive\"|\"defensive\"|\"aggressive\", command: \"stay\"|\"follow\"|\"attack\", actionBar, spells: [{ spellId, name, rank, autocast, passive }], cooldowns }; undefined when there is no pet (none summoned, or its bar was removed)." },
   { name: "petSpell", sig: "state.petSpell(idOrName): PetSpellEntry | undefined", purpose: "One of the pet's spells by id or name; undefined when there is none or the name is ambiguous." },
-  { name: "group", sig: "state.group(): GroupState | undefined", purpose: "The party: { inGroup, raid, leaderGuid, leaderName, leader (you), members: [{ guid, name, online, leader, assistant }], pendingInvite: { inviterName }, lastResult: { operation, name, result, text }, lastDecline }; undefined until any group packet." },
+  { name: "group", sig: "state.group(): GroupState | undefined", purpose: "The party: { inGroup, raid, leaderGuid, leaderName, leader (you), members: [{ guid, name, online, leader, assistant, inView, stats }], pendingInvite: { inviterName }, lastResult: { operation, name, result, text }, lastDecline }; undefined until any group packet. inView: the member's unit is in units(), which has its current health and position. stats: the party frame the server sends only while the member is out of sight (SMSG_PARTY_MEMBER_STATS), { online, dead, ghost, afk, dnd, health, maxHealth, powerType, power, maxPower, level, zone: { id, name }, position: { x, y } (no map), auras, asOf }, each field the last value a packet carried; undefined until one arrived." },
   { name: "mailbox", sig: "state.mailbox(): MailboxState | undefined", purpose: "The mailbox: { guid (the open mailbox), mails: [{ mailId, senderName, subject, body, money, cod, read, daysLeft, items }], total, newMail, lastResult: { action, result, text } }; undefined until any mail packet." },
   { name: "bank", sig: "state.bank(): BankContents", purpose: "The bank: { guid (the banker the frame was opened at), items: [{ bag (255 for the main bank, else the bank bag's slot 67-73), slot, guid, itemId, name, count }], bags, freeSlots, totalSlots }; the slots are known from login, moving items needs openBank." },
   { name: "pendingResurrect", sig: "get state.pendingResurrect: PendingResurrect | undefined", purpose: "The resurrection offered to you while dead: { casterGuid, casterName, sickness (accepting brings resurrection sickness), seq, ts }; undefined when none is pending, and again once you are alive." },
@@ -331,6 +331,7 @@ const STATE_INTERNAL = new Set([
   "upsertNearby",
   "foldFactionRow",
   "foldGroupList",
+  "foldPartyMemberStats",
   "groupPatch",
   "mailPatch",
 ]);
@@ -345,7 +346,7 @@ const EVENT_ROWS: readonly Row[] = [
   { name: "once", sig: "events.once(opcode, fn): Unsubscribe", purpose: "Subscribe to the next single event of an opcode." },
   { name: "waitFor", sig: "events.waitFor(predicate, options?): Promise<StreamEvent>", purpose: "Wait for the next event satisfying a predicate; throws EventTimeoutError on timeout, EventAbortedError if options.signal (or the client default) fires." },
   { name: "waitForOpcode", sig: "events.waitForOpcode(opcode, { timeout: ms }): Promise<StreamEvent>", purpose: "Wait for the next event of a given opcode." },
-  { name: "recent", sig: "events.recent(n?): StreamEvent[]", purpose: "The most recent buffered events, newest last." },
+  { name: "recent", sig: "events.recent(n?): StreamEvent[]", purpose: "The most recent buffered events, newest last. The party frame packets (SMSG_PARTY_MEMBER_STATS, _FULL) are not buffered: state.group() keeps their values, and on() and waitFor() see them as they arrive." },
   { name: "connected", sig: "get events.connected: boolean", purpose: "Whether the event socket is open." },
 ];
 

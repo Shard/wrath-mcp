@@ -200,6 +200,8 @@ describe("event frames", () => {
       "SMSG_GROUP_DESTROYED",
       "SMSG_PARTY_COMMAND_RESULT",
       "SMSG_GROUP_LIST",
+      "SMSG_PARTY_MEMBER_STATS",
+      "SMSG_PARTY_MEMBER_STATS_FULL",
       "SMSG_SHOW_MAILBOX",
       "SMSG_RECEIVED_MAIL",
       "SMSG_SEND_MAIL_RESULT",

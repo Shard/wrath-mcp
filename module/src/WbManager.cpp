@@ -842,6 +842,10 @@ namespace WrathBench
         { "CMSG_GROUP_DISBAND", CMSG_GROUP_DISBAND },
         { "CMSG_GROUP_SET_LEADER", CMSG_GROUP_SET_LEADER },
         { "CMSG_LOOT_METHOD", CMSG_LOOT_METHOD },
+        // the party frame's own refresh of one member (body u64 guid,
+        // unpacked); answered with SMSG_PARTY_MEMBER_STATS_FULL, or with
+        // the offline form for a guid not in the party
+        { "CMSG_REQUEST_PARTY_MEMBER_STATS", CMSG_REQUEST_PARTY_MEMBER_STATS },
         // group loot roll: the need/greed/pass/disenchant
         // button on the roll frame SMSG_LOOT_START_ROLL opened (body u64 roll
         // guid, u32 slot, u8 vote); the SDK's lootRoll builds it
@@ -6730,6 +6734,85 @@ namespace WrathBench
                         w.Add("lootMethod", (uint32)lootMethod).AddGuid("looterGuid", (uint64_t)looter)
                          .Add("lootThreshold", (uint32)threshold).Add("dungeonDifficulty", (uint32)dungeonDiff)
                          .Add("raidDifficulty", (uint32)raidDiff);
+                    }
+                    break;
+                }
+                case SMSG_PARTY_MEMBER_STATS:
+                case SMSG_PARTY_MEMBER_STATS_FULL:
+                {
+                    // The party frames of a member out of sight: the delta
+                    // Group::UpdatePlayerOutOfRange sends (WorldSession::
+                    // BuildPartyMemberStatsChangedPacket) only to members out
+                    // of the sender's sight range or on another map, once per
+                    // update with the fields that changed, and the _FULL
+                    // reply to CMSG_REQUEST_PARTY_MEMBER_STATS
+                    // (HandleRequestPartyMemberStatsOpcode). _FULL leads with
+                    // a u8 0; then both are packed guid, u32 GROUP_UPDATE_FLAG
+                    // mask, and one field per set bit in bit order: STATUS u16
+                    // MEMBER_STATUS_*, CUR_HP u32, MAX_HP u32, POWER_TYPE u8,
+                    // CUR_POWER u16, MAX_POWER u16, LEVEL u16, ZONE u16,
+                    // POSITION u16 x, u16 y (the float position truncated
+                    // into 16 bits, so read signed: most of the world is at
+                    // negative coordinates), AURAS u64 slot mask then (u32
+                    // spell, u8 flags) per set slot (spell 0 clears the slot
+                    // in a delta). Pet and vehicle fields follow; they are
+                    // left unread, and `mask` still says they were there. A
+                    // member the server cannot find is answered with _FULL,
+                    // mask STATUS and status 0 (offline). zoneName is the
+                    // client's AreaTable.dbc name for the zone id, the text
+                    // a party frame tooltip shows; an aura's name is its
+                    // Spell.dbc name, as on SMSG_AURA_UPDATE.
+                    bool const full = opcode == SMSG_PARTY_MEMBER_STATS_FULL;
+                    name = full ? "SMSG_PARTY_MEMBER_STATS_FULL" : "SMSG_PARTY_MEMBER_STATS";
+                    if (full)
+                        { uint8 unk; p >> unk; }
+                    uint64 guid = 0; p.readPackGUID(guid);
+                    uint32 mask; p >> mask;
+                    w.AddGuid("guid", (uint64_t)guid).Add("full", full).Add("mask", mask);
+                    if (mask & 0x00000001)
+                        { uint16 v; p >> v; w.Add("status", (uint32)v); }
+                    if (mask & 0x00000002)
+                        { uint32 v; p >> v; w.Add("health", v); }
+                    if (mask & 0x00000004)
+                        { uint32 v; p >> v; w.Add("maxHealth", v); }
+                    if (mask & 0x00000008)
+                        { uint8 v; p >> v; w.Add("powerType", (uint32)v); }
+                    if (mask & 0x00000010)
+                        { uint16 v; p >> v; w.Add("power", (uint32)v); }
+                    if (mask & 0x00000020)
+                        { uint16 v; p >> v; w.Add("maxPower", (uint32)v); }
+                    if (mask & 0x00000040)
+                        { uint16 v; p >> v; w.Add("level", (uint32)v); }
+                    if (mask & 0x00000080)
+                    {
+                        uint16 v; p >> v;
+                        w.Add("zoneId", (uint32)v);
+                        auto it = _areaTable.find(v);
+                        if (it != _areaTable.end() && !it->second.name.empty())
+                            w.Add("zoneName", it->second.name);
+                    }
+                    if (mask & 0x00000100)
+                        { int16 x, y; p >> x >> y; w.Add("x", (int32)x).Add("y", (int32)y); }
+                    if (mask & 0x00000200)
+                    {
+                        uint64 auraMask; p >> auraMask;
+                        std::string auras = "[";
+                        for (uint32 slot = 0; slot < 64; ++slot)
+                        {
+                            if (!(auraMask & (uint64(1) << slot)))
+                                continue;
+                            uint32 spellId; uint8 flags; p >> spellId >> flags;
+                            Json::Writer a;
+                            a.Add("slot", slot).Add("spellId", spellId).Add("flags", (uint32)flags);
+                            if (spellId)
+                                if (SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId))
+                                    if (info->SpellName[0])
+                                        a.Add("name", info->SpellName[0]);
+                            if (auras.size() > 1) auras += ',';
+                            auras += a.Str();
+                        }
+                        auras += "]";
+                        w.Raw("auras", auras);
                     }
                     break;
                 }

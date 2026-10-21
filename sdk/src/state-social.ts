@@ -77,6 +77,64 @@ export interface PetState {
 
 // ---------------------------------------------------------------- group
 
+/** A party member's power, as the party frame's bar names it (`Powers`: 0 mana, 1 rage, 2 focus, 3 energy, 6 runic power). */
+export type PartyPowerType = "mana" | "rage" | "focus" | "energy" | "happiness" | "runes" | "runic power";
+
+/** One of a party member's visible auras, as its party frame shows it. */
+export interface PartyMemberAura {
+  readonly slot: number;
+  readonly spellId: number;
+  /** The client's Spell.dbc name for the id, when the module served one. */
+  readonly name: string | undefined;
+  /** The `AFLAG_*` byte; 0x80 is a debuff. A delta writes 1 for every aura of a member's own. */
+  readonly flags: number;
+}
+
+/**
+ * The party frame of a member out of sight, folded from
+ * `SMSG_PARTY_MEMBER_STATS` (the server's delta) and `_FULL` (its answer to
+ * `CMSG_REQUEST_PARTY_MEMBER_STATS`). The server sends these only while the
+ * member is out of this character's sight range or on another map, and a
+ * delta carries only what changed, so each field is the last value a packet
+ * carried; one carried before a time in sight can be stale (while in sight
+ * nothing is sent, and the member's unit in `units()` has the current
+ * values, as a client's frame reads them there). Every field is `undefined`
+ * until a packet carried it.
+ *
+ * `status` arrives only with the full updates the server sends on a group
+ * join, a zone change, a teleport or map transfer and a resurrection, so a
+ * death in place shows as `health` 0: `dead` is true on either. A ghost's
+ * health is 1. The packet names no map: `position` is the member's x, y in
+ * whole yards on whatever map it is on.
+ */
+export interface PartyMemberStats {
+  /** `MEMBER_STATUS_ONLINE`, from the last packet that carried a status. */
+  readonly online: boolean | undefined;
+  /** `MEMBER_STATUS_DEAD`, or `health` observed as 0 (and not a ghost). */
+  readonly dead: boolean | undefined;
+  /** `MEMBER_STATUS_GHOST`: released, a spirit. */
+  readonly ghost: boolean | undefined;
+  readonly afk: boolean | undefined;
+  readonly dnd: boolean | undefined;
+  /** The raw `MEMBER_STATUS_*` bits behind the five above. */
+  readonly statusFlags: number | undefined;
+  readonly health: number | undefined;
+  readonly maxHealth: number | undefined;
+  readonly powerType: PartyPowerType | undefined;
+  readonly power: number | undefined;
+  readonly maxPower: number | undefined;
+  readonly level: number | undefined;
+  /** The zone the member is in, named from the client's AreaTable.dbc. */
+  readonly zone: { readonly id: number; readonly name: string | undefined } | undefined;
+  /** Whole yards, on the member's own map, which the packet does not name. */
+  readonly position: { readonly x: number; readonly y: number } | undefined;
+  /** The visible auras, by slot. */
+  readonly auras: readonly PartyMemberAura[] | undefined;
+  /** The cache's wall-clock stamp of the last packet for this member. */
+  readonly asOf: number;
+  readonly seq: number;
+}
+
 /** One other member of the party, as `SMSG_GROUP_LIST` lists them (self is never in the list). */
 export interface GroupMember {
   readonly guid: GuidKey;
@@ -85,6 +143,10 @@ export interface GroupMember {
   readonly subGroup: number;
   readonly assistant: boolean;
   readonly leader: boolean;
+  /** Whether the member's unit is in view (`units()` has it, with the current health and position). */
+  readonly inView: boolean;
+  /** The party frame while out of sight (`SMSG_PARTY_MEMBER_STATS`); `undefined` until one arrived. */
+  readonly stats: PartyMemberStats | undefined;
 }
 
 /**

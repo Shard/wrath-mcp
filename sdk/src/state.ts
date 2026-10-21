@@ -73,6 +73,7 @@ import {
   type MailEntryData,
   type MailListResultData,
   type PartyCommandResultData,
+  type PartyMemberStatsData,
   type PetActionBarButton,
   type PetNameQueryResponseData,
   type PetSpell,
@@ -115,6 +116,9 @@ import {
   type BankContents,
   type GroupMember,
   type GroupState,
+  type PartyMemberAura,
+  type PartyMemberStats,
+  type PartyPowerType,
   type ItemText,
   type MailEntry,
   type MailboxState,
@@ -159,6 +163,32 @@ const PLAYER_FLAGS_RESTING = 0x0000_0020;
  * cannot tell one from the living.
  */
 const PLAYER_FLAGS_GHOST = 0x0000_0010;
+
+/**
+ * `MEMBER_STATUS_*` (AzerothCore `Group.h`), the status word of
+ * `SMSG_PARTY_MEMBER_STATS`: the bits a client's party frame reads for
+ * offline, dead, ghost, AFK and DND.
+ */
+const MEMBER_STATUS_ONLINE = 0x01;
+const MEMBER_STATUS_DEAD = 0x04;
+const MEMBER_STATUS_GHOST = 0x08;
+const MEMBER_STATUS_AFK = 0x40;
+const MEMBER_STATUS_DND = 0x80;
+
+/** A member as `SMSG_GROUP_LIST` left it; `group()` joins `inView` and `stats` on at read time. */
+type StoredGroupMember = Omit<GroupMember, "inView" | "stats">;
+type StoredGroupState = Omit<GroupState, "members"> & { readonly members: readonly StoredGroupMember[] };
+
+/** `Powers` by id, as a party frame's power bar names them. */
+const PARTY_POWER_TYPES: Readonly<Record<number, PartyPowerType>> = {
+  0: "mana",
+  1: "rage",
+  2: "focus",
+  3: "energy",
+  4: "happiness",
+  5: "runes",
+  6: "runic power",
+};
 
 // The wire's react/command state byte, as the pet frame names it; the
 // pair the `pet()` fold reads. The names themselves live in `./state-social`.
@@ -1697,7 +1727,14 @@ export class StateCache {
   /** petNumber -> given name, from `SMSG_PET_NAME_QUERY_RESPONSE`. Never pruned: the module asks once per number. */
   private readonly petNames = new Map<number, string>();
 
-  private groupState: GroupState | undefined;
+  private groupState: StoredGroupState | undefined;
+
+  /**
+   * member guid -> the party frame folded from `SMSG_PARTY_MEMBER_STATS[_FULL]`,
+   * joined onto `group().members` at read time because every `SMSG_GROUP_LIST`
+   * rebuilds the member list. Cleared when this character leaves the group.
+   */
+  private readonly partyStats = new Map<GuidKey, PartyMemberStats>();
 
   /** The open resurrection offer; closed by the resurrect itself and by a new login. */
   private resurrectOffer: (ResurrectRequestData & { readonly seq: number; readonly ts: number }) | undefined;
@@ -2481,9 +2518,20 @@ export class StateCache {
 
   // ---------------------------------------------------------------- group
 
-  /** The party, or `undefined` until any group packet has been observed. */
+  /**
+   * The party, or `undefined` until any group packet has been observed. Each
+   * member carries whether its unit is in view and, once one arrived, the
+   * party frame the server sends while it is out of sight (`stats`).
+   */
   group(): GroupState | undefined {
-    return this.groupState;
+    const g = this.groupState;
+    if (g === undefined) return undefined;
+    const members = g.members.map((m) => ({
+      ...m,
+      inView: this.nearby.has(m.guid),
+      stats: this.partyStats.get(m.guid),
+    }));
+    return { ...g, members };
   }
 
   // ----------------------------------------------------------------- mail
@@ -2547,7 +2595,7 @@ export class StateCache {
 
   private foldGroupList(d: GroupListData, seq: number, ts: number): void {
     const prev = this.groupState;
-    const members: GroupMember[] = d.left
+    const members: StoredGroupMember[] = d.left
       ? []
       : d.members.map((m: GroupMemberData) => ({
           guid: m.guid,
@@ -2580,8 +2628,57 @@ export class StateCache {
     };
   }
 
-  private groupPatch(patch: Partial<GroupState>, seq: number, ts: number): void {
-    const prev: GroupState = this.groupState ?? {
+  /**
+   * One party-frame packet into the member's record. A `_FULL` answer
+   * replaces the record — it carries every field, and its aura list is the
+   * whole set — except that its offline form (status alone) keeps the rest.
+   * A delta overwrites only the fields its mask carried, and its aura entries
+   * set or clear single slots. `_FULL` leaves out the power type only for
+   * mana, so there its absence is mana; a delta without it keeps the last.
+   */
+  private foldPartyMemberStats(d: PartyMemberStatsData, seq: number, ts: number): void {
+    const prev = this.partyStats.get(d.guid);
+    const replace = d.full && d.health !== undefined;
+    const base = replace ? undefined : prev;
+    const statusFlags = d.status ?? base?.statusFlags;
+    const health = d.health ?? base?.health;
+    const has = (bit: number): boolean | undefined => (statusFlags === undefined ? undefined : (statusFlags & bit) !== 0);
+    const ghost = has(MEMBER_STATUS_GHOST);
+    const statusDead = has(MEMBER_STATUS_DEAD);
+    const dead = statusDead === true || (health === 0 && ghost !== true) ? true : statusDead;
+    let auras: PartyMemberAura[] | undefined = base?.auras === undefined ? undefined : [...base.auras];
+    if (d.auras !== undefined) {
+      const bySlot = new Map<number, PartyMemberAura>(replace || auras === undefined ? [] : auras.map((a) => [a.slot, a]));
+      for (const a of d.auras) {
+        if (a.spellId === 0) bySlot.delete(a.slot);
+        else bySlot.set(a.slot, { slot: a.slot, spellId: a.spellId, name: a.name, flags: a.flags });
+      }
+      auras = [...bySlot.values()].sort((x, y) => x.slot - y.slot);
+    }
+    const powerTypeId = d.powerType ?? (replace ? 0 : undefined);
+    this.partyStats.set(d.guid, {
+      online: has(MEMBER_STATUS_ONLINE),
+      dead,
+      ghost,
+      afk: has(MEMBER_STATUS_AFK),
+      dnd: has(MEMBER_STATUS_DND),
+      statusFlags,
+      health,
+      maxHealth: d.maxHealth ?? base?.maxHealth,
+      powerType: powerTypeId === undefined ? base?.powerType : PARTY_POWER_TYPES[powerTypeId],
+      power: d.power ?? base?.power,
+      maxPower: d.maxPower ?? base?.maxPower,
+      level: d.level ?? base?.level,
+      zone: d.zoneId === undefined ? base?.zone : { id: d.zoneId, name: d.zoneName },
+      position: d.x !== undefined && d.y !== undefined ? { x: d.x, y: d.y } : base?.position,
+      auras,
+      asOf: ts,
+      seq,
+    });
+  }
+
+  private groupPatch(patch: Partial<StoredGroupState>, seq: number, ts: number): void {
+    const prev: StoredGroupState = this.groupState ?? {
       inGroup: false,
       raid: false,
       groupGuid: undefined,
@@ -2725,7 +2822,7 @@ export class StateCache {
       skills: this.skills(),
       reputation: this.reputation(),
       pet: this.pet(),
-      group: this.groupState,
+      group: this.group(),
       mailbox: this.mailbox(),
       bank: this.bank(),
       trade: this.tradeState,
@@ -3167,11 +3264,19 @@ export class StateCache {
         return;
       }
       case "SMSG_GROUP_LIST": {
-        this.foldGroupList(event.data as GroupListData, event.seq, event.ts);
+        const d = event.data as GroupListData;
+        if (d.left) this.partyStats.clear();
+        this.foldGroupList(d, event.seq, event.ts);
+        return;
+      }
+      case "SMSG_PARTY_MEMBER_STATS":
+      case "SMSG_PARTY_MEMBER_STATS_FULL": {
+        this.foldPartyMemberStats(event.data as PartyMemberStatsData, event.seq, event.ts);
         return;
       }
       case "SMSG_GROUP_DESTROYED":
       case "SMSG_GROUP_UNINVITE": {
+        this.partyStats.clear();
         this.groupPatch({ inGroup: false, raid: false, groupGuid: undefined, leaderGuid: undefined, leaderName: undefined, leader: false, members: [], lootMethod: undefined }, event.seq, event.ts);
         return;
       }

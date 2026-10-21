@@ -52,6 +52,18 @@ export function moveEtaMs(event: StreamEvent | undefined): number | undefined {
   return event === undefined ? undefined : moveEtas.get(event);
 }
 
+/**
+ * Opcodes delivered to listeners, waits and consumers but not retained in the
+ * buffer `recent()` and a wait's lookback read. A party member out of sight
+ * sends its party frame about twice a second while it walks, plus one for
+ * each regen tick and hit; four of them would push half of the 500 retained
+ * events out in under a minute and with them the chat lines `waitForChat`
+ * looks back over. The state cache folds every one (`group().members[i].stats`
+ * keeps the latest values), and the runner's event window treats them as
+ * ambient (operator decision, Mark, 2026-10-21).
+ */
+const UNRETAINED_OPCODES: ReadonlySet<string> = new Set(["SMSG_PARTY_MEMBER_STATS", "SMSG_PARTY_MEMBER_STATS_FULL"]);
+
 const STREAM_GAP_ID = -1;
 const STREAM_ERROR_ID = -2;
 
@@ -102,7 +114,11 @@ export interface EventStreamOptions {
    * refuses with 401 — only a stub or a pre-auth module accepts that.
    */
   secret?: string;
-  /** How many events to retain for `waitFor`/`recent`. Default 500. */
+  /**
+   * How many events to retain for `waitFor`/`recent`. Default 500. The party
+   * frame packets (`SMSG_PARTY_MEMBER_STATS`, `_FULL`) are never retained:
+   * listeners and waits see them as they arrive, and the state cache keeps them.
+   */
   bufferSize?: number;
   /** First seq expected on a fresh session. Default 0 (the module starts there). */
   expectFromSeq?: number;
@@ -589,12 +605,14 @@ export class EventStream implements AsyncIterable<StreamEvent> {
   }
 
   private emit(event: StreamEvent): void {
-    this.buffer.push(event);
-    this.bufferEpochs.push(this.epochCounter);
-    if (this.buffer.length > this.bufferSize) {
-      const drop = this.buffer.length - this.bufferSize;
-      this.buffer.splice(0, drop);
-      this.bufferEpochs.splice(0, drop);
+    if (!UNRETAINED_OPCODES.has(event.opcode)) {
+      this.buffer.push(event);
+      this.bufferEpochs.push(this.epochCounter);
+      if (this.buffer.length > this.bufferSize) {
+        const drop = this.buffer.length - this.bufferSize;
+        this.buffer.splice(0, drop);
+        this.bufferEpochs.splice(0, drop);
+      }
     }
 
     for (const h of this.anyHandlers) h(event);
