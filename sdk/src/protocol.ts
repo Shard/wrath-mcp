@@ -581,6 +581,8 @@ export const updateFieldsSchema = z.looseObject({
   petNumber: z.number().optional(),
   /** Corpses: the player whose corpse or bones this is (`CORPSE_FIELD_OWNER`). */
   corpseOwnerGuid: guidSchema.optional(),
+  /** Corpses: `CORPSE_FIELD_FLAGS`, raw; bit 0x01 (`CORPSE_FLAG_BONES`) marks bones. */
+  corpseFlags: z.number().optional(),
   race: z.number().optional(),
   class: z.number().optional(),
   gender: z.number().optional(),

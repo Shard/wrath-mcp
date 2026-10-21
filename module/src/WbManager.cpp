@@ -5584,6 +5584,11 @@ namespace WrathBench
             // name-queries to label "<name>'s corpse".
             if (index == CORPSE_FIELD_OWNER)     { g.corpseOwner.lo = v; g.corpseOwner.hasLo = true; return true; }
             if (index == CORPSE_FIELD_OWNER + 1) { g.corpseOwner.hi = v; g.corpseOwner.hasHi = true; return true; }
+            // CORPSE_FIELD_FLAGS (PUBLIC), raw: CORPSE_FLAG_BONES is what a
+            // client reads to draw bones rather than a body. Bones are a new
+            // object under the corpse's guid, created after the corpse's
+            // destroy with the flag set (Map::ConvertCorpseToBones).
+            if (index == CORPSE_FIELD_FLAGS) { f.Add("corpseFlags", v); return true; }
         }
         else if (typeId == TYPEID_GAMEOBJECT)
         {

@@ -144,6 +144,13 @@ function only<T>(hit: Resolution<T>): T | undefined {
   return hit.kind === "one" ? hit.value : undefined;
 }
 
+/**
+ * `CORPSE_FLAG_BONES` (AzerothCore `Corpse.h`, `CorpseFlags`) in the
+ * `corpseFlags` the module serves raw: what was a corpse is bones, scenery to
+ * a client and no resurrection's target.
+ */
+const CORPSE_FLAG_BONES = 0x01;
+
 /** `UNIT_FLAG_TAXI_FLIGHT` — the bit a client reads to know it is being flown. */
 const UNIT_FLAG_TAXI_FLIGHT = 0x0010_0000;
 
@@ -1338,7 +1345,7 @@ export interface UnitView {
   readonly maxHealth: number | undefined;
   /**
    * `true` when health was observed *and* is 0, and on every `corpse` (a
-   * player's body or bones, which is dead by what it is). Unobserved stays
+   * player's body, which is dead by what it is). Unobserved stays
    * undefined, and so does anything with no health to observe (a game object,
    * a spell's ground effect).
    */
@@ -3933,7 +3940,9 @@ export class StateCache {
    *
    * A query over what the cache already holds: nothing is observed here that
    * `nearby` did not already carry, and nothing is invented. Items and
-   * containers (our own inventory) are left out; everything else in view is
+   * containers (our own inventory) are left out, and so are bones (a corpse
+   * whose owner is alive again or has died again, `CORPSE_FLAG_BONES`) and any
+   * corpse an owner's newer one replaces; everything else in view is
    * included, *untyped objects too* — an object we have seen but whose create
    * block we missed is still in view, and hiding it would make the world look
    * emptier than it is.
@@ -3950,7 +3959,9 @@ export class StateCache {
     const f = normalizeUnitFilter(filter);
     const from = this.self.position?.value;
     const out: UnitView[] = [];
+    const superseded = supersededCorpses(this.nearby.values());
     for (const obj of this.nearby.values()) {
+      if (superseded.has(obj.guid)) continue;
       const view = toUnitView(obj, from, this.creatures);
       if (view === undefined) continue;
 
@@ -4035,7 +4046,9 @@ export class StateCache {
 
     let best: UnitView | undefined;
     let bestD2 = Infinity;
+    const superseded = supersededCorpses(this.nearby.values());
     for (const obj of this.nearby.values()) {
+      if (superseded.has(obj.guid)) continue;
       const p = pointOf(obj)?.value;
       if (!p) continue;
       if (predicate && !predicate(obj)) continue;
@@ -4609,6 +4622,8 @@ function toUnitView(
 ): UnitView | undefined {
   const type = obj.objectType?.value;
   if (type === "item" || type === "container") return undefined;
+  // Bones are scenery to a client, not a corpse: no row.
+  if (type === "corpse" && isBones(obj)) return undefined;
   const point = pointOf(obj)?.value;
   const distance =
     from && point
@@ -4638,6 +4653,40 @@ function toUnitView(
     goType: goTypeOf(obj),
     docked: obj.transport?.value.docked,
   };
+}
+
+function isBones(obj: NearbyObject): boolean {
+  return ((obj.fields.get("corpseFlags")?.value ?? 0) & CORPSE_FLAG_BONES) !== 0;
+}
+
+/**
+ * The corpses in view that an owner's newer corpse replaces. A player has one
+ * corpse at a time — the core turns the old one to bones before it lays the
+ * new one (`Player::CreateCorpse`) — so a second corpse row for one owner is a
+ * destroy the cache missed, and the newer create is the corpse. Over the whole
+ * view, before any filter, so a filter can never leave the stale one standing
+ * in for the real one. Bones and corpses with no observed owner are not
+ * grouped.
+ */
+function supersededCorpses(objects: Iterable<NearbyObject>): Set<GuidKey> {
+  const newest = new Map<GuidKey, NearbyObject>();
+  const superseded = new Set<GuidKey>();
+  const created = (o: NearbyObject) => o.objectType?.seq ?? o.firstSeq;
+  for (const obj of objects) {
+    if (obj.objectType?.value !== "corpse" || isBones(obj)) continue;
+    const owner = obj.ownerGuid?.value;
+    if (owner === undefined) continue;
+    const held = newest.get(owner);
+    if (held === undefined) {
+      newest.set(owner, obj);
+    } else if (created(obj) > created(held)) {
+      superseded.add(held.guid);
+      newest.set(owner, obj);
+    } else {
+      superseded.add(obj.guid);
+    }
+  }
+  return superseded;
 }
 
 /**

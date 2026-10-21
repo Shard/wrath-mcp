@@ -984,7 +984,15 @@ not need it, docs/CONTRACTS.md):
   the player whose corpse or bones this is — a client labels it "<name>'s
   corpse" from the owner's name). On a corpse's `create` with an owner not yet
   name-queried this session the module issues the `CMSG_NAME_QUERY` a client
-  does, so an owner who was never in view is named too
+  does, so an owner who was never in view is named too. `corpseFlags`
+  (CORPSE_FIELD_FLAGS, PUBLIC, the raw integer; the module names no bit):
+  `CORPSE_FLAG_BONES` (0x01) marks bones, which a client draws as scenery and
+  no resurrection reaches. A corpse turns to bones when its owner comes back
+  to life or dies again, or when it expires (`Map::ConvertCorpseToBones`):
+  the corpse is destroyed (`SMSG_DESTROY_OBJECT`) and the bones are a new
+  `create` under the same guid with the owner kept and the flags `0x05`
+  (bones and 0x04, which every corpse carries). CORPSE_FIELD_DYNAMIC_FLAGS is
+  not served: only a battleground's insignia bones set it
 
 Values are the raw client-visible integers from the update stream (health is
 whatever the server sends a client — no extra precision is added). A `values`
