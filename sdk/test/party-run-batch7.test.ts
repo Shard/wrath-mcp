@@ -294,10 +294,9 @@ describe("state.self.casting: the cast bar, and the refusals it explains", () =>
     expect(cache.self.casting).toBeUndefined();
   });
 
-  // a2 mage, 03:40:37.737-03:40:39.280: Frostbolt casting (2.1s), a second
-  // sent at +0.9s answered not_ready, a third at +1.5s cancelled the first
-  // (CAST_FAILED interrupted, SPELL_FAILURE, then its own SPELL_START).
-  test("not_ready and interrupted say you are still casting, when you are", async () => {
+  // a2 mage, 03:40:37.737: Frostbolt casting (2.1s), a second sent at +0.9s
+  // answered not_ready.
+  test("not_ready says you are still casting, when you are", async () => {
     const stub = startStub({ onConnect: castWorld });
     const client = await inWorld(stub);
     await folded(client, "SMSG_CREATURE_QUERY_RESPONSE", creatureQuery.seq);
@@ -312,16 +311,6 @@ describe("state.self.casting: the cast bar, and the refusals it explains", () =>
       "castSpell not_ready: Frost Lance (7322) on Thistlebore: you are still casting Frost Lance (7322), 1.2s left; " +
         "its cooldown, or the global cooldown, is still running",
     ]);
-    await client.castSpell(7322, CREATURE_GUID);
-    push(stub, castFailed(42, 7322, 40, T + 1543));
-    push(stub, spellFailure(43, 7322, T + 1543));
-    push(stub, spellStart(44, 7322, 2100, T + 1543));
-    await folded(client, "SMSG_SPELL_START", 44);
-    expect(client.drainActionHints().map((h) => `${h.action} ${h.status}: ${h.hint}`)).toEqual([
-      "castSpell interrupted: Frost Lance (7322) on Thistlebore: you were still casting Frost Lance (7322), 0.6s left when your next cast went out, " +
-        "and that cancelled it; cast again once state.self.casting is clear",
-    ]);
-    expect(client.state.self.casting?.value).toEqual({ spellId: 7322, name: "Frost Lance", endsAt: T + 1543 + 2100 });
     // With nothing on the bar, not_ready keeps its own words.
     push(stub, spellGo(45, 7322, T + 3643));
     await folded(client, "SMSG_SPELL_GO", 45);

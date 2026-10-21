@@ -684,7 +684,11 @@ const ERROR_CODE_HINTS: Record<string, string> = {
     "(ignore its error), then await sdk.createSession({...})",
   unsupported_action:
     "that action is not in the module's whitelist — inspect the sdk surface for what is supported",
-  moving: "a move is in progress — await sdk.stop() first, or supersede it with sdk.moveTo(...)",
+  // Only face sends it: a walk runs forward, and a running character faces
+  // the way it runs, so a turn mid-walk would steer it off its path.
+  moving:
+    "a move is running, and a running character faces the way it runs: a turn would steer it off its path, so nothing was sent; " +
+    "await sdk.stop() and then face, or walk toward what you want to face",
   missing_guid:
     "this action needs a guid argument — get one from state.nearbyUnits() or state.closest(...)",
   missing_position: "move_to needs finite x, y and z numbers",
@@ -2420,15 +2424,13 @@ function castFailedHint(state: StateCache, cast: PendingCast, reason: string, ca
     const name = state.nearby.get(key)?.name?.value ?? state.nameOf(key);
     on = ` on ${name ?? cast.targetGuid}`;
   }
-  // Our own cast still running says more than either refusal's own words:
+  // Our own cast still running says more than the refusal's own words:
   // the 2026-10-21 mage's routine sent a cast 11 ms after the last one and
   // read not_ready as a cooldown.
   const meaning =
     casting !== undefined && cause === "not_ready"
       ? `you are still casting ${casting}; ${CAST_FAILURE_MEANING.not_ready}`
-      : casting !== undefined && cause === "interrupted"
-        ? `you were still casting ${casting} when your next cast went out, and that cancelled it; cast again once state.self.casting is clear`
-        : CAST_FAILURE_MEANING[cause];
+      : CAST_FAILURE_MEANING[cause];
   // A weapon-slot refusal with the slot's own item observed broken says
   // which item: the durability fields are what the client's tooltip reads.
   const weapon = CAST_FAILURE_WEAPON_SLOT[reason];
@@ -3652,8 +3654,6 @@ export class WrathClient {
 
   /** `castSpell` casts awaiting the server's first word, by spell id (`castVerdict`). */
   private readonly pendingCasts = new Map<number, PendingCast>();
-  /** The stream position at our last `cast_spell` dispatch: a cast sent after the one on the bar began (`castVerdict`). */
-  private lastCastSeq = -1;
 
   /**
    * The last `move_to` this client sent: when, and its moveId once acked. With
@@ -4301,8 +4301,10 @@ export class WrathClient {
    * Takes either an absolute orientation in radians (0 = east/+x,
    * counter-clockwise) or a point to turn toward; the module resolves a point
    * into an orientation and echoes the one it used. Rejects with
-   * `WrathRequestError` code `moving` while a move is running — stop first, or
-   * supersede with `moveTo`.
+   * `WrathRequestError` code `moving` while a move is running, nothing sent:
+   * the walk runs forward, a client running forward travels where it faces,
+   * and a facing held off the walk's course is what no client sends — stop
+   * first, or supersede with `moveTo`.
    *
    * Unlike the calls that take a target, it takes no guid or name: facing a
    * unit is facing its position, `face({ x: unit.x, y: unit.y })`. A string
@@ -4395,7 +4397,6 @@ export class WrathClient {
       origin: this.originOf?.(),
     };
     this.pendingCasts.set(spellId, cast);
-    this.lastCastSeq = cast.sinceSeq ?? -1;
     try {
       return await this.dispatchCast(spellId, targetGuid);
     } catch (err) {
@@ -4495,15 +4496,6 @@ export class WrathClient {
     }
     if (status !== "interrupted") {
       this.tallyActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status));
-      return;
-    }
-    // Interrupted by our own next cast: the module sends castCount 0, so the
-    // core's spell_in_progress refusal never fires and a cast sent while
-    // another runs cancels it (Spell::prepare). Told when the interrupted
-    // spell is the one on the bar and a cast of ours went out after it began.
-    const bar = this.state.self.casting;
-    if (casting !== undefined && bar?.value.spellId === failed.spellId && this.lastCastSeq >= bar.seq) {
-      this.tallyActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status, status, casting));
       return;
     }
     // An interrupt has two causes this client can tell apart from the rest:

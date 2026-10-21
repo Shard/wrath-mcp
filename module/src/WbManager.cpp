@@ -2943,6 +2943,10 @@ namespace WrathBench
         if (!player)
             return;
 
+        // A walk is forward running, and a client running forward travels
+        // where it faces: a facing sent mid-walk would either not match the
+        // travel (no client sends that) or bend the walk off its planned path.
+        // Refused, nothing sent (PROTOCOL.md "face").
         if (s->move.active)
             return ack->set_value({409, Json::Writer().Add("ok", false).Add("error", "moving").Str()});
 
@@ -3006,8 +3010,13 @@ namespace WrathBench
         {
             uint32 spellId = static_cast<uint32>(req.GetInt("spellId"));
             uint64_t target = ParseGuid(req, "targetGuid");
+            // castCount is the client's own counter (BenchSession::castCount):
+            // with 0 the core skips its in-progress check (Spell::prepare) and
+            // a cast sent during another cancels it, where a client's is
+            // refused SPELL_FAILED_SPELL_IN_PROGRESS.
+            uint8 const castCount = s->NextCastCount();
             p = new WorldPacket(CMSG_CAST_SPELL, 1 + 4 + 1 + 4 + 9);
-            *p << uint8(0) << uint32(spellId) << uint8(0);   // castCount, spellId, castFlags
+            *p << uint8(castCount) << uint32(spellId) << uint8(0);   // castCount, spellId, castFlags
             if (target)
             {
                 *p << uint32(0x0002);                        // TARGET_FLAG_UNIT
@@ -3015,7 +3024,7 @@ namespace WrathBench
             }
             else
                 *p << uint32(0);                             // TARGET_FLAG_NONE (self/auto target)
-            auditW.Add("spellId", spellId);
+            auditW.Add("spellId", spellId).Add("castCount", (uint32)castCount);
             if (target)
                 auditW.AddGuid("targetGuid", target);
         }
@@ -3233,8 +3242,11 @@ namespace WrathBench
             uint32 startQuest = proto ? proto->StartQuest : 0;
             if (spellId)
             {
+                // The same client cast counter as cast_spell's: the core hands
+                // it to the item's spell (Player::CastItemUseSpell), whose
+                // in-progress check skips a 0 the same way.
                 p = new WorldPacket(CMSG_USE_ITEM, 1 + 1 + 1 + 4 + 8 + 4 + 1 + 4 + 9);
-                *p << uint8(bag) << uint8(slot) << uint8(0) << uint32(spellId);
+                *p << uint8(bag) << uint8(slot) << uint8(s->NextCastCount()) << uint32(spellId);
                 *p << uint64(item->GetGUID().GetRawValue()) << uint32(0) << uint8(0);
                 if (target)
                 {
@@ -5901,11 +5913,52 @@ namespace WrathBench
             w.Add("name", info->SpellName[0]);
     }
 
+    // The forms a Spell.dbc shapeshift mask names: bit n-1 is form n
+    // (SpellInfo::CheckShapeshift reads it the same way).
+    static std::string FormListJson(uint32 mask)
+    {
+        std::string out = "[";
+        for (uint32 form = 1; form <= 32; ++form)
+            if (mask & (1u << (form - 1)))
+            {
+                if (out.size() > 1) out += ',';
+                out += std::to_string(form);
+            }
+        return out + "]";
+    }
+
+    // A spellbook row's stance facts, as the client's own Spell.dbc has them:
+    // the forms the spell may be cast in (`stances`) and may not
+    // (`stancesNot`), and the form a form-changing spell puts the caster in
+    // (`form`, its SPELL_AURA_MOD_SHAPESHIFT misc value), so a refusal can
+    // name the stance from the book. Read from the DBC store, not SpellInfo,
+    // which the server corrects for itself (SpellInfoCorrections). Each is
+    // omitted when the DBC says nothing. Spellbook rows only: AddSpellFields
+    // rides on every aura and cast event, which have no use for it.
+    static void AddSpellbookFields(Json::Writer& w, uint32 spellId)
+    {
+        AddSpellFields(w, spellId);
+        SpellEntry const* e = sSpellStore.LookupEntry(spellId);
+        if (!e)
+            return;
+        if (e->Stances)
+            w.Raw("stances", FormListJson(e->Stances));
+        if (e->StancesNot)
+            w.Raw("stancesNot", FormListJson(e->StancesNot));
+        for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+            if (e->Effect[i] == SPELL_EFFECT_APPLY_AURA && e->EffectApplyAuraName[i] == SPELL_AURA_MOD_SHAPESHIFT
+                && e->EffectMiscValue[i] > 0)
+            {
+                w.Add("form", (uint32)e->EffectMiscValue[i]);
+                break;
+            }
+    }
+
     static std::string SpellJson(uint32 spellId)
     {
         Json::Writer w;
         w.Add("spellId", spellId);
-        AddSpellFields(w, spellId);
+        AddSpellbookFields(w, spellId);
         return w.Str();
     }
 
@@ -6467,7 +6520,7 @@ namespace WrathBench
                     name = "SMSG_LEARNED_SPELL";
                     uint32 spellId; p >> spellId;
                     w.Add("spellId", spellId);
-                    AddSpellFields(w, spellId);
+                    AddSpellbookFields(w, spellId);
                     break;
                 }
                 case SMSG_REMOVED_SPELL:
@@ -6484,7 +6537,7 @@ namespace WrathBench
                     name = "SMSG_SUPERCEDED_SPELL";
                     uint32 oldId, newId; p >> oldId >> newId;
                     w.Add("supersededSpellId", oldId).Add("spellId", newId);
-                    AddSpellFields(w, newId);
+                    AddSpellbookFields(w, newId);
                     break;
                 }
                 case SMSG_SPELL_COOLDOWN:

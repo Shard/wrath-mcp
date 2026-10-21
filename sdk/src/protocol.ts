@@ -1411,14 +1411,28 @@ export const trainerBuyFailedDataSchema = z.looseObject({
 export type TrainerBuyFailedData = z.infer<typeof trainerBuyFailedDataSchema>;
 
 /**
+ * The stance facts of a spellbook row's Spell.dbc entry, each absent when the
+ * row has none (module/PROTOCOL.md, "Spellbook, cooldowns, talents"): the
+ * shapeshift form ids the spell may be cast in and may not, and the form a
+ * form-changing spell puts the caster in.
+ */
+const spellStanceFields = {
+  stances: z.array(z.number()).optional(),
+  stancesNot: z.array(z.number()).optional(),
+  form: z.number().optional(),
+};
+
+/**
  * One spellbook row. `rank` and `name` are what a client reads from its own
  * Spell.dbc for the id (1 / absent for an unranked or unknown spell); the
- * module serves them the way it serves item-template fields.
+ * module serves them the way it serves item-template fields, and the stance
+ * facts beside them.
  */
 export const knownSpellSchema = z.looseObject({
   spellId: z.number(),
   rank: z.number().optional(),
   name: z.string().optional(),
+  ...spellStanceFields,
 });
 export type KnownSpellData = z.infer<typeof knownSpellSchema>;
 
@@ -1453,6 +1467,7 @@ export const supersededSpellDataSchema = z.looseObject({
   spellId: z.number(),
   rank: z.number().optional(),
   name: z.string().optional(),
+  ...spellStanceFields,
 });
 export type SupersededSpellData = z.infer<typeof supersededSpellDataSchema>;
 

@@ -195,6 +195,14 @@ namespace WrathBench
         MoveState move;
         uint64_t moveIdGen{0};
 
+        // The client's cast counter (world thread only): the u8 a client
+        // stamps on every CMSG_CAST_SPELL and CMSG_USE_ITEM it sends, one
+        // more each time. The core keys its "another cast is in progress"
+        // refusal on it being nonzero (Spell::prepare), so it runs 1..255 and
+        // never 0, which the core reserves for casts no client asked for.
+        uint8 castCount{0};
+        uint8 NextCastCount() { castCount = castCount == 255 ? 1 : castCount + 1; return castCount; }
+
         // Areatrigger edge detection (world thread only): the DBC volumes the
         // mover is currently inside, and the map they were tested on. A client
         // sends CMSG_AREATRIGGER once on crossing into a volume and never again

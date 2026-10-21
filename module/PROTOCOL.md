@@ -488,6 +488,18 @@ Success `200`: `{ "ok": true, "action": "face", "orientation": 1.57 }`
 Additional errors: `400 {"ok":false,"error":"missing_face_target","action":"face","param":"orientation or x,y"}`,
 `409 {"ok":false,"error":"moving"}` (stop first, or supersede with `move_to`).
 
+The refusal while moving is the client's own limit, not a module shortcut. A
+walk is sent as forward running (`MOVEMENTFLAG_FORWARD`, with the orientation
+of the leg it is on), and a client running forward travels where it faces:
+its turn mid-run (`MSG_MOVE_SET_FACING` or a heartbeat with a new
+orientation) bends the run itself. Sending the facing while the walk keeps
+its course would put a facing on the wire that does not match the travel,
+which no client's packets show. Strafe and backpedal flags reach only the
+eight directions relative to facing, so they cannot hold an arbitrary facing
+along a navmesh path either. A turn that the walk then follows would leave
+the path the module planned. So a `face` mid-walk is refused with nothing
+sent, and the character turns once it stands.
+
 #### Single-opcode actions (quest/combat extension)
 
 Every action below synthesizes exactly one client opcode into the stock
@@ -504,7 +516,7 @@ them: `{ "ok": true, "action": "<name>" }`.
 | `clear_target` | — | `CMSG_SET_SELECTION` | guid 0 |
 | `attack_start` | `guid` | `CMSG_ATTACKSWING` | melee auto-attack; server swings while in range and facing. A swing it refuses is reported once as `SMSG_ATTACKSWING_NOTINRANGE` / `SMSG_ATTACKSWING_BADFACING` (latched: see "Swing errors" under the combat table) |
 | `attack_stop` | — | `CMSG_ATTACKSTOP` | |
-| `cast_spell` | `spellId`, `targetGuid?` | `CMSG_CAST_SPELL` | no `targetGuid` = self/auto target (mask 0); with it, TARGET_FLAG_UNIT + packed guid. A game object guid works too (the core resolves the packed guid by its type), which is how chests open; a client would set TARGET_FLAG_GAMEOBJECT for it |
+| `cast_spell` | `spellId`, `targetGuid?` | `CMSG_CAST_SPELL` | no `targetGuid` = self/auto target (mask 0); with it, TARGET_FLAG_UNIT + packed guid. A game object guid works too (the core resolves the packed guid by its type), which is how chests open; a client would set TARGET_FLAG_GAMEOBJECT for it. The leading cast count is the client's own: one per-session u8 counter, shared with `use_item`, one more on every cast and running 1..255 (never 0). The core skips its in-progress check for a count of 0 (`Spell::prepare`), so a cast sent while another is still casting would silently cancel it; with a count it is refused `SMSG_CAST_FAILED` `spell_in_progress` (105), as a client's is, and the cast in progress goes on. A cast sent with 400 ms or less of the running one left (and of the global cooldown) is held by the server's spell queue (`SpellQueue.Window`, default 400) and goes off after it, count or not. The audit row carries `castCount` |
 | `cancel_cast` | `spellId` | `CMSG_CANCEL_CAST` | |
 | `interact` | `guid` | `CMSG_GAMEOBJ_USE` | doors, buttons, quest objects, mailboxes. Not chests: the core's `GameObject::Use` has no chest case and returns silently; a client opens a chest with `cast_spell` of the lock's Opening spell at the object's guid (the SDK's `lootCorpse` does this) |
 | `gossip_hello` | `guid` | `CMSG_GOSSIP_HELLO` | opens the NPC gossip menu (`SMSG_GOSSIP_MESSAGE`) |
@@ -529,7 +541,7 @@ them: `{ "ok": true, "action": "<name>" }`.
 | `sell_item` | `guid`, `itemGuid`, `count?` | `CMSG_SELL_ITEM` | `count` 0/omitted = whole stack |
 | `repair_all` | `guid` | `CMSG_REPAIR_ITEM` | item guid 0 = repair everything |
 | `equip_item` | `bag`, `slot` | `CMSG_AUTOEQUIP_ITEM` | `bag` 255 = backpack/equipment container, `slot` 23-38 = backpack slots |
-| `use_item` | `bag`, `slot`, `targetGuid?` | `CMSG_USE_ITEM`, or `CMSG_QUESTGIVER_QUERY_QUEST` | module fills item guid + on-use spell id from the item (client-cache knowledge). An item with no on-use spell but a `startquest` is right-clicked the way a client does it: `CMSG_QUESTGIVER_QUERY_QUEST` with the item guid as the questgiver and the template's quest id (`HandleUseItemOpcode` drops spell id 0 as unknown, so `CMSG_USE_ITEM` is never the packet for it); the server answers `SMSG_QUESTGIVER_QUEST_DETAILS`, and `quest_accept` with the same item guid takes it. `400 no_item_at_slot`; `400 item_not_usable` only when the item has neither an on-use spell nor a quest to start. The audit row carries `spellId`, `itemGuid`, `startQuest` |
+| `use_item` | `bag`, `slot`, `targetGuid?` | `CMSG_USE_ITEM`, or `CMSG_QUESTGIVER_QUERY_QUEST` | module fills item guid + on-use spell id from the item (client-cache knowledge) and the cast count from the counter `cast_spell` uses. An item with no on-use spell but a `startquest` is right-clicked the way a client does it: `CMSG_QUESTGIVER_QUERY_QUEST` with the item guid as the questgiver and the template's quest id (`HandleUseItemOpcode` drops spell id 0 as unknown, so `CMSG_USE_ITEM` is never the packet for it); the server answers `SMSG_QUESTGIVER_QUEST_DETAILS`, and `quest_accept` with the same item guid takes it. `400 no_item_at_slot`; `400 item_not_usable` only when the item has neither an on-use spell nor a quest to start. The audit row carries `spellId`, `itemGuid`, `startQuest` |
 | `destroy_item` | `bag`, `slot`, `count?` | `CMSG_DESTROYITEM` | `count` 0/omitted = whole stack |
 | `trainer_list` | `guid` | `CMSG_TRAINER_LIST` | `SMSG_TRAINER_LIST` follows — or nothing at all when the NPC is out of interaction range, is not a trainer, or trains another class (the handler returns silently) |
 | `trainer_buy_spell` | `guid`, `spellId` | `CMSG_TRAINER_BUY_SPELL` | costs the character's own money server-side; answered by `SMSG_TRAINER_BUY_SUCCEEDED` or `SMSG_TRAINER_BUY_FAILED` |
@@ -1417,14 +1429,26 @@ names is the SDK's job.
 Spellbook, cooldowns, talents (additive). `rank` and `name` on a spell
 row are what a client reads from its own Spell.dbc for the id (`rank` 1 when
 unranked; both absent when the id is unknown to the core) — client-cache
-knowledge, like item-template fields:
+knowledge, like item-template fields. A spellbook row (`SMSG_INITIAL_SPELLS`,
+`SMSG_LEARNED_SPELL`, `SMSG_SUPERCEDED_SPELL`, written `…` below) also
+carries the stance facts of the same Spell.dbc row, each absent when the row
+has none: `stances`, the shapeshift form ids the spell may be cast in (its
+`Stances` mask, bit n-1 = form n, as `SpellInfo::CheckShapeshift` reads it);
+`stancesNot`, the forms it may not be cast in (`StancesNot`); and `form`, the
+form a form-changing spell puts the caster in (the misc value of its
+`SPELL_AURA_MOD_SHAPESHIFT` effect: Battle Stance 17, Defensive Stance 18,
+Cat Form 1, Stealth 30, …). They are read from the DBC store a client has, not
+from the server's corrected `SpellInfo`, so a `stances` list joined to the
+book's `form` rows names the stance an `only_shapeshift` refusal wants. Some
+spells may also be cast in no form at all, which the mask does not say (the
+core's `SPELL_ATTR2_ALLOW_WHILE_NOT_SHAPESHIFTED`):
 
 | opcode | id | `data` fields |
 |---|---|---|
-| `SMSG_INITIAL_SPELLS` | 0x12A | `{ "spells": [{ "spellId", "rank"?, "name"? }], "cooldowns": [{ "spellId", "itemId", "category", "cooldownMs", "categoryCooldownMs" }] }` — the whole active-spec spellbook, sent during login before `SMSG_LOGIN_VERIFY_WORLD`; a category cooldown carries its time in `categoryCooldownMs` and 0 in `cooldownMs`; `categoryCooldownMs` 0x80000000 with `cooldownMs` 1 is the core's "infinite" marker |
-| `SMSG_LEARNED_SPELL` | 0x12B | `{ "spellId", "rank"?, "name"? }` |
+| `SMSG_INITIAL_SPELLS` | 0x12A | `{ "spells": [{ "spellId", "rank"?, "name"?, … }], "cooldowns": [{ "spellId", "itemId", "category", "cooldownMs", "categoryCooldownMs" }] }` — the whole active-spec spellbook, sent during login before `SMSG_LOGIN_VERIFY_WORLD`; a category cooldown carries its time in `categoryCooldownMs` and 0 in `cooldownMs`; `categoryCooldownMs` 0x80000000 with `cooldownMs` 1 is the core's "infinite" marker |
+| `SMSG_LEARNED_SPELL` | 0x12B | `{ "spellId", "rank"?, "name"?, … }` |
 | `SMSG_REMOVED_SPELL` | 0x203 | `{ "spellId" }` |
-| `SMSG_SUPERCEDED_SPELL` | 0x12C | `{ "supersededSpellId", "spellId", "rank"?, "name"? }` — the old rank leaves the book, `spellId` replaces it (a `SMSG_LEARNED_SPELL` for the new id follows) |
+| `SMSG_SUPERCEDED_SPELL` | 0x12C | `{ "supersededSpellId", "spellId", "rank"?, "name"?, … }` — the old rank leaves the book, `spellId` replaces it (a `SMSG_LEARNED_SPELL` for the new id follows) |
 | `SMSG_SPELL_COOLDOWN` | 0x134 | `{ "guid", "flags": <u8>, "cooldowns": [{ "spellId", "cooldownMs" }] }` — cooldowns that just started for `guid` (self or pet); `flags & 1` = the GCD was triggered too; a 0 ms entry is a GCD-only marker |
 | `SMSG_COOLDOWN_EVENT` | 0x135 | `{ "spellId", "guid" }` — "start the timer you already know for this spell": the duration is Spell.dbc knowledge the module does not serve |
 | `SMSG_CLEAR_COOLDOWN` | 0x1DE | `{ "spellId", "guid" }` |

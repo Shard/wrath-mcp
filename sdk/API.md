@@ -177,8 +177,8 @@ to; walking into one takes you through — graveyard — where the spirit was
 released, `{ map, x, y, z, zone?, area? }`, zone and area named once you have
 stood there — casting — your own cast in progress, `{ spellId, name, endsAt }`
 (endsAt epoch ms), from its SMSG_SPELL_START until its SMSG_SPELL_GO or
-SMSG_SPELL_FAILURE, the cast bar a client draws; a cast sent while it runs
-cancels it, and a channel never shows here — health,
+SMSG_SPELL_FAILURE, the cast bar a client draws; a channel never shows here
+— health,
 targetGuid, and ghost: `state.self.ghost.value` is true while your released
 spirit walks as a ghost, whose health reads 1, not 0) and `state.nearby` (a
 Map keyed by guid) are plain properties; the members below are getters and
