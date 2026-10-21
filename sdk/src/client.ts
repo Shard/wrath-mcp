@@ -1105,6 +1105,9 @@ export const MOVE_HINTS: Readonly<Record<string, (point: MovePoint, data: MoveRe
   interrupted: () =>
     `the move stopped early (death, root, stun, or the server rejected the movement). Check state.self, ` +
     `then retry from where you are.`,
+  // A root or a stun (module/PROTOCOL.md, `rooted`): a refusal carries no
+  // route, a walk the root stopped does.
+  rooted: (_p, d) => (d.pathLength === undefined ? ROOTED_MOVE_HINT : ROOTED_WALK_HINT),
   superseded: () =>
     `a newer moveTo replaced this one and is the move walking now. It came from this run's own code: another ` +
     `routine, a snippet, or a helper's walk (killTarget's approach). Retrying on superseded cancels that newer ` +
@@ -1142,6 +1145,18 @@ const ASYNC_MOVE_VERDICT_MS = 250;
 /** The refusal of a move while dead and not released; nothing is sent. */
 const DEAD_MOVE_HINT =
   "you are dead and a corpse cannot move; nothing was sent. sdk.repop() releases your spirit, and a ghost can walk.";
+
+/**
+ * `rooted`, refused: the module was told the character is rooted (a root, a
+ * stun) and sent nothing. Proposed wording, for the operator's approval.
+ */
+const ROOTED_MOVE_HINT = "you are rooted or stunned and cannot move until it wears off; the move was not sent.";
+
+/**
+ * `rooted`, mid-walk: a root or a stun stopped a walk where the character
+ * stood. Proposed wording, for the operator's approval.
+ */
+const ROOTED_WALK_HINT = "a root or stun stopped you mid-walk where you stand; you cannot move until it wears off.";
 
 /** `interrupted` when the verdict found the character dead. */
 const MOVE_DIED_HINT =
@@ -1349,6 +1364,23 @@ const MOVE_LEAVES_NO_STOP: ReadonlySet<string> = new Set([
   "path_incomplete",
   "drop",
 ]);
+
+/**
+ * A `rooted` verdict that refused the move: the module sent nothing, and the
+ * verdict carries no route (`pathLength`), which a walk the root stopped
+ * does. Like the planning refusals it moved nothing and is remembered for a
+ * repeat (`MOVE_REJECTION_MEMO_MS`: a root outlasts the window), but it sends
+ * no stop: the module's root ack already told the server the character
+ * stands still, and a rooted client sends nothing.
+ */
+function rootedRefusal(data: MoveResultData): boolean {
+  return data.status === "rooted" && data.pathLength === undefined;
+}
+
+/** A verdict that moved nothing: a refusal at planning, or a root's. */
+function refusedUnmoved(data: MoveResultData): boolean {
+  return MOVE_LEAVES_NO_STOP.has(data.status) || rootedRefusal(data);
+}
 
 /**
  * How long the server's refusal of a `moveTo` stands for.
@@ -3615,7 +3647,7 @@ export class WrathClient {
       this.lastMoveVerdictId = Math.max(this.lastMoveVerdictId, d.moveId);
       // A move refused at planning never moved the character: it is no walk
       // of ours, whatever it was sent during.
-      if (NEVER_MOVED.has(d.status)) {
+      if (NEVER_MOVED.has(d.status) || rootedRefusal(d)) {
         this.unmovedIds.add(d.moveId);
         if (this.unmovedIds.size > 16) this.unmovedIds.delete(this.unmovedIds.values().next().value as number);
         if (this.ownMove?.moveId === d.moveId) this.ownMove = undefined;
@@ -6893,7 +6925,7 @@ export class WrathClient {
     // Only a move that walked can have outlasted the budget: a refusal at
     // planning moved nothing, and the note's "dispatch it with moveToAsync"
     // would point a too_far at a call with the same cap.
-    if (!MOVE_LEAVES_NO_STOP.has(status)) {
+    if (!refusedUnmoved(data)) {
       if (timeoutNote !== undefined) extras.push(timeoutNote);
       noteBudget(event);
     }
@@ -7023,7 +7055,7 @@ export class WrathClient {
       ...(nearest !== undefined ? { nearest } : {}),
       ...(hint !== undefined ? { hint } : {}),
     };
-    if (MOVE_LEAVES_NO_STOP.has(status)) {
+    if (refusedUnmoved(data)) {
       // Nothing moved, so this verdict is about a position and a destination
       // that both still hold: remember it for the repeat (see
       // `MOVE_REJECTION_MEMO_MS`). The refusal's own `pos` is already folded

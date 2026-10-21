@@ -1492,32 +1492,43 @@ namespace WrathBench
     // server's record of the last flag the module sent (Player::IsInWater,
     // which ProcessMovementInfo keeps from the packets). Never on a
     // transport: a deck is not water.
-    static void SendMovePacket(BenchSession& s, Player* player, uint16 opcode, uint32 moveFlags,
-        float x, float y, float z, float o, Transport* transport = nullptr)
+    //
+    // AppendMovementInfo is the MovementInfo alone, shared with the forced-root
+    // acks (AnswerForceRoot), whose body is packGUID, the echoed counter, then
+    // this same MovementInfo: one writer, so an ack can never disagree with the
+    // walk about the transport block or the swimming flag.
+    static void AppendMovementInfo(WorldPacket& p, BenchSession& s, Player* player, uint32 moveFlags,
+        float x, float y, float z, float o, Transport* transport)
     {
         if (transport)
             moveFlags |= MOVEMENTFLAG_ONTRANSPORT;
         bool const swimming = !transport && (s.move.active ? s.move.swimming : player->IsInWater());
         if (swimming)
             moveFlags |= MOVEMENTFLAG_SWIMMING;
-        WorldPacket* p = new WorldPacket(opcode, 8 + 4 + 2 + 4 + 16 + 8 + 16 + 4 + 1 + 4 + 4);
-        *p << player->GetPackGUID();
-        *p << uint32(moveFlags);
-        *p << uint16(0);            // flags2
-        *p << uint32(getMSTime());
-        *p << float(x) << float(y) << float(z) << float(o);
+        p << uint32(moveFlags);
+        p << uint16(0);             // flags2
+        p << uint32(getMSTime());
+        p << float(x) << float(y) << float(z) << float(o);
         if (transport)
         {
             float lx = x, ly = y, lz = z, lo = o;
             transport->CalculatePassengerOffset(lx, ly, lz, &lo);
-            *p << transport->GetPackGUID();
-            *p << float(lx) << float(ly) << float(lz) << float(lo);
-            *p << uint32(transport->GetPathProgress());
-            *p << int8(-1);         // seat: none (not a vehicle)
+            p << transport->GetPackGUID();
+            p << float(lx) << float(ly) << float(lz) << float(lo);
+            p << uint32(transport->GetPathProgress());
+            p << int8(-1);          // seat: none (not a vehicle)
         }
         if (swimming)
-            *p << float(0.0f);      // pitch: level, swimming along the surface
-        *p << uint32(0);            // fallTime
+            p << float(0.0f);       // pitch: level, swimming along the surface
+        p << uint32(0);             // fallTime
+    }
+
+    static void SendMovePacket(BenchSession& s, Player* player, uint16 opcode, uint32 moveFlags,
+        float x, float y, float z, float o, Transport* transport = nullptr)
+    {
+        WorldPacket* p = new WorldPacket(opcode, 8 + 4 + 2 + 4 + 16 + 8 + 16 + 4 + 1 + 4 + 4);
+        *p << player->GetPackGUID();
+        AppendMovementInfo(*p, s, player, moveFlags, x, y, z, o, transport);
         s.ws->QueuePacket(p);
     }
 
@@ -2608,6 +2619,24 @@ namespace WrathBench
             Audit(*s, "action", a.Str());
         }
 
+        if (s->rooted.load())
+        {
+            // A rooted client cannot move: nothing is sent, not even the stop a
+            // redirect sends (the root ack was the stop). A walk the tick has
+            // not ended yet ends `rooted` here, and the request is refused with
+            // the same status after its ack, as a refusal at planning is.
+            if (s->move.active)
+                FinishMove(*s, "rooted");
+            uint64_t const moveId = ++s->moveIdGen;
+            s->move.moveId = moveId;
+            ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "move_to").Add("moveId", moveId).Str()});
+            Json::Writer w;
+            w.Add("moveId", moveId).Add("status", "rooted");
+            w.Raw("pos", PosJson(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation()));
+            EmitEvent(*s, "WB_MOVE_RESULT", 0xFF01, w.Str());
+            return;
+        }
+
         if (s->move.active)
         {
             // A client whose run is redirected stops first: without this the
@@ -2882,7 +2911,13 @@ namespace WrathBench
 
         Audit(*s, "action", Json::Writer().Add("op", "stop").Str());
 
-        if (s->move.active)
+        if (s->move.active && s->rooted.load())
+        {
+            // Rooted mid-walk and the tick has not ended it yet: the root ack
+            // already stopped the character where the mover stood.
+            FinishMove(*s, "rooted");
+        }
+        else if (s->move.active)
         {
             MoveState& m = s->move;
             // Stop where the "client" is (the interpolated position); the server
@@ -4201,6 +4236,16 @@ namespace WrathBench
             return;
         }
 
+        // Rooted or stunned (OnRootPacket): a client that is told so stops,
+        // and its root ack already carried the stop at the mover's point, so
+        // the move ends here with no further packet. After the death check:
+        // dying roots too (Player::KillPlayer), and a death is `interrupted`.
+        if (s.rooted.load())
+        {
+            FinishMove(s, "rooted");
+            return;
+        }
+
         int64_t dt = nowMs - m.lastMs;
         m.lastMs = nowMs;
         if (dt <= 0)
@@ -4596,6 +4641,117 @@ namespace WrathBench
         }
     }
 
+    // Forced roots. Unit::SendMoveRoot roots a client-controlled unit by
+    // packet alone: SMSG_FORCE_MOVE_ROOT / SMSG_FORCE_MOVE_UNROOT (packGUID,
+    // u32 movement counter) to the controlling client, which stops, answers
+    // CMSG_FORCE_MOVE_ROOT_ACK / CMSG_FORCE_MOVE_UNROOT_ACK and from then on
+    // keeps itself still until the unroot; the server trusts it to. Stuns
+    // arrive the same way (Unit::SetStunned -> SetRooted -> SendMoveRoot), and
+    // so do death (Player::KillPlayer) and its end (BuildPlayerRepop,
+    // ResurrectPlayer). A unit the client does not control (feared, confused)
+    // is rooted server-side instead: MOVEMENTFLAG_ROOT set in place and
+    // SMSG_SPLINE_MOVE_ROOT / UNROOT (packGUID alone) sent to the set, the
+    // character's own client included. Only an unroot ack clears a
+    // server-side ROOT once control is back (WorldSession::HandleMoveRootAck),
+    // and while ROOT stands the core drops every movement packet
+    // (VerifyMovementInfo), so a client that never answers is wedged for good:
+    // the Deadmines fear-then-stun case.
+    //
+    // The ack is queued here, in the tap, the moment the server sends the
+    // packet: in arrival order behind whatever the session already queued, and
+    // before a far teleport later on can bump the map-change counter past it
+    // (HandleMoveRootAck ignores a counter at or below
+    // Player::GetMapChangeOrderCounter). Where the unroot and the far teleport
+    // are one handler call (the repop's graveyard port to another map) no
+    // client's ack can arrive in time; the ack is still sent, as a client
+    // sends it.
+    void Manager::OnRootPacket(BenchSession& s, WorldSession* ws, uint16_t opcode, WorldPacket const& packet)
+    {
+        Player* player = ws->GetPlayer();
+        if (!player)
+            return;
+        uint64_t const self = player->GetGUID().GetRawValue();
+        WorldPacket p(packet);
+        try
+        {
+            if (opcode == SMSG_MULTIPLE_MOVES)
+            {
+                // Player::SendInitialPacketsAfterAddToMap (login, far port):
+                // u32 size, then per sub-packet u8 length (opcode + body), u16
+                // opcode, body. Only the root is read; the rest is skipped.
+                uint32 size = 0; p >> size;
+                while (p.rpos() + 3 <= p.size())
+                {
+                    uint8 len = 0; uint16 sub = 0;
+                    p >> len >> sub;
+                    size_t const end = p.rpos() + (len >= 2 ? len - 2 : 0);
+                    if (sub == SMSG_FORCE_MOVE_ROOT || sub == SMSG_FORCE_MOVE_UNROOT)
+                    {
+                        uint64 guid = 0; p.readPackGUID(guid);
+                        uint32 counter = 0; p >> counter;
+                        if (guid == self)
+                        {
+                            s.rooted.store(sub == SMSG_FORCE_MOVE_ROOT);
+                            AnswerForceRoot(s, ws, sub == SMSG_FORCE_MOVE_ROOT, guid, counter);
+                        }
+                    }
+                    if (end > p.size())
+                        break;
+                    p.rpos(end);
+                }
+                return;
+            }
+            uint64 guid = 0; p.readPackGUID(guid);
+            if (guid != self)
+                return; // a vehicle or a charmed mover: never driven by the module
+            bool const root = opcode == SMSG_FORCE_MOVE_ROOT || opcode == SMSG_SPLINE_MOVE_ROOT;
+            s.rooted.store(root);
+            if (opcode == SMSG_FORCE_MOVE_ROOT || opcode == SMSG_FORCE_MOVE_UNROOT)
+            {
+                uint32 counter = 0; p >> counter;
+                AnswerForceRoot(s, ws, root, guid, counter);
+            }
+        }
+        catch (std::exception const&)
+        {
+            // A short packet (ByteBufferException): nothing to answer.
+        }
+    }
+
+    // The ack's body, as WorldSession::HandleMoveRootAck reads it: packGUID,
+    // the echoed u32 counter, then a MovementInfo where the character is now,
+    // with no moving flag (a rooted client has stopped) and MOVEMENTFLAG_ROOT
+    // on the root ack only (ReadMovementInfo strips it on arrival anyway). The
+    // server applies that MovementInfo (HandleMoverRelocation), so a root ack
+    // during a walk is the walk's stop: it carries the mover's own point, where
+    // this "client" stands, and the tick then ends the move `rooted` with no
+    // further packet. Outside a walk it is the server's position. Reading the
+    // mover here is safe: the tap runs during the core's session and map
+    // updates, which the world script update (the mover's tick) never overlaps.
+    void Manager::AnswerForceRoot(BenchSession& s, WorldSession* ws, bool root, uint64_t guid, uint32_t counter)
+    {
+        Player* player = ws->GetPlayer();
+        if (!player || player->GetGUID().GetRawValue() != guid)
+            return;
+        MoveState const& m = s.move;
+        bool const walking = m.active && !m.inFall;
+        float const x = walking ? m.curX : player->GetPositionX();
+        float const y = walking ? m.curY : player->GetPositionY();
+        float const z = walking ? m.curZ : player->GetPositionZ();
+        float const o = walking ? m.curO : player->GetOrientation();
+        Transport* transport = walking ? FindTransportAt(player->GetMap(), x, y, z) : player->GetTransport();
+        uint16 const opcode = root ? CMSG_FORCE_MOVE_ROOT_ACK : CMSG_FORCE_MOVE_UNROOT_ACK;
+        WorldPacket* p = new WorldPacket(opcode, 8 + 4 + 4 + 2 + 4 + 16 + 8 + 16 + 4 + 1 + 4 + 4);
+        *p << player->GetPackGUID();
+        *p << uint32(counter);
+        AppendMovementInfo(*p, s, player, root ? MOVEMENTFLAG_ROOT : MOVEMENTFLAG_NONE, x, y, z, o, transport);
+        ws->QueuePacket(p);
+        Audit(s, "action", Json::Writer().Add("op", "root_ack")
+            .Add("opcode", root ? "CMSG_FORCE_MOVE_ROOT_ACK" : "CMSG_FORCE_MOVE_UNROOT_ACK")
+            .Add("counter", counter).Add("moveId", walking ? m.moveId : uint64_t(0))
+            .Raw("pos", PosJson(x, y, z, o)).Str());
+    }
+
     // A real client sends MSG_CORPSE_QUERY once it is a ghost (after the repop
     // teleport lands), and draws the answer as the corpse marker on its map.
     // The parked client has no map, so the module issues the same one-shot
@@ -4710,6 +4866,12 @@ namespace WrathBench
             tmp << counter << uint32(getMSTime());
             ws->QueuePacket(new WorldPacket(std::move(tmp), GameTime::Now()));
         }
+
+        // Forced and spline roots: the rooted state, and the client's ack.
+        if (opcode == SMSG_FORCE_MOVE_ROOT || opcode == SMSG_FORCE_MOVE_UNROOT
+            || opcode == SMSG_SPLINE_MOVE_ROOT || opcode == SMSG_SPLINE_MOVE_UNROOT
+            || opcode == SMSG_MULTIPLE_MOVES)
+            OnRootPacket(*s, ws, opcode, packet);
 
         // Keep the client-side object cache in sync with destroys.
         if (opcode == SMSG_DESTROY_OBJECT && packet.size() >= 8)

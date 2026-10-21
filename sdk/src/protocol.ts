@@ -781,6 +781,7 @@ export const MOVE_STATUSES = [
   "interrupted",
   "stopped",
   "superseded",
+  "rooted",
 ] as const;
 export type KnownMoveStatus = (typeof MOVE_STATUSES)[number];
 /** Widened, so a status this revision does not know still parses. */

@@ -225,6 +225,13 @@ namespace WrathBench
         // read by the mover on the world thread, hence atomic.
         std::atomic<uint32> pendingTransferMap{0};
 
+        // Rooted, as this "client" has been told: set by SMSG_FORCE_MOVE_ROOT
+        // and SMSG_SPLINE_MOVE_ROOT for the character's own guid, cleared by
+        // their UNROOT twins (OnRootPacket). A rooted client cannot move, so
+        // while it is set the mover stops and move_to is refused `rooted`.
+        // Written on tap threads, read on the world thread, hence atomic.
+        std::atomic<bool> rooted{false};
+
         // Teleport-ack pacing (world thread only): when the last ack for a
         // still-pending teleport was queued, 0 when none is pending. See
         // TickTeleportAcks.
@@ -532,6 +539,13 @@ namespace WrathBench
         // only): MSG_MOVE_TELEPORT_ACK / MSG_MOVE_WORLDPORT_ACK through the
         // stock handlers, so the destination is applied and movement resumes.
         void TickTeleportAcks(int64_t nowMs);
+
+        // Forced roots, answered the way a client answers them (tap threads):
+        // CMSG_FORCE_MOVE_ROOT_ACK / CMSG_FORCE_MOVE_UNROOT_ACK queued the
+        // moment the server's packet is sent, and the rooted state above kept
+        // from the root packets, SMSG_MULTIPLE_MOVES' sub-packets included.
+        void OnRootPacket(BenchSession& s, WorldSession* ws, uint16_t opcode, WorldPacket const& packet);
+        void AnswerForceRoot(BenchSession& s, WorldSession* ws, bool root, uint64_t guid, uint32_t counter);
 
         // Ask MSG_CORPSE_QUERY once per death, after the ghost's graveyard
         // teleport has been acked, the way a client does on becoming a ghost

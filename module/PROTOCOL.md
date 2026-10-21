@@ -461,11 +461,17 @@ then the new path starts from wherever the character is. A request that fails
 before anything moves (`too_far` and the planning causes below) likewise sends
 a stop if the server still holds the character as moving.
 
+A rooted character cannot move (Roots, below): while the module holds the
+character rooted, a `move_to` is refused before planning with status `rooted`,
+acked with `moveId` alone like any refusal, and nothing is sent, not even the
+redirect's stop; a walk still running then ends `rooted` first.
+
 #### stop
 
 Stop moving (sends `MSG_MOVE_STOP` where the character currently is). Always
 acks `200 { "ok": true, "action": "stop" }`; if a move was in
-progress it additionally ends with a `WB_MOVE_RESULT` status `stopped`.
+progress it additionally ends with a `WB_MOVE_RESULT` status `stopped`, or
+`rooted` with no packet when a root has already stopped it.
 
 Request: `{ "token": "run-abc123", "action": "stop" }`
 
@@ -867,6 +873,50 @@ follows a same-map teleport; this is how own position follows one. On the wire
 the packet carries a `u32` movement-order counter between the packGUID and the
 MovementInfo; it is consumed, not served.
 
+Roots. The core roots a unit its client controls by packet alone
+(`Unit::SendMoveRoot`): `SMSG_FORCE_MOVE_ROOT` (0x0E8) and
+`SMSG_FORCE_MOVE_UNROOT` (0x0EA), each a packGUID and a `u32` movement
+counter, sent to the controlling client, which stops, answers, and keeps
+itself still until the unroot; the server sets nothing and trusts it to.
+Stuns arrive the same way (`Unit::SetStunned` -> `SetRooted` ->
+`SendMoveRoot`; `Unit::IsClientControlled` does not look at the stun flag), as
+do death (`Player::KillPlayer`) and its end (`BuildPlayerRepop`,
+`ResurrectPlayer`). A unit its client does not control (feared, confused) is
+rooted server-side instead: `MOVEMENTFLAG_ROOT` set in place and
+`SMSG_SPLINE_MOVE_ROOT` (0x31A) / `SMSG_SPLINE_MOVE_UNROOT` (0x304), a
+packGUID alone, sent to the set, own client included. At login and after a
+far port an immobilized character's root rides inside `SMSG_MULTIPLE_MOVES`
+(0x51E; `Player::SendInitialPacketsAfterAddToMap`), each sub-packet a `u8`
+length, `u16` opcode and body.
+
+The module answers as a client does (module-internal client behaviour, like
+the teleport acks; none of these packets is served as an event):
+`CMSG_FORCE_MOVE_ROOT_ACK` (0x0E9) and `CMSG_FORCE_MOVE_UNROOT_ACK` (0x0EB),
+both read by `WorldSession::HandleMoveRootAck` as the packGUID, the echoed
+`u32` counter and a MovementInfo (the movement packets' layout) where the
+character stands, with no moving flag and `MOVEMENTFLAG_ROOT` on the root ack
+only (`ReadMovementInfo` strips ROOT from every client packet on arrival).
+Where a walk is running the ack carries the walk's own point, so it is the
+walk's stop; otherwise the server's position. Each is queued from the tap
+the moment the server sends the packet, behind whatever the session already
+queued, own guid only, and audited. The unroot ack is what clears a
+server-side ROOT once control is back: the observed case was a fear, a stun
+landing under it (ROOT set in place), the fear ending (a FORCE root, ignored
+as already rooted) and the stun ending (a FORCE unroot); with no ack the core
+kept ROOT through death, release and the far port, and dropped every movement
+packet after (`VerifyMovementInfo`). An ack whose counter is at or below the
+counter at the last far teleport is ignored as from the old map
+(`Player::GetMapChangeOrderCounter`), so where the unroot and a far port are
+one handler call — a repop whose graveyard is on another map — no client's
+ack lands in time; the ack is still sent, as a client sends it.
+
+The module also keeps the rooted state a client keeps: set by
+`SMSG_FORCE_MOVE_ROOT` and `SMSG_SPLINE_MOVE_ROOT` for the character's own
+guid (the multiple-moves sub-packet included), cleared by their unroot twins.
+While it is set the mover stops (`rooted`, above) and `move_to` is refused
+`rooted`. `face` still turns, which is right for a root; a stunned client
+cannot turn, and the module does not yet tell the two apart.
+
 `SMSG_COMPRESSED_UPDATE_OBJECT` never appears on this stream: the core
 compresses large update packets at socket-write time, below the module's tap,
 so the tap always sees the uncompressed `SMSG_UPDATE_OBJECT`.
@@ -1089,11 +1139,20 @@ at the top of this document.
   `SMSG_NEW_WORLD` will follow; `pos` is the pre-teleport position and the
   arrival point is the `MSG_MOVE_TELEPORT_ACK` observed-movement event (own
   guid), which the server sends before this result.
-- `interrupted` — the move stopped early (death, root, rejection, or the
+- `interrupted` — the move stopped early (death, rejection, or the
   character left the map for a non-teleport reason); `pos` is where the
   character actually is.
 - `stopped` — a `stop` action ended the move.
 - `superseded` — a newer `move_to` replaced this move.
+- `rooted` — a root or a stun holds the character (Roots, below). A
+  refusal: the `move_to` arrived while the character was rooted and nothing
+  was sent; it carries no `pathLength`. A walk the root stopped: the root ack
+  was its stop, at the point the walk had reached, and the verdict carries
+  the walk's `pathLength` like any other dispatched move. Its `pos` is read
+  back as always, and the server applies the ack on the session's next
+  update, after the verdict, so `pos` can trail the point the walk stopped
+  at by up to one heartbeat's walk (about 3.5y at run speed). Death roots
+  too, but a walk the character dies on ends `interrupted`.
 
 `WB_MOVE_PROGRESS.pos` is the engine's interpolated position (what a client
 would render); `WB_MOVE_RESULT.pos` is read back from the live character, so an
@@ -1683,6 +1742,10 @@ next day's, only ever forward, so a session reopened later under the same
 token appends to that day's file and a past day's file gets no further write.
 The retention pass rests on that: a past day's file is deletable once it is
 quiet for the window, whatever the server's start.
+
+The root acks (Roots, above) log one `action` record each, `op: "root_ack"`
+with the `opcode` sent, the echoed `counter`, the `pos` the ack carried and
+the `moveId` of the walk it stopped (0 outside a walk).
 
 Synthesized movement logs one `action` record per `move_to`/`stop`/`face`
 request (`force: true` on the record when the request said so) plus one per
