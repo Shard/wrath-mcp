@@ -33,6 +33,7 @@ import {
   WrathRequestError,
   WrathTransportError,
 } from "./src/index";
+import { CLIENT_PLUMBING } from "./src/client";
 import { EventAbortedError, EventTimeoutError } from "./src/events";
 
 /** One documented member: its name (verified against the prototype), signature, and one-line purpose. */
@@ -158,76 +159,6 @@ const CLIENT_RAW: readonly Row[] = [
   { name: "declineGroupInvite", sig: "declineGroupInvite(): Promise<RawActionResponse>", purpose: "Decline the pending invitation." },
   { name: "raw", sig: "raw(opcode: string, payload?: hex | Uint8Array | RawField[]): Promise<RawActionResponse>", purpose: "Escape hatch: send one allowlisted CMSG_* opcode with a body you build — a field list like [{ u32: 5 }, { guid: unit.guid }, { cstring: \"x\" }] is packed little-endian for you; field kinds are u8, u16, u32, i32, f32, u64 (decimal string), guid, packedGuid, cstring (NUL-terminated) and bytes (hex). The allowlist is the module's — ordinary client opcodes no sdk method sends (talents, the other chat types and emotes, item moves and buyback, cancelling an aura, channel or auto-repeat, sheathing, stand state, declining a resurrection, taxi node status); an opcode off it is refused as opcode_not_allowed with a hint, nothing sent. The answer arrives on sdk.events only if its opcode is whitelisted there." },
 ];
-
-/** WrathClient prototype members that are internal plumbing, deliberately undocumented. */
-const CLIENT_INTERNAL = new Set([
-  "action",
-  // Operator-only (module/PROTOCOL.md "Authentication"): a snippet's own
-  // credential is refused on these, so the model is not shown them.
-  "lease",
-  "releaseLease",
-  "noteActionHint",
-  "tallyActionHint",
-  "rewordActionHint",
-  "drainActionHints",
-  "request",
-  "postMoveTo",
-  "watchAsyncMove",
-  "moveRecipe",
-  "asyncMoveRecipe",
-  "isCorpse",
-  "trackedCast",
-  "dispatchCast",
-  "castVerdict",
-  "watchOwnJump",
-  "castRefusal",
-  "ownMoveSince",
-  "recallMoveRejection",
-  "waitOwnTeleportAck",
-  "reclaimRefusal",
-  "awaitAliveFields",
-  "awaitAreaAfter",
-  "reclaimReadyAt",
-  "resolveGossipOption",
-  "petGuidOrRefuse",
-  "petCommand",
-  "nameMailSenders",
-  "questDetailsFrom",
-  "rewardChoices",
-  "petRefusal",
-  "lootRollRefusal",
-  "targetGuid",
-  "isChest",
-  "openChest",
-  "useItemVerdict",
-  "targetRef",
-  "byName",
-  "resolveRawGuids",
-  "resolveTalent",
-  "bankClosed",
-  "noBankItem",
-  "petAction",
-  "mailboxGuidOrThrow",
-  "mailboxGuid",
-  "noMailbox",
-  "waitMailResult",
-  "bankMove",
-  "sellAndConfirm",
-  "questOffer",
-  "questTakenByItsOwnOffer",
-  "faceQuietly",
-  "waitForState",
-  "waitEvent",
-  "currentSignal",
-  "remainingBudgetMs",
-  "throwIfAborted",
-  "sleepAborting",
-  "clientParityQueries",
-  "fireAndForget",
-  "flushStatusQueries",
-  "forgetStatus",
-  "trackQuestLog",
-]);
 
 // ---------------------------------------------------------------- state rows
 
@@ -383,7 +314,7 @@ function prototypeMembers(proto: object): string[] {
  * direction. This is what keeps API.md from advertising a method that does not
  * exist and from silently omitting one that does.
  */
-function checkDrift(label: string, proto: object, documented: readonly Row[], internal: Set<string>): void {
+function checkDrift(label: string, proto: object, documented: readonly Row[], internal: ReadonlySet<string>): void {
   const live = new Set(prototypeMembers(proto));
   const docNames = new Set(documented.map((r) => r.name));
 
@@ -554,7 +485,7 @@ ${table(EVENT_ROWS)}
 }
 
 function main(): void {
-  checkDrift("WrathClient", WrathClient.prototype, [...CLIENT_ENDPOINTS, ...CLIENT_HELPERS, ...CLIENT_RAW], CLIENT_INTERNAL);
+  checkDrift("WrathClient", WrathClient.prototype, [...CLIENT_ENDPOINTS, ...CLIENT_HELPERS, ...CLIENT_RAW], CLIENT_PLUMBING);
   checkDrift("StateCache", StateCache.prototype, STATE_ROWS, STATE_INTERNAL);
   checkDrift("EventStream", EventStream.prototype, EVENT_ROWS, EVENT_INTERNAL);
   // Touch the error exports so a rename of any breaks the build here too.

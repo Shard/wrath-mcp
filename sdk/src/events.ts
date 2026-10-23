@@ -21,6 +21,7 @@ import {
   type KnownEvent,
   type KnownOpcode,
 } from "./protocol";
+import { settleOnLaterTurns } from "./turn";
 
 /** Opcode of a gap marker. Lowercase, so it can never collide with an `SMSG_*`. */
 export const STREAM_GAP = "stream_gap";
@@ -817,3 +818,12 @@ export class EventStream implements AsyncIterable<StreamEvent> {
     }
   }
 }
+
+/**
+ * `waitFor` as the SDK's own waits call it: a buffered answer resolves in the
+ * caller's turn, as it always has (turn.ts, on why the I/O paths keep theirs).
+ */
+export const waitForInTurn = EventStream.prototype.waitFor;
+
+// A caller's wait the buffer already answers settles on a later turn (turn.ts).
+settleOnLaterTurns(EventStream.prototype, ["waitFor", "waitForOpcode"]);

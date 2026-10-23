@@ -551,6 +551,16 @@ goes through `upsertNearby()`. Add the schema in `src/protocol.ts`, add one
 it exists so `protocol-social.ts` never reaches back into `protocol.ts` at
 value level, which is a module-eval cycle `tsc` cannot see.
 
+**Every call crosses the event loop.** A call answered locally (a refusal
+that sends nothing, a wait the event buffer already answers) would otherwise
+settle in microtasks, and a snippet loop over it starves every timer and IPC
+message in the sandbox until the host kills it as blocked. So every method on
+the caller's surface, and `events.waitFor`/`waitForOpcode`, settles after one
+`setImmediate` when it neither sent a request nor saw a turn pass; a call that
+did either is untouched (`src/turn.ts`). The surface is every `WrathClient`
+prototype member not in `CLIENT_PLUMBING` (`src/client.ts`), the same list the
+API reference generator leaves out, so a new private method goes there.
+
 **Dependencies.** Zod, and only at the external boundary: `src/protocol.ts`
 (with `src/protocol-social.ts`) validates module messages and hands plain
 TypeScript types to everything downstream. Transport is Bun's built-in `fetch`
