@@ -1834,6 +1834,11 @@ function questgiverOutOfReach(state: StateCache, guid: GuidArg): number | undefi
   return distance !== undefined && distance > QUESTGIVER_REACH_CEILING ? Math.round(distance) : undefined;
 }
 
+/** Whether the state cache knows `guid` as a questgiver-type game object. */
+function isQuestGiverObject(state: StateCache, guid: string): boolean {
+  return state.units({ type: "gameObject" }).some((u) => u.guid === guid && u.goType === "questgiver");
+}
+
 /** The `too_far` hint every quest call gives, nothing having been sent. */
 function questgiverTooFarHint(distance: number): string {
   return `the questgiver is ${distance}y away — interact range is ~${INTERACT_RANGE}y; moveTo it first`;
@@ -8542,7 +8547,8 @@ export class WrathClient {
   }
 
   /**
-   * Send `quest_list` and return the offer the NPC answered with.
+   * Send `quest_list` (on a questgiver game object, `interact`, as a client
+   * does) and return the offer the questgiver answered with.
    *
    * The one place the answer shapes are reconciled, shared by
    * `questsAvailableFrom` and `acceptQuestFrom` so they can never drift:
@@ -8592,7 +8598,16 @@ export class WrathClient {
     // completion window for a quest already in it is a turn-in, not an offer.
     const inLogBefore = new Set(this.state.questLog.map((q) => q.questId));
     const npcKey = guidKey(npcGuid);
-    await this.questList(npcGuid);
+    // A questgiver game object (a wanted poster, a Candy Bucket) is asked
+    // the way a client asks it: a right-click on it is CMSG_GAMEOBJ_USE, and
+    // the questgiver case of GameObject::Use prepares and sends the same
+    // quest menu a creature's hello does, with the same three answer shapes.
+    // CMSG_QUESTGIVER_HELLO finds creatures only (GetNPCIfCanInteractWith),
+    // so the hello on an object was dropped and every such call timed out.
+    // Only the questgiver type is used: using any other object acts on it (a
+    // door opens, a trap fires), which no question about quests should do.
+    if (isQuestGiverObject(this.state, npcKey)) await this.action({ action: "interact", guid: npcKey });
+    else await this.questList(npcGuid);
     const menu = await this
       .waitEvent(
         (e) =>

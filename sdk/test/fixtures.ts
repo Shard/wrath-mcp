@@ -736,14 +736,14 @@ export const addKill = {
 };
 
 /** The quest list as a *gossip*-flagged questgiver answers it. */
-export function gossipWithQuests(questIds: readonly number[], seq = 45): unknown {
+export function gossipWithQuests(questIds: readonly number[], seq = 45, guid = CREATURE_GUID): unknown {
   return {
     seq,
     opcode: "SMSG_GOSSIP_MESSAGE",
     opcodeId: 0x17d,
     ts: 1_700_000_000_450,
     data: {
-      guid: CREATURE_GUID,
+      guid,
       menuId: 3,
       textId: 9,
       options: [{ optionId: 0, icon: 0, text: "fixture option" }],
@@ -753,14 +753,14 @@ export function gossipWithQuests(questIds: readonly number[], seq = 45): unknown
 }
 
 /** The same list as a plain questgiver answers it. */
-export function questGiverList(questIds: readonly number[], seq = 46): unknown {
+export function questGiverList(questIds: readonly number[], seq = 46, guid = CREATURE_GUID): unknown {
   return {
     seq,
     opcode: "SMSG_QUESTGIVER_QUEST_LIST",
     opcodeId: 0x185,
     ts: 1_700_000_000_460,
     data: {
-      guid: CREATURE_GUID,
+      guid,
       greeting: "fixture greeting",
       quests: questIds.map((questId) => ({
         questId,
@@ -820,14 +820,14 @@ export function offerReward(
   };
 }
 
-export function requestItems(questId: number, completable: boolean, seq = 48): unknown {
+export function requestItems(questId: number, completable: boolean, seq = 48, guid = CREATURE_GUID): unknown {
   return {
     seq,
     opcode: "SMSG_QUESTGIVER_REQUEST_ITEMS",
     opcodeId: 0x18b,
     ts: 1_700_000_000_480,
     data: {
-      guid: CREATURE_GUID,
+      guid,
       questId,
       title: "fixture quest",
       text: "fixture request text",
