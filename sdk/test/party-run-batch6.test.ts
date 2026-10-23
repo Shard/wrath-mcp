@@ -133,7 +133,7 @@ const emote = (seq: number, type: number, senderName: string | undefined, messag
   });
 
 describe("creature speech: %s is the speaker, as a client prints it", () => {
-  test("state.chat fills a creature emote's template; a player's line and an achievement's are left as sent", () => {
+  test("state.chat fills a creature emote's template; a player's line is left as sent, and an achievement's with nothing to fill it", () => {
     const c = StateCache.replay(
       toEvents([
         ...loginSequence,

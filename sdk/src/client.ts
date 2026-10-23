@@ -77,6 +77,7 @@ import {
   type MoveProgressData,
   type MoveResultData,
   type NameQueryResponseData,
+  type AchievementEarnedData,
   type MoveUpdateData,
   type MoveStatus,
   type MoveToResponse,
@@ -120,6 +121,7 @@ import {
   partyResultText,
   isQuestGiverMarkerInput,
   chatMessageAsShown,
+  ACHIEVEMENT_CHAT_TYPES,
   PLAYER_FLAGS_GHOST,
   pointOf,
   questGiverStatusName,
@@ -6788,7 +6790,9 @@ export class WrathClient {
    * it: a player sender named by the name query's answer or the group roster
    * (`StateCache.namedChatEntry`). A line whose sender had no name yet is
    * tested again when that sender's name query answers, so
-   * `m => m.senderName === "Name"` matches a line that arrived first.
+   * `m => m.senderName === "Name"` matches a line that arrived first. An
+   * achievement line is tested again when the `SMSG_ACHIEVEMENT_EARNED` that
+   * names its achievement lands, which the server sends just after the line.
    */
   async waitForChat(
     match: string | ((entry: ChatEntry) => boolean),
@@ -6796,9 +6800,18 @@ export class WrathClient {
   ): Promise<ChatEntry> {
     const predicate = typeof match === "string" ? (e: ChatEntry) => e.message === match : match;
     // Lines this wait has tested with no sender name, by sender guid, to be
-    // tested again once that guid's name query answers.
+    // tested again once that guid's name query answers; and achievement lines
+    // by achievement id, to be tested again once an earn names it. Kept as
+    // they came off the wire, so the retest fills them from scratch.
     const unnamed = new Map<string, ChatEntry[]>();
+    const unlinked = new Map<number, ChatEntry[]>();
     let hit: ChatEntry | undefined;
+    const test = (line: ChatEntry): boolean => {
+      const shown = this.state.namedChatEntry(line);
+      if (!predicate(shown)) return false;
+      hit = shown;
+      return true;
+    };
     await this.waitEvent(
       (e) => {
         if (isDecodeError(e.data)) return false;
@@ -6807,26 +6820,30 @@ export class WrathClient {
         const retest = (guids: Iterable<string>): boolean => {
           for (const guid of [...guids]) {
             for (const line of unnamed.get(guid) ?? []) {
-              const named = this.state.namedChatEntry(line);
-              if (named.senderName === undefined) continue;
+              if (this.state.namedChatEntry(line).senderName === undefined) continue;
               unnamed.delete(guid);
-              if (predicate(named)) {
-                hit = named;
-                return true;
-              }
+              if (test(line)) return true;
             }
           }
           return false;
         };
         if (isEvent(e, "SMSG_NAME_QUERY_RESPONSE")) return retest([(e.data as NameQueryResponseData).guid]);
         if (isEvent(e, "SMSG_GROUP_LIST")) return retest(unnamed.keys());
-        if (!isEvent(e, "SMSG_MESSAGECHAT")) return false;
-        const entry = this.state.namedChatEntry(toChatEntry(e.seq, e.ts, e.data as ChatFields));
-        if (predicate(entry)) {
-          hit = entry;
-          return true;
+        if (isEvent(e, "SMSG_ACHIEVEMENT_EARNED")) {
+          const id = (e.data as AchievementEarnedData).achievement.achievementId;
+          const lines = unlinked.get(id) ?? [];
+          unlinked.delete(id);
+          return lines.some(test);
         }
-        if (entry.senderName === undefined) unnamed.set(entry.senderGuid, [...(unnamed.get(entry.senderGuid) ?? []), entry]);
+        if (!isEvent(e, "SMSG_MESSAGECHAT")) return false;
+        const line = toChatEntry(e.seq, e.ts, e.data as ChatFields);
+        if (test(line)) return true;
+        if (this.state.namedChatEntry(line).senderName === undefined) {
+          unnamed.set(line.senderGuid, [...(unnamed.get(line.senderGuid) ?? []), line]);
+        }
+        if (ACHIEVEMENT_CHAT_TYPES.has(line.type) && line.achievementId !== undefined) {
+          unlinked.set(line.achievementId, [...(unlinked.get(line.achievementId) ?? []), line]);
+        }
         return false;
       },
       {

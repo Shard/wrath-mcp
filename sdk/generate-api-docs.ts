@@ -262,6 +262,7 @@ const STATE_INTERNAL = new Set([
   "joinName",
   "mergeFields",
   "rebuildAchievements",
+  "noteAchievementName",
   "upsertNearby",
   "foldFactionRow",
   "foldGroupList",
