@@ -1247,13 +1247,24 @@ function climbHint(dz: number, edge: { x: number; y: number }): string {
 
 /**
  * A `drop` whose foot lies under the ground (`surfaceZ`): refused forced or
- * not, since no client falls through terrain. The foot is a z the request
- * guessed below the surface — the module's guard, not the fall estimate,
- * is what stops it, and the recovery is a z on the surface, not force.
+ * not, since no client falls through terrain. The module's guard, not the
+ * fall estimate, is what stops it. When the request's own z is below the
+ * surface (more than the module's 1y), the foot is a z the request guessed
+ * and the recovery is a z on the surface. When it is not, the mesh's route
+ * ends under a structure whatever z is asked for (the foot is the mesh's,
+ * not the request's), so the hint does not send the caller after a z.
  */
+const BURIED_TARGET_MARGIN = 1.0;
 function buriedFootHint(p: MovePoint, d: MoveResultData, surfaceZ: number): string {
   const edge = d.reachedPos ?? d.pos;
   const foot = edge.z + (d.dz ?? 0);
+  if (!(p.z < surfaceZ - BURIED_TARGET_MARGIN)) {
+    return (
+      `stopped at the edge (${fmtXY(edge)}): the route ends under a structure, landing at z ${foot.toFixed(1)} ` +
+      `below the surface at z ${surfaceZ.toFixed(1)}, whatever z you ask for — changing the target z will not ` +
+      `help. Pick a destination at another x,y or approach from another side. force does not apply.`
+    );
+  }
   return (
     `stopped at the edge (${fmtXY(edge)}): the drop ahead lands at z ${foot.toFixed(1)}, underground (the ground ` +
     `here is z ${surfaceZ.toFixed(1)}). Your target z ${p.z.toFixed(1)} is below the ground — retry with a z on ` +

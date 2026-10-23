@@ -822,8 +822,10 @@ export const moveResultDataSchema = z.looseObject({
   safeFall: z.number().optional(),
   /**
    * `drop` only, when the step's foot lies under the ground at its x,y: the
-   * surface it is under. Such a step is refused forced or not (no client falls
-   * through terrain); the z asked for was a guess below the surface.
+   * surface it is under (a foot in or on water is never under it). Such a
+   * step is refused forced or not (no client falls through terrain); a z
+   * asked for below the surface was a guess, and one on the surface means the
+   * mesh's route ends under a structure whatever z is asked for.
    */
   surfaceZ: z.number().optional(),
   /**

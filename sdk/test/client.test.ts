@@ -1152,6 +1152,36 @@ describe("client: movement", () => {
       await stub.stop();
     });
 
+    test("a buried foot under a target z on the surface is the route's, and the hint does not send the caller after a z", async () => {
+      // Deadmines cove: a request at z 3.04, above the 2.31 surface, whose
+      // route still ends at the mesh's own point under it. No z the caller
+      // picks changes that, so the hint does not blame the request's z.
+      const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate]) });
+      const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+      await client.createSession({ character: "Fenwick" });
+      const p = client.moveTo({ x: -128, y: -834, z: 3.04 }, { timeout: 2000 });
+      const ev = moveResult("drop", 1, 30) as { data: Record<string, unknown> };
+      ev.data.reachedPos = { x: -126.9, y: -832.3, z: 2.46 };
+      ev.data.dz = -3.69;
+      ev.data.target = { x: -128, y: -834, z: 3.04 };
+      ev.data.surfaceZ = 2.31;
+      stub.push(JSON.stringify(ev));
+      const r = await p;
+      expect(r.ok).toBe(false);
+      if (r.ok) throw new Error("unreachable");
+      expect(r.status).toBe("drop");
+      expect(r.hint).toContain(
+        "stopped at the edge (-126.9, -832.3): the route ends under a structure, landing at z -1.2 below the " +
+          "surface at z 2.3, whatever z you ask for — changing the target z will not help. Pick a destination at " +
+          "another x,y or approach from another side. force does not apply.",
+      );
+      expect(r.hint).not.toContain("Your target z");
+      expect(r.hint).not.toContain("force: true");
+      expect(stub.actions.map((a) => a.action)).toEqual(["move_to", "stop"]);
+      client.close();
+      await stub.stop();
+    });
+
     test("force on moveTo and moveToAsync rides the request, and a forced drop verdict is not re-issued", async () => {
       const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate]) });
       const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });

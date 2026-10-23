@@ -1146,10 +1146,16 @@ at the top of this document.
   edge's height at the foot's x,y, which the foot sits more than 1y below.
   Such a foot is a z the request guessed and the mesh never resolved — a
   point inside solid ground that no client can fall to — and the caller
-  should quote a z on the surface instead. The same guard runs per segment
-  while walking; a ledge that slips past planning stops the character at the
-  edge with the same status and `pos` at the edge, or, on a forced downward
-  one, is walked with the client's fall packets.
+  should quote a z on the surface instead. A foot in or on water over its
+  bed is not under the ground, whatever solid lies over it (a lip or an
+  overhang above a cove): the surface search sees solid geometry only, so
+  the foot is tested against the server's liquid status there
+  (`Map::GetLiquidData`, the swim test's query, Swimming above) and, in
+  water or no more than 1y over it, is a fall into water, judged like any
+  other drop. The same guard runs per segment while walking; a ledge that
+  slips past planning stops the character at the edge with the same status
+  and `pos` at the edge, or, on a forced downward one, is walked with the
+  client's fall packets.
 - `transferred` — a map transfer took the character mid-move (an areatrigger
   portal, a cross-map port); the server applies the destination itself. `pos`
   is the last old-map position; the new map and arrival point follow on

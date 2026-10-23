@@ -1760,14 +1760,32 @@ namespace WrathBench
     // earned this), and not enough to take a floor over the edge's head — a
     // walkway's upper landing beside a 2.4y step down (Stormwind) — for the
     // ground, which a character at the edge is already under.
+    // GetHeight sees solid geometry only, so a foot in water under a lip or
+    // an overhang (the mesh's water point, Deadmines cove: a foot at -1.2
+    // under a surface at 2.3) reads as buried although it is a fall into
+    // water. A foot in or on water over its bed is therefore not buried:
+    // the swim test's own query (GetLiquidData at the foot) with the swim
+    // test's own reading — a valid Level over the bed, and the foot no more
+    // than SWIM_SURFACE_TOLERANCE above it (the mesh's water polygons lie on
+    // the surface within a voxel or two). Level is the test, not Status: the
+    // vmap branch sets Status from the level alone, even for a z under the
+    // WMO floor, and fills Level and DepthLevel only for a z at or above the
+    // bed (the grid branch the same, within 0.2y), so a foot under a lake
+    // bed is still refused.
     static constexpr float FOOT_UNDER_SURFACE = 1.0f;
     static constexpr float EDGE_LOOK_OFFSET = 1.0f;
     static bool FootUnderSurface(Player* player, WbVec const& edge, WbVec const& foot, float* surfaceZ)
     {
+        Map* map = player->GetMap();
         float top = edge.z + EDGE_LOOK_OFFSET;
         float search = std::max(DEFAULT_HEIGHT_SEARCH, top - foot.z + FOOT_UNDER_SURFACE);
-        float s = player->GetMap()->GetHeight(player->GetPhaseMask(), foot.x, foot.y, top, true, search);
+        float s = map->GetHeight(player->GetPhaseMask(), foot.x, foot.y, top, true, search);
         if (s <= INVALID_HEIGHT || foot.z >= s - FOOT_UNDER_SURFACE)
+            return false;
+        LiquidData const liquid = map->GetLiquidData(player->GetPhaseMask(), foot.x, foot.y, foot.z,
+            player->GetCollisionHeight(), {});
+        if (liquid.Status != LIQUID_MAP_NO_WATER && liquid.Level > INVALID_HEIGHT && liquid.DepthLevel > INVALID_HEIGHT
+            && liquid.Level > liquid.DepthLevel && foot.z <= liquid.Level + SWIM_SURFACE_TOLERANCE)
             return false;
         *surfaceZ = s;
         return true;
