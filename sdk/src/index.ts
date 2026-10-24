@@ -92,6 +92,7 @@ export {
   STREAM_GAP,
 } from "./events";
 export type {
+  ConnectStreamOptions,
   EventByOpcode,
   EventStreamOptions,
   StreamErrorEvent,

@@ -62,7 +62,9 @@ namespace WrathBench
         // Decide an /events upgrade before the handshake: false refuses the
         // socket with 401 so an unauthenticated subscriber never registers.
         virtual bool AuthorizeWs(std::string const& token, std::string const& authorization) = 0;
-        virtual void OnWsOpen(std::string const& token, std::shared_ptr<IWsConn> conn) = 0;
+        // replay: the subscribe carried `replay=1`, asking for the reattach
+        // replay on this connection (PROTOCOL.md, "/events").
+        virtual void OnWsOpen(std::string const& token, std::shared_ptr<IWsConn> conn, bool replay) = 0;
         virtual void OnWsClose(std::string const& token, IWsConn* conn) = 0;
     };
 

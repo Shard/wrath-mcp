@@ -39,12 +39,14 @@ using tcp = asio::ip::tcp;
 
 namespace WrathBench
 {
-    // Split "/events?token=abc&x=1" into path and a token= value.
-    static void SplitTarget(std::string const& target, std::string& path, std::string& token)
+    // Split "/events?token=abc&replay=1" into path, the token= value and
+    // whether replay=1 was asked for (the reattach replay, PROTOCOL.md).
+    static void SplitTarget(std::string const& target, std::string& path, std::string& token, bool& replay)
     {
         auto q = target.find('?');
         path = q == std::string::npos ? target : target.substr(0, q);
         token.clear();
+        replay = false;
         if (q == std::string::npos)
             return;
         std::string query = target.substr(q + 1);
@@ -54,10 +56,13 @@ namespace WrathBench
             auto amp = query.find('&', i);
             std::string pair = query.substr(i, amp == std::string::npos ? std::string::npos : amp - i);
             auto eq = pair.find('=');
-            if (eq != std::string::npos && pair.substr(0, eq) == "token")
+            if (eq != std::string::npos)
             {
-                token = pair.substr(eq + 1);
-                return;
+                std::string const key = pair.substr(0, eq);
+                if (key == "token")
+                    token = pair.substr(eq + 1);
+                else if (key == "replay")
+                    replay = pair.substr(eq + 1) == "1";
             }
             if (amp == std::string::npos) break;
             i = amp + 1;
@@ -68,8 +73,8 @@ namespace WrathBench
     class WsSession : public IWsConn, public std::enable_shared_from_this<WsSession>
     {
     public:
-        WsSession(tcp::socket&& socket, IHttpSink* sink, std::string token)
-            : _ws(std::move(socket)), _sink(sink), _token(std::move(token)) { }
+        WsSession(tcp::socket&& socket, IHttpSink* sink, std::string token, bool replay)
+            : _ws(std::move(socket)), _sink(sink), _token(std::move(token)), _replay(replay) { }
 
         void Run(http::request<http::string_body> req)
         {
@@ -108,7 +113,7 @@ namespace WrathBench
                 return;
             }
             _opened = true;
-            _sink->OnWsOpen(_token, shared_from_this());
+            _sink->OnWsOpen(_token, shared_from_this(), _replay);
             DoRead();
         }
 
@@ -155,6 +160,7 @@ namespace WrathBench
         websocket::stream<tcp::socket> _ws;
         IHttpSink* _sink;
         std::string _token;
+        bool _replay{false};
         beast::flat_buffer _buffer;
         std::deque<std::string> _outbox;
         bool _opened{false};
@@ -197,7 +203,8 @@ namespace WrathBench
                 return;
 
             std::string path, token;
-            SplitTarget(std::string(_req.target()), path, token);
+            bool replay = false;
+            SplitTarget(std::string(_req.target()), path, token, replay);
 
             std::string authorization(_req[http::field::authorization]);
 
@@ -211,7 +218,7 @@ namespace WrathBench
                     SendReply({401, R"({"ok":false,"error":"unauthorized"})"}, false);
                     return;
                 }
-                std::make_shared<WsSession>(_stream.release_socket(), _sink, token)->Run(_req);
+                std::make_shared<WsSession>(_stream.release_socket(), _sink, token, replay)->Run(_req);
                 return; // socket ownership handed off
             }
 

@@ -410,8 +410,13 @@ export type LoginVerifyWorldData = z.infer<typeof loginVerifyWorldDataSchema>;
 /**
  * Synthetic module event: emitted as the first frame when a WebSocket attaches
  * to a session whose character is already in world (reattach after a dropped
- * socket). Carries only what SMSG_LOGIN_VERIFY_WORLD plus the session response
- * would have carried at real login.
+ * socket, a restarted sandbox, a resumed run). Carries only what
+ * SMSG_LOGIN_VERIFY_WORLD plus the session response would have carried at
+ * real login. `replay: true` says the module is about to replay what a
+ * connected client holds — own create block with every item, own auras, the
+ * login packets, a create block for everything in view — ending with
+ * `WB_REPLAY_DONE` (module/PROTOCOL.md, "/events"); a same-token
+ * `createSession` emits the frame without it.
  */
 export const sessionStateDataSchema = z.looseObject({
   character: z.string(),
@@ -429,8 +434,21 @@ export const sessionStateDataSchema = z.looseObject({
   zoneName: z.string().optional(),
   areaId: z.number().optional(),
   areaName: z.string().optional(),
+  replay: z.boolean().optional(),
 });
 export type SessionStateData = z.infer<typeof sessionStateDataSchema>;
+
+/**
+ * Synthetic module event closing a reattach replay (the one a
+ * `WB_SESSION_STATE` with `replay: true` opened): `objects` is how many
+ * objects in view were restated, the character and its items aside. It
+ * carries no game state of its own; it is the mark a consumer waits on
+ * before reading a cache the replay just filled.
+ */
+export const replayDoneDataSchema = z.looseObject({
+  objects: z.number(),
+});
+export type ReplayDoneData = z.infer<typeof replayDoneDataSchema>;
 
 /**
  * Synthetic module event: the map-transition portals in view (PROTOCOL.md,
@@ -1807,6 +1825,7 @@ export const eventDataSchemas = {
   SMSG_GAMEOBJECT_QUERY_RESPONSE: gameObjectQueryResponseDataSchema,
   WB_MOVE_PROGRESS: moveProgressDataSchema,
   WB_SESSION_STATE: sessionStateDataSchema,
+  WB_REPLAY_DONE: replayDoneDataSchema,
   WB_AREA: areaDataSchema,
   WB_MOVE_RESULT: moveResultDataSchema,
   WB_RIDE_PROGRESS: rideProgressDataSchema,

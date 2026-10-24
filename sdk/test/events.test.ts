@@ -627,3 +627,66 @@ describe("event stream: connect() rides the ladder", () => {
     stream.close();
   });
 });
+
+// ----------------------------------------------- asking for the replay
+//
+// `connect({ replay: true })` puts `replay=1` on the one subscribe it opens
+// (module/PROTOCOL.md, "/events"); the ladder's own reconnects never carry it,
+// so a drop in a live stream gets the plain state frame, not a burst.
+
+describe("event stream: asking for the reattach replay", () => {
+  /** A stub that records each subscribe's URL and can drop the socket after the first. */
+  function startUrlStub(opts: { dropFirst?: boolean } = {}) {
+    const urls: string[] = [];
+    const server = Bun.serve<unknown, never>({
+      port: 0,
+      fetch(req, srv) {
+        urls.push(new URL(req.url).search);
+        return srv.upgrade(req, { data: {} }) ? undefined : new Response("no", { status: 400 });
+      },
+      websocket: {
+        open(ws) {
+          if (opts.dropFirst === true && urls.length === 1) setTimeout(() => ws.close(), 10);
+        },
+        message() {},
+      },
+    });
+    return { url: `ws://127.0.0.1:${server.port}/events`, urls, stop: () => server.stop(true) };
+  }
+
+  test("the flag rides the subscribe it was asked on and no other", async () => {
+    const stub = startUrlStub();
+    const stream = new EventStream({ url: stub.url, token: "t", reconnect: false });
+    await stream.connect({ replay: true });
+    expect(stub.urls).toEqual(["?token=t&replay=1"]);
+    // Already open: a second ask opens nothing and so asks nothing.
+    await stream.connect({ replay: true });
+    expect(stub.urls).toHaveLength(1);
+    stream.close();
+    // A deliberate reopen without the flag is plain.
+    await stream.connect();
+    expect(stub.urls).toEqual(["?token=t&replay=1", "?token=t"]);
+    stream.close();
+    await stub.stop();
+  });
+
+  test("the ladder's reconnect after a drop does not ask", async () => {
+    const stub = startUrlStub({ dropFirst: true });
+    const stream = new EventStream({ url: stub.url, token: "t", reconnectMinDelayMs: 5, reconnectMaxDelayMs: 20 });
+    await stream.connect({ replay: true });
+    const deadline = Date.now() + 3_000;
+    while (stub.urls.length < 2 && Date.now() < deadline) await Bun.sleep(10);
+    expect(stub.urls).toEqual(["?token=t&replay=1", "?token=t"]);
+    stream.close();
+    await stub.stop();
+  });
+
+  test("a plain connect() never asks", async () => {
+    const stub = startUrlStub();
+    const stream = new EventStream({ url: stub.url, token: "t", reconnect: false });
+    await stream.connect();
+    expect(stub.urls).toEqual(["?token=t"]);
+    stream.close();
+    await stub.stop();
+  });
+});

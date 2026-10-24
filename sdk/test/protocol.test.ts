@@ -111,6 +111,7 @@ describe("event frames", () => {
       "SMSG_GAMEOBJECT_QUERY_RESPONSE",
       "WB_MOVE_PROGRESS",
     "WB_SESSION_STATE",
+      "WB_REPLAY_DONE",
       "WB_AREA",
       "WB_MOVE_RESULT",
       "WB_RIDE_PROGRESS",

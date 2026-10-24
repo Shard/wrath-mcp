@@ -1937,6 +1937,16 @@ export class StateCache {
   private selfMap: number | undefined;
 
   /**
+   * A reattach replay is in flight (`WB_SESSION_STATE` with `replay: true`
+   * seen, `WB_REPLAY_DONE` not yet): the replay's own self create block
+   * replaces `self.fields` instead of merging into them, because a create
+   * block carries no zero-valued field and a merge would keep a stale
+   * non-zero value from before the socket went down (money spent to zero,
+   * a quest slot emptied) under the replayed truth.
+   */
+  private replayPending = false;
+
+  /**
    * The last spline the server launched for our own character
    * (`SMSG_MONSTER_MOVE` for our guid), kept until it is landed on or
    * superseded. A client flies itself along it locally; the module serves its
@@ -3102,6 +3112,7 @@ export class StateCache {
           character: string; guid: GuidKey; map: number; x: number; y: number;
           z: number; o: number; level: number; mapName?: string; instanceType?: number;
           zoneId?: number; zoneName?: string; areaId?: number; areaName?: string;
+          replay?: boolean;
         };
         if (this.seed.guid !== undefined && this.seed.guid !== d.guid) {
           this.anomalyBuf.push({
@@ -3113,7 +3124,19 @@ export class StateCache {
           return;
         }
         if (this.seed.guid === undefined) this.seedSelf({ guid: d.guid, name: d.character });
-        this.evictOnMapChange(d.map);
+        // A replay follows: the module is about to restate everything a
+        // client holds, own items included, so nothing seen before it is
+        // still vouched for. A restarted child has nothing here anyway; a
+        // reopened socket in a live child may hold objects that left view
+        // while it was down, and a replayed set that lacks them is the
+        // truth. Self fields stay: the create block that follows restates
+        // every non-zero one, as the login's does.
+        if (d.replay === true) {
+          this.forgetAllNearby();
+          this.replayPending = true;
+        } else {
+          this.evictOnMapChange(d.map);
+        }
         this.selfMap = d.map;
         this.self.position = {
           value: { map: d.map, x: d.x, y: d.y, z: d.z, o: d.o },
@@ -3145,6 +3168,13 @@ export class StateCache {
         this.placeGraveyard(false);
         return;
       }
+      case "WB_REPLAY_DONE":
+        // The mark that closes a reattach replay. Everything it vouches for
+        // arrived as ordinary frames before it; the cache has nothing to add.
+        // A replay that stopped short (`incomplete`) never sent its self
+        // create, so the next ordinary one must merge as usual.
+        this.replayPending = false;
+        return;
       case "WB_PORTALS": {
         // The portals in view, the whole set on each change (PROTOCOL.md).
         const d = event.data as {
@@ -4299,6 +4329,18 @@ export class StateCache {
       if (block.runSpeed !== undefined) {
         this.self.fields.set("runSpeed", { value: block.runSpeed, seq, ts });
       }
+      if (this.replayPending) {
+        // The replay's own create is the whole field block, as a login's is
+        // to a fresh cache: what it leaves out is zero, not "unchanged".
+        this.replayPending = false;
+        const kept = new Map<string, Observed<number>>();
+        for (const key of ["moveFlags", "runSpeed"]) {
+          const v = this.self.fields.get(key);
+          if (v !== undefined) kept.set(key, v);
+        }
+        this.self.fields.clear();
+        for (const [key, v] of kept) this.self.fields.set(key, v);
+      }
       this.mergeFields(this.self, block.fields, seq, ts);
       return;
     }
@@ -4358,6 +4400,16 @@ export class StateCache {
       if (t === "item" || t === "container") continue;
       this.forget(guid);
     }
+  }
+
+  /**
+   * The whole view goes, own items and containers included: the reattach
+   * replay (`WB_SESSION_STATE` with `replay: true`) restates every one of
+   * them in the create blocks that follow, so what is not restated was not
+   * at the client any more.
+   */
+  private forgetAllNearby(): void {
+    for (const guid of [...this.nearby.keys()]) this.forget(guid);
   }
 
   /**
@@ -4725,7 +4777,11 @@ export class StateCache {
 
   /**
    * Copy the char-enum row for our own character onto `self`. Only runs when a
-   * seed identified us; matching by name alone would be a guess.
+   * seed identified us; matching by name alone would be a guess. The row's
+   * level is the one at the character screen, so it only fills a level
+   * nothing else has stated: a `createSession` repeated on a session already
+   * in world seeds self again, and would otherwise put the login's level back
+   * over the one `WB_SESSION_STATE` and the update blocks have said since.
    */
   private adoptOwnCharacter(): void {
     const enumerated = this.characters;
@@ -4737,7 +4793,7 @@ export class StateCache {
     if (!row) return;
     if (this.self.guid === undefined) this.self.guid = row.guid;
     if (this.self.name === undefined) this.self.name = row.name;
-    this.self.level = { value: row.level, seq: enumerated.seq, ts: enumerated.ts };
+    if (this.self.level === undefined) this.self.level = { value: row.level, seq: enumerated.seq, ts: enumerated.ts };
   }
 
   /**

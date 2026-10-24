@@ -144,6 +144,19 @@ export interface EventStreamOptions {
   now?: () => number;
 }
 
+/** Options for `EventStream.connect()`. */
+export interface ConnectStreamOptions {
+  /**
+   * Ask the module for the reattach replay on the socket this call opens
+   * (module/PROTOCOL.md, "/events"): the `WB_SESSION_STATE` then marks
+   * `replay: true` and is followed by everything a connected client holds,
+   * closed by `WB_REPLAY_DONE`. For a caller whose cache holds nothing — a
+   * restarted sandbox child, a resumed run. Ignored while the stream is
+   * already open; never set by the stream's own reconnects.
+   */
+  replay?: boolean;
+}
+
 export interface WaitForOptions {
   /** Reject with `EventTimeoutError` after this many ms. Default 10000. */
   timeout?: number;
@@ -261,6 +274,8 @@ export class EventStream implements AsyncIterable<StreamEvent> {
   readonly token: string;
 
   private readonly url: string;
+  /** Set by `connect({ replay: true })`, consumed by the next socket opened. */
+  private replayOnOpen = false;
   // An ECMAScript private field, not TS `private`: the sandbox shares the
   // ambient client's event stream with snippet code, and a `#`-field is absent
   // from `Object.keys`/`Reflect.ownKeys`/`JSON.stringify`/`Bun.inspect`, so the
@@ -346,7 +361,7 @@ export class EventStream implements AsyncIterable<StreamEvent> {
    * really did end stay ended, because they were the caller's to end: the
    * `waitFor`s it rejected, and the async iterators it finished.
    */
-  connect(): Promise<void> {
+  connect(options: ConnectStreamOptions = {}): Promise<void> {
     // The deliberate reopen: the close is no longer in force, and the next
     // failure ladder starts from its first rung rather than the cap.
     if (this.closedByUser) {
@@ -354,6 +369,12 @@ export class EventStream implements AsyncIterable<StreamEvent> {
       this.attempt = 0;
     }
     if (this.connected) return Promise.resolve();
+    // Asked for by a caller that holds nothing (a restarted sandbox child, a
+    // resumed run): the next socket this opens subscribes with `replay=1`,
+    // and the module answers it with the reattach replay (PROTOCOL.md,
+    // "/events"). The ladder's own reconnects never ask — a live cache
+    // wants the plain state frame, not its view dropped and restated.
+    if (options.replay === true) this.replayOnOpen = true;
     return new Promise<void>((resolve, reject) => {
       this.connectWaiters.add({ resolve, reject, failures: 0 });
       // A socket in CONNECTING (or CLOSING, whose close will reschedule) or a
@@ -441,11 +462,15 @@ export class EventStream implements AsyncIterable<StreamEvent> {
     // Bun's WebSocket takes request headers as a second-argument option (the
     // WHATWG signature has only protocols there, hence the cast). Custom
     // implementations receive the same object and may ignore it.
+    // The replay flag rides this one subscribe and no later one: whether this
+    // attempt succeeds or the ladder retries it, the request was made once.
+    const url = this.replayOnOpen ? `${this.url}&replay=1` : this.url;
+    this.replayOnOpen = false;
     const ws =
       this.#secret === undefined
-        ? new this.WS(this.url)
+        ? new this.WS(url)
         : new (this.WS as unknown as new (url: string, init: { headers: Record<string, string> }) => WebSocket)(
-            this.url,
+            url,
             { headers: { authorization: `Bearer ${this.#secret}` } },
           );
     this.socket = ws;

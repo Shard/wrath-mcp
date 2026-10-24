@@ -228,6 +228,19 @@ namespace WrathBench
         int64_t lastPortalCheckMs{0};
         std::string portalsKey;
 
+        // The reattach replay (PROTOCOL.md, "/events"). Connections that
+        // subscribed with replay=1 and are owed a replay, and when it is
+        // due: both under _sessMutex (io threads add, the world thread's
+        // TickReplays drains). lastReplayMs is world thread only; the
+        // minimum interval between two replays of one session is measured
+        // from it. replayTargets is non-null only while the world thread is
+        // sending a replay, and points EmitEvent at the connections that
+        // asked instead of every subscriber of the token.
+        std::vector<std::shared_ptr<IWsConn>> replayWaiters;
+        int64_t replayDueMs{0};
+        int64_t lastReplayMs{0};
+        std::atomic<std::vector<std::shared_ptr<IWsConn>> const*> replayTargets{nullptr};
+
         // Map transfer in flight: the destination map from SMSG_TRANSFER_PENDING,
         // cleared by SMSG_NEW_WORLD / SMSG_TRANSFER_ABORTED. Set on tap threads,
         // read by the mover on the world thread, hence atomic.
@@ -326,7 +339,7 @@ namespace WrathBench
         HttpReply HandleHttp(std::string const& method, std::string const& target, std::string const& body,
             std::string const& authorization, bool loopbackPeer) override;
         bool AuthorizeWs(std::string const& token, std::string const& authorization) override;
-        void OnWsOpen(std::string const& token, std::shared_ptr<IWsConn> conn) override;
+        void OnWsOpen(std::string const& token, std::shared_ptr<IWsConn> conn, bool replay) override;
         void OnWsClose(std::string const& token, IWsConn* conn) override;
 
     private:
@@ -587,10 +600,27 @@ namespace WrathBench
         void EmitEvent(BenchSession& s, std::string const& opcodeName, uint16_t opcodeId, std::string const& dataJson);
         // Emit one synthetic WB_SESSION_STATE for an in-world session (see
         // module/PROTOCOL.md): the client-visible self state a fresh
-        // SMSG_LOGIN_VERIFY_WORLD carries.
-        // World thread only (reads Player). Reused by the WS-reattach path and by
-        // an idempotent same-token createSession so the caller re-syncs state.
-        void EmitSessionState(std::shared_ptr<BenchSession> const& s);
+        // SMSG_LOGIN_VERIFY_WORLD carries. With `replayTo`, the frame says
+        // `replay: true`, the reattach replay follows it (ReplayClientState)
+        // and all of it goes to those connections alone. World thread only
+        // (reads Player). TickReplays passes the connections that asked; an
+        // idempotent same-token createSession and a plain subscribe pass
+        // nullptr and get the state frame alone, fanned out as any event.
+        void EmitSessionState(std::shared_ptr<BenchSession> const& s,
+            std::vector<std::shared_ptr<IWsConn>> const* replayTo);
+        // Run the replays that are due: one burst per session, shared by
+        // every connection that asked since the last one, no sooner than
+        // REPLAY_MIN_INTERVAL_MS after it. World thread, from Update.
+        void TickReplays(int64_t nowMs);
+        // Re-send what a connected client holds for this character: the login
+        // packets that carry state outside update fields, the transports, its
+        // own create block with every item and bag, its auras, a create block
+        // for everything in its visibility set, and the pet bar, closed by
+        // WB_REPLAY_DONE — always, an exception included. Every packet is one
+        // the core's own login path sends, built by the core's own builders;
+        // nothing is broadcast and no server state moves (PROTOCOL.md,
+        // "/events"). World thread only.
+        void ReplayClientState(BenchSession& s, Player* player);
         void Audit(BenchSession& s, char const* kind, std::string const& json);
         // Open (or roll to) the session's audit file for a UTC day. auditMutex held.
         void OpenAudit(BenchSession& s, int64_t day);
