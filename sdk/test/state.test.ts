@@ -2005,6 +2005,7 @@ describe("state cache: quest objectives from the quest query", () => {
   test("before the query answers, the entry has no title and objectives are undefined, not []", () => {
     const q = withWorld([questAccepted]).quest(QUEST_ID)!;
     expect(q.title).toBeUndefined();
+    expect(q.level).toBeUndefined();
     expect(q.objectives).toBeUndefined();
     expect(q.counts).toEqual([0, 0, 0, 0]);
   });
@@ -2015,6 +2016,7 @@ describe("state cache: quest objectives from the quest query", () => {
     expect(c.quests.get(QUEST_ID)?.value.level).toBe(3);
     const q = c.quest(QUEST_ID)!;
     expect(q.title).toBe("Kobold Camp Cleanup");
+    expect(q.level).toBe(3);
     expect(q.objectives).toEqual([
       { kind: "kill", entry: KOBOLD_ENTRY, text: undefined, required: 8, have: 0, done: false },
       { kind: "interact", entry: GO_ENTRY, text: "Unlock the chest", required: 1, have: 0, done: false },
@@ -2145,6 +2147,27 @@ describe("state cache: quest objectives from the quest query", () => {
       wornBagCreate,
     ]);
     expect(mixed.quest(QUEST_ID)!.objectives!.at(-1)).toMatchObject({ kind: "collect", have: 2, done: false });
+  });
+
+  test("a quest that scales to the player (template level -1 or 0) reads as the character's level", () => {
+    const scaling = (level: number) => {
+      const r = questQueryResponse() as { data: Record<string, unknown> };
+      return { ...r, data: { ...r.data, level } };
+    };
+    const c = withWorld([questAccepted, scaling(-1)]);
+    const own = c.self.level?.value;
+    expect(own).toBeGreaterThan(0);
+    expect(c.quests.get(QUEST_ID)?.value.level).toBe(-1);
+    expect(c.quest(QUEST_ID)?.level).toBe(own);
+    expect(withWorld([questAccepted, scaling(0)]).quest(QUEST_ID)?.level).toBe(own);
+  });
+
+  test("a scaling quest has no level while the character's level is unobserved", () => {
+    const r = questQueryResponse() as { data: Record<string, unknown> };
+    const c = withWorld([questAccepted, { ...r, data: { ...r.data, level: -1 } }]);
+    (c.self as { level: unknown }).level = undefined;
+    expect(c.quest(QUEST_ID)?.title).toBe("Kobold Camp Cleanup");
+    expect(c.quest(QUEST_ID)?.level).toBeUndefined();
   });
 
   test("the answer arriving before the log entry still joins; the template is never pruned", () => {

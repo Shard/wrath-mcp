@@ -694,6 +694,16 @@ export interface QuestLogEntry {
   /** From the quest query answer, once it has arrived. */
   readonly title: string | undefined;
   /**
+   * The quest's level as the client's quest log shows it, from the quest
+   * query answer's `level`. A template level of -1 (or 0) marks a quest that
+   * scales to the player, and reads as the character's current level: the
+   * core resolves it that way itself (`Player::GetQuestLevel`), and its
+   * response writer notes the client must do the same. `undefined` until the
+   * answer has arrived, or while a scaling quest's character level is
+   * unobserved. The raw template value stays on `state.quests`.
+   */
+  readonly level: number | undefined;
+  /**
    * The objectives as the client's quest log renders them ("Kobold Vermin
    * slain: 3/8"), joined from the quest query answer (`required`, `text`,
    * `entry`) and the log's own counters (`have`). `undefined` until
@@ -2090,6 +2100,7 @@ export class StateCache {
         slot,
         questId: id.value,
         title: info?.title,
+        level: questLogLevel(info?.level, this.self.level?.value),
         objectives: info === undefined ? undefined : this.questObjectives(info, counts, complete),
         state: raw,
         complete,
@@ -5307,6 +5318,15 @@ function toUnitPosition(pos: PositionData): UnitPosition {
 const QUEST_LOG_SLOTS = 25;
 /** The quest log's completion bit, the one the probe verified live. */
 const QUEST_STATE_COMPLETE = 1;
+/**
+ * A quest log entry's level: the template's when it is positive, else the
+ * character's (`Player::GetQuestLevel`, the core's own resolution of a quest
+ * that scales to the player). `undefined` when either half is unobserved.
+ */
+function questLogLevel(template: number | undefined, character: number | undefined): number | undefined {
+  if (template === undefined) return undefined;
+  return template > 0 ? template : character;
+}
 /** `QUEST_FLAGS_EXPLORATION` in the template's flags (QuestDef.h): the quest has an exploration objective. */
 const QUEST_FLAGS_EXPLORATION = 0x4;
 /** A quest-log slot's quest id field, `quest<slot>Id`. */
