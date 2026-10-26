@@ -7845,6 +7845,12 @@ namespace WrathBench
                     w.Add("questId", questId);
                     break;
                 }
+                // The quest log's 25 slots are taken (Player::SatisfyQuestLog):
+                // an accept adds nothing and the client shows "Quest log is
+                // full." Bodiless; the refused quest is not named.
+                case SMSG_QUESTLOG_FULL:
+                    name = "SMSG_QUESTLOG_FULL";
+                    break;
                 // ---------------------------------------------------- gossip
                 case SMSG_GOSSIP_MESSAGE:
                 {

@@ -1469,6 +1469,7 @@ Quests and gossip (quest/gossip text served as the client would show it):
 | `SMSG_QUESTUPDATE_ADD_ITEM` | 0x19A | `{}` — the core sends it empty; item progress is in the quest-log update fields |
 | `SMSG_QUESTUPDATE_COMPLETE` | 0x198 | `{ "questId" }` — an exploration or scripted-event objective credited: its only sender is `Player::AreaExploredOrEventHappens`, once per accept, when the server-only `Explored` flag flips, whether or not the rest of the quest is done. NOT sent for kill/item objectives at the pinned commit; read completion from the quest-log `State` complete bit or the final `ADD_KILL` with `current == required` |
 | `SMSG_QUESTUPDATE_FAILED` | 0x196 | `{ "questId" }` |
+| `SMSG_QUESTLOG_FULL` | 0x195 | `{}` — bodiless: the quest log's 25 slots are taken, so an accept (or an auto-accept on a hello or query) added nothing (`Player::SatisfyQuestLog`); the client shows "Quest log is full." The refused quest is not named |
 | `SMSG_GOSSIP_MESSAGE` | 0x17D | `{ "guid", "menuId", "textId", "options": [{ "optionId", "icon", "text" }], "quests": [{ "questId", "icon", "level", "title" }] }` |
 | `SMSG_GOSSIP_COMPLETE` | 0x17E | `{}` |
 

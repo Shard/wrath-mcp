@@ -863,6 +863,17 @@ export function inventoryChangeFailure(
   };
 }
 
+/** The bodiless refusal of an accept on a full quest log (`Player::SatisfyQuestLog`). */
+export function questLogFull(seq: number): unknown {
+  return {
+    seq,
+    opcode: "SMSG_QUESTLOG_FULL",
+    opcodeId: 0x195,
+    ts: 1_700_000_000_496,
+    data: {},
+  };
+}
+
 /** The source slot zeroed with no arrival seen: the item left the backpack. */
 export function inventorySlotCleared(seq: number, slot: number): unknown {
   return selfFields(seq, { [`invSlot${slot}Lo`]: 0, [`invSlot${slot}Hi`]: 0 });

@@ -64,6 +64,7 @@ import {
   questGiverList,
   questGiverStatus,
   questGiverStatusMultiple,
+  questLogFull,
   questProgress,
   questQueryResponse,
   questRewarded,
@@ -2642,6 +2643,45 @@ describe("client: quests", () => {
     expect(result.hint).toContain("free a bag slot");
     expect(client.state.quest(QUEST_ID)).toBeUndefined();
     expect(client.drainActionHints()[0]).toMatchObject({ action: "acceptQuestFrom", status: "inventory_full" });
+    client.close();
+    await stub.stop();
+  });
+
+  test("an accept on a full quest log is quest_log_full at once, not a timeout", async () => {
+    // Player::SatisfyQuestLog: the core adds nothing and sends the bodiless
+    // SMSG_QUESTLOG_FULL, the client's "Quest log is full."
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    const started = Date.now();
+    const pending = client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 5000 });
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify(questGiverList([QUEST_ID], 86)));
+    await untilAction(stub, "quest_accept");
+    stub.push(JSON.stringify(questLogFull(87)));
+    const result = await pending;
+    expect(Date.now() - started).toBeLessThan(2000);
+    if (result.ok || result.status !== "quest_log_full") throw new Error(`unexpected ${result.status}`);
+    expect(result.questId).toBe(QUEST_ID);
+    expect(result.hint).toContain("25 quests");
+    expect(result.hint).toContain("questAbandon");
+    expect(client.state.quest(QUEST_ID)).toBeUndefined();
+    expect(client.drainActionHints()[0]).toMatchObject({ action: "acceptQuestFrom", status: "quest_log_full" });
+    client.close();
+    await stub.stop();
+  });
+
+  test("a full-log refusal from before the accept is not read as its answer", async () => {
+    // An auto-accept hello on a full log sends its own SMSG_QUESTLOG_FULL
+    // before the accept; only one after the accept answers it.
+    const stub = startStub({ onConnect: () => [...questWorld(), JSON.stringify(questLogFull(31))] });
+    const client = await inWorld(stub);
+    await client.events.waitFor((e) => e.seq === 31, { timeout: 2000 });
+    const pending = client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 2000 });
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify(questGiverList([QUEST_ID], 88)));
+    await untilAction(stub, "quest_accept");
+    stub.push(JSON.stringify({ ...(questAccepted as object), seq: 89 }));
+    expect(await pending).toMatchObject({ ok: true, status: "accepted", questId: QUEST_ID });
     client.close();
     await stub.stop();
   });
@@ -5677,6 +5717,23 @@ describe("client: quest-start items and the questgiver marker pre-check (2026-08
     const result = await accept;
     expect(result).toMatchObject({ ok: true, status: "accepted", questId: START_QUEST, title: "The Tome of Divinity" });
     expect(stub.actions.map((x) => x.action)).not.toContain("quest_list");
+    client.close();
+    await stub.stop();
+  });
+
+  test("acceptQuestFrom(itemGuid) on a full quest log is quest_log_full at once, not a timeout", async () => {
+    const stub = startStub({ onConnect: () => tome() });
+    const client = await inWorld(stub);
+    await client.events.waitForOpcode("SMSG_ITEM_QUERY_SINGLE_RESPONSE", { timeout: 2000 });
+    const started = Date.now();
+    const accept = client.acceptQuestFrom(ITEM_GUID, START_QUEST, { timeout: 5000 });
+    await untilAction(stub, "quest_details");
+    stub.push(details(91, ITEM_GUID, START_QUEST));
+    await untilAction(stub, "quest_accept");
+    stub.push(JSON.stringify(questLogFull(92)));
+    const result = await accept;
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(result).toMatchObject({ ok: false, status: "quest_log_full", questId: START_QUEST });
     client.close();
     await stub.stop();
   });

@@ -1881,6 +1881,7 @@ export const eventDataSchemas = {
   SMSG_QUESTUPDATE_ADD_ITEM: questUpdateAddItemDataSchema,
   SMSG_QUESTUPDATE_COMPLETE: questUpdateQuestIdDataSchema,
   SMSG_QUESTUPDATE_FAILED: questUpdateQuestIdDataSchema,
+  SMSG_QUESTLOG_FULL: emptyDataSchema,
   SMSG_GOSSIP_MESSAGE: gossipMessageDataSchema,
   SMSG_GOSSIP_COMPLETE: emptyDataSchema,
   // loot, vendor, inventory

@@ -2248,6 +2248,16 @@ export type QuestAcceptResult =
     }
   | {
       readonly ok: false;
+      /**
+       * The quest log's 25 slots are taken (`SMSG_QUESTLOG_FULL`), so the
+       * quest was not added — accept again once one is abandoned or turned in.
+       */
+      readonly status: "quest_log_full";
+      readonly questId: number;
+      readonly hint: string;
+    }
+  | {
+      readonly ok: false;
       /** The cached positions put the questgiver out of reach; nothing was sent. */
       readonly status: "too_far";
       readonly questId: number;
@@ -2558,6 +2568,10 @@ const SINGLE_OFFER_OPCODES: ReadonlySet<string> = new Set([
  * window; the bound leaves room for a loaded server.
  */
 const QUEST_LOG_CATCH_UP_MS = 1000;
+
+/** `acceptQuestFrom`'s hint when the server answers `SMSG_QUESTLOG_FULL`. */
+const QUEST_LOG_FULL_HINT =
+  "the quest log is full (it holds 25 quests) — abandon one (questAbandon) or turn one in, then accept again";
 
 /** The questgiver markers that say "nothing to offer" before a quest list is even asked for. */
 const OFFERS_NOTHING: ReadonlySet<QuestGiverStatusName> = new Set([
@@ -7887,22 +7901,26 @@ export class WrathClient {
       // Raced against the quest landing in the log: a quest that gives an item
       // on accept is refused with SMSG_INVENTORY_CHANGE_FAILURE when the item
       // does not fit, and the quest is never added — the same answer
-      // turnInQuest reads for a reward that does not fit. Only a failure after
-      // this accept counts.
+      // turnInQuest reads for a reward that does not fit. A full log is
+      // refused with the bodiless SMSG_QUESTLOG_FULL, likewise adding nothing.
+      // Only a refusal after this accept counts: an auto-accept hello on a
+      // full log sends one of its own before it.
       const sinceSeq = this.events.recent(1)[0]?.seq;
       await this.questAccept(npc, questId);
       let quest = this.state.quest(questId);
       let refused: InventoryChangeFailureData | undefined;
+      let logFull = false;
       if (quest === undefined) {
         await this.waitEvent(
           (e) => {
             quest = this.state.quest(questId);
             if (quest !== undefined) return true;
-            if (
-              isEvent(e, "SMSG_INVENTORY_CHANGE_FAILURE") &&
-              !isDecodeError(e.data) &&
-              (sinceSeq === undefined || e.seq > sinceSeq)
-            ) {
+            if (sinceSeq !== undefined && e.seq <= sinceSeq) return false;
+            if (isEvent(e, "SMSG_QUESTLOG_FULL")) {
+              logFull = true;
+              return true;
+            }
+            if (isEvent(e, "SMSG_INVENTORY_CHANGE_FAILURE") && !isDecodeError(e.data)) {
               refused = e.data as InventoryChangeFailureData;
               return true;
             }
@@ -7911,9 +7929,15 @@ export class WrathClient {
           {
             timeout,
             ...(sinceSeq === undefined ? {} : { sinceSeq: sinceSeq + 1 }),
-            description: `quest ${questId} to appear in the quest log after accept (or SMSG_INVENTORY_CHANGE_FAILURE)`,
+            description:
+              `quest ${questId} to appear in the quest log after accept ` +
+              `(or SMSG_INVENTORY_CHANGE_FAILURE, or SMSG_QUESTLOG_FULL)`,
           },
         );
+      }
+      if (quest === undefined && logFull) {
+        this.noteActionHint("acceptQuestFrom", "quest_log_full", QUEST_LOG_FULL_HINT);
+        return { ok: false, status: "quest_log_full", questId, hint: QUEST_LOG_FULL_HINT };
       }
       if (quest === undefined && refused !== undefined) {
         const named = inventoryResultText(refused.result);
