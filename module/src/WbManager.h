@@ -43,6 +43,7 @@ class Player;
 // The parked-socket client end is an Asio tcp socket; forward-declare the type
 // so the header stays free of Asio. Defined in AzerothCore's Socket.h.
 #include "Socket.h" // for IoContextTcpSocket
+#include "Timer.h"  // getMSTime: the "client" clock's epoch (BenchSession)
 #include <boost/asio/io_context.hpp>
 
 namespace WrathBench
@@ -142,6 +143,7 @@ namespace WrathBench
         int64_t fallStartMs{0};     // ... since when (the edge heartbeat), and
         uint64_t fallMs{0};         // ... how long the fall takes (FallMs): the segment is timed by it, not by the run
         bool swimming{false};       // the "client" is swimming: packets carry MOVEMENTFLAG_SWIMMING, pace is swim speed
+        float sentO{0};             // orientation of the last movement packet sent (SendMovePacket): what the server and observers hold
     };
 
     // Per-token headless session. See docs/METHODOLOGY.md ("Client fidelity")
@@ -192,6 +194,13 @@ namespace WrathBench
         std::atomic<uint64_t> dropCount{0};
         std::atomic<uint64_t> eventSeq{0};
         std::atomic<bool> tearingDown{false};
+
+        // The "client" clock: milliseconds since this session was created, as
+        // a client's clock is its own and not the server's. Every timestamp the
+        // module sends as the client's (movement packets, CMSG_TIME_SYNC_RESP)
+        // reads it, so the server's time sync measures one consistent offset
+        // and translates the movement times with it (ClientMSTime, WbManager.cpp).
+        uint32_t const clientClockEpochMs{getMSTime()};
 
         // Movement synthesis (world thread only).
         MoveState move;
@@ -254,6 +263,37 @@ namespace WrathBench
         // while it is set the mover stops and move_to is refused `rooted`.
         // Written on tap threads, read on the world thread, hence atomic.
         std::atomic<bool> rooted{false};
+
+        // The movement-state flags this "client" has been told it has
+        // (MOVEMENTFLAG_WATERWALKING, _FALLING_SLOW, _HOVER, _CAN_FLY): set and
+        // cleared by SMSG_MOVE_WATER_WALK / _LAND_WALK, _FEATHER_FALL /
+        // _NORMAL_FALL, _SET_HOVER / _UNSET_HOVER, _SET_CAN_FLY / _UNSET_CAN_FLY
+        // (OnMoveFlagPacket), SMSG_MULTIPLE_MOVES' sub-packets and the
+        // SMSG_SPLINE_MOVE_ twins of the first three. A client carries them on
+        // every movement packet it sends, so AppendMovementInfo ORs them in:
+        // the core replaces its whole record of the flags with each packet's.
+        // Written on tap threads, read on the world thread, hence atomic.
+        std::atomic<uint32_t> stateMoveFlags{0};
+
+        // Answers this "client" owes and sends on the module's next world
+        // tick rather than inside the packet tap (Manager::TickClientAnswers),
+        // in the order the server's packets arrived: CMSG_TIME_SYNC_RESP and
+        // the forced speed-change acks. The tap runs inside
+        // WorldSession::SendPacket, before the core has finished with the
+        // packet (SendTimeSync stamps its send time only after SendPacket
+        // returns), and an ack must be judged against the server's state when
+        // the core will read it, not when it was asked for. The world tick
+        // runs after the session and map updates, so an answer queued then is
+        // read at the start of the next one: a real round trip. Pushed on tap
+        // threads, drained on the world thread, hence the mutex.
+        struct PendingAnswer
+        {
+            uint16_t opcode{0};   // SMSG_TIME_SYNC_REQ or the SMSG_FORCE_* change being answered
+            uint32_t counter{0};
+            float speed{0.0f};    // the speed change's new speed, echoed
+        };
+        std::mutex answerMutex;
+        std::vector<PendingAnswer> pendingAnswers;
 
         // Teleport-ack pacing (world thread only): when the last ack for a
         // still-pending teleport was queued, 0 when none is pending. See
@@ -598,6 +638,29 @@ namespace WrathBench
         // from the root packets, SMSG_MULTIPLE_MOVES' sub-packets included.
         void OnRootPacket(BenchSession& s, WorldSession* ws, uint16_t opcode, WorldPacket const& packet);
         void AnswerForceRoot(BenchSession& s, WorldSession* ws, bool root, uint64_t guid, uint32_t counter);
+
+        // Forced speed changes, answered the way a client answers them (tap
+        // threads): each SMSG_FORCE_*_SPEED_CHANGE / *_RATE_CHANGE for the
+        // character's own guid gets the matching CMSG_..._ACK, queued the
+        // moment the server sends it. The ack is what tells observers the new
+        // speed (HandleForceSpeedChangeAck relays MSG_MOVE_SET_*_SPEED).
+        void OnSpeedChangePacket(BenchSession& s, WorldSession* ws, uint16_t opcode, WorldPacket const& packet);
+
+        // Send the answers the tap queued (BenchSession::pendingAnswers):
+        // time-sync responses and speed-change acks, world thread only, for
+        // every live session whether or not its character is in a map (a far
+        // teleport's time sync included).
+        void TickClientAnswers();
+        void SendSpeedChangeAck(BenchSession& s, WorldSession* ws, Player* player, uint16_t opcode, uint32_t counter,
+            float speed, uint8_t alreadySent);
+
+        // Forced movement-state changes, answered the same way (tap threads):
+        // water walk, feather fall, hover and can-fly, each set/unset packet
+        // for the character's own guid updating stateMoveFlags and getting its
+        // CMSG_MOVE_*_ACK (HandleMoveFlagChangeOpcode relays MSG_MOVE_* to the
+        // set). AnswerMoveFlag is shared with SMSG_MULTIPLE_MOVES (OnRootPacket).
+        void OnMoveFlagPacket(BenchSession& s, WorldSession* ws, uint16_t opcode, WorldPacket const& packet);
+        void AnswerMoveFlag(BenchSession& s, WorldSession* ws, uint16_t opcode, uint64_t guid, uint32_t counter);
 
         // Ask MSG_CORPSE_QUERY once per death, after the ghost's graveyard
         // teleport has been acked, the way a client does on becoming a ghost

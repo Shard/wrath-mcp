@@ -343,6 +343,18 @@ sequence a real client would send (`MSG_MOVE_START_FORWARD`, heartbeats every
 in water (Swimming, below). The caller never sees the path — only progress
 and a terminal result event.
 
+Turns. Where the route bends, the walk reports the turn when it passes the
+point, as a client reports its own turn mid-run: `MSG_MOVE_SET_FACING` with
+`MOVEMENTFLAG_FORWARD`, where the body is, with the new leg's heading, and
+the heartbeat interval restarts from it. Observers run a character on along
+the last heading they were sent, so without it they carried it past each
+bend for up to a heartbeat and then snapped it back. One packet per change of
+more than about 3 degrees (0.05 rad) from the heading last sent, so a curve
+of smaller bends is reported once their sum passes that; none between a
+forced ledge's edge and its landing (`force`, below). The packets carry the
+session's own client clock (Speed changes and the clock, under
+"Movement/observation extension").
+
 Request:
 ```json
 { "token": "run-abc123", "action": "move_to", "x": -8913.2, "y": -137.6, "z": 80.9 }
@@ -1000,6 +1012,130 @@ guid (the multiple-moves sub-packet included), cleared by their unroot twins.
 While it is set the mover stops (`rooted`, above) and `move_to` is refused
 `rooted`. `face` still turns, which is right for a root; a stunned client
 cannot turn, and the module does not yet tell the two apart.
+
+Speed changes and the clock. The core changes the speed of a unit its client
+controls by packet too (`Unit::SetSpeed` -> `SendSpeedToController`):
+`SMSG_FORCE_WALK_SPEED_CHANGE` (0x2DA), `SMSG_FORCE_RUN_SPEED_CHANGE` (0x0E2),
+`SMSG_FORCE_RUN_BACK_SPEED_CHANGE` (0x0E4), `SMSG_FORCE_SWIM_SPEED_CHANGE`
+(0x0E6), `SMSG_FORCE_SWIM_BACK_SPEED_CHANGE` (0x2DC),
+`SMSG_FORCE_TURN_RATE_CHANGE` (0x2DE), `SMSG_FORCE_FLIGHT_SPEED_CHANGE`
+(0x381), `SMSG_FORCE_FLIGHT_BACK_SPEED_CHANGE` (0x383) and
+`SMSG_FORCE_PITCH_RATE_CHANGE` (0x45C), each a packGUID, a `u32` movement
+counter, a `u8` on the run-speed packet only, and the new speed, sent to the
+controlling client alone. Observers learn the speed only from that client's
+answer, the matching ack (`CMSG_FORCE_WALK_SPEED_CHANGE_ACK` 0x2DB,
+`..._RUN_...` 0x0E3, `..._RUN_BACK_...` 0x0E5, `..._SWIM_...` 0x0E7,
+`..._SWIM_BACK_...` 0x2DD, `CMSG_FORCE_TURN_RATE_CHANGE_ACK` 0x2DF,
+`..._FLIGHT_...` 0x382, `..._FLIGHT_BACK_...` 0x384,
+`CMSG_FORCE_PITCH_RATE_CHANGE_ACK` 0x45D), which
+`WorldSession::HandleForceSpeedChangeAck` applies and relays to the set as
+`MSG_MOVE_SET_*_SPEED`; unanswered, a mounted, dismounted, slowed or ghostly
+character's observers extrapolated its run at the old speed while its
+heartbeats advanced at the new one. The module answers each for its own guid
+on its next world tick, a round trip after the server sent it, in the order
+asked (module-internal client behaviour; neither packet is served as an
+event): packGUID, the echoed counter, a MovementInfo, then the speed the
+packet named, never a reading of the module's own. The world tick runs after
+the session and map updates, so the core reads the ack at the start of the
+next one. The handler checks the speed only on the ack that brings its count
+of unanswered changes of that type (`Player::m_forced_speed_changes`) to
+zero, against the server's speed then: it corrects a lower one and kicks the
+player for a higher one. A change made while the character is not under its
+client's control (feared, confused, charmed) goes to the set as the creature
+opcode and leaves that count alone, so the last ack can echo a speed the
+server no longer has. The module therefore withholds an ack that would be the
+last of its type outstanding (counting the ones it sent this tick) when its
+speed is no longer the server's: the count stays one high, which only makes
+the core skip the check on the next ack of that type. The MovementInfo is where the client is
+and what it is doing, since the handler applies it: during a walk the mover's
+point running forward (`MOVEMENTFLAG_FORWARD`, the core reads it as it reads a
+heartbeat); stopping, the stop's point with no moving flag; rooted, the root
+ack's point with `MOVEMENTFLAG_ROOT`; mid-fall the edge heartbeat restated
+(the server's position, running), which leaves the fall's start where the edge
+put it; otherwise the server's position, standing. An ack whose counter is at
+or below the last far teleport's is ignored as from the old map, as a
+client's is.
+
+Movement-state changes arrive the same way (`Unit::SetWaterWalking`,
+`SetFeatherFall`, `SetHover`, `SetCanFly`, from the auras that grant them and
+from a ghost's repop and resurrection), packGUID and a `u32` counter to the
+controlling client alone: `SMSG_MOVE_WATER_WALK` (0x0DE) /
+`SMSG_MOVE_LAND_WALK` (0x0DF), `SMSG_MOVE_FEATHER_FALL` (0x0F2) /
+`SMSG_MOVE_NORMAL_FALL` (0x0F3), `SMSG_MOVE_SET_HOVER` (0x0F4) /
+`SMSG_MOVE_UNSET_HOVER` (0x0F5), `SMSG_MOVE_SET_CAN_FLY` (0x343) /
+`SMSG_MOVE_UNSET_CAN_FLY` (0x344), and the first three of them inside
+`SMSG_MULTIPLE_MOVES` at login and after a far teleport. The core does not set
+the flag itself: the client does, carries it on every movement packet after,
+and answers `CMSG_MOVE_WATER_WALK_ACK` (0x2D0), `CMSG_MOVE_FEATHER_FALL_ACK`
+(0x2CF), `CMSG_MOVE_HOVER_ACK` (0x0F6) or `CMSG_MOVE_SET_CAN_FLY_ACK` (0x345).
+All four go to `WorldSession::HandleMoveFlagChangeOpcode`, which copies the
+ack's flags into its record of the unit (before its old-map counter check),
+applies the MovementInfo as a movement packet, clears the pending flight
+change on a can-fly ack whose counter matches, and relays `MSG_MOVE_WATER_WALK`,
+`MSG_MOVE_FEATHER_FALL`, `MSG_MOVE_HOVER` or `MSG_MOVE_UPDATE_CAN_FLY` to the
+set; unanswered, every ghost's observers were never told it walks on water.
+The module keeps the four flags as this client's state
+(`MOVEMENTFLAG_WATERWALKING`, `_FALLING_SLOW`, `_HOVER`, `_CAN_FLY`), clears
+them on `SMSG_NEW_WORLD` and `SMSG_LOGIN_VERIFY_WORLD` (the server restates
+what still holds once the character is in the map, and sends nothing for an
+unset made while it was out of one), sets or clears the one the packet names,
+then answers for its own guid from the tap (module-internal, as the
+speed acks; none of these packets is served as an event): packGUID, the echoed
+counter, the MovementInfo as the speed acks build it (the new flag on it), and
+the `u32` the handler reads and never uses (1 set, 0 unset). Every movement
+packet and ack after carries the flags, since the core replaces its record of
+them with each packet's; one the server dropped without a packet is stripped
+on arrival (`ReadMovementInfo` removes each without its aura). Two
+deliberate gaps, until the walker can live the state: `MOVEMENTFLAG_CAN_FLY`
+is kept but never sent, the can-fly ack included (it is still sent: it tells
+observers and clears the pending flight change), because the core's
+pathfinder plans `move_to` on the character and, with the flag held
+(`Player::CanFly`), stops settling route points on the ground
+(`WorldObject::UpdateAllowedPositionZ`) and takes a straight-line shortcut
+where the start or target is more than 7y off the mesh (`PathGenerator`),
+while the walker has no flight; and `MOVEMENTFLAG_WATERWALKING` is dropped
+from every packet that swims, since the walker swims a water-walking body
+under the surface (below) and no client sends the two together. The
+`SMSG_SPLINE_MOVE_` twins of the first three (sent while the client does not
+control the unit, which the server then flags itself) update the state and
+want no ack. No ack is sent while the character moves another unit (a vehicle,
+a charm): the handler writes the flags onto whatever the session moves.
+
+With the server now holding hover, the core's pathfinder reads it as it
+would a real client's: over land a hovering character's route points are
+raised by its hover height (1y for a player) and so walked there
+(`WorldObject::UpdateAllowedPositionZ`, from `PathGenerator::NormalizePath`).
+Water walking is kept but not lived, a known gap: the walker's water test
+(Swimming, above) does not read it, so a water-walking body (every ghost,
+Water Walking, Levitate) is still swum under the surface at swim speed where
+a client runs on it at run speed.
+
+`SMSG_MOVE_KNOCK_BACK` (0x0EF) is not answered: a client's
+`CMSG_MOVE_KNOCK_BACK_ACK` is the start of the arc (`MOVEMENTFLAG_FALLING`
+and the launch velocity, which the handler relays to observers as
+`MSG_MOVE_KNOCK_BACK`), and owes the arc's packets and a `MSG_MOVE_FALL_LAND`
+where the body comes down, which the module would have to simulate (collision
+included). Unanswered, the server keeps the character where it stood and
+observers see no knockback; nothing on the server waits on the ack.
+
+Every timestamp the module sends as the client's (the movement packets, the
+acks, `CMSG_TIME_SYNC_RESP`) reads one clock of the session's own,
+milliseconds since the session was created, as a client's clock is its own and
+not the server's. The module answers `SMSG_TIME_SYNC_REQ` on its next world
+tick, a round trip later, with the echoed counter and that clock then,
+stamped as received the moment it is queued. The core takes the offset between the clocks from those answers
+(`HandleTimeSyncResp`, `ComputeNewClockDelta`) and adds it to every movement
+time before relaying it (`SynchronizeMovement`), so observers get the server
+time of each packet. The clock is not the server's because an offset of ~0 is
+never adopted (the core moves it only past 25ms) and reads as "no sync". The
+answer waits for the tick because the tap runs inside `SendPacket`, before
+`SendTimeSync` stamps the request's send time: an answer stamped there could
+precede that stamp across a millisecond boundary, the core's u32 round trip
+then wraps to ~2^32 ms and the offset it takes is ~2^31 ms (relayed movement
+times ~24.8 days out). For the same reason the receive stamp is not the one
+the socket gives a real client's answer, the start of the world tick, which
+precedes a send made within it. Sessions whose character is between maps are
+answered too: a far teleport's arrival resets the sync and asks again.
 
 `SMSG_COMPRESSED_UPDATE_OBJECT` never appears on this stream: the core
 compresses large update packets at socket-write time, below the module's tap,
@@ -1920,7 +2056,14 @@ any other.
 
 The root acks (Roots, above) log one `action` record each, `op: "root_ack"`
 with the `opcode` sent, the echoed `counter`, the `pos` the ack carried and
-the `moveId` of the walk it stopped (0 outside a walk).
+the `moveId` of the walk it stopped (0 outside a walk). The speed-change and
+movement-state acks (Speed changes and the clock, above) log one each, `op:
+"move_ack"`, with the `kind` (`speed`, `water_walk`, `feather_fall`, `hover`,
+`can_fly`), the `opcode` sent, the echoed `counter`, the `speed` echoed
+(`speed`) or whether the flag was set (`apply`, the others), the `pos` the ack
+carried and the `moveId` of the walk it was sent during (0 outside a walk). A
+speed ack withheld because the server's speed has moved on is logged with
+`withheld: true` and that `serverSpeed`, and nothing is sent.
 
 Synthesized movement logs one `action` record per `move_to`/`stop`/`face`
 request (`force: true` on the record when the request said so) plus one per
@@ -1928,6 +2071,7 @@ dispatched movement packet (`op: "move_pkt"` with the opcode and position;
 `cause: "drop"` on the stop at a refused ledge, `cause: "drop_forced"` on the
 edge heartbeat and the `MSG_MOVE_FALL_LAND` of a forced one, or the
 `MSG_MOVE_START_SWIM` it becomes when the foot is deep water; `cause:
+"turn"` on the `MSG_MOVE_SET_FACING` of a turn (Turns, above); `cause:
 "water"` on the `MSG_MOVE_START_SWIM` / `MSG_MOVE_STOP_SWIM` of a swim
 transition, with the mesh's z there, `meshZ`, beside the body's in `pos`, and
 the `collisionHeight` the threshold came from), so the packet
