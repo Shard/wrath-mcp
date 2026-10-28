@@ -2218,12 +2218,35 @@ namespace WrathBench
 
         // The route the mesh has toward the request when it has none to it:
         // the core's partial path as far as it got, else the planned start
-        // alone. A path_incomplete hands it to TryEdgeDrop.
+        // alone. A path_incomplete hands it to TryEdgeDrop. When that route
+        // itself steps down a ledge on its way to its end, the edge past the
+        // end is a second fall and is refused (`second_ledge`); the walk on is
+        // then tried once more from the route's start, where the character
+        // stands, toward the same request, under the same rules — one fall,
+        // a descent. A ghost released onto a two-polygon terrace below the
+        // Skettis ledge had every move refused so: its route ran down the
+        // terrace's own 3.8y step, and off its edge from there.
         std::vector<WbVec> partial;
         auto incomplete = [&]() {
             r.status = "path_incomplete";
             if (!partial.empty())
                 TryEdgeDrop(player, partial, x, y, z, reqZ, force, r);
+            bool routeLedge = false; // the route itself steps down a ledge on its way to its end
+            for (size_t i = 0; i + 1 < partial.size() && !routeLedge; ++i)
+                routeLedge = IsDropSegment(partial[i], partial[i + 1], nullptr);
+            if (r.status && std::strcmp(r.edgeDrop.reason, "second_ledge") == 0 && routeLedge)
+            {
+                PathResolve::EdgeDrop const first = r.edgeDrop;
+                r.edgeDrop = PathResolve::EdgeDrop{};
+                TryEdgeDrop(player, std::vector<WbVec>{ partial.front() }, x, y, z, reqZ, force, r);
+                if (!r.edgeDrop.tried)
+                    r.edgeDrop = first; // the request is not below the start: the first answer stands
+                else
+                {
+                    r.edgeDrop.fromStart = true;
+                    r.edgeDrop.firstReason = first.reason;
+                }
+            }
             return r;
         };
 
@@ -2654,64 +2677,215 @@ namespace WrathBench
         WbVec const edge = prev;
         ed.walkYards = travelled;
 
-        // The fall: past the edge the surface is read from the edge's height
-        // at each sample (FootUnderSurface's look), the body's line and the
-        // look's own line held at that height clear of models (a client falls
-        // through the air, not through an overhang or a deck), and the fall
-        // lands where the surface stops falling away — the first sample whose
-        // next is no longer a ledge below it, or the last before the request.
-        // A cliff that is not sheer is fallen down to its foot, not to a
-        // ledge of its face.
-        float const fallTop = edge.z + EDGE_LOOK_OFFSET;
-        float const fallSearch = std::max(DEFAULT_HEIGHT_SEARCH, fallTop - z + DEFAULT_HEIGHT_SEARCH);
+        // The fall, as a client's body falls. It leaves the edge at the run
+        // speed the walker drives it at (GetSpeed(MOVE_RUN): a ghost's
+        // faster run included) and keeps that speed forward while it drops
+        // by the core's own fall clock (Movement::computeFallElevation: the
+        // curve MoveSpline gives a falling spline, Feather Fall's slower
+        // terminal velocity included). Sample by sample along the line it
+        // lands where that arc first meets the surface under it — so it
+        // clears a shelf narrower than its flight, as a running client does,
+        // and lands on one wider; the arc's own line, at the feet and at body
+        // height, must be clear of models, and where it is not the body comes
+        // down in the last column it crossed. On the ground it falls on only
+        // down a pair steeper than the guard's ramp (a face no client stands
+        // on, whatever the mesh says) and stops at the first pair that is not:
+        // that is where it lands. The Skettis face, 109y over 30y, has a
+        // patch 1.98y over one sample 6y down it, under the guard's 2y: a
+        // body that stepped off would catch there, mid-face; the arc passes
+        // over it and meets the face 23y out, which it slides down to its
+        // foot. Still in the air at the request, the body comes down there:
+        // a slower start (any forward speed up to the run is a client's) puts
+        // the arc onto the surface at the request, if that arc clears the
+        // ground before it. Bounded in practice by the fall itself: the arc
+        // ends at its contact, the face at its first walkable pair, so flat
+        // ground ends the run at the next sample; never past the request.
+        float const run = player->GetSpeed(MOVE_RUN);
+        if (!(run > 0.01f))
+            return refuse("no_speed");
+        bool const slowFall = player->HasFeatherFallAura();
+        float const fallSearch = std::max(DEFAULT_HEIGHT_SEARCH, edge.z + EDGE_LOOK_OFFSET - z + DEFAULT_HEIGHT_SEARCH);
+        auto bodyAt = [&](float t, float speed) { // the arc's height at `t` yards along the line
+            return edge.z - Movement::computeFallElevation((t - travelled) / speed, slowFall);
+        };
+        struct Column { float t; WbVec ground; };
+        std::vector<Column> air;  // the columns the arc crossed, with the ground under each
         WbVec landing = foot;
-        if (!clear(edge, edge.z, landing, edge.z))
-            return refuse("blocked");
-        for (float t = footT; t < dist; )
+        float landT = footT;
+        bool touched = false;
         {
-            t = std::min(t + EDGE_SAMPLE_STEP, dist);
-            WbVec next{ from.x + ux * t, from.y + uy * t, 0.0f };
-            // Something in the way ahead: the fall comes down short of it, in
-            // the last column read clear (the edge-to-foot lines were the walk
-            // on's last check, so there is always one).
-            if (!lookClear(landing, next, fallTop) || !clear(landing, edge.z, next, edge.z))
-                break;
-            bool climb = false;
-            float const s = SurfaceUnder(player, next.x, next.y, fallTop, fallSearch, &climb);
-            if (climb || s <= INVALID_HEIGHT)
-                break; // land before the rise, or before a hole in the world
-            next.z = s;
-            float dz = 0.0f;
-            if (!IsDropSegment(landing, next, &dz) || dz > 0.0f)
-                break;
-            landing = next;
+            WbVec prevArc = edge;
+            for (float t = footT; ; t = std::min(t + EDGE_SAMPLE_STEP, dist))
+            {
+                float const body = bodyAt(t, run);
+                WbVec here{ from.x + ux * t, from.y + uy * t, body };
+                // Something in the arc's way: the body comes down in the last
+                // column it crossed (the edge's own, before the first).
+                if (!map->isInLineOfSight(prevArc.x, prevArc.y, prevArc.z + EDGE_LOOK_OFFSET, here.x, here.y, here.z + EDGE_LOOK_OFFSET,
+                        phase, LINEOFSIGHT_ALL_CHECKS, VMAP::ModelIgnoreFlags::Nothing)
+                    || !clear(prevArc, prevArc.z, here, here.z))
+                {
+                    if (air.empty())
+                        return refuse("blocked");
+                    landing = air.back().ground;
+                    landT = air.back().t;
+                    touched = true;
+                    break;
+                }
+                bool climb = false;
+                float const s = SurfaceUnder(player, here.x, here.y, body + EDGE_LOOK_OFFSET, fallSearch, &climb);
+                if (s <= INVALID_HEIGHT && !climb)
+                    return refuse("no_surface");
+                if (climb || s >= body)
+                {
+                    // The arc meets the ground here (terrain over the look is
+                    // ground it ran into on the way: the column before).
+                    if (climb && air.empty())
+                        return refuse("climb");
+                    landing = climb ? air.back().ground : WbVec{ here.x, here.y, s };
+                    landT = climb ? air.back().t : t;
+                    touched = true;
+                    break;
+                }
+                air.push_back({ t, { here.x, here.y, s } });
+                prevArc = here;
+                if (t >= dist)
+                    break;
+            }
+        }
+        if (!touched)
+        {
+            // In the air over the request: the slower start whose arc comes
+            // down on the surface there, which must clear the ground before it
+            // and, step by step, the same two lines the run's arc is held to.
+            Column const& at = air.back();
+            float const secs = Movement::computeFallTime(edge.z - at.ground.z, slowFall);
+            float const speed = secs > 0.0f ? (at.t - travelled) / secs : run;
+            WbVec prevArc = edge;
+            for (Column const& c : air)
+            {
+                WbVec const here{ c.ground.x, c.ground.y, c.t < at.t ? bodyAt(c.t, speed) : at.ground.z };
+                if (c.t < at.t && here.z < c.ground.z)
+                    return refuse("air_to_request");
+                if (!map->isInLineOfSight(prevArc.x, prevArc.y, prevArc.z + EDGE_LOOK_OFFSET, here.x, here.y, here.z + EDGE_LOOK_OFFSET,
+                        phase, LINEOFSIGHT_ALL_CHECKS, VMAP::ModelIgnoreFlags::Nothing)
+                    || !clear(prevArc, prevArc.z, here, here.z))
+                    return refuse("air_to_request");
+                prevArc = here;
+            }
+            landing = at.ground;
+            landT = at.t;
+        }
+        else
+        {
+            // On the ground: down a face steeper than the ramp, no farther.
+            for (float t = landT; t < dist; )
+            {
+                t = std::min(t + EDGE_SAMPLE_STEP, dist);
+                WbVec next{ from.x + ux * t, from.y + uy * t, 0.0f };
+                float const top = landing.z + EDGE_LOOK_OFFSET;
+                if (!lookClear(landing, next, top))
+                    break;
+                bool climb = false;
+                float const s = SurfaceUnder(player, next.x, next.y, top, fallSearch, &climb);
+                if (climb || s <= INVALID_HEIGHT)
+                    break;
+                next.z = s;
+                float dz = 0.0f;
+                if (!IsDropSegment(landing, next, &dz) || dz >= 0.0f || !clear(landing, landing.z, next, next.z))
+                    break;
+                landing = next;
+            }
         }
         ed.hasEdge = true;
         ed.edge = edge;
         ed.landing = landing;
-        // Every sample of the fall lies a ledge below the one before it, so
-        // the edge-to-landing segment is one the guard calls a ledge, and is
-        // walked as one: a heartbeat at the edge, the landing at the foot.
+        // A short drop onto level ground comes down a few yards out at a run,
+        // too far for the guard to call the edge-to-landing segment a ledge;
+        // stepped off instead (the slowest start), the body lands at the
+        // foot, which the walk on found a ledge below the edge.
+        {
+            float adz = 0.0f;
+            if (!IsDropSegment(edge, landing, &adz) || adz >= 0.0f)
+                landing = foot;
+        }
+        // The edge-to-landing segment is one the guard calls a ledge, so it
+        // is walked as one: a heartbeat at the edge, the landing at the foot.
         float fallDz = 0.0f;
         if (!IsDropSegment(edge, landing, &fallDz) || fallDz >= 0.0f)
             return refuse("not_a_ledge");
 
-        // The leg below, from the landing to the request, the way a move from
-        // the landing would start: on the mesh, else from the mesh nearest it
-        // within START_SNAP_RADIUS, with the straight walk onto it — so the
-        // landing is a point the next move can start from, and a landing on a
-        // cliff's face, whose nearest mesh is the plateau, is a climb the
-        // one-ledge rule below refuses. The core's path, else the module's
-        // planner, as ResolvePathAt; it must end within 4y of the request.
+        // The leg below, from the landing to the request: from the mesh under
+        // the landing when the request can be reached from it, else from the
+        // walkable mesh nearest the landing within START_SNAP_RADIUS that is
+        // not on a closed island apart from the request's polygon
+        // (WbNav::NearestReachable, as an island end is walked to its
+        // reachable mesh), with the straight walk onto it clear at body
+        // height. The foot of a cliff is where the mesh is broken up around
+        // whatever stands there: at Skettis the nearest polygon to the
+        // landing is a 2-polygon island 0.1y off, the main mesh 1.4y. A
+        // landing on a cliff's face, whose nearest such mesh is the plateau,
+        // is a climb the one-ledge rule below refuses. The core's path, else
+        // the module's planner, as ResolvePathAt; it must end within 4y of
+        // the request.
+        auto& mmap = map->GetMapCollisionData().GetMMapData();
+        dtNavMesh const* navMesh = mmap.GetNavMesh();
+        dtNavMeshQuery const* query = mmap.GetNavMeshQuery();
+        ExcludePolysFilter const base;
+        float endPt[3] = { y, z, x };
+        dtPolyRef const endRef = query ? CorePolyAt(query, base, endPt, nullptr) : 0;
         WbVec start = landing;
+        std::vector<WbVec> snapWalk; // the ground between the landing and the mesh it walks onto
         {
             PathGenerator probe(player);
             probe.CalculatePath(landing.x, landing.y, landing.z, landing.x, landing.y, landing.z, false);
-            if (probe.GetPathType() & (PATHFIND_NOT_USING_PATH | PATHFIND_FARFROMPOLY_START))
+            float landPt[3] = { landing.y, landing.z, landing.x };
+            dtPolyRef const landRef = query ? CorePolyAt(query, base, landPt, nullptr) : 0;
+            if ((probe.GetPathType() & (PATHFIND_NOT_USING_PATH | PATHFIND_FARFROMPOLY_START))
+                || !landRef || (navMesh && WbNav::OnIsland(navMesh, base, endRef, landRef)))
             {
-                if (!NearestMeshPoint(player, landing.x, landing.y, landing.z, START_SNAP_RADIUS, start))
+                float extents[3] = { START_SNAP_RADIUS, 50.0f, START_SNAP_RADIUS };
+                float closest[3] = { 0.0f, 0.0f, 0.0f };
+                dtPolyRef ref = 0;
+                if (!navMesh || !query || !WbNav::NearestReachable(navMesh, query, endRef, landPt, extents, &ref, closest))
                     return refuse("landing_off_mesh");
+                start = { closest[2], closest[0], closest[1] };
                 ed.landingSnap = true;
+                // The walk onto it is walked on the ground under the walk on's
+                // own rule: each sample's surface read from 1y over the last,
+                // nothing rising past that (terrain by its height, a model by
+                // the look's line), no pair a ledge (that would be a second
+                // fall), nothing at body height in the way. The search box
+                // is the start snap's, 50y deep, so without this a snap to
+                // mesh over a face or across a gap would be walked through
+                // the air or the rock.
+                float const sx = start.x - landing.x, sy = start.y - landing.y;
+                float const len = std::sqrt(sx * sx + sy * sy);
+                if (len < 0.01f && !clear(landing, landing.z, start, start.z))
+                    return refuse("blocked"); // straight up or down onto it: the body's line alone
+                WbVec p = landing;
+                for (float t = 0.0f; t < len; )
+                {
+                    t = std::min(t + EDGE_SAMPLE_STEP, len);
+                    WbVec n{ landing.x + sx * t / len, landing.y + sy * t / len, 0.0f };
+                    float const top = p.z + EDGE_LOOK_OFFSET;
+                    if (!lookClear(p, n, top))
+                        return refuse("snap_climb");
+                    bool climb = false;
+                    float const s = SurfaceUnder(player, n.x, n.y, top, DEFAULT_HEIGHT_SEARCH, &climb);
+                    if (climb)
+                        return refuse("snap_climb");
+                    if (s <= INVALID_HEIGHT)
+                        return refuse("no_surface");
+                    n.z = s;
+                    if (IsDropSegment(p, n, nullptr))
+                        return refuse("snap_ledge");
+                    if (!clear(p, p.z, n, n.z))
+                        return refuse("blocked");
+                    if (t < len)
+                        snapWalk.push_back(n);
+                    p = n;
+                }
             }
         }
         auto nearEnd = [&](WbVec const& v) {
@@ -2732,15 +2906,9 @@ namespace WrathBench
         }
         if (below.empty())
         {
-            auto& mmap = map->GetMapCollisionData().GetMMapData();
-            dtNavMesh const* navMesh = mmap.GetNavMesh();
-            dtNavMeshQuery const* query = mmap.GetNavMeshQuery();
             dtNavMeshQuery const* plan = navMesh ? WbNav::PlannerQuery(navMesh) : nullptr;
-            ExcludePolysFilter const base;
             float startPt[3] = { start.y, start.z, start.x };
-            float endPt[3] = { y, z, x };
             dtPolyRef const startRef = query ? CorePolyAt(query, base, startPt, nullptr) : 0;
-            dtPolyRef const endRef = query ? CorePolyAt(query, base, endPt, nullptr) : 0;
             char const* why = "";
             std::vector<WbVec> planned;
             if (plan && startRef && endRef
@@ -2770,6 +2938,7 @@ namespace WrathBench
         cand.points = partial;
         cand.points.insert(cand.points.end(), walk.begin(), walk.end());
         cand.points.push_back(landing);
+        cand.points.insert(cand.points.end(), snapWalk.begin(), snapWalk.end());
         if (ed.landingSnap)
             cand.points.push_back(below.front());
         cand.points.insert(cand.points.end(), below.begin() + 1, below.end());
@@ -3158,6 +3327,8 @@ namespace WrathBench
                     if (ed.hasEdge)
                         a.Raw("edge", vec(ed.edge)).Raw("landing", vec(ed.landing))
                             .Add("walkYards", (double)ed.walkYards).Add("landingSnap", ed.landingSnap);
+                    if (ed.fromStart)
+                        a.Add("fromStart", true).Add("firstReason", ed.firstReason);
                     Audit(*s, "action", a.Str());
                 }
             }

@@ -459,6 +459,8 @@ namespace WrathBench
                 WbVec landing;
                 float walkYards{0};       // from `from` to the edge, off the mesh
                 bool landingSnap{false};  // the leg below starts from the mesh nearest the landing
+                bool fromStart{false};    // tried again from the route's start after the route's own ledge (`firstReason`)
+                char const* firstReason{""};
             } edgeDrop;
         };
         // One pass of the cause ladder at x,y,z; reqZ is the z the agent asked
