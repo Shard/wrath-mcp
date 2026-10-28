@@ -1329,7 +1329,14 @@ at the top of this document.
   and a route the core runs out on (the Deadmines mine's tunnels are 177
   polygons) is searched again with 16384 nodes, 512 polygons and 256 points
   of 4y — the same route the core would build with room to finish, audited
-  as `op: "move_long_plan"`. Where the mesh got is never the request itself:
+  as `op: "move_long_plan"`. A request the character already stands at —
+  within the smooth path's 0.3y slop of the start in 2D, within 2y of its
+  height, on the start's own polygon or one linked to it — is not a route
+  either answers (the core adds a second point to a one-point smooth path
+  only for a one-polygon corridor, and calls the rest NOPATH): after both have
+  failed, the walk is that step, dispatched like any route and arriving,
+  where it would otherwise have been `path_incomplete`; audited as
+  `op: "move_end_slop"`. Where the mesh got is never the request itself:
   the core's partial path ends at the request when its corridor is the start
   polygon alone, or when it gave up and returned the straight line (74
   points or more, or no polygon path), and a subdivision from there was the
@@ -1386,7 +1393,12 @@ at the top of this document.
   around what stands there), walked onto over the ground under the walk on's
   own rule — no rise past the look, no pair a ledge, nothing at body height
   in the way — by the core's path or the module's planner, ending within 4y
-  of the request. The fall must be the route's only ledge, so `force` given
+  of the request. When neither has one and the landing (or the mesh it walks
+  onto) is where the request is — within the smooth path's 0.3y slop of it in
+  2D, within 2y of its height, on the request's own polygon or one linked
+  to it — the route ends at the landing with no leg below (two points
+  that close on neighbouring polygons are a path neither the core nor the
+  planner returns, as for any move, below). The fall must be the route's only ledge, so `force` given
   for it never walks a second one. When the mesh's own route steps down a
   ledge on its way to its end (a terrace whose mesh is a small island with a
   steep step inside it) and is refused for that second ledge, the walk on is
@@ -2121,8 +2133,13 @@ found, `edge`, `landing`, `walkYards` (the walk on from `from` to the edge) and
 `landingSnap` (the leg below starts from the mesh nearest the landing) — with,
 whenever that snap was tried, taken or refused (`snap_ledge`, `snap_climb`),
 `snapTo` (the mesh point it aimed at) and `snapYards` (its distance from the
-landing, 3D) — and `fromStart` with `firstReason` when it was tried again from the route's start
-after the route's own ledge (`second_ledge`).
+landing, 3D) — `endAtLanding` when the landing (or its snap) was where the
+request is and the route ended there with no leg below, and `fromStart` with `firstReason` when it was tried again from the route's start
+after the route's own ledge (`second_ledge`). A move that was already where
+its request is (within the smooth path's slop, above) logs
+`op: "move_end_slop"` after the drop guard has settled the step, with its
+`status` (`ok`, or the guard's verdict) and `to`, the request as resolved;
+the walk itself ends at that x,y at the start's z.
 Each `move_to` that reaches the mesh also logs one `op: "move_path"` record at
 dispatch — `moveId`, `status` (`"ok"` when the walk was dispatched, else the
 `WB_MOVE_RESULT` status), `pointCount`, and `points` (the resolved polyline,

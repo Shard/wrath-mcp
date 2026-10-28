@@ -2116,6 +2116,46 @@ namespace WrathBench
         return levels.size();
     }
 
+    // Two points the mesh's smooth path cannot join although one stands where
+    // the other is: within the path's own slop of each other in 2D
+    // (WbNav::SMOOTH_SLOP, the core's SMOOTH_PATH_SLOP — the steering skips
+    // a corner that close), on one floor (MESH_LEVEL_MERGE), on the same
+    // polygon or two linked neighbours — and when two, the core adds a second point
+    // to a one-point smooth path only for a one-polygon corridor, so it
+    // answers NOPATH and the planner no_route (WbNav::PlanCorridor). Only ever
+    // asked after both have failed; a route that exists is always theirs.
+    static bool WithinSlop(Player* player, WbVec const& a, float x, float y, float z)
+    {
+        float const dx = a.x - x, dy = a.y - y;
+        if (dx * dx + dy * dy > WbNav::SMOOTH_SLOP * WbNav::SMOOTH_SLOP || std::fabs(a.z - z) > MESH_LEVEL_MERGE)
+            return false;
+        auto& mmap = player->GetMap()->GetMapCollisionData().GetMMapData();
+        dtNavMesh const* navMesh = mmap.GetNavMesh();
+        dtNavMeshQuery const* query = mmap.GetNavMeshQuery();
+        if (!navMesh || !query)
+            return false;
+        ExcludePolysFilter const base;
+        float pa[3] = { a.y, a.z, a.x };
+        float pb[3] = { y, z, x };
+        dtPolyRef const ra = CorePolyAt(query, base, pa, nullptr);
+        dtPolyRef const rb = CorePolyAt(query, base, pb, nullptr);
+        if (!ra || !rb)
+            return false;
+        if (ra == rb)
+            return true;
+        // A direct neighbour, by the polygon's own links: exact, where an
+        // island test only bounds a component's size (two stacked floors a
+        // couple of yards apart are both large and joined by nothing).
+        dtMeshTile const* tile = nullptr;
+        dtPoly const* poly = nullptr;
+        if (dtStatusFailed(navMesh->getTileAndPolyByRef(ra, &tile, &poly)))
+            return false;
+        for (unsigned int i = poly->firstLink; i != DT_NULL_LINK; i = tile->links[i].next)
+            if (tile->links[i].ref == rb)
+                return true;
+        return false;
+    }
+
     // How far from a request whose own polygon is on an island the walk may
     // end instead, at the reachable mesh nearest it: the core's own
     // far-from-polygon distance (PathGenerator::BuildPolyPath paths to an end
@@ -2272,6 +2312,19 @@ namespace WrathBench
         std::vector<WbVec> partial;
         auto incomplete = [&]() {
             r.status = "path_incomplete";
+            // Already where the request is (WithinSlop: within the smooth
+            // path's slop on a neighbouring polygon, which neither the core nor
+            // the planner joins): the walk is the step to it, settled like any
+            // route. Audited as move_end_slop.
+            if (WithinSlop(player, { sx, sy, sz }, x, y, z))
+            {
+                r.status = nullptr;
+                r.hasReached = false;
+                r.slopEnd = true;
+                r.points = { { sx, sy, sz }, { x, y, sz } };
+                SettleRoute(player, r, z, reqZ, force);
+                return r;
+            }
             if (!partial.empty())
                 TryEdgeDrop(player, partial, x, y, z, reqZ, force, r);
             bool routeLedge = false; // the route itself steps down a ledge on its way to its end
@@ -2962,7 +3015,16 @@ namespace WrathBench
                 && nearEnd(planned.back()))
                 below = std::move(planned);
         }
-        if (below.size() < 2)
+        // Neither has a path, and the start is where the request is
+        // (WithinSlop): the route ends there, with no leg below. At Skettis
+        // the fall came down 0.8y straight under the request, on the polygon
+        // beside its own, and was refused no_route_from_landing.
+        if (below.empty() && WithinSlop(player, start, x, y, z))
+        {
+            below.push_back(start);
+            ed.endAtLanding = true;
+        }
+        if (below.empty())
             return refuse("no_route_from_landing");
 
         // The route: the mesh's as far as it got, the walk on, the fall, the
@@ -3322,6 +3384,10 @@ namespace WrathBench
                             .Raw("to", Json::Writer().Add("x", (double)r.endToX).Add("y", (double)r.endToY).Add("z", (double)r.endToZ).Str());
                     Audit(*s, "action", a.Str());
                 }
+                if (r.slopEnd)
+                    Audit(*s, "action", Json::Writer().Add("op", "move_end_slop").Add("moveId", moveId)
+                        .Add("status", r.status ? r.status : "ok")
+                        .Raw("to", Json::Writer().Add("x", (double)x).Add("y", (double)y).Add("z", (double)z).Str()).Str());
                 if (r.longPlan)
                     Audit(*s, "action", Json::Writer().Add("op", "move_long_plan").Add("moveId", moveId)
                         .Add("polys", r.longPolys).Add("pointCount", (uint64_t)r.points.size()).Str());
@@ -3375,6 +3441,8 @@ namespace WrathBench
                             .Add("walkYards", (double)ed.walkYards).Add("landingSnap", ed.landingSnap);
                     if (ed.landingSnap)
                         a.Raw("snapTo", vec(ed.snapTo)).Add("snapYards", (double)ed.snapYards);
+                    if (ed.endAtLanding)
+                        a.Add("endAtLanding", true);
                     if (ed.fromStart)
                         a.Add("fromStart", true).Add("firstReason", ed.firstReason);
                     Audit(*s, "action", a.Str());

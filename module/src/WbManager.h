@@ -466,6 +466,10 @@ namespace WrathBench
             // The core's path and the subdivision both fell short and the
             // module's planner built the route (op: move_long_plan).
             bool longPlan{false};
+            // The request is within the smooth path's slop of the start on a
+            // neighbouring polygon, which neither the core nor the planner
+            // joins: the walk is the step to it (op: move_end_slop).
+            bool slopEnd{false};
             uint32 longPolys{0};
             bool nearestSearched{false}; // target_off_mesh: the bounded search for mesh near the target ran
             bool hasNearest{false};      // ... and found a point (nearestX/Y/Z)
@@ -502,6 +506,7 @@ namespace WrathBench
                 WbVec snapTo;             // ... this point (whenever a snap was attempted, refused or not)
                 float snapYards{0};       // ... this far from the landing, 3D
                 bool fromStart{false};    // tried again from the route's start after the route's own ledge (`firstReason`)
+                bool endAtLanding{false}; // the landing (or its snap) is where the request is: no leg below
                 char const* firstReason{""};
             } edgeDrop;
         };
