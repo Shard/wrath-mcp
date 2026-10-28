@@ -1029,7 +1029,7 @@ export type MoveResult =
        * `path_incomplete`: how far the mesh could get toward the request (the
        * module already tried one subdivision from here); route around, or
        * approach from another side. `drop`: the last point before the route
-       * steps off a ledge — the edge, on the character's level.
+       * steps off a ledge — the edge, on the level the route reached it on.
        */
       readonly reachedPos?: Point3;
       /**

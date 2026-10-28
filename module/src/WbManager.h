@@ -139,6 +139,8 @@ namespace WrathBench
         float surfaceZ{0};
         bool force{false};          // request said force: ledges are walked (and fallen off), not refused
         bool inFall{false};         // walking a forced downward ledge: MSG_MOVE_FALL_LAND is owed at its foot
+        int64_t fallStartMs{0};     // ... since when (the edge heartbeat), and
+        uint64_t fallMs{0};         // ... how long the fall takes (FallMs): the segment is timed by it, not by the run
         bool swimming{false};       // the "client" is swimming: packets carry MOVEMENTFLAG_SWIMMING, pace is swim speed
     };
 
@@ -442,6 +444,22 @@ namespace WrathBench
                 float dz{0};
                 uint32 points{0};         // the last re-planned route's point count (0 when none was built)
             } replan;
+            // The edge drop past the end of the mesh (TryEdgeDrop), audit only
+            // (op: move_edge_drop): `tried` whenever a path_incomplete's
+            // request lay below the route's end; `taken` when the route is now
+            // the walk on, the fall and the leg below, else `reason`.
+            struct EdgeDrop
+            {
+                bool tried{false};
+                bool taken{false};
+                char const* reason{""};
+                WbVec from;               // the end of the mesh's route
+                bool hasEdge{false};      // ... and once found: the lip and where the fall lands
+                WbVec edge;
+                WbVec landing;
+                float walkYards{0};       // from `from` to the edge, off the mesh
+                bool landingSnap{false};  // the leg below starts from the mesh nearest the landing
+            } edgeDrop;
         };
         // One pass of the cause ladder at x,y,z; reqZ is the z the agent asked
         // for (meshZ is reported relative to it).
@@ -458,6 +476,15 @@ namespace WrathBench
         // only its `replan` record changes.
         void ReplanSteep(Player* player, float sx, float sy, float sz, float x, float y, float z, float reqZ,
             bool force, std::vector<size_t> const& refusing, PathResolve& r);
+        // A path_incomplete whose request lies below the end of the mesh's
+        // route (`partial`, from the planned start): walk on from that end
+        // toward the request to an edge, fall to the surface below, and route
+        // on from the landing. `r` becomes that route, settled like any other
+        // (a `drop` unforced, walked forced), only when the fall is its one
+        // ledge and the leg below reaches the request; otherwise only its
+        // `edgeDrop` record changes.
+        void TryEdgeDrop(Player* player, std::vector<WbVec> const& partial, float x, float y, float z, float reqZ,
+            bool force, PathResolve& r);
         // The z-ladder around it: ground height at x,y first for a unit
         // target, as a fallback after target_off_mesh otherwise; then the
         // mesh's walkable level over x,y when it is the column's only one
