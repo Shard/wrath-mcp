@@ -5870,6 +5870,58 @@ describe("client: quest-start items and the questgiver marker pre-check (2026-08
     await stub.stop();
   });
 
+  test("turnInQuest on a quest the log shows complete sends past a current `none`, and the server's offer completes it", async () => {
+    // fleet-codex-sol-61-freeplay-gpt-6-1-sol-20261018-a3, turn 2117: Balos
+    // Jacken answered the status query `none` while hostile (the core shows
+    // no marker to enemies), then surrendered with quest 1286 complete.
+    // turnInQuest refused on that `none` with nothing sent, while a raw
+    // choose-reward took the quest the server offered. The marker is a hint;
+    // a complete quest in the log is asked about.
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    stub.push(JSON.stringify(questAccepted)); // seq 30
+    stub.push(JSON.stringify(questComplete)); // seq 32
+    stub.push(JSON.stringify(questGiverStatus(CREATURE_GUID, 0, 91))); // none, newer than every field
+    await Bun.sleep(20);
+    expect(client.state.quest(QUEST_ID)?.complete).toBe(true);
+
+    const pending = client.turnInQuest(CREATURE_GUID, QUEST_ID, 0, { timeout: 2000 });
+    await untilAction(stub, "quest_complete");
+    stub.push(JSON.stringify(offerReward(QUEST_ID, 92)));
+    await untilAction(stub, "quest_choose_reward");
+    stub.push(JSON.stringify(questRewarded(QUEST_ID, 93)));
+    expect(await pending).toMatchObject({ ok: true, status: "complete", questId: QUEST_ID });
+    expect(client.drainActionHints()).toEqual([]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a marker older than the NPC's last faction change no longer refuses: the surrender that turns an NPC friendly", async () => {
+    // The core answers `none` to a creature hostile to us whatever it has,
+    // and nothing re-asks when a scripted NPC's faction flips (Balos
+    // Jacken's surrender to faction 35). questsAvailableFrom has no quest log
+    // to fall back on, so the dating is what lets it ask.
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    stub.push(JSON.stringify(questGiverStatus(CREATURE_GUID, 0, 91))); // none, asked while hostile
+    await Bun.sleep(20);
+    const refused = await client.questsAvailableFrom(CREATURE_GUID, { timeout: 10_000 });
+    expect(refused).toMatchObject({ ok: false, status: "nothing_on_offer", quests: [] });
+    expect(stub.actions.map((a) => a.action)).not.toContain("quest_list");
+    client.drainActionHints();
+
+    stub.push(frame(92, "SMSG_UPDATE_OBJECT", { blocks: 1, objects: [{ update: "values", guid: CREATURE_GUID, fields: { faction: 35 } }] }));
+    await Bun.sleep(20);
+    expect(client.state.nearby.get(CREATURE_GUID)?.questGiver?.value).toBe(0);
+    const listed = client.questsAvailableFrom(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify(questGiverList([OTHER_QUEST_ID], 93)));
+    expect((await listed).quests.map((q) => q.questId)).toEqual([OTHER_QUEST_ID]);
+    expect(client.drainActionHints()).toEqual([]);
+    client.close();
+    await stub.stop();
+  });
+
   test("a marker older than the last quest-log change still asks for the quest list", async () => {
     // Right after a turn-in the NPC's marker still reads `reward` until the
     // refreshed one lands, and the next quest of its chain is on offer by
