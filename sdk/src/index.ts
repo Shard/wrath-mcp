@@ -68,6 +68,8 @@ export type {
   AcceptResurrectionResult,
   SpiritHealerOptions,
   SpiritHealerResult,
+  UnstuckOptions,
+  UnstuckResult,
   RepairAllResult,
   LootRollRefusalStatus,
   LootRollResult,

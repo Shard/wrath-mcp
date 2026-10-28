@@ -3518,6 +3518,90 @@ function spiritHealerSilence(distance: number | undefined, timeout: number): str
 }
 
 /**
+ * Spell 7355, "Stuck": what the stock client's Help → "I'm stuck" button
+ * casts (`CMSG_CAST_SPELL`, no target). Every character knows it (SkillLine
+ * 183, granted to all races and classes); it may be cast while dead, takes
+ * 10 s, is interrupted by moving, cannot be cast in combat, and has a
+ * 5-minute cooldown. Its effect (`Spell::EffectStuck`) releases a body,
+ * moves a ghost to the graveyard nearest it, and for the living uses the
+ * Hearthstone, or without a ready one moves the character up to 5 yards.
+ */
+const STUCK_SPELL = 7355;
+/** The Hearthstone item `Spell::EffectStuck` looks for in the bags. */
+const HEARTHSTONE_ITEM = 6948;
+/** How long a first `unstuck()` stays armed for the confirming second call, in ms. */
+const UNSTUCK_CONFIRM_MS = 60_000;
+
+export interface UnstuckOptions {
+  /**
+   * The whole budget for the confirming call, in ms: the 10 s cast, then the
+   * move the server makes. Default 20000, under the runner's 30 s snippet cap.
+   */
+  timeout?: number;
+}
+
+/**
+ * The outcome of `unstuck()`. `confirm` is the first call: nothing was sent,
+ * and the hint says what the server will do given your state now and that a
+ * second call within 60 s does it. `moved` is the server's teleport observed
+ * after the cast, with where you are now (the cache's `state.self`).
+ * `cast_failed` is the server refusing or interrupting the cast, with its
+ * reason. `unconfirmed` is a cast that went off, or no answer at all, with no
+ * move observed.
+ */
+export type UnstuckResult =
+  | { readonly ok: false; readonly status: "confirm"; readonly hint: string }
+  | {
+      readonly ok: true;
+      readonly status: "moved";
+      readonly position: WorldPosition | undefined;
+      readonly zone: string | undefined;
+      readonly area: string | undefined;
+    }
+  | { readonly ok: false; readonly status: "cast_failed"; readonly result: number; readonly reason: string | undefined; readonly hint: string }
+  | { readonly ok: false; readonly status: "unconfirmed"; readonly hint: string };
+
+/** What a confirmed `unstuck()` will do from the state the cache shows now, and how to confirm it. */
+function unstuckConfirmText(state: StateCache, corpse: boolean): string {
+  const head =
+    'unstuck() is the game\'s Help → "I\'m stuck": it casts Stuck (spell 7355), a 10-second cast that moving ' +
+    "interrupts and combat refuses, with a 5-minute cooldown. ";
+  let effect: string;
+  if (corpse) {
+    effect = "You are dead and not released: it releases your spirit, as repop() does, to the graveyard nearest you. ";
+  } else if (state.self.ghost?.value === true) {
+    effect =
+      "You are a ghost: the server moves you to the graveyard nearest where you stand now, which can be the one " +
+      "you were released at; your corpse stays where it is. ";
+  } else {
+    const home = state.self.bindPoint?.value.area.name;
+    const hearth = state.bag().items.some((i) => i.itemId === HEARTHSTONE_ITEM);
+    effect = hearth
+      ? `You are alive and carry a Hearthstone: if it is off cooldown the server uses it, taking you to your bind point` +
+        `${home ? ` (${home})` : ""} and putting the Hearthstone on its 30-minute cooldown; if it is still cooling down, ` +
+        "it moves you up to 5 yards in a random direction instead. "
+      : "You are alive and carry no Hearthstone: the server moves you up to 5 yards in a random direction. ";
+  }
+  return `${head}${effect}Nothing was sent. Call unstuck() again within ${UNSTUCK_CONFIRM_MS / 1000}s to do it.`;
+}
+
+/** Why a confirmed `unstuck()` cast did not go off, from the server's reason. */
+function unstuckFailedHint(reason: string | undefined, result: number): string {
+  const head = `Stuck was not cast: the server answered ${reason ?? `code ${result}`}`;
+  const why =
+    reason === "affecting_combat"
+      ? ": it cannot be cast in combat"
+      : reason === "not_ready"
+        ? ": its 5-minute cooldown is still running"
+        : reason === "moving"
+          ? ": it cannot begin while you move, so stand still"
+          : reason === "interrupted"
+            ? ": its 10-second cast was interrupted (moving does that), so stand still until it ends"
+            : "";
+  return `${head}${why}. A new attempt asks for confirmation again.`;
+}
+
+/**
  * How long after an own teleport a helper waits for the `WB_AREA` naming
  * where it landed, in ms: far past the world tick it takes, and short enough
  * that a port within one area (which sends none) costs little.
@@ -3716,6 +3800,9 @@ export class WrathClient {
 
   /** `castSpell` casts awaiting the server's first word, by spell id (`castVerdict`). */
   private readonly pendingCasts = new Map<number, PendingCast>();
+
+  /** Until when (epoch ms) a first `unstuck()` stays armed for the confirming call; undefined when not armed. */
+  private unstuckArmedUntil: number | undefined;
 
   /**
    * The last `move_to` this client sent: when, and its moveId once acked. With
@@ -5821,6 +5908,142 @@ export class WrathClient {
       this.noteActionHint("spiritHealerActivate", "unconfirmed", hint);
       return { ok: false, status: "unconfirmed", distance, hint } as const;
     });
+  }
+
+  /**
+   * The stock client's Help → "I'm stuck", confirmed by calling it twice
+   * (operator decision, 2026-10-28). The first call sends nothing and
+   * answers `confirm`, saying what the server will do from the state the
+   * cache shows now; a second call within `UNSTUCK_CONFIRM_MS` sends what
+   * the button sends, `CMSG_CAST_SPELL` of Stuck (`STUCK_SPELL`) with no
+   * target, and waits for the outcome: the cast's start and go (or the
+   * server's refusal), then the teleport `Spell::EffectStuck` makes — a
+   * same-map `MSG_MOVE_TELEPORT_ACK`, or `SMSG_NEW_WORLD` for a Hearthstone
+   * home on another map — and the `WB_AREA` naming where it landed. Each send
+   * spends the confirmation; a call after the window has lapsed asks again.
+   *
+   * Stuck may be cast while dead, so unlike `castSpell` this is not refused
+   * for a ghost or a body: the cast goes through the same handler a client's
+   * would, and the server decides.
+   */
+  async unstuck(options: UnstuckOptions = {}): Promise<UnstuckResult> {
+    const now = Date.now();
+    if (this.unstuckArmedUntil === undefined || now > this.unstuckArmedUntil) {
+      this.unstuckArmedUntil = now + UNSTUCK_CONFIRM_MS;
+      const hint = unstuckConfirmText(this.state, this.isCorpse());
+      this.noteActionHint("unstuck", "confirm", hint);
+      return { ok: false, status: "confirm", hint };
+    }
+    this.unstuckArmedUntil = undefined;
+    // The confirm line still waiting in the harness block would tell the
+    // model nothing was sent once this sends: drop it.
+    this.actionHints.delete(`unstuck:confirm:${this.originOf?.() ?? ""}`);
+    const wasCorpse = this.isCorpse();
+    const timeout = options.timeout ?? 20_000;
+    const deadline = now + timeout;
+    const own = (caster: string): boolean => this.state.self.guid === undefined || guidKey(caster) === this.state.self.guid;
+    let portSeq: number | undefined;
+    const offPort = this.events.onAny((e) => {
+      if (isOwnPort(e, this.state.self.guid)) portSeq = e.seq;
+    });
+    const unconfirmed = (hint: string): UnstuckResult => {
+      this.noteActionHint("unstuck", "unconfirmed", hint);
+      return { ok: false, status: "unconfirmed", hint };
+    };
+    try {
+      // The cast's words, matched by spell id: the handler answers in the
+      // same world tick as the dispatch, often before the ack, so events
+      // since `from` count. A `dont_report` failure is the server's own
+      // silent cancel, not a refusal a client shows.
+      let from = this.events.recent(1)[0]?.seq;
+      const castWord = (e: StreamEvent): boolean => {
+        if ((from !== undefined && e.seq <= from) || isDecodeError(e.data)) return false;
+        if (isEvent(e, "SMSG_SPELL_START")) return (e.data as SpellStartData).spellId === STUCK_SPELL && own((e.data as SpellStartData).casterGuid);
+        if (isEvent(e, "SMSG_SPELL_GO")) return (e.data as SpellGoData).spellId === STUCK_SPELL && own((e.data as SpellGoData).casterGuid);
+        if (isEvent(e, "SMSG_CAST_FAILED")) {
+          const d = e.data as CastFailedData;
+          return d.spellId === STUCK_SPELL && d.reason !== "dont_report";
+        }
+        if (isEvent(e, "SMSG_SPELL_FAILURE")) {
+          const d = e.data as SpellFailureData;
+          return d.spellId === STUCK_SPELL && d.reason !== "dont_report" && own(d.casterGuid);
+        }
+        return false;
+      };
+      const wait = async (ms: number, description: string): Promise<StreamEvent | undefined> => {
+        try {
+          return await this.waitEvent(castWord, { timeout: Math.max(1, ms), description });
+        } catch (e) {
+          if (e instanceof EventTimeoutError) return undefined;
+          throw e;
+        }
+      };
+      await this.dispatchCast(STUCK_SPELL, undefined);
+      let verdict = await wait(Math.min(CAST_VERDICT_MS, deadline - Date.now()), "the server's answer to the Stuck cast (spell 7355)");
+      if (verdict === undefined) {
+        return unconfirmed(
+          `no answer to the Stuck cast arrived within ${Math.round(CAST_VERDICT_MS / 1000)}s; re-read state.self.position before trying again`,
+        );
+      }
+      if (isEvent(verdict, "SMSG_SPELL_START")) {
+        from = verdict.seq;
+        verdict = await wait(deadline - Date.now(), "the end of the Stuck cast (SMSG_SPELL_GO, or its failure)");
+        if (verdict === undefined) {
+          return unconfirmed(
+            `the Stuck cast began but neither went off nor failed within ${Math.round(timeout / 1000)}s; re-read state.self.position`,
+          );
+        }
+      }
+      if (!isEvent(verdict, "SMSG_SPELL_GO")) {
+        const d = verdict.data as CastFailedData | SpellFailureData;
+        const hint = unstuckFailedHint(d.reason, d.result);
+        this.noteActionHint("unstuck", "cast_failed", hint);
+        return { ok: false, status: "cast_failed", result: d.result, reason: d.reason, hint };
+      }
+      if (portSeq === undefined) {
+        try {
+          const port = await this.waitEvent((e) => portSeq !== undefined || isOwnPort(e, this.state.self.guid), {
+            timeout: Math.max(1, deadline - Date.now()),
+            includeBuffered: false,
+            description: "the teleport Stuck makes (MSG_MOVE_TELEPORT_ACK or SMSG_NEW_WORLD)",
+          });
+          if (portSeq === undefined && isOwnPort(port, this.state.self.guid)) portSeq = port.seq;
+        } catch (e) {
+          if (!(e instanceof EventTimeoutError)) throw e;
+        }
+      }
+      if (portSeq === undefined) {
+        return unconfirmed(
+          `Stuck went off but no move was observed within ${Math.round(timeout / 1000)}s: the server moves no one on a flight, ` +
+            "and a ghost only where a graveyard serves the zone; re-read state.self.position",
+        );
+      }
+      // A body's release lands its ghost flag a few ms after the port, as
+      // `repop` waits for; a caller reading `state.self` next sees the ghost.
+      const ghostWindow = Math.min(REPOP_SETTLE_MS, deadline - Date.now());
+      if (wasCorpse && this.state.self.ghost?.value !== true && ghostWindow > 0) {
+        try {
+          await this.waitEvent(() => this.state.self.ghost?.value === true, {
+            timeout: ghostWindow,
+            includeBuffered: false,
+            description: "the ghost flag after Stuck released the body",
+          });
+        } catch (e) {
+          if (!(e instanceof EventTimeoutError)) throw e;
+        }
+      }
+      await this.awaitAreaAfter(portSeq, deadline);
+      const self = this.state.self;
+      return {
+        ok: true,
+        status: "moved",
+        position: self.position?.value,
+        zone: self.zone?.value.name || undefined,
+        area: self.area?.value.name || undefined,
+      };
+    } finally {
+      offPort();
+    }
   }
 
   /**
