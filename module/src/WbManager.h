@@ -459,6 +459,8 @@ namespace WrathBench
                 WbVec landing;
                 float walkYards{0};       // from `from` to the edge, off the mesh
                 bool landingSnap{false};  // the leg below starts from the mesh nearest the landing
+                WbVec snapTo;             // ... this point (whenever a snap was attempted, refused or not)
+                float snapYards{0};       // ... this far from the landing, 3D
                 bool fromStart{false};    // tried again from the route's start after the route's own ledge (`firstReason`)
                 char const* firstReason{""};
             } edgeDrop;

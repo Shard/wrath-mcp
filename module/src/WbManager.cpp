@@ -2851,6 +2851,9 @@ namespace WrathBench
                     return refuse("landing_off_mesh");
                 start = { closest[2], closest[0], closest[1] };
                 ed.landingSnap = true;
+                ed.snapTo = start;
+                ed.snapYards = std::sqrt((start.x - landing.x) * (start.x - landing.x)
+                    + (start.y - landing.y) * (start.y - landing.y) + (start.z - landing.z) * (start.z - landing.z));
                 // The walk onto it is walked on the ground under the walk on's
                 // own rule: each sample's surface read from 1y over the last,
                 // nothing rising past that (terrain by its height, a model by
@@ -3327,6 +3330,8 @@ namespace WrathBench
                     if (ed.hasEdge)
                         a.Raw("edge", vec(ed.edge)).Raw("landing", vec(ed.landing))
                             .Add("walkYards", (double)ed.walkYards).Add("landingSnap", ed.landingSnap);
+                    if (ed.landingSnap)
+                        a.Raw("snapTo", vec(ed.snapTo)).Add("snapYards", (double)ed.snapYards);
                     if (ed.fromStart)
                         a.Add("fromStart", true).Add("firstReason", ed.firstReason);
                     Audit(*s, "action", a.Str());

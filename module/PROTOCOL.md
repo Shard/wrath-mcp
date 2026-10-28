@@ -1956,8 +1956,10 @@ polyline is the `move_path` — else a `reason` (`no_edge`, `climb`, `blocked`,
 `no_route_from_landing`, `second_ledge`, `air_to_request`, `no_speed`,
 `no_direction`, `not_a_ledge`), `from` (the route's end), and, once an edge was
 found, `edge`, `landing`, `walkYards` (the walk on from `from` to the edge) and
-`landingSnap` (the leg below starts from the mesh nearest the landing), and
-`fromStart` with `firstReason` when it was tried again from the route's start
+`landingSnap` (the leg below starts from the mesh nearest the landing) — with,
+whenever that snap was tried, taken or refused (`snap_ledge`, `snap_climb`),
+`snapTo` (the mesh point it aimed at) and `snapYards` (its distance from the
+landing, 3D) — and `fromStart` with `firstReason` when it was tried again from the route's start
 after the route's own ledge (`second_ledge`).
 Each `move_to` that reaches the mesh also logs one `op: "move_path"` record at
 dispatch — `moveId`, `status` (`"ok"` when the walk was dispatched, else the
