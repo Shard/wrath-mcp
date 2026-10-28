@@ -8,7 +8,7 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 
-const BRIDGE = join(import.meta.dir, "..", "src", "mcp-bridge.ts");
+const BRIDGE = join(import.meta.dir, "..", "src", "bridge.ts");
 
 async function exitedWithin(proc: Bun.Subprocess, timeoutMs: number): Promise<boolean> {
   return Promise.race([

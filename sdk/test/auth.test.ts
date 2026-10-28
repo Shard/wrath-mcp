@@ -22,8 +22,8 @@ describe("client: authentication", () => {
       await client.health();
       await client.say("hi");
       client.close();
-      // upgrade, /health, /action — every one carried the bearer.
-      expect(stub.authorizations).toEqual([`Bearer ${PORT_SECRET}`, `Bearer ${PORT_SECRET}`, `Bearer ${PORT_SECRET}`]);
+      // connect's protocol check (/health), upgrade, /health, /action — every one carried the bearer.
+      expect(stub.authorizations).toEqual([`Bearer ${PORT_SECRET}`, `Bearer ${PORT_SECRET}`, `Bearer ${PORT_SECRET}`, `Bearer ${PORT_SECRET}`]);
     } finally {
       await stub.stop();
     }

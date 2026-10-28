@@ -1,0 +1,28 @@
+{
+  "name": "@wrathbench/mcp",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "module": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./sandbox-child": "./src/sandbox/child.ts",
+    "./redact": "./src/redact.ts",
+    "./module-auth": "./src/module-auth.ts",
+    "./jsonsafe": "./src/jsonsafe.ts",
+    "./scratchpad": "./src/scratchpad.ts",
+    "./client-cache": "./src/sandbox/client-cache.ts",
+    "./paths": "./src/paths.ts",
+    "./tools": "./src/tools.ts"
+  },
+  "scripts": {
+    "start": "bun src/main.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "dependencies": {
+    "@wrathbench/sdk": "workspace:*",
+    "zod": "4.4.3"
+  }
+}

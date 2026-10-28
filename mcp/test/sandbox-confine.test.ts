@@ -64,7 +64,7 @@ describe("confinementPlan", () => {
     const p = plan(6);
     const underRepo = p.fs.filter((r) => r.path.startsWith(REPO)).map((r) => r.path);
     expect(underRepo).toEqual([
-      `${REPO}/runner`,
+      `${REPO}/mcp`,
       `${REPO}/sdk`,
       `${REPO}/node_modules`,
       `${REPO}/package.json`,
@@ -97,8 +97,8 @@ describe("confinementPlan", () => {
   });
 
   test("missing paths are dropped; the executables are listed whether or not they exist", () => {
-    const p = confinementPlan({ repoRoot: REPO, bunExe: BUN, moduleUrl: "http://m:8086", abi: 6, pid: PID, interpreter: LOADER, exists: (path) => path === "/usr" || path === `${REPO}/runner` });
-    expect(p.fs.map((r) => r.path)).toEqual(["/usr", `${REPO}/runner`]);
+    const p = confinementPlan({ repoRoot: REPO, bunExe: BUN, moduleUrl: "http://m:8086", abi: 6, pid: PID, interpreter: LOADER, exists: (path) => path === "/usr" || path === `${REPO}/mcp` });
+    expect(p.fs.map((r) => r.path)).toEqual(["/usr", `${REPO}/mcp`]);
   });
 
   test("TCP: connect to the module URL's port only, bind nowhere", () => {

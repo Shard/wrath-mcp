@@ -31,56 +31,6 @@ export interface ActionHintNote {
 }
 
 /**
- * A death-window transition the child latched the moment the event carrying it
- * arrived, rather than the moment the host next sampled.
- *
- * The host samples every `stateIntervalMs` (60s in the fleet); an entire death,
- * release and spirit-healer resurrection fits inside 30 seconds, so the sampled
- * window read misses whole deaths (run
- * `fleet-sonnet-low-freeplay-sonnet-low-20260827-a2`: three deaths, none
- * recorded). The child sees every event, so the transition is latched there and
- * drained from here; `ts` is the event's own timestamp, which is when the thing
- * happened.
- */
-export interface DeathSignal {
-  kind: "death" | "release" | "resurrect";
-  /** The timestamp of the event that carried the transition. */
-  ts: number;
-  /** That event's stream seq, for correlation with the event log. */
-  seq: number;
-  /** Death only: the corpse as the cache held it at that instant; absent when only its dungeon's entrance was known. */
-  position?: { map: number; x: number; y: number; z: number; source: "corpse_query" | "death_spot" };
-  /** Release only: the graveyard the spirit was released to. */
-  graveyard?: { map: number; x: number; y: number; z: number };
-  /** Death only: the zone/area ids at the moment of death. */
-  zone?: number;
-  area?: number;
-  /** Death only: the ghost flag as it read at that instant (usually false). */
-  released?: boolean;
-}
-
-/**
- * A flight transition the child latched the moment the event carrying it
- * arrived, for the same reason `DeathSignal` exists: the host samples every
- * 60s, two legs of a chain can both land inside one sample, and the area a
- * landing is written with must be the landing's, not the sample's (a landing
- * read a minute late once placed the character in the Deeprun Tram it had
- * since walked into). `taxi` is the flag turning on after an accepted reply;
- * `taxi_landed` is it turning off. Both carry the position and zone/area ids
- * as the cache held them at that instant.
- */
-export interface FlightSignal {
-  kind: "taxi" | "taxi_landed";
-  /** The timestamp of the event that carried the transition. */
-  ts: number;
-  /** That event's stream seq, for correlation with the event log. */
-  seq: number;
-  position?: { map: number; x: number; y: number; z: number };
-  zone?: number;
-  area?: number;
-}
-
-/**
  * Where the character is trying to get to: the destination of the current or
  * last `move_to` this session dispatched, and what became of it.
  *
@@ -197,32 +147,19 @@ export type HostToChild =
   /** Abort the eval with this id: fires its `signal`, so SDK waits it left behind settle. */
   | { t: "abort"; id: number }
   /**
-   * `action_hints` drains the SDK's hint tally for a tool result that is not a
-   * snippet's (`SandboxHost.drainActionHints`); a snippet's own result and
-   * pong drain it themselves. `snippet_delta` drains what changed since the
-   * last drain (`snippet-delta.ts`), once per snippet result on a driver that
-   * renders it (`SandboxHost.snippetDelta`). `context_events` is the turn's event window: the
-   * last `limit` non-ambient events and how many ambient ones the span held
-   * (`ContextEvents`). `trace_drain` empties the trace recorder's buffer
-   * (`trace-recorder.ts`, a `TraceDrain`): record only, drained by the host's
-   * state ticker, never by anything the model reads. `nearby_drain` is the
-   * same for the nearby recorder (`nearby-recorder.ts`, a `NearbyDrain`),
-   * whose rows go to the live map's ring and nowhere else.
+   * Ask the child for a value by name. The core answers `recent_events`
+   * (`EventSummary[]`), `action_hints` (drains the SDK's hint tally for a tool
+   * result that is not a snippet's, `SandboxHost.drainActionHints`; a
+   * snippet's own result and pong drain it themselves) and `state_summary`
+   * (the snapshot, `SandboxHost.stateSnapshot`); every other name is a method
+   * a child extension registered (`SandboxChildExtension.rpc`), such as a
+   * harness's own drains. A name nobody registered answers the snapshot, as
+   * `state_summary` does.
    */
   | {
       t: "rpc";
       id: number;
-      method:
-        | "recent_events"
-        | "context_events"
-        | "state_summary"
-        | "death_signals"
-        | "flight_signals"
-        | "party_signals"
-        | "action_hints"
-        | "snippet_delta"
-        | "trace_drain"
-        | "nearby_drain";
+      method: string;
       params: { limit?: number };
     }
   /**
@@ -259,19 +196,6 @@ export interface EvalResultMsg {
   durationMs: number;
 }
 
-/**
- * The events a turn's context is built from: the last N events that are not
- * ambient movement (`CONTEXT_POLICY.EVENT_WINDOW_EXCLUDE`) nor a bystander's
- * spell combat-log line (`spellLogShown`, not counted as ambient), oldest first, and
- * how many ambient events arrived in the span they cover — from the oldest
- * one returned to now, or since the child started when every non-ambient
- * event it has seen is in the list.
- */
-export interface ContextEvents {
-  events: EventSummary[];
-  folded: number;
-}
-
 export interface EventSummary {
   seq: number;
   ts: number;
@@ -280,16 +204,15 @@ export interface EventSummary {
   data: unknown;
   schemaError?: string | undefined;
   /**
-   * The combat-log sentence for a direct spell hit, heal or power gain
-   * (`spellLogNote` in context.ts), resolved in the child as the event
-   * arrived, while the units it names were still in view. Absent on every
-   * other event.
+   * A sentence a child extension resolved for this event as it arrived
+   * (`SandboxChildExtension.summarize`), while what it names was still in
+   * view — a harness's combat-log line, say. Absent on every other event.
    */
   note?: string | undefined;
   /**
-   * A spell combat-log line that involves neither us nor a party member's
-   * damage taken (`spellLogShown`): kept off the event window, shown on the
-   * raw stream.
+   * Set by a child extension on an event that is someone else's business
+   * (a harness's bystander spell line): `recent_events` leaves it out of the
+   * default view and shows it on the raw stream.
    */
   bystander?: true | undefined;
 }

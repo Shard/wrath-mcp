@@ -93,6 +93,21 @@ one. Secrets are compared in constant time. With `WrathBench.Secret` unset or
 shorter than 32 characters the module does not listen at all (logged at ERROR),
 so a mis-deployed worldserver is unreachable rather than open.
 
+## Versioning
+
+The protocol has a version of its own, an integer the module serves as
+`protocol` on `GET /health` (today `1`). It moves only for a change an existing
+SDK would misread — a field that changes meaning or type, a shape or status
+that goes away. An addition (a new action, a new event, a new field) leaves it
+alone: every reader of this protocol ignores what it does not know, which is
+why the SDK's schemas are loose.
+
+The SDK states the protocol versions it can drive (`MODULE_PROTOCOL_VERSIONS`
+in `sdk/src/version.ts`) and checks the module's on `connect`, refusing one it
+cannot drive with `ModuleProtocolError` before it subscribes. A module that
+serves no `protocol` predates the field and speaks `1`. The build identity
+(`build`, `startedAtMs`) is a separate thing: which binary, not which wire.
+
 ## Endpoints
 
 ### GET /health
@@ -101,7 +116,7 @@ Module and world status. Either credential class, no body.
 
 Two views. Callers on that network — the runner and, through
 it, the snippet sandbox — get liveness plus build identity: `ok`, `module`,
-`worldStopped`, `worldLoaded`, `build`, `startedAtMs`, `uptimeMs`,
+`worldStopped`, `worldLoaded`, `build`, `startedAtMs`, `uptimeMs`, `protocol`,
 with `sessions` / `droppedPackets` / `droppedPacketsLive` present but zeroed
 (kept so the SDK response schema parses) and no `droppedByOpcode` or
 `worldLoad`. The global
@@ -127,7 +142,8 @@ Operator (loopback) response `200`:
                  "questTemplates": 9500, "dbUptimeS": 86400, "loadedAfterMs": 180000, "dbRestarted": false },
   "build": "harness-0.3-41-g0bfe207",
   "startedAtMs": 1787400000000,
-  "uptimeMs": 3600000
+  "uptimeMs": 3600000,
+  "protocol": 1
 }
 ```
 
@@ -151,6 +167,8 @@ Operator (loopback) response `200`:
   static initialisation). `build` + `startedAtMs` together identify "this
   build, this boot"; the fleet's preflight gate keys on exactly that pair.
 - `uptimeMs` — milliseconds since `startedAtMs`. Telemetry, not identity.
+- `protocol` — the wire protocol version this build speaks, an integer (see
+  "Versioning" below). Served to every caller; the SDK reads it on `connect`.
 - `sessions` — number of live bench sessions.
 - `droppedPackets` — lifetime count of outbound packets suppressed because they
   were not on the event whitelist (survives session teardown). Whitelist tuning

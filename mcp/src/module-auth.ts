@@ -1,5 +1,5 @@
 /**
- * The runner's side of the module's authentication (module/PROTOCOL.md,
+ * The host's side of the module's authentication (module/PROTOCOL.md,
  * "Authentication").
  *
  * Two credentials exist and this file keeps them apart:

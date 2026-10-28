@@ -94,11 +94,18 @@ namespace WrathBench
 #endif
     static int64_t const kStartedAtMs = NowMs();
 
+    // The wire protocol this build speaks, served on /health beside the build
+    // (PROTOCOL.md, "Versioning"). An SDK refuses a protocol it cannot drive.
+    // Bumped only for a change an existing SDK would misread; an addition to
+    // the protocol leaves it alone.
+    static uint32_t const kProtocolVersion = 1;
+
     static void AddBuildIdentity(Json::Writer& w)
     {
         w.Add("build", WRATHBENCH_BUILD);
         w.Add("startedAtMs", kStartedAtMs);
         w.Add("uptimeMs", NowMs() - kStartedAtMs);
+        w.Add("protocol", kProtocolVersion);
     }
 
     // Whether the world loaded whole, for /health (PROTOCOL.md, GET /health).

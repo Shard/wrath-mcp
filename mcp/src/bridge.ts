@@ -11,12 +11,12 @@
  * bridge as the "command": it pipes stdin to the socket and the socket to
  * stdout, byte for byte. Deliberately dependency-free so it starts fast.
  *
- *   bun runner/src/mcp-bridge.ts <port>
+ *   bun mcp/src/bridge.ts <port>
  */
 
 const port = Number(Bun.argv[2]);
 if (!Number.isInteger(port) || port <= 0) {
-  console.error("usage: bun runner/src/mcp-bridge.ts <port>");
+  console.error("usage: bun mcp/src/bridge.ts <port>");
   process.exit(2);
 }
 

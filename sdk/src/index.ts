@@ -1,9 +1,13 @@
 /**
  * @wrathbench/sdk — the surface the model programs against.
  *
- * The SDK's public shape is part of the harness version (docs/ARCHITECTURE.md).
- * Adding to it is a minor bump; changing or removing anything exported here is
- * a major one and wants a note in docs/METHODOLOGY.md.
+ * This file is the package's whole public surface, deliberately: nothing
+ * outside sdk/ imports a path under it (infra/stack-boundary.ts). The SDK is
+ * versioned on its own (`SDK_VERSION`, `version.ts`; docs/METHODOLOGY.md,
+ * "Fixed harness, frozen per version"); a change here that a model can see is
+ * still a harness change ("Changing this document" there).
+ * TODO: which changes to this surface bump which part of SDK_VERSION is not
+ * settled.
  */
 
 export {
@@ -325,3 +329,7 @@ export type {
   UpdateObjectData,
   ValuesBlock,
 } from "./protocol";
+
+export { GROUP_OR_WHISPER_CHAT_TYPES, isGroupOrWhisperChat } from "./chat";
+export { API_MD_PATH } from "./reference";
+export { checkModuleProtocol, MODULE_PROTOCOL_VERSIONS, ModuleProtocolError, SDK_VERSION } from "./version";

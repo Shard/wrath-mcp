@@ -152,6 +152,7 @@ import {
 } from "./state";
 import type { z } from "zod";
 import { isFuzzy, resolveName, type ResolvedRef, type ResolveTier } from "./resolve";
+import { checkModuleProtocol } from "./version";
 
 /**
  * What every guid-taking method accepts: the opaque decimal string the SDK
@@ -3639,9 +3640,28 @@ export interface RawActionResponse extends ActionResponse {
  * `SMSG_LOGIN_VERIFY_WORLD` — is emitted while `POST /session` is still
  * blocking, and it is the only source for the character list and the starting
  * position. Connecting first is what makes the state cache complete.
+ *
+ * Before either, it asks `GET /health` which module protocol the server
+ * speaks and refuses one this SDK cannot drive (`ModuleProtocolError`,
+ * `version.ts`), so a mismatched pair fails here, by name, rather than as a
+ * misparsed event later. A module that serves no protocol predates the field
+ * and passes; a `/health` that does not answer is left to the calls that
+ * follow, which report it in their own words.
  */
 export async function connect(options: ConnectOptions): Promise<WrathClient> {
   const client = new WrathClient(options);
+  let health: object | undefined;
+  try {
+    health = await client.health();
+  } catch {
+    health = undefined;
+  }
+  try {
+    if (health !== undefined) checkModuleProtocol(health);
+  } catch (err) {
+    client.close();
+    throw err;
+  }
   if (options.subscribeEvents ?? true) {
     try {
       await client.events.connect();

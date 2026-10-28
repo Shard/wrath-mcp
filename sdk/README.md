@@ -3,9 +3,10 @@
 The TypeScript library a model's snippets call to drive a character. It wraps
 the module's HTTP/WebSocket protocol (`module/PROTOCOL.md`) in typed helpers,
 turns the module's packet stream into typed events, and folds those events into
-a state cache that says what the character can see right now. The runner hands
-it to every snippet as the ambient `sdk`, the scripted reference run plays
-through it from inside those snippets, and most of the smoke scripts under
+a state cache that says what the character can see right now. The stack's
+sandbox (`mcp/`) hands it to every snippet as the ambient `sdk`, the scripted
+reference run plays through it from inside those snippets, and most of the
+smoke scripts under
 `infra/smoke/` call it directly. Everything it knows comes through the module,
 so it observes only what a real client could observe (`docs/CONTRACTS.md`).
 
@@ -14,6 +15,79 @@ per-method reference generated from the source by `sdk/generate-api-docs.ts`.
 This file is for people working on the harness: how the pieces fit, the
 behaviours worth knowing before you compose helpers, and the rules the surface
 is held to.
+
+## The stack
+
+The SDK is the middle of three pieces that together give an agent a game
+client's eyes and hands on a stock AzerothCore — packets, not pixels — and
+nothing of the benchmark built on them:
+
+- `module/` (C++, GPL-2.0-or-later): the worldserver module. It takes actions
+  as the client opcodes a client would send and serves the packets a client
+  would receive, over HTTP and a WebSocket. Its wire is `module/PROTOCOL.md`.
+- `sdk/` (this package, `@wrathbench/sdk`): the typed client over that wire,
+  the event stream, the state cache, the helpers and their per-call hints.
+- `mcp/` (`@wrathbench/mcp`): the agent surface over the SDK — a confined,
+  persistent snippet sandbox holding one client, an MCP server, and the core
+  tools (`run_snippet`, `recent_events`, `state_summary`, `write_scratchpad`,
+  `edit_scratchpad`).
+
+What the agent may observe and do is `docs/CONTRACTS.md`; with
+`module/PROTOCOL.md` it is the stack's specification. `runner/` is the
+benchmark that drives the stack; nothing in the stack imports it
+(`bun run boundary`, `docs/ARCHITECTURE.md`, "The stack and the benchmark").
+
+### Quickstart
+
+1. **Add the module to a stock AzerothCore.** Check out AzerothCore at the
+   pinned commit, `3cafaf4a588fd1f287678fdb37438fdedd1ed85c` (`infra/PINS.md`),
+   copy `module/` to `modules/mod-wrathbench`, and build as usual; CMake finds
+   the module itself. `-DWRATHBENCH_BUILD=<your build id>` names the build on
+   `/health`. `infra/docker/server.Dockerfile` is this exact recipe. The
+   worldserver needs the 3.3.5a client data (`dbc`, `maps`, `vmaps`, `mmaps`)
+   for that core, which you supply; none of it is in this repository.
+2. **Configure it.** Copy `module/conf/mod_wrathbench.conf.dist` beside the
+   worldserver's config. `WrathBench.Secret` is required — the port secret,
+   32 characters or more; without it the module does not listen.
+   `WrathBench.Accounts` lists the game accounts sessions may use,
+   `WrathBench.BindAddress` and `WrathBench.Port` (default `0.0.0.0:8086`)
+   where it listens; keep that port on a private network.
+3. **Run the MCP server.** With Bun 1.4 and `bun install` at the repo root:
+
+   ```bash
+   WRATHBENCH_MODULE_URL=http://127.0.0.1:8086 \
+   WRATHBENCH_MODULE_SECRET=<the port secret> \
+     bun mcp/src/main.ts --account <an allowed account>
+   ```
+
+   It speaks MCP over stdio, so an MCP-capable agent launches it as its
+   server command. It leases a session secret for its token with the port
+   secret, hands the sandbox only that, and keeps the scratchpad and the
+   client cache under `--dir` (default `$TMPDIR/wrathbench-mcp/<token>`). The
+   sandbox needs Linux 6.7 or later (Landlock with TCP rules) and refuses to
+   run without it. Event lines and the state summary come back in a plain
+   rendering; a harness supplies its own (`CoreToolRender`).
+4. **Or use the SDK directly**, as the smoke scripts do (below, "At a
+   glance").
+
+### Versioning
+
+The SDK has its own version, `SDK_VERSION` (`src/version.ts`, the same string
+as `package.json`; `docs/METHODOLOGY.md`, "Fixed harness, frozen per
+version"), and `@wrathbench/mcp` carries the same one. As built, the runner
+depends on the stack at an exact version (`workspace:0.1.0`), so an SDK whose
+version moves fails the install until that dependency moves too, and every
+run records the version it drove as `sdkVersion` in `meta.json`. A change a
+model can see is still a harness change (`docs/METHODOLOGY.md`, "Changing
+this document"). Which changes bump which part of the SDK's version is not
+settled yet.
+
+The module's wire has a version of its own, the integer `protocol` on
+`GET /health` (`module/PROTOCOL.md`, "Versioning"). `connect` checks it before
+anything else and throws `ModuleProtocolError` for a protocol this SDK cannot
+drive (`MODULE_PROTOCOL_VERSIONS`); a module that predates the field passes.
+The build identity on the same endpoint (`build`, `startedAtMs`) says which
+binary, not which wire.
 
 ## At a glance
 
