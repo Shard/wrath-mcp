@@ -71,11 +71,11 @@ describe("runes", () => {
 });
 
 describe("channeling", () => {
-  const start = frame(41, "MSG_CHANNEL_START", { casterGuid: SELF_GUID, spellId: 5143, name: "Arcane Missiles", durationMs: 3000 });
+  const start = frame(41, "MSG_CHANNEL_START", { casterGuid: SELF_GUID, spellId: 5143, name: "Test Channel", durationMs: 3000 });
 
   test("an own channel start sets it with its end and target; a pushback moves the end; the update with no time ends it", () => {
     let cache = replay([...loginSequence, selfCreate, frame(40, "SMSG_SPELL_GO", { casterGuid: SELF_GUID, spellId: 5143, hitGuids: [], misses: [] }), start]);
-    expect(cache.self.channeling?.value).toEqual({ spellId: 5143, name: "Arcane Missiles", endsAt: TS + 41 + 3000, targetGuid: undefined });
+    expect(cache.self.channeling?.value).toEqual({ spellId: 5143, name: "Test Channel", endsAt: TS + 41 + 3000, targetGuid: undefined });
     expect(cache.self.casting).toBeUndefined();
     cache = replay([...loginSequence, selfCreate, start, selfValues(42, { channelObjectGuid: CREATURE_GUID, channelSpell: 5143 }), frame(43, "MSG_CHANNEL_UPDATE", { casterGuid: SELF_GUID, timeMs: 2500 })]);
     expect(cache.self.channeling?.value).toMatchObject({ targetGuid: CREATURE_GUID, endsAt: TS + 43 + 2500 });
@@ -93,7 +93,7 @@ describe("channeling", () => {
 describe("totems", () => {
   test("a created totem fills its slot, a new one replaces it, and the object's destroy removes it", () => {
     const created = (seq: number, slot: number, guid: string, spellId: number) =>
-      frame(seq, "SMSG_TOTEM_CREATED", { slot, guid, durationMs: 120_000, spellId, name: "Searing Totem" });
+      frame(seq, "SMSG_TOTEM_CREATED", { slot, guid, durationMs: 120_000, spellId, name: "Test Totem" });
     let cache = replay([...loginSequence, selfCreate, created(40, 0, TOTEM_GUID, 3599), created(41, 1, "77", 8071)]);
     expect(cache.self.totems.map((t) => [t.slot, t.element, t.guid])).toEqual([[0, "fire", TOTEM_GUID], [1, "earth", "77"]]);
     expect(cache.self.totems[0]?.expiresAt).toBe(TS + 40 + 120_000);
