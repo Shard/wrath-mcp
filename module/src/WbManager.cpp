@@ -9729,8 +9729,9 @@ namespace WrathBench
                 // faction. One packet per line of the text: u32 length (the
                 // NUL included), then the line. The core writes the line from
                 // a string_view, so the bytes run on past `length` into the
-                // lines after it; exactly `length` bytes are read and the text
-                // ends at the first NUL. No transfer follows.
+                // lines after it; exactly `length` bytes are read, and the
+                // last of them is the NUL or, for every line but the last, the
+                // newline that ended it, which is dropped. No transfer follows.
                 case SMSG_AREA_TRIGGER_MESSAGE:
                 {
                     name = "SMSG_AREA_TRIGGER_MESSAGE";
@@ -9743,6 +9744,8 @@ namespace WrathBench
                     if (len)
                         p.read(reinterpret_cast<uint8*>(text.data()), len);
                     text.resize(strnlen(text.c_str(), text.size()));
+                    if (!text.empty() && text.back() == '\n')
+                        text.pop_back();
                     w.Add("text", text);
                     break;
                 }

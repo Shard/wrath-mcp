@@ -2040,7 +2040,7 @@ Map transfers (navigation):
 | `SMSG_NEW_WORLD` | 0x03E | `{ "map": <u32>, "x", "y", "z", "o" }` — the arrival point (transport-local when aboard one) |
 | `SMSG_TRANSFER_ABORTED` | 0x040 | `{ "map": <u32>, "reason": <u8>, "arg": <u8?> }` — `arg` only for INSUF_EXPAN_LVL / DIFFICULTY / UNIQUE_MESSAGE |
 | `SMSG_CORPSE_NOT_IN_INSTANCE` | 0x506 | `{}` — bodiless: a dead character crossed a dungeon portal's areatrigger and the server refused it because its corpse is not in that dungeon or one inside it (`MapMgr::PlayerCannotEnter`); no transfer follows, and the `move_to` that crossed the trigger ends as it would have anyway |
-| `SMSG_AREA_TRIGGER_MESSAGE` | 0x2B8 | `{ "text": <string> }` — a portal's refusal in words (`WorldSession::SendAreaTriggerMessage`): a dungeon's level gate, a closed instance, a raid entered without a raid group, a battleground portal of the other faction. One event per line of the text (u32 length, then the line; read to the length and cut at the first NUL). No transfer follows, and the `move_to` that crossed the trigger ends as it would have anyway |
+| `SMSG_AREA_TRIGGER_MESSAGE` | 0x2B8 | `{ "text": <string> }` — a portal's refusal in words (`WorldSession::SendAreaTriggerMessage`): a dungeon's level gate, a closed instance, a raid entered without a raid group, a battleground portal of the other faction. One event per line of the text (u32 length, then the line; read to the length, cut at the first NUL, a line's own trailing newline dropped). No transfer follows, and the `move_to` that crossed the trigger ends as it would have anyway |
 
 `SMSG_NEW_WORLD` is the only map id a client receives after login
 (`SMSG_LOGIN_VERIFY_WORLD` is never re-sent), so it is what self position's

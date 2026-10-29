@@ -189,7 +189,7 @@ describe("a portal that refuses a ghost (SMSG_CORPSE_NOT_IN_INSTANCE)", () => {
 });
 
 describe("a portal refused in words (SMSG_AREA_TRIGGER_MESSAGE)", () => {
-  const gate = "You must be at least level 10 to enter.";
+  const gate = "The gate of Nowhere Keep turns you away.";
   const hint = `the server refused the portal: "${gate}". No transfer follows; you are where the walk ended.`;
 
   test("rides the arrival's hint and reaches the harness block", async () => {
