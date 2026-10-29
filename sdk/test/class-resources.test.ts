@@ -65,6 +65,21 @@ describe("runes", () => {
     expect(runes.map((r) => r.ready)).toEqual([true, true, true, true, false, true]);
   });
 
+  test("a relog starts the runes over from the base layout", () => {
+    const login = (loginSequence as { opcode: string }[]).find((f) => f.opcode === "SMSG_LOGIN_VERIFY_WORLD")!;
+    const cache = replay([
+      ...loginSequence,
+      selfCreate,
+      selfValues(40, { class: 6 }),
+      frame(41, "SMSG_CONVERT_RUNE", { index: 0, runeType: 3 }),
+      frame(42, "SMSG_SPELL_GO", { casterGuid: SELF_GUID, spellId: 45477, hitGuids: [], misses: [], runesBefore: 0x3f, runesAfter: 0x2f }),
+      { ...login, seq: 43, ts: TS + 43 },
+      selfValues(44, { class: 6 }),
+    ]);
+    expect(cache.self.runes?.value.map((r) => r.type)).toEqual(["blood", "blood", "unholy", "unholy", "frost", "frost"]);
+    expect(cache.self.runes?.value.every((r) => r.ready === undefined)).toBe(true);
+  });
+
   test("any other class has no runes", () => {
     expect(replay([...loginSequence, selfCreate, selfValues(40, { class: 1 })]).self.runes).toBeUndefined();
   });

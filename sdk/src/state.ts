@@ -3602,12 +3602,16 @@ export class StateCache {
           this.resurrectOffer = undefined;
           this.self.casting = undefined;
           // Nor a channel, combo points, totems or a mirror bar: a logout
-          // ends all four, and the runes are ready again.
+          // ends all four. The runes start over too: the login's self block
+          // re-seeds the base layout, and its aura applications re-announce
+          // any conversion.
           this.self.channeling = undefined;
           this.self.comboPoints = undefined;
           this.self.totems = [];
           this.self.mirrorTimers = [];
           this.runeReadyMask = undefined;
+          this.runeTypes = undefined;
+          this.self.runes = undefined;
         }
         // The new map's name arrives on its WB_AREA; until then only the id
         // (position.map) is known, so the old map's name is not kept.
