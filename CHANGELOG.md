@@ -191,7 +191,7 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 - A create block's absent fields read as zero. The core sends only the
   non-zero fields in a create (`Object::BuildValuesUpdate`), and a client
   starts every field at 0, so the cache now states `unitFlags`,
-  `dynamicFlags`, `npcFlags`, `standState` and `shapeshiftForm` (and, for the
+  `dynamicFlags`, `standState` and `shapeshiftForm` (and, for the
   character itself, `playerFlags` and `restedXp`) as 0 when a create block
   leaves them out. A fresh character reads `state.self.standState` stand,
   `sitting` false, `shapeshiftForm` none, `restedXp` 0, and a creature with no

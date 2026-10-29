@@ -5773,7 +5773,7 @@ function supersededCorpses(objects: Iterable<NearbyObject>): Set<GuidKey> {
  * `standState` and `shapeshiftForm` unpack `UNIT_FIELD_BYTES_1` / `_2`, so
  * they are absent only when every byte of the word is zero.
  */
-const CREATE_ZERO_UNIT_FIELDS = ["unitFlags", "dynamicFlags", "npcFlags", "standState", "shapeshiftForm"] as const;
+const CREATE_ZERO_UNIT_FIELDS = ["unitFlags", "dynamicFlags", "standState", "shapeshiftForm"] as const;
 /** Our own `playerFlags` and rested XP. Rested XP is PRIVATE, so nobody else's create states it. */
 const CREATE_ZERO_SELF_FIELDS = ["playerFlags", "restedXp"] as const;
 
