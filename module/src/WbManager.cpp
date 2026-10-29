@@ -626,6 +626,15 @@ namespace WrathBench
             l.allowGm = allowGm;
             character = l.character;
         }
+        // A live session under the token takes the lease's opt-in now, not at
+        // its next create: a re-lease without it must turn it off for the
+        // session already in world, whose create may never come again (a GM
+        // account's is refused before it could refresh anything). World
+        // thread, where the flag is read.
+        PushTask([this, token, allowGm]() {
+            if (auto live = FindByToken(token))
+                live->allowGm = allowGm;
+        });
         LOG_INFO("module", "wrathbench: leased {} to account {}{}", TokenTag(token), account, allowGm ? " (GM opt-in)" : "");
         Json::Writer w;
         w.Add("ok", true).Add("token", token).Add("account", account).Add("secret", secret).Add("allowGm", allowGm);

@@ -69,7 +69,7 @@ The lease is what binds a token to an account and a character:
   `true`, and returns the secret. Re-leasing a token rotates its secret (a
   resumed run re-leases the token it stored) and keeps its character binding
   unless the account changed; the opt-in is each lease's own, so a re-lease
-  without it turns it off.
+  without it turns it off, for a session already in world too.
 - A session-class `POST /session` lands on the lease's account whatever the body
   says (`403 account_not_leased` if the body names another), and takes the
   lease's GM opt-in whatever its body's `allowGm` says: only the port
@@ -242,9 +242,10 @@ command set, which no player's client has. On, both are the account's own
 business and the module passes them through. It exists so an operator who
 means to drive a GM account can, and so an agent never does by accident.
 A session-class create takes its lease's opt-in, whatever its body says
-("Authentication"); an operator-class create takes the body's. A same-token
-create that finds its session in world refreshes the session's opt-in to the
-create's, so a resumed caller that no longer asks for it turns it off. The
+("Authentication"); an operator-class create takes the body's. A session in
+world takes a new lease's opt-in for its token at once, so a resumed caller
+that re-leases without it turns it off whether or not it creates again; a
+same-token create that finds its session in world sets it to the create's. The
 module has no conf for it: the opt-in comes only from the holder of the port
 secret, who already decides which accounts the module serves.
 
