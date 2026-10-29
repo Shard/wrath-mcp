@@ -1,0 +1,55 @@
+# PR checks. Everything here runs from a bare clone: no game stack, no client
+# data, no secrets. The C++ module is not compiled here (it builds only inside
+# an AzerothCore tree); a module change is verified through a WrathBench pin
+# bump and its smoke suite (CONTRIBUTING.md).
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Bun checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+
+      - name: Bun version matches the pin
+        run: |
+          pinned="$(cat .bun-version)"
+          actual="$(bun --version)"
+          echo "pinned=$pinned actual=$actual"
+          test "$pinned" = "$actual"
+
+      - name: Install (frozen)
+        run: bun install --frozen-lockfile
+
+      # Fast to slow, so a bad type or a stale doc fails before the suite.
+      - name: Typecheck
+        run: bun run typecheck
+
+      # sdk/ and mcp/ import nothing outside themselves but declared
+      # dependencies, and the module includes headers by bare name only.
+      - name: Stack boundary
+        run: bun run boundary
+
+      # Regenerates sdk/API.md and fails if it differs from what is committed.
+      - name: Generated API docs are current
+        run: bun run docs:api:check
+
+      - name: Test suite
+        run: bun test
