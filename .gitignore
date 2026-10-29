@@ -1,0 +1,17 @@
+node_modules/
+*.log
+
+# Secrets never enter git: the module's port secret and anything else an
+# operator keeps in an env file.
+.env
+.env.*
+
+# Server data, client files, audit logs and any other local state. Nothing
+# Blizzard-derived is ever committed.
+data/
+
+# Claude Code session worktrees and local harness settings
+.claude/worktrees/
+.claude/settings.json
+
+.DS_Store

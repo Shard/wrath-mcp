@@ -1,0 +1,24 @@
+{
+  "name": "wrath-mcp",
+  "private": true,
+  "license": "MIT",
+  "workspaces": [
+    "sdk",
+    "mcp"
+  ],
+  "engines": {
+    "bun": "1.4.4"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "for p in sdk mcp scripts; do tsc --noEmit -p $p || exit 1; done",
+    "boundary": "bun scripts/boundary.ts",
+    "docs:api": "bun run sdk/generate-api-docs.ts",
+    "docs:api:check": "bun run sdk/generate-api-docs.ts && git diff --exit-code -- sdk/API.md",
+    "mcp": "bun mcp/src/main.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.4",
+    "typescript": "7.0.2"
+  }
+}

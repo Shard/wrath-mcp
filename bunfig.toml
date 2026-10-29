@@ -1,0 +1,6 @@
+# `bun test` from the root runs the sdk and mcp suites and the boundary check's
+# own tests. None of them needs a preload: every test runs against an
+# in-process stub of the module (`sdk/test/server.ts`) or a planted temp tree,
+# with no game stack and no config store. This file is also one of the root
+# manifests the confined snippet child may read (`mcp/src/sandbox/confine.ts`).
+[test]
