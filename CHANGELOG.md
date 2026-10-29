@@ -27,6 +27,21 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Added
 
+- **Jump.** `sdk.jump()` (in place) and `sdk.jump({ forward: true })` (at the
+  run speed along the facing), the `jump` action: `MSG_MOVE_JUMP` with the
+  stock client's launch, the arc flown as a client's physics fly it, and
+  `MSG_MOVE_FALL_LAND` where it comes down, which the server charges as any
+  fall; `jump()` waits for the landing (`WB_SELF_MOVE` cause `jump`) and
+  returns where the body came down. Refusals are values with hints
+  (`moving`, `falling`, `flying`, `rooted`, `swimming`, `on_transport`,
+  `controlling`). A jump rises about 1.6y, so it does not clear a step
+  `moveTo` refuses as a climb.
+- **Knockbacks are answered.** `SMSG_MOVE_KNOCK_BACK` for the character is
+  acked as a client acks it (`CMSG_MOVE_KNOCK_BACK_ACK` with the launch), and
+  the body flies the arc and lands where it comes down, reported as
+  `WB_SELF_MOVE` cause `knockback`; the server no longer holds a knocked
+  character in place. A walk in progress ends with the new status
+  `knocked_back`.
 - **The character flies.** A character the server has told it can fly
   (`SMSG_MOVE_SET_CAN_FLY`: a flying mount, a flight form) is flown as a
   possessed flyer is: a straight line at the z asked for, at its flight

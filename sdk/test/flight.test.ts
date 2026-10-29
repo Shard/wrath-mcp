@@ -74,7 +74,7 @@ describe("fly: the character's own flight", () => {
     stub.push(result(1, 30, "falling"));
     const r = await pending;
     expect(r).toMatchObject({ ok: false, status: "falling" });
-    expect(r.hint).toMatch(/you are falling.*the move was not sent/);
+    expect(r.hint).toMatch(/you are in the air.*the move was not sent/);
     expect(stub.actions.map((a) => a.action)).toEqual(["move_to"]);
     await done();
   });

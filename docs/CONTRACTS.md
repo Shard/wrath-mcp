@@ -31,7 +31,7 @@ Every action is dispatched as the client opcode a real client would send, throug
 
 The action set:
 - Session: create character (class, race, name), log in, log out.
-- Movement: move to position (client movement packets along a path, or a straight flight for a character the server has told it can fly), stop, face, jump is not required.
+- Movement: move to position (client movement packets along a path, or a straight flight for a character the server has told it can fly), stop, face, jump (in place or forward).
 - Targeting: set target, clear target.
 - Combat: start and stop auto-attack, cast spell by id (with optional target), cancel cast. A cast, or an item's use, may also carry an item target (`TARGET_FLAG_ITEM`, an item the character holds) and a ground target (`TARGET_FLAG_DEST_LOCATION`, a point the caller gives in full), in the target block a client writes; the server judges both.
 - Interaction: interact with object, open gossip with NPC, select gossip option.

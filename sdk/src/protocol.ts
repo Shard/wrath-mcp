@@ -235,6 +235,7 @@ export type ActionRequest =
   | { token: string; action: "say"; text: string }
   | { token: string; action: "move_to"; x: number; y: number; z: number; guid?: string }
   | { token: string; action: "stop" }
+  | { token: string; action: "jump"; forward?: boolean }
   | { token: string; action: "face"; orientation: number }
   | { token: string; action: "face"; x: number; y: number }
   // quest/combat extension. Guids are decimal strings on the wire.
@@ -887,6 +888,7 @@ export const MOVE_STATUSES = [
   "stunned",
   "falling",
   "cannot_fly",
+  "knocked_back",
   "controlling",
 ] as const;
 export type KnownMoveStatus = (typeof MOVE_STATUSES)[number];
@@ -976,10 +978,11 @@ export type RideProgressData = z.infer<typeof rideProgressDataSchema>;
  * outside any `move_to`, as a client's own physics would: the drop from a
  * taxi flight's last spline point (`fromZ`) to the ground under it (`pos`),
  * sent as `MSG_MOVE_FALL_LAND` the tick the flight flag clears
- * (`cause: "taxi_landing"`), and the landing of a fall from the air after the
- * server took the ability to fly away mid-air (`cause: "fall"`, `fromZ` the
- * height it fell from; `MSG_MOVE_START_SWIM` when it comes down in deep
- * water). `pos` is where the character is after landing.
+ * (`cause: "taxi_landing"`), and the landing of an arc: a jump
+ * (`cause: "jump"`), a knockback (`"knockback"`), or a fall from the air
+ * after the server took the ability to fly away mid-air (`"fall"`); `fromZ`
+ * the height it left from, `MSG_MOVE_START_SWIM` when it came down in deep
+ * water. `pos` is where the character is after landing.
  */
 export const selfMoveDataSchema = z.looseObject({
   opcode: z.string(),
