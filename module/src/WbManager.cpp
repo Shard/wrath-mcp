@@ -1125,7 +1125,7 @@ namespace WrathBench
         // Guid-shaped fields are validated wherever they appear, before any
         // per-action branching: a truncated or non-decimal guid must never
         // silently become guid 0 (which targets nothing).
-        for (char const* key : { "guid", "targetGuid", "itemGuid" })
+        for (char const* key : { "guid", "targetGuid", "itemGuid", "itemTargetGuid" })
         {
             std::string v = req.GetString(key);
             if (!GuidFieldParses(v))
@@ -1234,6 +1234,11 @@ namespace WrathBench
             if ((action == "equip_item" || action == "use_item" || action == "destroy_item")
                 && (!req.Has("bag") || !req.Has("slot")))
                 return MissingParam(action, "missing_bag_slot", !req.Has("bag") ? "bag" : "slot");
+            // A ground target is a whole point: the module never makes up an axis.
+            if ((action == "cast_spell" || action == "use_item")
+                && (req.Has("destX") || req.Has("destY") || req.Has("destZ"))
+                && !(req.Has("destX") && req.Has("destY") && req.Has("destZ")))
+                return MissingParam(action, "missing_dest", !req.Has("destX") ? "destX" : (!req.Has("destY") ? "destY" : "destZ"));
             if (action == "learn_talent" && (!req.Has("talentId") || !req.Has("rank")))
                 return MissingParam(action, "missing_talent", !req.Has("talentId") ? "talentId" : "rank");
             if (action == "learn_preview_talents" && !req.Has("talents"))
@@ -3831,6 +3836,79 @@ namespace WrathBench
         try { return std::stoull(v); } catch (...) { return 0; }
     }
 
+    // What a cast aims at, as cast_spell and use_item take it (PROTOCOL.md):
+    // a unit or object (targetGuid), an item the character holds
+    // (itemTargetGuid) and a point on the ground (destX, destY, destZ).
+    struct CastTargets
+    {
+        uint64_t unit{0};
+        uint64_t item{0};
+        bool hasDest{false};
+        float x{0.0f}, y{0.0f}, z{0.0f};
+    };
+
+    // The targets off a request: the error code, or nullptr. An item guid of
+    // 0, or a point off the float range, is refused rather than dropped,
+    // which would send the cast with no item or no point. A guid that does
+    // not parse, and a partial point, are refused on the io thread.
+    static char const* ParseCastTargets(Json::Value const& req, CastTargets& t)
+    {
+        t.unit = ParseGuid(req, "targetGuid");
+        if (req.Has("itemTargetGuid"))
+        {
+            t.item = ParseGuid(req, "itemTargetGuid");
+            if (!t.item)
+                return "invalid_item_target";
+        }
+        if (req.Has("destX"))
+        {
+            t.hasDest = true;
+            t.x = (float)req.GetDouble("destX");
+            t.y = (float)req.GetDouble("destY");
+            t.z = (float)req.GetDouble("destZ");
+            if (!std::isfinite(t.x) || !std::isfinite(t.y) || !std::isfinite(t.z))
+                return "invalid_dest";
+        }
+        return nullptr;
+    }
+
+    // The SpellCastTargets block after a cast's header, in the order the core
+    // reads it (Spell.cpp SpellCastTargets::Read): u32 mask; the packed object
+    // guid under TARGET_FLAG_UNIT; the packed item guid under
+    // TARGET_FLAG_ITEM; under TARGET_FLAG_DEST_LOCATION the packed transport
+    // guid and x, y, z. The transport guid is always 0, so the point is a
+    // world position: SpellCastTargets::Update relocates by a transport only
+    // when one is named. With a unit alone, or nothing, this is the u32 2 +
+    // packed guid, or the u32 0, both actions have always written.
+    static void WriteCastTargets(WorldPacket& p, CastTargets const& t)
+    {
+        uint32 mask = TARGET_FLAG_NONE;
+        if (t.unit)
+            mask |= TARGET_FLAG_UNIT;
+        if (t.item)
+            mask |= TARGET_FLAG_ITEM;
+        if (t.hasDest)
+            mask |= TARGET_FLAG_DEST_LOCATION;
+        p << uint32(mask);
+        if (t.unit)
+            p.appendPackGUID(t.unit);
+        if (t.item)
+            p.appendPackGUID(t.item);
+        if (t.hasDest)
+        {
+            p.appendPackGUID(0);                             // transport guid: none
+            p << float(t.x) << float(t.y) << float(t.z);
+        }
+    }
+
+    static void AuditCastTargets(Json::Writer& w, CastTargets const& t)
+    {
+        if (t.item)
+            w.AddGuid("itemTargetGuid", t.item);
+        if (t.hasDest)
+            w.Add("destX", (double)t.x).Add("destY", (double)t.y).Add("destZ", (double)t.z);
+    }
+
     // Every action that is one synthesized client opcode through the stock
     // handlers (docs/CONTRACTS.md action contract). The ack means "opcode
     // queued"; the game outcome arrives as whitelisted events.
@@ -3871,24 +3949,21 @@ namespace WrathBench
         else if (action == "cast_spell")
         {
             uint32 spellId = static_cast<uint32>(req.GetInt("spellId"));
-            uint64_t target = ParseGuid(req, "targetGuid");
+            CastTargets targets;
+            if (char const* bad = ParseCastTargets(req, targets))
+                return err(400, bad);
             // castCount is the client's own counter (BenchSession::castCount):
             // with 0 the core skips its in-progress check (Spell::prepare) and
             // a cast sent during another cancels it, where a client's is
             // refused SPELL_FAILED_SPELL_IN_PROGRESS.
             uint8 const castCount = s->NextCastCount();
-            p = new WorldPacket(CMSG_CAST_SPELL, 1 + 4 + 1 + 4 + 9);
+            p = new WorldPacket(CMSG_CAST_SPELL, 1 + 4 + 1 + 4 + 9 + 9 + 1 + 12);
             *p << uint8(castCount) << uint32(spellId) << uint8(0);   // castCount, spellId, castFlags
-            if (target)
-            {
-                *p << uint32(0x0002);                        // TARGET_FLAG_UNIT
-                p->appendPackGUID(target);
-            }
-            else
-                *p << uint32(0);                             // TARGET_FLAG_NONE (self/auto target)
+            WriteCastTargets(*p, targets);                   // no target: mask 0, self/auto target
             auditW.Add("spellId", spellId).Add("castCount", (uint32)castCount);
-            if (target)
-                auditW.AddGuid("targetGuid", target);
+            if (targets.unit)
+                auditW.AddGuid("targetGuid", targets.unit);
+            AuditCastTargets(auditW, targets);
         }
         else if (action == "cancel_cast")
         {
@@ -4085,7 +4160,9 @@ namespace WrathBench
         {
             uint8 bag = static_cast<uint8>(req.GetInt("bag"));
             uint8 slot = static_cast<uint8>(req.GetInt("slot"));
-            uint64_t target = ParseGuid(req, "targetGuid");
+            CastTargets targets;
+            if (char const* bad = ParseCastTargets(req, targets))
+                return err(400, bad);
             // The glyph slot a client's glyph frame sends with a glyph (the
             // u32 after the item guid; 0 for every other item). The server
             // drops anything past its six slots (MAX_GLYPH_SLOT_INDEX) as a
@@ -4116,16 +4193,18 @@ namespace WrathBench
                 // The same client cast counter as cast_spell's: the core hands
                 // it to the item's spell (Player::CastItemUseSpell), whose
                 // in-progress check skips a 0 the same way.
-                p = new WorldPacket(CMSG_USE_ITEM, 1 + 1 + 1 + 4 + 8 + 4 + 1 + 4 + 9);
+                p = new WorldPacket(CMSG_USE_ITEM, 1 + 1 + 1 + 4 + 8 + 4 + 1 + 4 + 9 + 9 + 1 + 12);
                 *p << uint8(bag) << uint8(slot) << uint8(s->NextCastCount()) << uint32(spellId);
                 *p << uint64(item->GetGUID().GetRawValue()) << uint32(glyphSlot) << uint8(0);
-                if (target)
-                {
-                    *p << uint32(0x0002);                        // TARGET_FLAG_UNIT
-                    p->appendPackGUID(target);
-                }
-                else
-                    *p << uint32(0);
+                // HandleUseItemOpcode reads the same SpellCastTargets block a
+                // cast does, after the cast flags.
+                WriteCastTargets(*p, targets);
+            }
+            else if ((startQuest || (proto && proto->HasFlag(ITEM_FLAG_HAS_LOOT))) && (targets.item || targets.hasDest))
+            {
+                // The quest offer and the loot window below take no target:
+                // an item or a point would be dropped, not aimed.
+                return err(400, "no_spell_to_target");
             }
             else if (startQuest)
             {
@@ -4161,6 +4240,8 @@ namespace WrathBench
                 auditW.Add("open", true);
             if (spellId && glyphSlot)
                 auditW.Add("glyphSlot", (uint32)glyphSlot);
+            if (spellId)
+                AuditCastTargets(auditW, targets);
         }
         else if (action == "destroy_item")
         {

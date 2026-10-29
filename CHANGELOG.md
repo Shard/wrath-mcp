@@ -100,6 +100,22 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   (`state.self.proficiency`, re-sent by the reattach replay),
   `SMSG_SPELLORDAMAGE_IMMUNE`, `SMSG_ENVIRONMENTAL_DAMAGE_LOG` and
   `SMSG_SPELL_DELAYED` (which moves `state.self.casting.endsAt`).
+- Item and ground targets on a cast: `cast_spell` and `use_item` take
+  `itemTargetGuid` (`TARGET_FLAG_ITEM`, an item the character holds) and
+  `destX`/`destY`/`destZ` (`TARGET_FLAG_DEST_LOCATION`, all three or none),
+  written into the cast's target block as a client writes it; without them
+  the encoding is unchanged. In the SDK, `castSpell(id, target?, { targetItem,
+  targetPoint })` and the same two options on `useItem`: an item by name,
+  guid or `{ bag, slot }` (worn slots as bag 255), a point `{ x, y, z }` or a
+  unit at its position. A point without z is refused with nothing sent. These
+  are the target forms Feed Pet, poisons, stones and oils on a weapon,
+  enchanting, Disenchant, Prospecting and Milling, and ground-targeted spells
+  and items use.
+  New module errors `invalid_item_target`, `invalid_dest`, `missing_dest` and
+  `no_spell_to_target` (an item that starts a quest or opens for loot takes no
+  target). Cast-failure hints name the item or the point and say what the
+  item-target codes mean (`wrong_pet_food`, `cant_be_disenchanted`,
+  `item_gone`, …).
 
 ### Changed
 
