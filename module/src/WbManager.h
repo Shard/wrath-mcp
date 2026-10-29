@@ -30,6 +30,7 @@ class WorldSession;
 class WorldSocket;
 class WorldPacket;
 class Player;
+class Unit;
 
 // The parked-socket client end is an Asio tcp socket; forward-declare the type
 // so the header stays free of Asio. Defined in AzerothCore's Socket.h.
