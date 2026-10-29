@@ -2089,8 +2089,10 @@ Served in `SMSG_UPDATE_OBJECT` `fields` alongside the existing set:
   compressed out, and the SDK joins halves into guids and addresses the
   slot as `(bag = the bag's equipment slot 19-22, slot = n)`, which is what
   `CMSG_USE_ITEM` / `CMSG_DESTROYITEM` / `CMSG_AUTOEQUIP_ITEM` resolve
-  through `Player::GetItemByPos`. Nothing new on the action side: swap and
-  split stay off the allowlist.
+  through `Player::GetItemByPos`. Nothing new on the action side: moving,
+  swapping and splitting items is the raw allowlist's (`CMSG_SWAP_ITEM`,
+  `CMSG_SPLIT_ITEM` and the rest of its inventory line), addressed by the
+  same `(bag, slot)` pairs.
 
 ## Audit log
 
