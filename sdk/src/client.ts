@@ -5455,8 +5455,8 @@ export class WrathClient {
    * The loot of an item `useItem` opened (`CMSG_OPEN_ITEM`): its window
    * (`SMSG_LOOT_RESPONSE` under the item's own guid) emptied the client's way,
    * as a chest's is, and the bag pushes counted. A window that closes at once
-   * is `empty`; a refusal — locked, or dead — is `SMSG_INVENTORY_CHANGE_FAILURE`
-   * for the item and comes back as `refused`. Silence throws `EventTimeoutError`.
+   * is `empty`; a refusal is `SMSG_INVENTORY_CHANGE_FAILURE` and comes back as
+   * `refused`. Silence throws `EventTimeoutError`.
    */
   private async openedItemLoot(
     item: BagSlotItem,
@@ -5465,13 +5465,18 @@ export class WrathClient {
     timeout: number,
   ): Promise<UseItemResult> {
     const ours = (guid: string) => guidKey(guid) === item.guid;
+    // A locked item is refused naming it; a dead opener is refused naming no
+    // item (HandleOpenItemOpcode sends EQUIP_ERR_YOU_ARE_DEAD with none, which
+    // the tap serves as guid "0"), so that counts as this open's answer too.
+    const refusal = (d: InventoryChangeFailureData) =>
+      isOwnInventoryFailure(d, item.guid) || (d.result !== 0 && d.itemGuid !== undefined && guidKey(d.itemGuid) === "0");
     const first = await this.waitEvent(
       (e) =>
         (sinceSeq === undefined || e.seq > sinceSeq) &&
         !isDecodeError(e.data) &&
         ((isEvent(e, "SMSG_LOOT_RESPONSE") && !isLootError(e.data as LootResponseData) && ours((e.data as LootWindowData).guid)) ||
           (isEvent(e, "SMSG_LOOT_RELEASE_RESPONSE") && ours((e.data as { guid: string }).guid)) ||
-          (isEvent(e, "SMSG_INVENTORY_CHANGE_FAILURE") && isOwnInventoryFailure(e.data as InventoryChangeFailureData, item.guid))),
+          (isEvent(e, "SMSG_INVENTORY_CHANGE_FAILURE") && refusal(e.data as InventoryChangeFailureData))),
       {
         timeout,
         description:

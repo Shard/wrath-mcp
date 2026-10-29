@@ -216,6 +216,18 @@ describe("client: useItem on an item that opens for loot", () => {
     await stub.stop();
   });
 
+  test("a dead opener is refused naming no item, and that is this open's answer", async () => {
+    const stub = startStub({ onConnect: () => clamWorld() });
+    const client = await clamInHand(stub);
+    const pending = client.useItem("Thick Clam", undefined, undefined, { timeout: 2000 });
+    await untilAction(stub, "use_item");
+    // EQUIP_ERR_YOU_ARE_DEAD, sent with no item: the tap serves guid "0".
+    stub.push(JSON.stringify(frame(90, "SMSG_INVENTORY_CHANGE_FAILURE", { result: 38, itemGuid: "0", itemGuid2: "0" })));
+    expect(await pending).toMatchObject({ ok: false, status: "refused", result: 38 });
+    client.close();
+    await stub.stop();
+  });
+
   test("a window that closes at once is empty", async () => {
     const stub = startStub({ onConnect: () => clamWorld() });
     const client = await clamInHand(stub);
