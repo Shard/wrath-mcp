@@ -85,11 +85,18 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   `path_incomplete` at the last clear point when it runs into either
   (`flight: true` on the verdict; `moveTo`'s hint says to fly higher or
   around). The unit's root and movement-state packets are answered with its
-  guid and kept as its own state. The status `controlling` is kept for the
-  one case no packet can drive — the core holds a mover that is not in the
-  character's map — and for a walk that control changes hands under. Before
-  this change the server silently dropped such a walk and it ended
-  `interrupted`.
+  guid and kept as its own state; a seated passenger's root and
+  movement-state acks carry the seat's transport block, so an ack during
+  the boarding spline no longer takes it off the seat in the server's
+  record. The walk's drift guard scales with the pace, so a flight is not
+  ended `interrupted` for outrunning a runner's tolerance. The status
+  `controlling` is kept for the one case no packet can drive — the core
+  holds a mover that is not in the character's map — and for a walk that
+  control changes hands under. Before this change the server silently
+  dropped such a walk and it ended `interrupted`.
+- `petCast(spell, point)`: a ground target for the controlled unit's bar
+  (a vehicle cannon's shot), sent as `CMSG_PET_CAST_SPELL` with
+  `TARGET_FLAG_DEST_LOCATION`; a unit target and no target are as before.
 - Unit state flags named, from the `unitFlags` and `dynamicFlags` the module
   already serves (no wire change): `units()` rows carry `inCombat`,
   `stunned`, `skinnable`, `lootable`, `tapped` and `tappedByYou` (the client's

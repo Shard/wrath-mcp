@@ -778,7 +778,10 @@ whose handler does nothing a non-GM client could not do:
   aggressive, type 0x81 / 0xC1 / 0x01 with a spell id; the SDK's `petAttack`,
   `petFollow`, `petStay`, `petReact`, `petCast`, `petDismiss` build it),
   `CMSG_PET_CAST_SPELL` (`u64 pet guid, u8 cast count, u32 spell, u8 flags,
-  SpellCastTargets`), `CMSG_PET_STOP_ATTACK` (`u64 pet guid`),
+  SpellCastTargets` as `cast_spell` carries them; the SDK's `petCast` with a
+  point builds it with `TARGET_FLAG_DEST_LOCATION`, the shot a vehicle's
+  cannon takes from its bar; the handler takes a pet or a charmed or
+  possessed unit alike), `CMSG_PET_STOP_ATTACK` (`u64 pet guid`),
   `CMSG_PET_ABANDON` (`u64 pet guid`), `CMSG_PET_RENAME` (`u64 pet guid,
   cstring name, u8 declined`), `CMSG_PET_SET_ACTION` (`u64 pet guid, (u32
   position, u32 button) × 1..2`), `CMSG_PET_SPELL_AUTOCAST` (`u64 pet guid,
@@ -1312,16 +1315,23 @@ position, speed, map and water are the walk's, and the verdicts and progress
 events name it (`mover`, with `pos` the unit's). A ground mover (a steed) is
 walked over the mesh as the character is, planned from the unit's own
 position and collision height at its run speed, with the same ledge, water
-and turn rules; a flying mover (a creature whose template or state flies:
-the Eye of Acherus) is flown, as a client flies it, in a straight line at
-the z asked for and at its flight speed (`flight: true` on the ack's
+and turn rules; a flying mover (the Eye of Acherus: a unit whose create
+block, or a `SMSG_MOVE_SET_CAN_FLY` for its guid since, carried the flight
+flags — can-fly, flying or no gravity — which is how a client knows, never
+the creature's template) is flown, as a client flies it, in a straight line
+at the z asked for and at its flight speed (`flight: true` on the ack's
 siblings, the progress events and the verdict), the line judged against the
-geometry a client has — the map's line of sight over models and game objects
-and the terrain under each 4y sample — and refused `path_incomplete` at the
-last clear point when it runs into either; a flight has no water, no ledges
-and no transport legs, and the unit's own `FLYING | CAN_FLY` ride its
-packets (the core keeps them once the mover has its fly aura,
-`ReadMovementInfo`, and strips them until then). The unit's root packets
+geometry a client has — models and game objects by the map's line of sight
+(`Map::isInLineOfSight`, which does not see terrain), the terrain by its own
+height under each 4y sample (`Map::GetGridHeight`, whatever z the sample is
+at) — and refused `path_incomplete` at the last clear point when it runs
+into either; a flight has no water, no ledges and no transport legs, and the
+unit's own `FLYING | CAN_FLY` ride its packets (the core keeps them once the
+mover has its fly aura, `ReadMovementInfo`, and strips them until then). The
+walk's drift guard (the walker ending a move `interrupted` when the server's
+position falls more than a tolerance behind the walker's, checked each
+heartbeat) scales with the pace: 15y up to 6.25 y/s, then 0.8 s of the pace
+plus 10y, since the server's position is the last heartbeat's. The unit's root packets
 (`SMSG_FORCE_MOVE_ROOT` with its guid, `Unit::SendMoveRoot` to the
 controlling client) and movement-state changes are answered with its guid
 and kept as its own state, apart from the character's, which stands while

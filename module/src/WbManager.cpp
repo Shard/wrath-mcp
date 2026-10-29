@@ -1781,6 +1781,15 @@ namespace WrathBench
     // echoed counter, then this same MovementInfo: one writer, so an ack can
     // never disagree with the walk about the transport block, the swimming
     // flag, the state flags or the clock.
+    //
+    // Whether `unit` is the session's own character, as against a unit it
+    // moves: by identity, never by type (a possessed player is another
+    // player's character).
+    static bool IsOwnCharacter(BenchSession& s, Unit* unit)
+    {
+        return s.ws && unit == static_cast<Unit*>(s.ws->GetPlayer());
+    }
+
     static void AppendMovementInfo(WorldPacket& p, BenchSession& s, Unit* mover, uint32 moveFlags,
         float x, float y, float z, float o, Transport* transport)
     {
@@ -1790,7 +1799,8 @@ namespace WrathBench
         // character's alone: a flying mover flies, and its packets say so
         // (FLYING | CAN_FLY, which ReadMovementInfo keeps once the mover has
         // its fly aura and strips until then).
-        if (mover->IsPlayer())
+        bool const own = IsOwnCharacter(s, mover);
+        if (own)
             moveFlags |= s.stateMoveFlags.load() & ~uint32(MOVEMENTFLAG_CAN_FLY);
         else
             moveFlags |= s.moverMoveFlags.load();
@@ -1800,7 +1810,7 @@ namespace WrathBench
         // The walk's swim state only when the walk drives this unit (an ack
         // for the character while a vehicle is walked reads the character's).
         bool const walkIsThis = s.move.active
-            && (s.move.moverGuid ? mover->GetGUID().GetRawValue() == s.move.moverGuid : mover->IsPlayer());
+            && (s.move.moverGuid ? mover->GetGUID().GetRawValue() == s.move.moverGuid : own);
         bool const swimming = !transport && !flying && (walkIsThis ? s.move.swimming : mover->IsInWater());
         if (swimming)
             moveFlags = (moveFlags | MOVEMENTFLAG_SWIMMING) & ~uint32(MOVEMENTFLAG_WATERWALKING);
@@ -1869,9 +1879,9 @@ namespace WrathBench
 
     // The transport under a point of the walk, for the character alone: a
     // vehicle or a possessed unit is never walked onto a tram car or a boat.
-    static Transport* TransportUnder(Unit* mover, float x, float y, float z)
+    static Transport* TransportUnder(BenchSession& s, Unit* mover, float x, float y, float z)
     {
-        return mover->IsPlayer() ? FindTransportAt(mover->GetMap(), x, y, z) : nullptr;
+        return IsOwnCharacter(s, mover) ? FindTransportAt(mover->GetMap(), x, y, z) : nullptr;
     }
 
     // The MovementInfo of a unit as it stands, for the packets a client sends
@@ -1908,6 +1918,22 @@ namespace WrathBench
         if (flags & (MOVEMENTFLAG_SWIMMING | MOVEMENTFLAG_FLYING))
             p << float(unit->m_movementInfo.pitch);
         p << uint32(0);             // fallTime
+    }
+
+    // The MovementInfo of an ack for `unit`: the walk's or the server's pose
+    // (AppendMovementInfo) — unless the unit sits on a vehicle seat, when it
+    // is the seat's: the unit's own block with ONTRANSPORT, the vehicle's
+    // guid, the seat offset and the seat (AppendUnitMovementInfo). The
+    // handlers apply an ack's MovementInfo whole (HandleMoverRelocation), so
+    // an ack during the boarding spline that omitted the seat would take the
+    // passenger off it in the server's record.
+    static void AppendAckMovementInfo(WorldPacket& p, BenchSession& s, Unit* unit, uint32 moveFlags,
+        float x, float y, float z, float o, Transport* transport)
+    {
+        if (unit->GetVehicle())
+            AppendUnitMovementInfo(p, s, unit);
+        else
+            AppendMovementInfo(p, s, unit, moveFlags, x, y, z, o, transport);
     }
 
     // Swimming, as the server judges it and a client does it. Every number
@@ -2068,9 +2094,11 @@ namespace WrathBench
     // where it is to the point asked for, at the z asked for. Nothing here
     // reads the mesh. The line is judged against the geometry a client has:
     // the map's line of sight over models and game objects
-    // (Map::isInLineOfSight, as the core judges a spell's), and the terrain
-    // under each sample of the line (GetHeight with no vmap: the ground
-    // alone), so a line into a hillside or through a wall is refused as
+    // (Map::isInLineOfSight, as the core judges a spell's; it does not see
+    // terrain), and the terrain's own height under each sample of the line
+    // (Map::GetGridHeight, the ground at x,y whatever z is asked from — a
+    // sample inside a hill is below it; GetHeight would search down from the
+    // sample and find nothing), so a line into a hillside or through a wall is refused as
     // `path_incomplete` at the last clear sample — the agent flies higher or
     // around. The line's own length is the route (`pathLength`), its time the
     // mover's flight speed over it (FlightEtaMs). One LoS query per sample on
@@ -2100,7 +2128,7 @@ namespace WrathBench
         {
             float const t = float(k) / float(n);
             WbVec const at{from.x + sx * t, from.y + sy * t, from.z + sz * t};
-            float const terrain = map->GetHeight(mover->GetPhaseMask(), at.x, at.y, at.z, false);
+            float const terrain = map->GetGridHeight(at.x, at.y);
             bool const underGround = terrain > INVALID_HEIGHT && terrain > at.z + 0.5f;
             bool const seen = !underGround && map->isInLineOfSight(clear.x, clear.y, clear.z, at.x, at.y, at.z,
                 mover->GetPhaseMask(), LINEOFSIGHT_ALL_CHECKS, VMAP::ModelIgnoreFlags::Nothing);
@@ -3597,6 +3625,10 @@ namespace WrathBench
             w.Add("flight", true);
         m.moverGuid = 0;
         m.flying = false;
+        // `pos` always: a driven unit gone from the map by the verdict (a
+        // possession recalled, a ride's end despawning the mount, the session
+        // gone) leaves the walker's own last point, the client's last word on
+        // where it was.
         if (unit)
         {
             w.Raw("pos", PosJson(unit->GetPositionX(), unit->GetPositionY(), unit->GetPositionZ(), unit->GetOrientation()));
@@ -3606,6 +3638,8 @@ namespace WrathBench
                 w.Raw("onTransport", Json::Writer().AddGuid("guid", (uint64_t)t->GetGUID().GetRawValue())
                     .Add("entry", t->GetEntry()).Str());
         }
+        else
+            w.Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO));
         // The z the mesh resolved the request to, when it differed from the
         // request by more than 1y: the honest signal that the agent's z was off
         // and the module walked to the ground instead.
@@ -3694,7 +3728,14 @@ namespace WrathBench
             return;
         }
 
-        if (s->move.active)
+        if (s->move.active && !WalkDrives(*s, mover, player))
+        {
+            // The walk still running drove another unit (control changed hands
+            // since; the tick has not seen it yet): the server drops that
+            // unit's packets now, so nothing is sent and it ends `controlling`.
+            FinishMove(*s, "controlling");
+        }
+        else if (s->move.active)
         {
             // A client whose run is redirected stops first: without this the
             // server's last movement word stays MOVEMENTFLAG_FORWARD when the
@@ -3703,7 +3744,7 @@ namespace WrathBench
             // Hearthstone casts in nav-probe c3).
             MoveState& old = s->move;
             SendMovePacket(*s, mover, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, old.curX, old.curY, old.curZ, old.curO,
-                TransportUnder(mover, old.curX, old.curY, old.curZ));
+                TransportUnder(*s, mover, old.curX, old.curY, old.curZ));
             FinishMove(*s, "superseded");
         }
 
@@ -3753,10 +3794,14 @@ namespace WrathBench
         if (mover->GetExactDist2d(x, y) > 250.0f)
             return failEvent("too_far");
 
-        // A flying mover (the Eye of Acherus, a flying vehicle: a creature
-        // whose template or state flies) is not walked over the mesh: a
-        // client flies it in a straight line, and so does the module (PlanFlight).
-        bool const flying = mover != player && (mover->CanFly() || mover->IsFlying());
+        // A flying mover (the Eye of Acherus, a flying vehicle) is not walked
+        // over the mesh: a client flies it in a straight line, and so does the
+        // module (PlanFlight). Known the way a client knows it: from the
+        // flight flags the unit's own create block carried at the handover and
+        // the packets for its guid since (BenchSession::moverMoveFlags), never
+        // from the creature's template.
+        bool const flying = mover != player
+            && (s->moverMoveFlags.load() & (MOVEMENTFLAG_CAN_FLY | MOVEMENTFLAG_FLYING | MOVEMENTFLAG_DISABLE_GRAVITY)) != 0;
 
         // Resolve the request against the server's mmaps (the one sanctioned
         // navmesh use, docs/CONTRACTS.md "Pathing") into either a walkable
@@ -4011,7 +4056,7 @@ namespace WrathBench
         PlaceMover(*s, mover, m.curX, m.curY, m.curZ, MOVEMENTFLAG_NONE, now);
 
         SendMovePacket(*s, mover, MSG_MOVE_START_FORWARD, MOVEMENTFLAG_FORWARD, m.curX, m.curY, m.curZ, m.curO,
-            TransportUnder(mover, m.curX, m.curY, m.curZ));
+            TransportUnder(*s, mover, m.curX, m.curY, m.curZ));
         Json::Writer startW;
         startW.Add("op", "move_pkt").Add("opcode", "MSG_MOVE_START_FORWARD").Add("moveId", moveId);
         addMover(startW);
@@ -4041,7 +4086,14 @@ namespace WrathBench
             return;
         }
 
-        if (s->move.active && RootedFor(*s, mover, player))
+        if (s->move.active && !WalkDrives(*s, mover, player))
+        {
+            // The walk drove another unit and control has changed hands since
+            // (the tick has not seen it yet): its packets are dropped now, so
+            // nothing is sent and it ends `controlling`.
+            FinishMove(*s, "controlling");
+        }
+        else if (s->move.active && RootedFor(*s, mover, player))
         {
             // Rooted mid-walk and the tick has not ended it yet: the root ack
             // already stopped the character where the mover stood.
@@ -4053,7 +4105,7 @@ namespace WrathBench
             // Stop where the "client" is (the interpolated position); the server
             // accepts it the same way it accepts any client stop mid-run.
             SendMovePacket(*s, mover, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, m.curX, m.curY, m.curZ, m.curO,
-                TransportUnder(mover, m.curX, m.curY, m.curZ));
+                TransportUnder(*s, mover, m.curX, m.curY, m.curZ));
             FinishMove(*s, "stopped");
         }
         else
@@ -5333,7 +5385,7 @@ namespace WrathBench
         {
             MoveState& m = s.move;
             SendMovePacket(s, mover, MSG_MOVE_HEARTBEAT, MOVEMENTFLAG_FORWARD, x, y, z, m.curO,
-                TransportUnder(mover, x, y, z));
+                TransportUnder(s, mover, x, y, z));
             m.lastPacketMs = nowMs;
             Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_HEARTBEAT")
                 .Add("moveId", m.moveId).Add("cause", "areatrigger").Raw("pos", PosJson(x, y, z, m.curO)).Str());
@@ -5447,7 +5499,7 @@ namespace WrathBench
         m.curX = x; m.curY = y; m.curZ = meshZ;
         if (m.inFall || m.flying)
             return; // a flight has no water: the body is where the line puts it
-        Transport* transport = TransportUnder(mover, x, y, meshZ);
+        Transport* transport = TransportUnder(s, mover, x, y, meshZ);
         WaterPose const pose = transport ? WaterPose{false, meshZ} : WaterPoseAt(mover, x, y, meshZ);
         m.curZ = pose.z;
         if (pose.swimming == m.swimming)
@@ -5639,7 +5691,7 @@ namespace WrathBench
                     {
                         PlaceMover(s, mover, a.x, a.y, a.z, MOVEMENTFLAG_FORWARD, nowMs);
                         SendMovePacket(s, mover, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, m.curX, m.curY, m.curZ, m.curO,
-                            TransportUnder(mover, m.curX, m.curY, m.curZ));
+                            TransportUnder(s, mover, m.curX, m.curY, m.curZ));
                         Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_STOP")
                             .Add("moveId", m.moveId).Add("cause", "drop").Add("dz", (double)dz)
                             .Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO)).Str());
@@ -5655,7 +5707,7 @@ namespace WrathBench
                         m.curO = Position::NormalizeOrientation(std::atan2(sy, sx));
                         PlaceMover(s, mover, a.x, a.y, a.z, MOVEMENTFLAG_FORWARD, nowMs);
                         SendMovePacket(s, mover, MSG_MOVE_HEARTBEAT, MOVEMENTFLAG_FORWARD, m.curX, m.curY, m.curZ, m.curO,
-                            TransportUnder(mover, a.x, a.y, a.z));
+                            TransportUnder(s, mover, a.x, a.y, a.z));
                         m.lastPacketMs = nowMs;
                         Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_HEARTBEAT")
                             .Add("moveId", m.moveId).Add("cause", "drop_forced").Add("dz", (double)dz)
@@ -5710,7 +5762,7 @@ namespace WrathBench
                 // landing (Player::HandleFall), and treats the swim start as
                 // the end of the fall (ProcessMovementInfo).
                 m.inFall = false;
-                Transport* landT = TransportUnder(mover, b.x, b.y, b.z);
+                Transport* landT = TransportUnder(s, mover, b.x, b.y, b.z);
                 WaterPose const pose = landT ? WaterPose{false, b.z} : WaterPoseAt(mover, b.x, b.y, b.z);
                 m.curX = b.x; m.curY = b.y; m.curZ = pose.z;
                 bool const intoWater = pose.swimming && !m.swimming;
@@ -5735,7 +5787,7 @@ namespace WrathBench
             // for the server to confirm.
             PlaceMover(s, mover, m.destX, m.destY, m.destZ, MOVEMENTFLAG_FORWARD, nowMs);
             SendMovePacket(s, mover, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, m.curX, m.curY, m.curZ, m.curO,
-                TransportUnder(mover, m.destX, m.destY, m.destZ));
+                TransportUnder(s, mover, m.destX, m.destY, m.destZ));
             Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_STOP")
                 .Add("moveId", m.moveId).Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO)).Str());
             m.stopping = true;
@@ -5757,9 +5809,16 @@ namespace WrathBench
         // runs before a turn report (below), which restarts the interval: on a
         // bending route at a mount's speed turns can come faster than 500ms,
         // and the check must not wait on a heartbeat that never falls due.
+        // The tolerance follows the pace: the server's position is the last
+        // packet's, up to a heartbeat (500 ms) plus a map update behind the
+        // walker, so a fast mover (a flight at several times run speed) is
+        // legitimately farther from its walker than a runner. 15y at a run
+        // (7 y/s: ~4y of lag and the rest margin), and from there 0.8 s of
+        // the pace plus 10y, which is the same 15y up to 6.25 y/s.
+        float const driftTolerance = std::max(15.0f, pace * 0.8f + 10.0f);
         auto drifted = [&]() -> bool
         {
-            if (mover->GetExactDist2d(m.curX, m.curY) <= 15.0f)
+            if (mover->GetExactDist2d(m.curX, m.curY) <= driftTolerance)
                 return false;
             SendMovePacket(s, mover, MSG_MOVE_STOP, MOVEMENTFLAG_NONE,
                 mover->GetPositionX(), mover->GetPositionY(), mover->GetPositionZ(), mover->GetOrientation(),
@@ -5772,7 +5831,7 @@ namespace WrathBench
             if (drifted())
                 return;
             SendMovePacket(s, mover, MSG_MOVE_HEARTBEAT, MOVEMENTFLAG_FORWARD, m.curX, m.curY, m.curZ, m.curO,
-                TransportUnder(mover, m.curX, m.curY, m.curZ));
+                TransportUnder(s, mover, m.curX, m.curY, m.curZ));
             m.lastPacketMs = nowMs;
             Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_HEARTBEAT")
                 .Add("moveId", m.moveId).Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO)).Str());
@@ -5793,7 +5852,7 @@ namespace WrathBench
             if (drifted())
                 return;
             SendMovePacket(s, mover, MSG_MOVE_SET_FACING, MOVEMENTFLAG_FORWARD, m.curX, m.curY, m.curZ, m.curO,
-                TransportUnder(mover, m.curX, m.curY, m.curZ));
+                TransportUnder(s, mover, m.curX, m.curY, m.curZ));
             m.lastPacketMs = nowMs;
             Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_SET_FACING")
                 .Add("moveId", m.moveId).Add("cause", "turn")
@@ -6160,12 +6219,12 @@ namespace WrathBench
         float const y = walking ? m.curY : unit->GetPositionY();
         float const z = walking ? m.curZ : unit->GetPositionZ();
         float const o = walking ? m.curO : unit->GetOrientation();
-        Transport* transport = walking ? TransportUnder(unit, x, y, z) : unit->GetTransport();
+        Transport* transport = walking ? TransportUnder(s, unit, x, y, z) : unit->GetTransport();
         uint16 const opcode = root ? CMSG_FORCE_MOVE_ROOT_ACK : CMSG_FORCE_MOVE_UNROOT_ACK;
         WorldPacket* p = new WorldPacket(opcode, 8 + 4 + 4 + 2 + 4 + 16 + 8 + 16 + 4 + 1 + 4 + 4);
         *p << unit->GetPackGUID();
         *p << uint32(counter);
-        AppendMovementInfo(*p, s, unit, root ? MOVEMENTFLAG_ROOT : MOVEMENTFLAG_NONE, x, y, z, o, transport);
+        AppendAckMovementInfo(*p, s, unit, root ? MOVEMENTFLAG_ROOT : MOVEMENTFLAG_NONE, x, y, z, o, transport);
         ws->QueuePacket(p);
         Json::Writer a;
         a.Add("op", "root_ack")
@@ -6262,7 +6321,7 @@ namespace WrathBench
         a.y = atMover ? m.curY : unit->GetPositionY();
         a.z = atMover ? m.curZ : unit->GetPositionZ();
         a.o = atMover ? m.curO : unit->GetOrientation();
-        a.transport = atMover ? TransportUnder(unit, a.x, a.y, a.z) : unit->GetTransport();
+        a.transport = atMover ? TransportUnder(s, unit, a.x, a.y, a.z) : unit->GetTransport();
         a.flags = rooted ? MOVEMENTFLAG_ROOT : (running ? MOVEMENTFLAG_FORWARD : MOVEMENTFLAG_NONE);
         a.moveId = drives ? m.moveId : uint64_t(0);
         return a;
@@ -6360,7 +6419,7 @@ namespace WrathBench
         WorldPacket* p = new WorldPacket(ackOpcode, 8 + 4 + 4 + 2 + 4 + 16 + 8 + 16 + 4 + 1 + 4 + 4 + 4);
         *p << player->GetPackGUID();
         *p << uint32(counter);
-        AppendMovementInfo(*p, s, player, a.flags, a.x, a.y, a.z, a.o, a.transport);
+        AppendAckMovementInfo(*p, s, player, a.flags, a.x, a.y, a.z, a.o, a.transport);
         *p << float(speed);
         ws->QueuePacket(p);
         Audit(s, "action", Json::Writer().Add("op", "move_ack").Add("kind", "speed")
@@ -6576,7 +6635,7 @@ namespace WrathBench
         WorldPacket* p = new WorldPacket(c.ack, 8 + 4 + 4 + 2 + 4 + 16 + 8 + 16 + 4 + 1 + 4 + 4 + 4);
         *p << unit->GetPackGUID();
         *p << uint32(counter);
-        AppendMovementInfo(*p, s, unit, a.flags, a.x, a.y, a.z, a.o, a.transport);
+        AppendAckMovementInfo(*p, s, unit, a.flags, a.x, a.y, a.z, a.o, a.transport);
         *p << uint32(c.apply ? 1 : 0);  // read as a u32 and never used (HandleMoveFlagChangeOpcode)
         ws->QueuePacket(p);
         Json::Writer w;
