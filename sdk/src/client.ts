@@ -1054,6 +1054,14 @@ export type MoveResult =
       readonly ok: true;
       readonly status: "arrived";
       readonly moveId: number;
+      /**
+       * The unit this move drove when it was not the character — the vehicle
+       * or possessed unit the client moves (`state.self.control`); `position`
+       * is then that unit's. Absent on the character's own walk.
+       */
+      readonly mover?: string;
+      /** The leg was flown (a flying mover's straight line), not walked over the mesh. */
+      readonly flight?: boolean;
       readonly position: UnitPosition;
       readonly seq: number;
       readonly ts: number;
@@ -1085,6 +1093,8 @@ export type MoveResult =
       readonly ok: true;
       readonly status: "transferred";
       readonly moveId: number;
+      readonly mover?: string;
+      readonly flight?: boolean;
       /** Where the character was on the old map when the portal took it. */
       readonly position: UnitPosition;
       readonly seq: number;
@@ -1107,6 +1117,8 @@ export type MoveResult =
       readonly ok: true;
       readonly status: "teleported";
       readonly moveId: number;
+      readonly mover?: string;
+      readonly flight?: boolean;
       /** Where the character was when the teleport took it. */
       readonly position: UnitPosition;
       readonly seq: number;
@@ -1148,6 +1160,10 @@ export type MoveResult =
       readonly ok: false;
       readonly status: Exclude<KnownMoveStatus, "arrived" | "transferred" | "teleported"> | (string & {});
       readonly moveId: number;
+      /** The unit this move drove, or was asked to drive, when it was not the character; `position` is then that unit's. */
+      readonly mover?: string;
+      /** The leg was flown: a flying mover's straight line, judged against the client's own geometry. */
+      readonly flight?: boolean;
       readonly position: UnitPosition;
       readonly seq: number;
       readonly ts: number;
@@ -1228,10 +1244,14 @@ export const MOVE_HINTS: Readonly<Record<string, (point: MovePoint, data: MoveRe
     `cast, ignores pathing, and returns you to your bound inn; retry it if the cast fails with ` +
     `SPELL_FAILED_MOVING.`,
   path_incomplete: (p, d) =>
-    `the walkable mesh has no continuous route to (${fmtXY(p)})` +
-    (d.reachedPos ? `; it ends at (${fmtXY(d.reachedPos)}, z ${d.reachedPos.z.toFixed(1)})${heightGap(d.reachedPos.z - p.z)}` : "") +
-    `. The module already tried one subdivision. Route around (a road, a ramp, a door) or approach from ` +
-    `another side.`,
+    d.flight === true
+      ? `the straight flight line to (${fmtXY(p)}, z ${p.z.toFixed(1)}) runs into terrain or a building` +
+        (d.reachedPos ? `; it is clear as far as (${fmtXY(d.reachedPos)}, z ${d.reachedPos.z.toFixed(1)})` : "") +
+        `. Fly higher (a point well above the ground between) or around it, in a leg or two.`
+      : `the walkable mesh has no continuous route to (${fmtXY(p)})` +
+        (d.reachedPos ? `; it ends at (${fmtXY(d.reachedPos)}, z ${d.reachedPos.z.toFixed(1)})${heightGap(d.reachedPos.z - p.z)}` : "") +
+        `. The module already tried one subdivision. Route around (a road, a ramp, a door) or approach from ` +
+        `another side.`,
   drop: (p, d) => {
     const edge = d.reachedPos ?? d.pos;
     if (d.dz !== undefined && d.dz > 0) return climbHint(d.dz, edge);
@@ -1303,18 +1323,19 @@ const ROOTED_MOVE_HINT = "you are rooted or stunned and cannot move until it wea
 const ROOTED_WALK_HINT = "a root or stun stopped you mid-walk where you stand; you cannot move until it wears off.";
 
 /**
- * `controlling`, refused: the client moves another unit (a vehicle's driving
- * seat, a possession), which the walker does not drive yet, and sent nothing.
+ * `controlling`, refused: the server holds a mover for this client (a
+ * vehicle, a possessed unit: `state.self.control.mover`) that the walker
+ * cannot reach — not in view on this map — so nothing was sent.
  */
 const CONTROLLING_MOVE_HINT =
-  "you are controlling another unit (state.self.control.mover: a vehicle's driving seat or a possessed unit) and " +
-  "moveTo does not drive it yet; the move was not sent. Its spells are on state.pet() (petCast); leaveVehicle() " +
-  "returns control from a vehicle, and a possession ends with its own spell or on its own.";
+  "the unit you control (state.self.control.mover) is not on your map or not in view, so there is nothing to " +
+  "drive; the move was not sent. Wait for control to return (a possession ends on its own or with its recall " +
+  "spell on state.pet(); leaveVehicle() leaves a vehicle), then move again.";
 
-/** `controlling`, mid-walk: control passed to another unit and the walk ended where the character stood. */
+/** `controlling`, mid-walk: control changed hands and the walk ended where its unit stood. */
 const CONTROLLING_WALK_HINT =
-  "control passed to another unit mid-walk (state.self.control.mover) and the walk ended where you stand; " +
-  "moveTo does not drive that unit yet.";
+  "control changed hands mid-walk (state.self.control.mover) and the walk ended where its unit stood; " +
+  "read state.self.control and move again from here.";
 
 /** `UNIT_NPC_FLAG_SPELLCLICK` (AzerothCore `UnitDefines.h`): the unit takes `CMSG_SPELLCLICK`; cleared while its seats are full. */
 const UNIT_NPC_FLAG_SPELLCLICK = 0x0100_0000;
@@ -7920,6 +7941,8 @@ export class WrathClient {
       seq: event.seq,
       ts: event.ts,
       ...(data.pathLength !== undefined ? { pathLength: data.pathLength } : {}),
+      ...(data.mover !== undefined ? { mover: data.mover } : {}),
+      ...(data.flight === true ? { flight: true } : {}),
     } as const;
     if (status === "arrived") {
       // A portal this walk crossed that refused a ghost: the arrival is the

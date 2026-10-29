@@ -565,20 +565,20 @@ acked with `moveId` alone like any refusal, and nothing is sent, not even the
 redirect's stop; a walk still running then ends `rooted` first.
 
 While the client moves another unit (a vehicle's driving seat, a possession:
-"Vehicles and possession", below), a `move_to` is refused the same way with
-status `controlling`, `mover` naming the unit, and a walk still running ends
-`controlling` first: the server drops every movement packet that carries the
-character's own guid (`HandleMovementOpcodes` reads `Player::m_mover`), and the
-walker does not drive the other unit yet.
+"Vehicles and possession", below), the walk is that unit's — its guid on
+every packet, its position, speed and water, `mover` naming it on the ack's
+events and verdict, a flying unit's leg flown rather than walked — and a
+`move_to` is refused `controlling` only when the core holds a mover that is
+not in the character's map; a walk still running when control changes hands
+ends `controlling`.
 
 #### stop
 
 Stop moving (sends `MSG_MOVE_STOP` where the character currently is). Always
 acks `200 { "ok": true, "action": "stop" }`; if a move was in
 progress it additionally ends with a `WB_MOVE_RESULT` status `stopped`, or
-`rooted` with no packet when a root has already stopped it. Nothing is sent
-while the client moves another unit (`controlling`, above): the server would
-drop it.
+`rooted` with no packet when a root has already stopped it. While the client
+moves another unit the stop is that unit's ("Vehicles and possession").
 
 Request: `{ "token": "run-abc123", "action": "stop" }`
 
@@ -594,8 +594,9 @@ or `{ "token": "run-abc123", "action": "face", "x": -8900.0, "y": -130.0 }`
 Success `200`: `{ "ok": true, "action": "face", "orientation": 1.57 }`
 Additional errors: `400 {"ok":false,"error":"missing_face_target","action":"face","param":"orientation or x,y"}`,
 `409 {"ok":false,"error":"moving"}` (stop first, or supersede with `move_to`),
-`409 {"ok":false,"error":"controlling"}` (the client moves another unit,
-"Vehicles and possession" below; nothing sent).
+`409 {"ok":false,"error":"controlling"}` (the core holds a mover for this
+client that is not in the character's map, "Vehicles and possession" below;
+nothing sent). While the client moves another unit, the facing is that unit's.
 
 The refusal while moving is the client's own limit, not a module shortcut. A
 walk is sent as forward running (`MOVEMENTFLAG_FORWARD`, with the orientation
@@ -1305,13 +1306,36 @@ the world tick after the core has run the spline to its end
 (module-internal, audited as `op: "spline_done"`). A taxi's spline is the
 server's own flight and is ended by the core itself.
 
-What the module does not do yet: drive the other unit. While the vehicle or
-the possessed unit is the mover, `move_to` and `face` are refused
-`controlling` and `stop` sends nothing (above), the root and movement-state
-packets for the unit's guid are not answered, and the unit's own speed and
-flight flags are not carried. The vehicle's spells are still cast from its
-bar, and a seat that moves nothing (a cannon, a mine car the server drives)
-is driven by nothing.
+Driving. While the vehicle or the possessed unit is the mover, `move_to`,
+`stop` and `face` are that unit's: every packet carries its guid, its
+position, speed, map and water are the walk's, and the verdicts and progress
+events name it (`mover`, with `pos` the unit's). A ground mover (a steed) is
+walked over the mesh as the character is, planned from the unit's own
+position and collision height at its run speed, with the same ledge, water
+and turn rules; a flying mover (a creature whose template or state flies:
+the Eye of Acherus) is flown, as a client flies it, in a straight line at
+the z asked for and at its flight speed (`flight: true` on the ack's
+siblings, the progress events and the verdict), the line judged against the
+geometry a client has — the map's line of sight over models and game objects
+and the terrain under each 4y sample — and refused `path_incomplete` at the
+last clear point when it runs into either; a flight has no water, no ledges
+and no transport legs, and the unit's own `FLYING | CAN_FLY` ride its
+packets (the core keeps them once the mover has its fly aura,
+`ReadMovementInfo`, and strips them until then). The unit's root packets
+(`SMSG_FORCE_MOVE_ROOT` with its guid, `Unit::SendMoveRoot` to the
+controlling client) and movement-state changes are answered with its guid
+and kept as its own state, apart from the character's, which stands while
+it sits on a seat (`moverRooted`, `moverMoveFlags`: the unit's ROOT and
+flags from its create block at the handover, then the packets for its guid);
+a forced speed change of the unit is never acked, as no client's is
+(`HandleForceSpeedChangeAck` takes the character's guid alone).
+Areatriggers are tested where the character itself travels: on its feet or
+on a vehicle it sits in, never for a possessed unit that flies off while it
+stands. The vehicle's spells are cast from its bar; a seat that moves nothing
+(a cannon, a mine car the server drives) is rooted by the server and refused
+`rooted`. `controlling` remains for the one case no packet can drive: the
+core holds a mover that is not in the character's map, or control changes
+hands mid-walk.
 
 Every timestamp the module sends as the client's (the movement packets, the
 acks, `CMSG_TIME_SYNC_RESP`) reads one clock of the session's own,
@@ -1454,8 +1478,8 @@ session's own identity). Their `opcodeId`s are outside the real opcode range.
 
 | opcode | id | `data` fields |
 |---|---|---|
-| `WB_MOVE_PROGRESS` | 0xFF02 | `{ "moveId": <number>, "pos": { "x","y","z","o" }, "pathLength": <f>, "etaMs": <u64> }` — at most 1/s while moving; `pathLength` is the length in yards of the route the move walks (the resolved polyline, 3D), and `etaMs` how long the module's walker takes over it at the speeds it read at dispatch (move_to, "Walk time"), both the same on every event of the move; `etaMs` is absent when no speed could be read |
-| `WB_MOVE_RESULT` | 0xFF01 | `{ "moveId": <number>, "status": <str>, "pos": { "x","y","z","o" }, "meshZ": <f?>, "reachedPos": { "x","y","z" }? }` — `meshZ` only on `arrived` when the mesh z differed from the request; `reachedPos` on `path_incomplete` and `drop`; `"pathLength": <f>` and `"etaMs": <u64>` on the verdict of any move that was dispatched and walked (a refusal at planning has neither), the route's length in yards and its walk time as on `WB_MOVE_PROGRESS`; `"dz": <f>, "target": { "x","y","z" }` only on `drop`, plus `"safeFall": <u32>` when the character's own fall-height reduction (`SPELL_AURA_SAFE_FALL`, the client's buff frame) is non-zero, and `"surfaceZ": <f>` only when the step's foot lies under the ground surface at its x,y (the step is then refused forced or not); `"nearest": { "x","y","z" } | null` only on `target_off_mesh` (the walkable mesh point nearest the request within 20y, or `null` when none is); `"onTransport": { "guid": <guid-string>, "entry": <u32> }` when the character ended the move aboard a transport |
+| `WB_MOVE_PROGRESS` | 0xFF02 | `{ "moveId": <number>, "pos": { "x","y","z","o" }, "pathLength": <f>, "etaMs": <u64>, "mover": <guid-string>?, "flight": true? }` — at most 1/s while moving; `mover` only on a walk of another unit (a vehicle, a possessed unit: "Vehicles and possession"), whose position `pos` then is, and `flight` only when that unit's leg is flown; `pathLength` is the length in yards of the route the move walks (the resolved polyline, 3D), and `etaMs` how long the module's walker takes over it at the speeds it read at dispatch (move_to, "Walk time"), both the same on every event of the move; `etaMs` is absent when no speed could be read |
+| `WB_MOVE_RESULT` | 0xFF01 | `{ "moveId": <number>, "status": <str>, "pos": { "x","y","z","o" }, "meshZ": <f?>, "reachedPos": { "x","y","z" }? }` — `meshZ` only on `arrived` when the mesh z differed from the request; `reachedPos` on `path_incomplete` and `drop`; `"pathLength": <f>` and `"etaMs": <u64>` on the verdict of any move that was dispatched and walked (a refusal at planning has neither), the route's length in yards and its walk time as on `WB_MOVE_PROGRESS`; `"dz": <f>, "target": { "x","y","z" }` only on `drop`, plus `"safeFall": <u32>` when the character's own fall-height reduction (`SPELL_AURA_SAFE_FALL`, the client's buff frame) is non-zero, and `"surfaceZ": <f>` only when the step's foot lies under the ground surface at its x,y (the step is then refused forced or not); `"nearest": { "x","y","z" } | null` only on `target_off_mesh` (the walkable mesh point nearest the request within 20y, or `null` when none is); `"onTransport": { "guid": <guid-string>, "entry": <u32> }` when the character ended the move aboard a transport; `"mover": <guid-string>` on any verdict of a walk of another unit (and on `controlling`, the unit the core holds), with `pos` that unit's, and `"flight": true` when its leg was flown ("Vehicles and possession") |
 | `WB_RIDE_PROGRESS` | 0xFF05 | `{ "transportGuid": <guid-string>, "transportEntry": <u32>, "pos": { "x","y","z","o" } }` — at most 1/s while the character rides a transport and is not walking; the server-side position the transport carried it to |
 | `WB_TRANSPORT_PROGRESS` | 0xFF06 | `{ "guid": <guid-string>, "entry": <u32>, "pos": { "x","y","z","o" }, "progressMs": <u32>, "periodMs": <u32?>, "docked": <bool?>, "inRange": <bool?> }` — at most 1/s per session, one per transport on the character's map whose create block the session has received and that is within the map's visibility range of the character in 2D (`Map::GetVisibilityRange()`, the core's `Visibility.Distance.*` for the map — 100y on continents and 170y in instances by default — the distance the core sends every other object at; transports alone are sent map-wide) or is carrying it; a transport that leaves the range gets one last report with `"inRange": false` and no `docked` (its position as it left), then none until it is back: the car's current position on its `TransportAnimation.dbc` path (what a client animates locally from `pathProgress`), the clock and period, and `docked` when the keyframe segment the clock is on has no displacement (the car is dwelling at a platform; absent for transports without an animation path) |
 | `WB_AREATRIGGER` | 0xFF04 | `{ "triggerId": <u32>, "moveId": <number>, "pos": { "x","y","z","o" } }` — the character entered an `AreaTrigger.dbc` volume and `CMSG_AREATRIGGER` was sent for it (see below); `moveId` is the `move_to` that crossed into it, 0 when no move did (a taxi landing, a transport carrying the character, a teleport's arrival) |
@@ -1668,11 +1692,14 @@ at the top of this document.
   character actually is.
 - `stopped` — a `stop` action ended the move.
 - `superseded` — a newer `move_to` replaced this move.
-- `controlling` — the client moves another unit (a vehicle's driving seat, a
-  possession: "Vehicles and possession", below), named by `mover`
-  (guid-string), and the walker does not drive it yet. A refusal carries no
-  `pathLength` and sent nothing; a walk the handover ended carries its
-  `pathLength` and ended where the character stood, as `rooted` does.
+- `controlling` — the core holds a mover for this client (a vehicle, a
+  possessed unit: "Vehicles and possession", below), named by `mover`
+  (guid-string), that is not in the character's map, so no packet can drive
+  it: a refusal with no `pathLength` and nothing sent. A walk still running
+  when control changes hands ends the same way, with its `pathLength`, where
+  its unit stood. Every other verdict of a walk of another unit carries
+  `mover` too, with `pos` that unit's, and `flight: true` when the leg was
+  flown.
 - `rooted` — a root or a stun holds the character (Roots, below). A
   refusal: the `move_to` arrived while the character was rooted and nothing
   was sent; it carries no `pathLength`. A walk the root stopped: the root ack

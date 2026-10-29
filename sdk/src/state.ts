@@ -4611,7 +4611,17 @@ export class StateCache {
         // position, and the arrival point came on the `MSG_MOVE_TELEPORT_ACK`
         // the server sent *before* this result — folding `pos` here would
         // overwrite the arrival with where the character left from.
-        const d = event.data as { pos: PositionData; status?: string };
+        const d = event.data as { pos: PositionData; status?: string; mover?: GuidKey };
+        // A walk of another unit (`mover`: the vehicle or possessed unit the
+        // client moves) is that unit's position, folded onto it in view. The
+        // character rides a vehicle it sits in, so its own position follows
+        // that one; a possessed unit flies off while the character stands.
+        if (d.mover !== undefined && !this.isSelfGuid(d.mover)) {
+          this.upsertNearby(d.mover, event.seq, (obj) => {
+            obj.position = { value: { x: d.pos.x, y: d.pos.y, z: d.pos.z, o: d.pos.o }, seq: event.seq, ts: event.ts };
+          });
+          if (this.self.vehicle?.value.guid !== d.mover) return;
+        }
         // The character moving under its own control is off any server
         // spline, so a later landing has nothing to put it at.
         this.endSelfSpline();
