@@ -596,6 +596,29 @@ describe("event stream: connect() rides the ladder", () => {
     stream.close();
   });
 
+  test("a refused or a stalled connect names the stream's address, never its token", async () => {
+    const token = "a-session-token-that-must-not-leak-0123456789";
+    for (const plan of ["refuse", "stall"] as const) {
+      ScriptedSocket.instances = [];
+      ScriptedSocket.plan = () => plan;
+      const stream = new EventStream({
+        url: "ws://scripted:8086/events",
+        token,
+        reconnect: false,
+        connectTimeoutMs: 20,
+        webSocketImpl: ScriptedSocket as unknown as typeof WebSocket,
+      });
+      const err = (await stream.connect().catch((e: Error) => e)) as Error;
+      expect(err).toBeInstanceOf(EventStreamClosedError);
+      expect(err.message).toContain("ws://scripted:8086/events");
+      expect(err.message).not.toContain(token);
+      expect(err.message).not.toContain("token=");
+      // The socket itself was still opened with the token, as the module needs.
+      expect(ScriptedSocket.instances[0]!.url).toContain(`token=${token}`);
+      stream.close();
+    }
+  });
+
   test("an unreachable server rejects after a whole climb of the ladder while the stream keeps trying", async () => {
     const stream = scripted((i) => (i < 5 ? "refuse" : "open"));
     await expect(stream.connect()).rejects.toThrow(/failed to connect to ws:\/\/scripted.*\(3 attempts/);

@@ -707,6 +707,9 @@ const ERROR_CODE_HINTS: Record<string, string> = {
     "so check the account name itself (or that the account was created on this realm)",
   account_not_permitted:
     "the account name is not on the module's WrathBench.Accounts allowlist for this realm — use a permitted account",
+  gm_account:
+    "the account holds a security level above player, and the module serves player accounts only — " +
+    "use an account made with `account create` that no one has raised to GM",
   account_owned_by_other_token:
     "another live session's token holds a character on this account — wait for that session to end, or use a different account",
   character_not_found: "no character with that name exists on this account — check the name and the account",
@@ -4524,7 +4527,8 @@ export class WrathClient {
   private async trackedCast(spellId: number, targetGuid: string | undefined): Promise<ActionResponse> {
     // The two casts the cache can tell will never go off, refused with
     // nothing sent: a dead caster (a body or a ghost; the core answers
-    // caster_dead), and a spell the spellbook does not hold, which the core
+    // caster_dead), save Stuck, which may be cast dead (`STUCK_SPELL`), and a
+    // spell the spellbook does not hold, which the core
     // drops without a word (`HandleCastSpellOpcode`: `!HasActiveSpell`) —
     // unless the target is a game object, whose lock may take a spell the
     // book lacks, or the character drives another unit (a vehicle, a charm),
@@ -4557,12 +4561,14 @@ export class WrathClient {
   /** Why a `castSpell` cannot go off, from what the cache holds; undefined when nothing says so. */
   private castRefusal(spellId: number, targetGuid: string | undefined): { status: string; hint: string } | undefined {
     const ghost = this.state.self.ghost?.value === true;
-    if (ghost || this.isCorpse()) {
+    if ((ghost || this.isCorpse()) && spellId !== STUCK_SPELL) {
       return {
         status: "dead",
         hint: ghost
-          ? "you are a ghost and cannot cast; nothing was sent. Get back to life first (reclaimCorpse, or a Spirit Healer)."
-          : "you are dead and cannot cast; nothing was sent. sdk.repop() releases your spirit.",
+          ? "you are a ghost and can cast only Stuck (spell 7355, what unstuck() sends); nothing was sent. " +
+            "Get back to life first (reclaimCorpse, or a Spirit Healer)."
+          : "you are dead and can cast only Stuck (spell 7355, what unstuck() sends); nothing was sent. " +
+            "sdk.repop() releases your spirit.",
       };
     }
     const book = this.state.spells();
@@ -5922,9 +5928,10 @@ export class WrathClient {
    * home on another map — and the `WB_AREA` naming where it landed. Each send
    * spends the confirmation; a call after the window has lapsed asks again.
    *
-   * Stuck may be cast while dead, so unlike `castSpell` this is not refused
-   * for a ghost or a body: the cast goes through the same handler a client's
-   * would, and the server decides.
+   * Stuck may be cast while dead, so this is not refused for a ghost or a
+   * body (nor is `castSpell(7355)`, the one spell `castSpell` sends dead):
+   * the cast goes through the same handler a client's would, and the server
+   * decides.
    */
   async unstuck(options: UnstuckOptions = {}): Promise<UnstuckResult> {
     const now = Date.now();

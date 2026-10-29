@@ -185,15 +185,42 @@ describe("castSpell: refused before dispatch when it cannot go off", () => {
     const client = await inWorld(stub);
     await folded(client, "SMSG_UPDATE_OBJECT", 20);
     const dead = (await client.castSpell(2050).catch((e: Error) => e)) as Error;
-    expect(dead.message).toBe("castSpell dead: you are dead and cannot cast; nothing was sent. sdk.repop() releases your spirit.");
+    expect(dead.message).toBe(
+      "castSpell dead: you are dead and can cast only Stuck (spell 7355, what unstuck() sends); nothing was sent. " +
+        "sdk.repop() releases your spirit.",
+    );
     push(stub, ghost(21));
     await folded(client, "SMSG_UPDATE_OBJECT", 21);
     const asGhost = (await client.castSpell(2050).catch((e: Error) => e)) as Error;
     expect(asGhost.message).toBe(
-      "castSpell dead: you are a ghost and cannot cast; nothing was sent. Get back to life first (reclaimCorpse, or a Spirit Healer).",
+      "castSpell dead: you are a ghost and can cast only Stuck (spell 7355, what unstuck() sends); nothing was sent. " +
+        "Get back to life first (reclaimCorpse, or a Spirit Healer).",
     );
     expect(stub.actions.some((a) => a.action === "cast_spell")).toBe(false);
     expect(client.drainActionHints().map((h) => [h.action, h.status, h.count])).toEqual([["castSpell", "dead", 2]]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("Stuck (7355) is sent dead, as a body or a ghost, as a client's Help button sends it", async () => {
+    const book = frame(16, "SMSG_INITIAL_SPELLS", {
+      spells: [
+        { spellId: 2050, rank: 1, name: "Lesser Heal" },
+        { spellId: 7355, rank: 0, name: "Stuck" },
+      ],
+      cooldowns: [],
+    });
+    const stub = startStub({ onConnect: () => frames([...loginSequence, book, selfCreate, values(20, SELF_GUID, { health: 0 })]) });
+    const client = await inWorld(stub);
+    await folded(client, "SMSG_UPDATE_OBJECT", 20);
+    await client.castSpell(7355);
+    push(stub, ghost(21));
+    await folded(client, "SMSG_UPDATE_OBJECT", 21);
+    await client.castSpell(7355);
+    // Every other spell is still refused for a ghost, with nothing sent.
+    expect(((await client.castSpell(2050).catch((e: Error) => e)) as Error).message).toStartWith("castSpell dead: you are a ghost");
+    expect(stub.actions.filter((a) => a.action === "cast_spell").map((a) => (a as { spellId?: number }).spellId)).toEqual([7355, 7355]);
+    expect(client.drainActionHints().map((h) => [h.action, h.status, h.count])).toEqual([["castSpell", "dead", 1]]);
     client.close();
     await stub.stop();
   });
