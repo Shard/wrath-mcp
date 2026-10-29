@@ -273,6 +273,20 @@ namespace WrathBench
         // Written on tap threads, read on the world thread, hence atomic.
         std::atomic<uint32_t> stateMoveFlags{0};
 
+        // The unit this "client" moves (Player::m_mover), as the server has
+        // told it: 0 for the character itself, else the guid of the vehicle
+        // or possessed unit SMSG_CLIENT_CONTROL_UPDATE handed it
+        // (OnClientControlUpdate); reset on login and every new world, where
+        // the core makes the character its own mover again. Written on tap
+        // threads, read on the world thread, hence atomic.
+        std::atomic<uint64_t> activeMover{0};
+
+        // The id of a boarding or exit spline the server launched the
+        // character on (OnSelfSpline) and whose end this "client" still owes
+        // as CMSG_MOVE_SPLINE_DONE (TickSplineDone); 0 when none. Written on
+        // tap threads, read and cleared on the world thread, hence atomic.
+        std::atomic<uint32_t> pendingSplineDone{0};
+
         // Answers this "client" owes and sends on the module's next world
         // tick rather than inside the packet tap (Manager::TickClientAnswers),
         // in the order the server's packets arrived: CMSG_TIME_SYNC_RESP and
@@ -673,6 +687,19 @@ namespace WrathBench
         // set). AnswerMoveFlag is shared with SMSG_MULTIPLE_MOVES (OnRootPacket).
         void OnMoveFlagPacket(BenchSession& s, WorldSession* ws, uint16_t opcode, WorldPacket const& packet);
         void AnswerMoveFlag(BenchSession& s, WorldSession* ws, uint16_t opcode, uint64_t guid, uint32_t counter);
+
+        // Client control handovers (tap threads): SMSG_CLIENT_CONTROL_UPDATE
+        // moves the client's mover to a vehicle or possessed unit and back.
+        // The module keeps the mover (BenchSession::activeMover) and sends
+        // what a client sends on each: CMSG_SET_ACTIVE_MOVER for a unit it
+        // may now move, CMSG_MOVE_NOT_ACTIVE_MOVER for one it stops moving.
+        void OnClientControlUpdate(BenchSession& s, WorldSession* ws, WorldPacket const& packet);
+
+        // A vehicle's boarding and exit splines on the character's own guid
+        // (tap threads note the spline id; the world tick reports its end
+        // with CMSG_MOVE_SPLINE_DONE, as a client does).
+        void OnSelfSpline(BenchSession& s, WorldSession* ws, uint16_t opcode, WorldPacket const& packet);
+        void TickSplineDone();
 
         // Ask MSG_CORPSE_QUERY once per death, after the ghost's graveyard
         // teleport has been acked, the way a client does on becoming a ghost

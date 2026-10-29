@@ -34,6 +34,8 @@
 #include "DetourCommon.h"
 #include "PathGenerator.h"
 #include "MovementTypedefs.h"
+#include "MoveSpline.h"
+#include "ObjectAccessor.h"
 #include "Player.h"
 #include "SharedDefines.h"
 #include "SpellInfo.h"
@@ -390,6 +392,7 @@ namespace WrathBench
         TickClientAnswers();
         TickMovers(nowMs);
         TickGrounded(nowMs);
+        TickSplineDone();
         TickRiders(nowMs);
         TickTransports(nowMs);
 
@@ -1086,6 +1089,14 @@ namespace WrathBench
         // a ghost asking where its corpse is (the module asks once per death
         // on the client's behalf; this lets a snippet re-ask)
         { "MSG_CORPSE_QUERY", MSG_CORPSE_QUERY },
+        // vehicles: the click on a unit's spellclick (the vehicle cursor;
+        // body u64 guid, SpellHandler.cpp HandleSpellClick casts the unit's
+        // npc_spellclick_spells spell at the character), and the party's
+        // "enter player vehicle" (u64 player guid, HandleEnterPlayerVehicle:
+        // raid members within interaction range only). Leaving and changing
+        // seat are actions: both carry the client's own MovementInfo.
+        { "CMSG_SPELLCLICK", CMSG_SPELLCLICK },
+        { "CMSG_PLAYER_VEHICLE_ENTER", CMSG_PLAYER_VEHICLE_ENTER },
         { nullptr, 0 },
     };
     static constexpr size_t kRawPayloadMaxBytes = 512;
@@ -1194,7 +1205,7 @@ namespace WrathBench
                 "spirit_healer_activate", "questgiver_status_query", nullptr };
             static char const* kNoParams[] = {
                 "clear_target", "attack_stop", "loot_money", "repop", "reclaim_corpse",
-                "questgiver_status_multiple_query", nullptr };
+                "questgiver_status_multiple_query", "vehicle_exit", nullptr };
 
             bool known = false;
             bool needsGuid = false;
@@ -1207,7 +1218,8 @@ namespace WrathBench
                 known = action == "cast_spell" || action == "cancel_cast" || action == "quest_abandon"
                      || action == "loot_item" || action == "equip_item" || action == "use_item"
                      || action == "destroy_item" || action == "quest_query"
-                     || action == "learn_talent" || action == "learn_preview_talents" || action == "raw";
+                     || action == "learn_talent" || action == "learn_preview_talents" || action == "raw"
+                     || action == "vehicle_change_seat";
             if (!known)
                 return {400, Json::Writer().Add("ok", false).Add("error", "unsupported_action").Add("action", action).Str()};
 
@@ -1243,6 +1255,8 @@ namespace WrathBench
                 return MissingParam(action, "missing_talent", !req.Has("talentId") ? "talentId" : "rank");
             if (action == "learn_preview_talents" && !req.Has("talents"))
                 return MissingParam(action, "missing_talents", "talents");
+            if (action == "vehicle_change_seat" && !req.Has("seat"))
+                return MissingParam(action, "missing_seat", "seat");
             if (action == "raw")
             {
                 // The escape hatch (PROTOCOL.md "raw"): an allowlisted client opcode by
@@ -1801,6 +1815,42 @@ namespace WrathBench
         AppendMovementInfo(*p, s, player, moveFlags, x, y, z, o, transport);
         s.ws->QueuePacket(p);
         s.move.sentO = o;
+    }
+
+    // The MovementInfo of a unit as it stands, for the packets a client sends
+    // about a unit it is not walking: the mover it hands back
+    // (CMSG_MOVE_NOT_ACTIVE_MOVER), the vehicle it leaves or changes seat on
+    // (CMSG_DISMISS_CONTROLLED_VEHICLE, CMSG_CHANGE_SEATS_ON_CONTROLLED_VEHICLE)
+    // and its own body at the end of a boarding or exit spline
+    // (CMSG_MOVE_SPLINE_DONE). The unit's own flags, less what a standing
+    // body cannot carry (the moving and turning bits, FALLING, whose jump
+    // block the layout would then want, the spline bits, and ROOT, which
+    // ReadMovementInfo strips from every client packet), its position, its
+    // transport block when it is aboard one (the seat included: that is how
+    // a passenger's packets name the seat, Vehicle::AddPassenger), the pitch
+    // the swim and fly flags put in the layout, and fallTime 0. The time is
+    // the session's own clock, as on every packet of this client's
+    // (AppendMovementInfo). Read on the world thread, or from the tap during
+    // the core's map update, as AnswerForceRoot reads the character.
+    static void AppendUnitMovementInfo(WorldPacket& p, BenchSession& s, Unit* unit)
+    {
+        uint32 const flags = unit->m_movementInfo.GetMovementFlags()
+            & ~uint32(MOVEMENTFLAG_MASK_MOVING | MOVEMENTFLAG_MASK_TURNING | MOVEMENTFLAG_SPLINE_ENABLED | MOVEMENTFLAG_ROOT);
+        p << uint32(flags);
+        p << uint16(0);             // flags2
+        p << uint32(ClientMSTime(s));
+        p << float(unit->GetPositionX()) << float(unit->GetPositionY()) << float(unit->GetPositionZ()) << float(unit->GetOrientation());
+        if (flags & MOVEMENTFLAG_ONTRANSPORT)
+        {
+            MovementInfo::TransportInfo const& t = unit->m_movementInfo.transport;
+            p.appendPackGUID(t.guid.GetRawValue());
+            p << float(t.pos.GetPositionX()) << float(t.pos.GetPositionY()) << float(t.pos.GetPositionZ()) << float(t.pos.GetOrientation());
+            p << uint32(t.time);
+            p << int8(t.seat);
+        }
+        if (flags & (MOVEMENTFLAG_SWIMMING | MOVEMENTFLAG_FLYING))
+            p << float(unit->m_movementInfo.pitch);
+        p << uint32(0);             // fallTime
     }
 
     // Swimming, as the server judges it and a client does it. Every number
@@ -3454,6 +3504,28 @@ namespace WrathBench
             Audit(*s, "action", a.Str());
         }
 
+        if (static_cast<Unit*>(player->m_mover) != player)
+        {
+            // The client moves another unit (a vehicle's driving seat, a
+            // possession: OnClientControlUpdate), and the server drops every
+            // movement packet that carries the character's own guid
+            // (HandleMovementOpcodes reads Player::m_mover). The walker does
+            // not drive that unit yet, so the request is refused before
+            // planning, acked with moveId alone as `rooted` is, and a walk
+            // still running ends the same way; `mover` names the unit.
+            if (s->move.active)
+                FinishMove(*s, "controlling");
+            uint64_t const moveId = ++s->moveIdGen;
+            s->move.moveId = moveId;
+            ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "move_to").Add("moveId", moveId).Str()});
+            Json::Writer w;
+            w.Add("moveId", moveId).Add("status", "controlling");
+            w.AddGuid("mover", static_cast<Unit*>(player->m_mover)->GetGUID().GetRawValue());
+            w.Raw("pos", PosJson(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation()));
+            EmitEvent(*s, "WB_MOVE_RESULT", 0xFF01, w.Str());
+            return;
+        }
+
         if (s->rooted.load())
         {
             // A rooted client cannot move: nothing is sent, not even the stop a
@@ -3793,12 +3865,15 @@ namespace WrathBench
                 FindTransportAt(player->GetMap(), m.curX, m.curY, m.curZ));
             FinishMove(*s, "stopped");
         }
-        else
+        else if (static_cast<Unit*>(player->m_mover) == player)
         {
             SendMovePacket(*s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE,
                 player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation(),
                 player->GetTransport());
         }
+        // Else the client moves another unit (OnClientControlUpdate): a stop
+        // under the character's own guid would be dropped by the server, and
+        // the walker does not drive that unit yet, so nothing is sent.
         ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "stop").Str()});
     }
 
@@ -3816,6 +3891,12 @@ namespace WrathBench
         // Refused, nothing sent (PROTOCOL.md "face").
         if (s->move.active)
             return ack->set_value({409, Json::Writer().Add("ok", false).Add("error", "moving").Str()});
+        // The character's own facing while the client moves another unit
+        // (OnClientControlUpdate) would be dropped by the server
+        // (HandleMovementOpcodes), and the walker does not turn that unit yet.
+        // Refused, nothing sent.
+        if (static_cast<Unit*>(player->m_mover) != player)
+            return ack->set_value({409, Json::Writer().Add("ok", false).Add("error", "controlling").Str()});
 
         float target = hasO ? Position::NormalizeOrientation(o)
                             : (hasXY ? player->GetAngle(x, y) : player->GetOrientation());
@@ -4317,6 +4398,70 @@ namespace WrathBench
             for (auto const& [id, rank] : pairs)
                 *p << uint32(id) << uint32(rank);
             auditW.Add("count", (uint64_t)pairs.size()).Raw("talents", raw.empty() ? "[]" : raw);
+        }
+        else if (action == "vehicle_exit")
+        {
+            // The client's Leave Vehicle. From the driving seat the client
+            // moves the vehicle (Player::m_mover is it, OnClientControlUpdate)
+            // and hands the vehicle's last MovementInfo back with
+            // CMSG_DISMISS_CONTROLLED_VEHICLE (packGUID of the mover, a
+            // MovementInfo; VehicleHandler.cpp HandleDismissControlledVehicle
+            // applies it and exits); from any other seat it sends the bodiless
+            // CMSG_REQUEST_VEHICLE_EXIT (HandleRequestVehicleExit, which exits
+            // only from a seat whose flags allow it, and logs the rest
+            // silently). The seat, the vehicle and whether the vehicle is the
+            // mover are what a client knows of its own ride; not aboard, it
+            // has no button to press, so nothing is sent.
+            Unit* base = player->GetVehicleBase();
+            if (!base)
+                return err(409, "not_in_vehicle");
+            if (static_cast<Unit*>(player->m_mover) == base)
+            {
+                p = new WorldPacket(CMSG_DISMISS_CONTROLLED_VEHICLE, 8 + 4 + 2 + 4 + 16 + 8 + 16 + 4 + 1 + 4 + 4);
+                *p << base->GetPackGUID();
+                AppendUnitMovementInfo(*p, *s, base);
+                auditW.Add("opcode", "CMSG_DISMISS_CONTROLLED_VEHICLE");
+            }
+            else
+            {
+                p = new WorldPacket(CMSG_REQUEST_VEHICLE_EXIT, 0);
+                auditW.Add("opcode", "CMSG_REQUEST_VEHICLE_EXIT");
+            }
+            auditW.AddGuid("vehicleGuid", base->GetGUID().GetRawValue());
+        }
+        else if (action == "vehicle_change_seat")
+        {
+            // The vehicle frame's seat click. From the driving seat the client
+            // sends CMSG_CHANGE_SEATS_ON_CONTROLLED_VEHICLE: packGUID of the
+            // vehicle, its MovementInfo (the mover's last word, which the
+            // handler keeps as the vehicle's), packGUID of the unit whose seat
+            // is wanted (the vehicle itself; an accessory's seat would name the
+            // accessory) and the i8 seat; from any other seat
+            // CMSG_REQUEST_VEHICLE_SWITCH_SEAT, packGUID of the vehicle and
+            // the i8 seat. Both reach HandleChangeSeatsOnControlledVehicle,
+            // which refuses a seat whose flags forbid switching, and a seat
+            // that is taken, silently.
+            Unit* base = player->GetVehicleBase();
+            if (!base)
+                return err(409, "not_in_vehicle");
+            int8 const seat = static_cast<int8>(req.GetInt("seat"));
+            if (static_cast<Unit*>(player->m_mover) == base)
+            {
+                p = new WorldPacket(CMSG_CHANGE_SEATS_ON_CONTROLLED_VEHICLE, 8 + 4 + 2 + 4 + 16 + 8 + 16 + 4 + 1 + 4 + 4 + 8 + 1);
+                *p << base->GetPackGUID();
+                AppendUnitMovementInfo(*p, *s, base);
+                *p << base->GetPackGUID();
+                *p << int8(seat);
+                auditW.Add("opcode", "CMSG_CHANGE_SEATS_ON_CONTROLLED_VEHICLE");
+            }
+            else
+            {
+                p = new WorldPacket(CMSG_REQUEST_VEHICLE_SWITCH_SEAT, 8 + 1);
+                *p << base->GetPackGUID();
+                *p << int8(seat);
+                auditW.Add("opcode", "CMSG_REQUEST_VEHICLE_SWITCH_SEAT");
+            }
+            auditW.AddGuid("vehicleGuid", base->GetGUID().GetRawValue()).Add("seat", (int32_t)seat);
         }
         else if (action == "raw")
         {
@@ -5200,6 +5345,14 @@ namespace WrathBench
             // Removed from the map for a reason that is not a teleport (logout
             // in flight): the move has no server verdict left to wait for.
             FinishMove(s, "interrupted");
+            return;
+        }
+        if (static_cast<Unit*>(player->m_mover) != player)
+        {
+            // Control went to a vehicle or a possessed unit mid-walk
+            // (OnClientControlUpdate): the server drops the character's own
+            // packets from here on, and the walker does not drive that unit yet.
+            FinishMove(s, "controlling");
             return;
         }
 
@@ -6198,6 +6351,196 @@ namespace WrathBench
             .Raw("pos", PosJson(a.x, a.y, a.z, a.o)).Str());
     }
 
+    // Client control. Player::SetClientControl tells the client which unit
+    // it moves and whether it may: SMSG_CLIENT_CONTROL_UPDATE, packGUID and
+    // a u8 (1 move it, 0 not). A possession and a vehicle's driving seat
+    // (Unit::SetCharmedBy, CHARM_TYPE_POSSESS / CHARM_TYPE_VEHICLE) send
+    // (unit, 1) and SetMover(unit); the end of either (RemoveCharmedBy)
+    // sends (unit, 0) then (character, 1) and SetMover(character); a fear
+    // or confusion sends (character, 0) and (character, 1) with no mover
+    // change. From the handover on every movement packet and ack must carry
+    // the mover's guid (HandleMovementOpcodes, HandleMoveRootAck and
+    // HandleMoveFlagChangeOpcode all read Player::m_mover), so the module
+    // keeps it (BenchSession::activeMover) and sends what a stock client
+    // sends on the handover, client behaviour and never an agent action:
+    // CMSG_SET_ACTIVE_MOVER (u64 guid) for a unit it may now move, which
+    // HandleSetActiveMoverOpcode only checks against m_mover, and
+    // CMSG_MOVE_NOT_ACTIVE_MOVER (packGUID, MovementInfo) for the unit it
+    // stops moving, whose MovementInfo HandleMoveNotActiveMover keeps only
+    // while that unit is still the mover (by the time the queue is read the
+    // core has run SetMover for the character; a real client's packet
+    // crosses it the same way). The packet is served as an event too
+    // (DecodeEvent), which is what the SDK shows as state.self.control.
+    void Manager::OnClientControlUpdate(BenchSession& s, WorldSession* ws, WorldPacket const& packet)
+    {
+        Player* player = ws->GetPlayer();
+        if (!player)
+            return;
+        uint64 guid = 0;
+        uint8 allowMove = 0;
+        try
+        {
+            WorldPacket p(packet);
+            p.readPackGUID(guid);
+            p >> allowMove;
+        }
+        catch (std::exception const&)
+        {
+            return; // a short packet (ByteBufferException): nothing to answer
+        }
+        uint64_t const self = player->GetGUID().GetRawValue();
+        uint64_t const before = s.activeMover.load();
+        if (allowMove)
+        {
+            s.activeMover.store(guid == self ? 0 : guid);
+            WorldPacket* p = new WorldPacket(CMSG_SET_ACTIVE_MOVER, 8);
+            *p << uint64(guid);
+            ws->QueuePacket(p);
+            Audit(s, "action", Json::Writer().Add("op", "active_mover").Add("opcode", "CMSG_SET_ACTIVE_MOVER")
+                .AddGuid("guid", (uint64_t)guid).Add("self", guid == self).Str());
+            return;
+        }
+        if (guid == self || before != guid)
+            return; // control of the character itself withheld (a fear), or a unit this client was not moving
+        s.activeMover.store(0);
+        // The unit's own position and flags, as the server holds them: the
+        // tap runs inside the map update, where reading it is safe (as
+        // AnswerForceRoot reads the character).
+        Unit* unit = ObjectAccessor::GetUnit(*player, ObjectGuid(guid));
+        if (!unit)
+            return;
+        WorldPacket* p = new WorldPacket(CMSG_MOVE_NOT_ACTIVE_MOVER, 8 + 4 + 2 + 4 + 16 + 8 + 16 + 4 + 1 + 4 + 4);
+        *p << unit->GetPackGUID();
+        AppendUnitMovementInfo(*p, s, unit);
+        ws->QueuePacket(p);
+        Audit(s, "action", Json::Writer().Add("op", "active_mover").Add("opcode", "CMSG_MOVE_NOT_ACTIVE_MOVER")
+            .AddGuid("guid", (uint64_t)guid)
+            .Raw("pos", PosJson(unit->GetPositionX(), unit->GetPositionY(), unit->GetPositionZ(), unit->GetOrientation())).Str());
+    }
+
+    // The packGUID at the head of a packet, read in place (no copy: every
+    // SMSG_MONSTER_MOVE on the map passes OnSelfSpline, and only the
+    // character's own is read further). False on a short packet.
+    static bool PeekPackGUID(WorldPacket const& packet, uint64& guid)
+    {
+        if (packet.size() < 1)
+            return false;
+        uint8 const mask = packet[0];
+        size_t pos = 1;
+        guid = 0;
+        for (uint8 i = 0; i < 8; ++i)
+        {
+            if (!(mask & (uint8(1) << i)))
+                continue;
+            if (pos >= packet.size())
+                return false;
+            guid |= uint64(packet[pos++]) << (i * 8);
+        }
+        return true;
+    }
+
+    // The splines a vehicle moves the character on: onto its seat
+    // (Vehicle::AddPassenger, MoveSplineInit::SetTransportEnter) and off it
+    // (Unit::_ExitVehicle, SetTransportExit), each sent to the character too
+    // as SMSG_MONSTER_MOVE_TRANSPORT or SMSG_MONSTER_MOVE. A client reports
+    // the end of each with CMSG_MOVE_SPLINE_DONE (packGUID, its MovementInfo,
+    // u32 spline id; TaxiHandler.cpp HandleMoveSplineDoneOpcode). The core
+    // takes the report only while the character is its own mover — a
+    // passenger seat's boarding, and every exit (RemoveCharmedBy restores the
+    // mover before the exit spline) — and then clears the "expecting a
+    // transport change" it set when it launched the spline
+    // (Player::SetExpectingChangeTransport) and relays the body's root state
+    // to the set; from a driving seat the vehicle is the mover and the report
+    // is dropped (mover->GetGUID() != guid), as a stock client's is. The tap
+    // only notes the spline id (BenchSession::pendingSplineDone); the world
+    // tick sends the report once the core has run the spline to its end
+    // (TickSplineDone). Only the character's own guid, and only the two
+    // boarding flags: a taxi's spline is the server's own flight, ended by
+    // the core itself.
+    void Manager::OnSelfSpline(BenchSession& s, WorldSession* ws, uint16_t opcode, WorldPacket const& packet)
+    {
+        Player* player = ws->GetPlayer();
+        if (!player)
+            return;
+        uint64 head = 0;
+        if (!PeekPackGUID(packet, head) || head != player->GetGUID().GetRawValue())
+            return;
+        try
+        {
+            WorldPacket p(packet);
+            uint64 guid = 0; p.readPackGUID(guid);
+            if (opcode == SMSG_MONSTER_MOVE_TRANSPORT)
+            {
+                uint64 transportGuid = 0; p.readPackGUID(transportGuid); // the vehicle: DecodeEvent serves it
+                (void)transportGuid;
+                p.read_skip<int8>();            // seat
+            }
+            p.read_skip<uint8>();               // toggle
+            p.read_skip<float>(); p.read_skip<float>(); p.read_skip<float>();
+            uint32 splineId = 0; p >> splineId;
+            uint8 type = 0; p >> type;
+            if (type == 1)                      // MonsterMoveStop: no flags follow
+                return;
+            switch (type)
+            {
+                case 2: p.read_skip<float>(); p.read_skip<float>(); p.read_skip<float>(); break; // facing spot
+                case 3: p.read_skip<uint64>(); break;                                             // facing target
+                case 4: p.read_skip<float>(); break;                                              // facing angle
+                default: break;
+            }
+            uint32 splineFlags = 0; p >> splineFlags;
+            if (splineFlags & (0x00800000 | 0x01000000)) // MoveSplineFlag::TransportEnter | TransportExit
+                s.pendingSplineDone.store(splineId);
+        }
+        catch (std::exception const&)
+        {
+            // A short packet (ByteBufferException): nothing to report.
+        }
+    }
+
+    // The world tick's half: once the core has finished the spline the tap
+    // noted (Unit::UpdateSplineMovement marks it done), send the client's
+    // report. The body is the character's own as it then stands
+    // (AppendUnitMovementInfo: on its seat, the transport block names the
+    // vehicle and the seat; off it, the exit point), and the spline id is
+    // the one the packet carried. A later spline with another id makes the
+    // report moot (the core checks the id), so it is dropped.
+    void Manager::TickSplineDone()
+    {
+        std::vector<std::shared_ptr<BenchSession>> sessions;
+        {
+            std::lock_guard<std::mutex> lock(_sessMutex);
+            for (auto& [token, s] : _byToken)
+                if (!s->tearingDown.load() && s->pendingSplineDone.load() != 0)
+                    sessions.push_back(s);
+        }
+        for (auto& s : sessions)
+        {
+            uint32_t const id = s->pendingSplineDone.load();
+            if (!s->ws || sWorldSessionMgr->FindSession(s->accountId) != s->ws)
+                continue;
+            Player* player = s->ws->GetPlayer();
+            if (!player || !player->IsInWorld() || !player->movespline)
+                continue;
+            if (player->movespline->GetId() != id)
+            {
+                s->pendingSplineDone.store(0);
+                continue;
+            }
+            if (!player->movespline->Finalized())
+                continue;
+            s->pendingSplineDone.store(0);
+            WorldPacket* p = new WorldPacket(CMSG_MOVE_SPLINE_DONE, 8 + 4 + 2 + 4 + 16 + 8 + 16 + 4 + 1 + 4 + 4 + 4);
+            *p << player->GetPackGUID();
+            AppendUnitMovementInfo(*p, *s, player);
+            *p << uint32(id);
+            s->ws->QueuePacket(p);
+            Audit(*s, "action", Json::Writer().Add("op", "spline_done").Add("opcode", "CMSG_MOVE_SPLINE_DONE")
+                .Add("splineId", id)
+                .Raw("pos", PosJson(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation())).Str());
+        }
+    }
+
     // A real client sends MSG_CORPSE_QUERY once it is a ghost (after the repop
     // teleport lands), and draws the answer as the corpse marker on its map.
     // The parked client has no map, so the module issues the same one-shot
@@ -6326,7 +6669,14 @@ namespace WrathBench
         // character was out of the world (Unit::SetWaterWalking and the rest
         // send nothing then) would otherwise leave a stale bit.
         if (opcode == SMSG_NEW_WORLD || opcode == SMSG_LOGIN_VERIFY_WORLD)
+        {
             s->stateMoveFlags.store(0);
+            // The character is its own mover again once it is in the map
+            // (Player::SendInitialPacketsAfterAddToMap, SetMover(this)), and
+            // no boarding spline survives a map change.
+            s->activeMover.store(0);
+            s->pendingSplineDone.store(0);
+        }
 
         // Forced and spline roots: the rooted state, and the client's ack.
         if (opcode == SMSG_FORCE_MOVE_ROOT || opcode == SMSG_FORCE_MOVE_UNROOT
@@ -6342,6 +6692,16 @@ namespace WrathBench
         // can-fly) and their spline twins: the client's state, and its ack.
         if (MoveFlagChange c; LookupMoveFlagChange(opcode, c))
             OnMoveFlagPacket(*s, ws, opcode, packet);
+
+        // Client control: a vehicle's driving seat or a possession hands the
+        // client another unit to move and takes it back (OnClientControlUpdate).
+        if (opcode == SMSG_CLIENT_CONTROL_UPDATE)
+            OnClientControlUpdate(*s, ws, packet);
+
+        // The boarding and exit splines a vehicle moves the character on,
+        // whose end the client reports (OnSelfSpline, TickSplineDone).
+        if (opcode == SMSG_MONSTER_MOVE || opcode == SMSG_MONSTER_MOVE_TRANSPORT)
+            OnSelfSpline(*s, ws, opcode, packet);
 
         // Keep the client-side object cache in sync with destroys.
         if (opcode == SMSG_DESTROY_OBJECT && packet.size() >= 8)
@@ -7754,6 +8114,63 @@ namespace WrathBench
     // Whitelisted SMSG decoders. Field layouts mirror the server-side
     // builders in AzerothCore at the pinned commit; see module/PROTOCOL.md.
     // =================================================================
+    // The body of SMSG_MONSTER_MOVE after the unit's packGUID (and, on
+    // SMSG_MONSTER_MOVE_TRANSPORT, after the transport's packGUID and the
+    // seat), as PacketBuilder::WriteCommonMonsterMovePart and WriteMonsterMove
+    // lay it out: u8 toggle, the start point, u32 spline id, u8 type (1 is a
+    // stop, nothing follows), the facing the type names, u32 spline flags,
+    // the animation when flagged, u32 duration, the parabolic pair when
+    // flagged, then the points. Destination and duration only: the path
+    // points are consumed and dropped. `transportExit` names the flag the
+    // exit spline carries (MoveSplineFlag::TransportExit, Unit::_ExitVehicle):
+    // on the character's own guid, how a client learns it is off its seat.
+    static void DecodeMonsterMoveBody(WorldPacket& p, Json::Writer& w)
+    {
+        uint8 toggle; p >> toggle;
+        float sx, sy, sz; p >> sx >> sy >> sz;
+        uint32 splineId; p >> splineId;
+        uint8 type; p >> type;
+        w.Raw("pos", Json::Writer().Add("x", (double)sx).Add("y", (double)sy).Add("z", (double)sz).Str());
+        if (type == 1)                          // MonsterMoveStop
+        {
+            w.Add("stopped", true);
+            return;
+        }
+        switch (type)
+        {
+            case 2: { float fx, fy, fz; p >> fx >> fy >> fz; break; } // facing spot
+            case 3: { uint64 t; p >> t; break; }                     // facing target
+            case 4: { float a; p >> a; break; }                      // facing angle
+            default: break;
+        }
+        uint32 splineFlags; p >> splineFlags;
+        if (splineFlags & 0x01000000)           // MoveSplineFlag::TransportExit
+            w.Add("transportExit", true);
+        if (splineFlags & 0x00200000)           // animation
+            { uint8 animId; uint32 startTime; p >> animId >> startTime; }
+        uint32 duration; p >> duration;
+        if (splineFlags & 0x00000800)           // parabolic
+            { float accel; uint32 startTime; p >> accel >> startTime; }
+        uint32 pointCount; p >> pointCount;
+        float dx = sx, dy = sy, dz = sz;
+        if (splineFlags & (0x00002000 | 0x00040000)) // catmullrom/flying: full points
+        {
+            for (uint32 i = 0; i < pointCount; ++i)
+            {
+                float px, py, pz; p >> px >> py >> pz;
+                dx = px; dy = py; dz = pz;      // keep only the last (the destination)
+            }
+        }
+        else                                    // linear: destination + packed offsets
+        {
+            p >> dx >> dy >> dz;
+            if (pointCount > 1)
+                p.rpos(p.rpos() + size_t(pointCount - 1) * 4);
+        }
+        w.Raw("destination", Json::Writer().Add("x", (double)dx).Add("y", (double)dy).Add("z", (double)dz).Str());
+        w.Add("durationMs", duration);
+    }
+
     bool Manager::DecodeEvent(BenchSession& s, WorldSession* ws, uint16_t opcode,
         WorldPacket const& packet, std::string& name, std::string& dataJson)
     {
@@ -10462,6 +10879,21 @@ namespace WrathBench
                     w.Add("text", text);
                     break;
                 }
+                // ------------------------------------------ client control
+                case SMSG_CLIENT_CONTROL_UPDATE:
+                {
+                    // Player::SetClientControl: packGUID of the unit the client
+                    // moves, u8 1 when it may move it, 0 when not (a fear on
+                    // the character itself; a vehicle's driving seat or a
+                    // possession ending). The module answers it as a client
+                    // does (OnClientControlUpdate); served so the agent sees
+                    // whose movement it owns.
+                    name = "SMSG_CLIENT_CONTROL_UPDATE";
+                    uint64 guid = 0; p.readPackGUID(guid);
+                    uint8 allow = 0; p >> allow;
+                    w.AddGuid("guid", (uint64_t)guid).Add("allowMove", allow != 0);
+                    break;
+                }
                 // ---------------------------------------- creature movement
                 case SMSG_MONSTER_MOVE:
                 {
@@ -10470,48 +10902,26 @@ namespace WrathBench
                     // route.
                     name = "SMSG_MONSTER_MOVE";
                     uint64 guid = 0; p.readPackGUID(guid);
-                    uint8 toggle; p >> toggle;
-                    float sx, sy, sz; p >> sx >> sy >> sz;
-                    uint32 splineId; p >> splineId;
-                    uint8 type; p >> type;
                     w.AddGuid("guid", (uint64_t)guid);
-                    w.Raw("pos", Json::Writer().Add("x", (double)sx).Add("y", (double)sy).Add("z", (double)sz).Str());
-                    if (type == 1)                          // MonsterMoveStop
-                    {
-                        w.Add("stopped", true);
-                        break;
-                    }
-                    switch (type)
-                    {
-                        case 2: { float fx, fy, fz; p >> fx >> fy >> fz; break; } // facing spot
-                        case 3: { uint64 t; p >> t; break; }                     // facing target
-                        case 4: { float a; p >> a; break; }                      // facing angle
-                        default: break;
-                    }
-                    uint32 splineFlags; p >> splineFlags;
-                    if (splineFlags & 0x00200000)           // animation
-                        { uint8 animId; uint32 startTime; p >> animId >> startTime; }
-                    uint32 duration; p >> duration;
-                    if (splineFlags & 0x00000800)           // parabolic
-                        { float accel; uint32 startTime; p >> accel >> startTime; }
-                    uint32 pointCount; p >> pointCount;
-                    float dx = sx, dy = sy, dz = sz;
-                    if (splineFlags & (0x00002000 | 0x00040000)) // catmullrom/flying: full points
-                    {
-                        for (uint32 i = 0; i < pointCount; ++i)
-                        {
-                            float px, py, pz; p >> px >> py >> pz;
-                            dx = px; dy = py; dz = pz;      // keep only the last (the destination)
-                        }
-                    }
-                    else                                    // linear: destination + packed offsets
-                    {
-                        p >> dx >> dy >> dz;
-                        if (pointCount > 1)
-                            p.rpos(p.rpos() + size_t(pointCount - 1) * 4);
-                    }
-                    w.Raw("destination", Json::Writer().Add("x", (double)dx).Add("y", (double)dy).Add("z", (double)dz).Str());
-                    w.Add("durationMs", duration);
+                    DecodeMonsterMoveBody(p, w);
+                    break;
+                }
+                case SMSG_MONSTER_MOVE_TRANSPORT:
+                {
+                    // MoveSplineInit::Launch for a unit aboard a transport or
+                    // on a vehicle's seat: packGUID of the unit, packGUID of
+                    // the transport, i8 seat (-1 on a transport's deck, the
+                    // seat index on a vehicle), then the SMSG_MONSTER_MOVE
+                    // body, in the transport's own frame. For the character's
+                    // own guid it is the boarding spline Vehicle::AddPassenger
+                    // launches onto the seat: how a client learns which
+                    // vehicle, and which seat, it sits in.
+                    name = "SMSG_MONSTER_MOVE_TRANSPORT";
+                    uint64 guid = 0; p.readPackGUID(guid);
+                    uint64 transportGuid = 0; p.readPackGUID(transportGuid);
+                    int8 seat = -1; p >> seat;
+                    w.AddGuid("guid", (uint64_t)guid).AddGuid("transportGuid", (uint64_t)transportGuid).Add("seat", (int32_t)seat);
+                    DecodeMonsterMoveBody(p, w);
                     break;
                 }
                 default:
