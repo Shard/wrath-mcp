@@ -5,6 +5,52 @@ What each release of the stack changed: the module, `@wrathbench/sdk` and
 semantic versioning (`CONTRIBUTING.md`, "Versioning"). The module's wire
 version, `protocol` on `GET /health`, is separate and named where it moves.
 
+## Unreleased
+
+Wire protocol: unchanged, `1`. Every wire change below is an addition.
+
+### Operators must act
+
+- **`WrathBench.Enable` ships off.** `mod_wrathbench.conf.dist` now sets
+  `WrathBench.Enable = 0`, matching the code's default, so a worldserver that
+  only has the module built in opens no control port. A deployment that
+  relied on the shipped conf's `1` sets it, in its conf or as
+  `AC_WRATH_BENCH_ENABLE=1` in the worldserver's environment.
+
+### Added
+
+- The server's refusals a client shows, as events: `SMSG_AREA_TRIGGER_MESSAGE`
+  (a portal refused in words: a dungeon's level gate, a closed instance, a raid
+  without a raid group), `SMSG_QUESTGIVER_QUEST_INVALID` (why a quest cannot be
+  taken) and `SMSG_CHAT_PLAYER_NOT_FOUND` (a whisper to nobody online).
+  `SMSG_PLAYERBINDERROR` and `SMSG_RESURRECT_FAILED` are never sent by the
+  core, so nothing stands in for them.
+- The vendor buyback slots: `invSlot74`-`85` and `buybackPrice0`-`11` on self,
+  read by `state.buyback()`, the slot being what `CMSG_BUYBACK_ITEM` names.
+- Unit reaction: the module serves each unit's FactionTemplate.dbc row beside
+  its `faction` (`factionRow*`), and `units()` rows carry `reaction`
+  (`"hostile"`, `"neutral"` or `"friendly"`), the client's reading of that row
+  against the character's own and its reputation.
+- `use_item` takes `glyphSlot` (0-5), the slot a client's glyph frame sends
+  with a glyph; `useItem(..., { glyphSlot })` in the SDK.
+
+### Changed
+
+- `acceptQuestFrom` settles on `SMSG_QUESTGIVER_QUEST_INVALID` with
+  `status: "refused"`, the reason and a hint, where it waited out its timeout;
+  `useItem` on a quest-start item likewise answers `status: "quest_refused"`.
+- `waitForTransfer` settles on `SMSG_AREA_TRIGGER_MESSAGE` with
+  `status: "refused"` and the server's text, where it answered `no_transfer`
+  after its timeout, and a `moveTo` that crossed such a portal carries the
+  refusal in its hint.
+
+### Fixed
+
+- `module/PROTOCOL.md` said swap and split are off the raw allowlist; they are
+  on it.
+- `sdk/API.md`: `raw`'s row said no SDK method sends the talent opcodes, though
+  `learnTalent` sends `CMSG_LEARN_TALENT`; `state.self.corpse` is documented.
+
 ## 0.2.0
 
 Wire protocol: unchanged, `1`.
