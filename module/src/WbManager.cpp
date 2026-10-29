@@ -1741,8 +1741,11 @@ namespace WrathBench
     // Synthesize one client movement packet (MovementInfo layout mirrors
     // WorldSession::ReadMovementInfo: flags u32, flags2 u16, time u32, xyzo,
     // [ONTRANSPORT: packGUID transport, local xyzo, u32 transport time, i8 seat,]
-    // [SWIMMING: f32 pitch,] fallTime u32; no fall extras: the module never
-    // sends a packet mid-fall). The time is the session's own "client"
+    // [SWIMMING or FLYING: f32 pitch,] fallTime u32[, FALLING: f32 zspeed,
+    // f32 sinAngle, f32 cosAngle, f32 xyspeed]; the fall's clock and jump
+    // block only on a packet sent from an arc, `fall`, with FALLING set:
+    // TickArcs and the acks sent while the body is on one; every other
+    // packet carries fallTime 0 and no block). The time is the session's own "client"
     // clock (ClientMSTime), the one CMSG_TIME_SYNC_RESP reports, so the
     // server's time sync translates it to server time on every relay. When
     // the point is on a transport the packet says so the way a client's would:
@@ -1765,12 +1768,14 @@ namespace WrathBench
     // without them would undo the change. One the server has since dropped
     // without a packet is stripped by the core on arrival (ReadMovementInfo
     // removes each without its aura), so it can never be claimed falsely.
-    // Two deliberate gaps, until the walker can live the state: can-fly is
-    // kept but never sent, acks included (the core's Player::CanFly reads the
-    // flag from the packets, and with it set the pathfinder that plans
-    // move_to on the character stops settling route points on the ground
-    // and takes straight-line shortcuts off the mesh, PathGenerator and
-    // UpdateAllowedPositionZ, while the walker only walks); and water walking
+    // Two deliberate gaps: can-fly is kept but sent only while the body is
+    // in the air (BenchSession::airborne: a flight of the character took off
+    // and has not landed), with FLYING beside it, acks included (the core's
+    // Player::CanFly reads the flag from the packets, and with it set the
+    // pathfinder that plans a ground move_to on the character stops settling
+    // route points on the ground and takes straight-line shortcuts off the
+    // mesh, PathGenerator and UpdateAllowedPositionZ, while a ground walk
+    // only walks; a body in the air is flown, never planned); and water walking
     // is dropped from a packet that swims (the walker swims a water-walking
     // body under the surface where a client runs on it, and no client sends
     // the two together).
@@ -1791,32 +1796,44 @@ namespace WrathBench
     }
 
     static void AppendMovementInfo(WorldPacket& p, BenchSession& s, Unit* mover, uint32 moveFlags,
-        float x, float y, float z, float o, Transport* transport)
+        float x, float y, float z, float o, Transport* transport, FallInfo const* fall = nullptr)
     {
         // The character's told flags, or the controlled unit's (a vehicle, a
         // possessed unit: BenchSession::moverMoveFlags, its own flags at the
         // handover and the packets for its guid since). The can-fly gap is the
         // character's alone: a flying mover flies, and its packets say so
         // (FLYING | CAN_FLY, which ReadMovementInfo keeps once the mover has
-        // its fly aura and strips until then).
+        // its fly aura and strips until then). The character's own body in
+        // the air (airborne) carries both, as a flying client's packets do.
         bool const own = IsOwnCharacter(s, mover);
         if (own)
+        {
             moveFlags |= s.stateMoveFlags.load() & ~uint32(MOVEMENTFLAG_CAN_FLY);
+            if (s.airborne.load())
+                moveFlags |= MOVEMENTFLAG_FLYING | MOVEMENTFLAG_CAN_FLY;
+        }
         else
             moveFlags |= s.moverMoveFlags.load();
         if (transport)
             moveFlags |= MOVEMENTFLAG_ONTRANSPORT;
         // The walk's swim and flight state only when the walk drives this unit
         // (an ack for the character while a vehicle is walked reads the
-        // character's). FLYING is the walk's own, as a client's physics set it
-        // on an airborne can-fly unit: no packet tells the client (the core
-        // adds it to a possessed flyer in place, Unit::SetCharmedBy).
+        // character's). A controlled unit's FLYING is the walk's own, as a
+        // client's physics set it on an airborne can-fly unit: no packet tells
+        // the client (the core adds it to a possessed flyer in place,
+        // Unit::SetCharmedBy). The character's is airborne's, above, which
+        // outlives the walk when a flight ends in the air.
         bool const walkIsThis = s.move.active
             && (s.move.moverGuid ? mover->GetGUID().GetRawValue() == s.move.moverGuid : own);
-        if (walkIsThis && s.move.flying)
+        if (walkIsThis && s.move.flying && !own)
             moveFlags |= MOVEMENTFLAG_FLYING;
         bool const flying = (moveFlags & MOVEMENTFLAG_FLYING) != 0;
-        bool const swimming = !transport && !flying && (walkIsThis ? s.move.swimming : mover->IsInWater());
+        // A body on an arc is falling: FALLING and the jump block, never
+        // with FLYING (ReadMovementInfo strips FALLING beside CAN_FLY).
+        if (fall && !flying)
+            moveFlags |= MOVEMENTFLAG_FALLING;
+        bool const falling = (moveFlags & MOVEMENTFLAG_FALLING) != 0;
+        bool const swimming = !transport && !flying && !falling && (walkIsThis ? s.move.swimming : mover->IsInWater());
         if (swimming)
             moveFlags = (moveFlags | MOVEMENTFLAG_SWIMMING) & ~uint32(MOVEMENTFLAG_WATERWALKING);
         p << uint32(moveFlags);
@@ -1832,17 +1849,21 @@ namespace WrathBench
             p << uint32(transport->GetPathProgress());
             p << int8(-1);          // seat: none (not a vehicle)
         }
+        // Pitch: level while swimming along the surface or hovering; a flown
+        // leg's own slope while the walk flies this unit (MoveState::pitch).
         if (swimming || flying)
-            p << float(0.0f);       // pitch: level, swimming along the surface or flying straight
-        p << uint32(0);             // fallTime
+            p << float(walkIsThis && s.move.flying ? s.move.pitch : 0.0f);
+        p << uint32(falling ? fall->timeMs : 0);   // fallTime
+        if (falling)
+            p << float(fall->zspeed) << float(fall->sinAngle) << float(fall->cosAngle) << float(fall->xyspeed);
     }
 
     static void SendMovePacket(BenchSession& s, Unit* mover, uint16 opcode, uint32 moveFlags,
-        float x, float y, float z, float o, Transport* transport = nullptr)
+        float x, float y, float z, float o, Transport* transport = nullptr, FallInfo const* fall = nullptr)
     {
-        WorldPacket* p = new WorldPacket(opcode, 8 + 4 + 2 + 4 + 16 + 8 + 16 + 4 + 1 + 4 + 4);
+        WorldPacket* p = new WorldPacket(opcode, 8 + 4 + 2 + 4 + 16 + 8 + 16 + 4 + 1 + 4 + 4 + 16);
         *p << mover->GetPackGUID();
-        AppendMovementInfo(*p, s, mover, moveFlags, x, y, z, o, transport);
+        AppendMovementInfo(*p, s, mover, moveFlags, x, y, z, o, transport, fall);
         s.ws->QueuePacket(p);
         s.move.sentO = o;
     }
@@ -1947,12 +1968,12 @@ namespace WrathBench
     // an ack during the boarding spline that omitted the seat would take the
     // passenger off it in the server's record.
     static void AppendAckMovementInfo(WorldPacket& p, BenchSession& s, Unit* unit, uint32 moveFlags,
-        float x, float y, float z, float o, Transport* transport)
+        float x, float y, float z, float o, Transport* transport, FallInfo const* fall = nullptr)
     {
         if (unit->GetVehicle())
             AppendUnitMovementInfo(p, s, unit);
         else
-            AppendMovementInfo(p, s, unit, moveFlags, x, y, z, o, transport);
+            AppendMovementInfo(p, s, unit, moveFlags, x, y, z, o, transport, fall);
     }
 
     // Swimming, as the server judges it and a client does it. Every number

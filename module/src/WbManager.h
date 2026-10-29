@@ -48,6 +48,41 @@ namespace WrathBench
         float x{0}, y{0}, z{0};
     };
 
+    // The jump block of a falling client's MovementInfo
+    // (WorldSession::ReadMovementInfo: after fallTime, when
+    // MOVEMENTFLAG_FALLING is set: zspeed, sinAngle, cosAngle, xyspeed) and
+    // the fall's own clock (fallTime, ms since it left the ground). zspeed is
+    // the client's convention, negative upward (SMSG_MOVE_KNOCK_BACK sends
+    // -speedZ, Unit::KnockbackFrom).
+    struct FallInfo
+    {
+        uint32 timeMs{0};
+        float zspeed{0}, sinAngle{0}, cosAngle{1}, xyspeed{0};
+    };
+
+    // A body in the air on a ballistic arc, as a client's physics fly it
+    // (world thread only): where it left from, its velocity then, the jump
+    // block its packets carry, and where and when the arc meets the ground
+    // (SimulateArc). Today one cause: `fall`, a character left in the air
+    // by a flight when the server takes its ability to fly away (a
+    // dismount, a no-fly zone).
+    struct ArcState
+    {
+        bool active{false};
+        char const* cause{""};
+        int64_t startMs{0};
+        int64_t lastPacketMs{0};
+        float x0{0}, y0{0}, z0{0}, o{0};
+        float vx{0}, vy{0}, vz{0};   // y/s; vz upward
+        bool slowFall{false};
+        uint32 moveFlags{0};         // FORWARD for a running jump, else none
+        FallInfo fall;               // the jump block (fall.timeMs set per packet)
+        bool hasLanding{false};
+        WbVec landing{};
+        uint32 landMs{0};            // the arc's time to the landing
+        bool intoWater{false};       // lands swimming: MSG_MOVE_START_SWIM, not MSG_MOVE_FALL_LAND
+    };
+
     // One AreaTrigger.dbc record (3.3.5a). Client-side knowledge: the volumes
     // a client tests its own position against to send CMSG_AREATRIGGER.
     struct AreaTriggerRec
@@ -137,7 +172,8 @@ namespace WrathBench
         bool swimming{false};       // the "client" is swimming: packets carry MOVEMENTFLAG_SWIMMING, pace is swim speed
         float sentO{0};             // orientation of the last movement packet sent (SendMovePacket): what the server and observers hold
         uint64_t moverGuid{0};      // the unit this walk drives when it is not the character (a vehicle, a possessed unit); 0 for the character
-        bool flying{false};         // a flying mover's straight leg: flight speed, no water, no ledges, no areatriggers
+        bool flying{false};         // a straight flown leg: flight speed, no water, no ledges; areatriggers only for the character's own
+        float pitch{0};             // a flown leg's pitch, the line's own slope (radians, up positive)
     };
 
     // Per-token headless session. See docs/METHODOLOGY.md ("Client fidelity")
@@ -275,6 +311,22 @@ namespace WrathBench
         // the core replaces its whole record of the flags with each packet's.
         // Written on tap threads, read on the world thread, hence atomic.
         std::atomic<uint32_t> stateMoveFlags{0};
+
+        // The character's own body is flying (MOVEMENTFLAG_FLYING with
+        // _CAN_FLY on its packets): set when a flight of the character takes
+        // off, kept while a flight ends in the air (the body hovers there),
+        // cleared when one lands, on a teleport and a new world, and when the
+        // server takes can-fly away while it is set, which leaves the body to
+        // fall (pendingFall). Written on the world thread and the tap, read on
+        // both, hence atomic.
+        std::atomic<bool> airborne{false};
+        // Can-fly was taken away while the body was in the air: the world
+        // tick starts its fall (TickArcs). Set on the tap, taken on the world
+        // thread.
+        std::atomic<bool> pendingFall{false};
+        // The arc the body is on (world thread; read by the acks from the tap
+        // as s.move is, see AnswerForceRoot).
+        ArcState arc;
 
         // The unit this "client" moves (Player::m_mover), as the server has
         // told it: 0 for the character itself, else the guid of the vehicle
@@ -462,7 +514,7 @@ namespace WrathBench
         void DoGameAction(std::string token, std::string action, std::string body,
             std::shared_ptr<std::promise<HttpReply>> ack);
         void DoDeleteSession(std::string token, std::shared_ptr<std::promise<HttpReply>> ack);
-        void DoMoveTo(std::string token, float x, float y, float z, std::string guid, bool force, std::shared_ptr<std::promise<HttpReply>> ack);
+        void DoMoveTo(std::string token, float x, float y, float z, std::string guid, bool force, bool fly, std::shared_ptr<std::promise<HttpReply>> ack);
         void DoStop(std::string token, std::shared_ptr<std::promise<HttpReply>> ack);
         void DoFace(std::string token, bool hasO, float o, bool hasXY, float x, float y, std::shared_ptr<std::promise<HttpReply>> ack);
 
@@ -666,6 +718,13 @@ namespace WrathBench
         // drops it, and the live position is tested against the areatrigger
         // volumes every tick, as a client tests its own position every frame.
         void TickGrounded(int64_t nowMs);
+        // A body in the air outside any walk (world thread only): the fall a
+        // lost can-fly leaves (pendingFall), flown as a client's physics fly
+        // it, heartbeats on the way and MSG_MOVE_FALL_LAND (or
+        // MSG_MOVE_START_SWIM) where it comes down, reported as WB_SELF_MOVE.
+        void TickArcs(int64_t nowMs);
+        void StartArc(BenchSession& s, Unit* mover, char const* cause, float vx, float vy, float vz,
+            uint32 moveFlags, FallInfo const& jump, int64_t nowMs);
         void TickRiders(int64_t nowMs);
         void TickTransports(int64_t nowMs);
         void FinishMove(BenchSession& s, char const* status);
