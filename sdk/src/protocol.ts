@@ -885,6 +885,8 @@ export const MOVE_STATUSES = [
   "superseded",
   "rooted",
   "stunned",
+  "falling",
+  "cannot_fly",
   "controlling",
 ] as const;
 export type KnownMoveStatus = (typeof MOVE_STATUSES)[number];
@@ -971,10 +973,13 @@ export type RideProgressData = z.infer<typeof rideProgressDataSchema>;
 
 /**
  * Module-synthesized: a movement packet the module sent for the character
- * outside any `move_to`, as a client's own physics would — today only the
- * drop from a taxi flight's last spline point (`fromZ`) to the ground under
- * it (`pos`), sent as `MSG_MOVE_FALL_LAND` the tick the flight flag clears.
- * `pos` is where the character stands after landing.
+ * outside any `move_to`, as a client's own physics would: the drop from a
+ * taxi flight's last spline point (`fromZ`) to the ground under it (`pos`),
+ * sent as `MSG_MOVE_FALL_LAND` the tick the flight flag clears
+ * (`cause: "taxi_landing"`), and the landing of a fall from the air after the
+ * server took the ability to fly away mid-air (`cause: "fall"`, `fromZ` the
+ * height it fell from; `MSG_MOVE_START_SWIM` when it comes down in deep
+ * water). `pos` is where the character is after landing.
  */
 export const selfMoveDataSchema = z.looseObject({
   opcode: z.string(),

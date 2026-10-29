@@ -575,13 +575,67 @@ events and verdict, a flying unit's leg flown rather than walked — and a
 not in the character's map; a walk still running when control changes hands
 ends `controlling`.
 
+Flying. A character the server has told it can fly (`SMSG_MOVE_SET_CAN_FLY`
+for its own guid, Movement-state changes below: a flying mount where flying
+is allowed, a flight form; never read from the DB) is flown as a flying
+mover is ("Driving", below): a straight line to the point at the z asked
+for, at its flight speed (`MOVE_FLIGHT`, the mount's auras in it), the line
+judged by the same line-of-sight and terrain samples and refused
+`path_incomplete` at the last clear point, `flight: true` on the ack's
+siblings, the progress events and the verdict. The ground is the default.
+The leg is flown only
+
+- when the request says so: optional `fly` (boolean), refused before
+  planning with status `cannot_fly` (acked with `moveId` alone, nothing
+  sent) when the character has not been told it can fly;
+- when the character is already in the air: a flight that ended there,
+  which no ground route starts from;
+- or when the ground has no route to the point: a walk refused
+  `path_incomplete`, `target_off_mesh`, `start_off_mesh`, `no_mesh` or a
+  climb (`drop` with a positive `dz`) is flown instead, and when the line is
+  refused too the verdict is the flight's, with `flight: true` (audited as
+  `op: "move_fly_fallback"` with both answers). A downward ledge (`drop`,
+  negative `dz`) is not: the ground has a route, which `force` takes, and
+  `too_far` holds a flight too.
+
+The packets are a client's (unverified against a capture; every flight
+opcode goes to `HandleMovementOpcodes` as a run does, `Opcodes.cpp`, so the
+server reads only their flags and position): from the ground,
+`MSG_MOVE_START_ASCEND` (0x359) with `MOVEMENTFLAG_ASCENDING`, then the
+run's `MSG_MOVE_START_FORWARD`, heartbeats and `MSG_MOVE_STOP`, each with
+`MOVEMENTFLAG_FLYING | MOVEMENTFLAG_CAN_FLY` and the pitch field the flag
+puts in the layout, the line's own slope (level within ±90°; a possessed
+flyer's flight is pitched the same way). Areatriggers are tested along it:
+the character itself travels. A flight whose point lies on solid ground
+(terrain, vmap or a game object's floor within 1y under or over it) lands
+there, its stop carrying no `FLYING`; any other ends in the air, water
+included, and the body hovers: every packet and ack carries
+`FLYING | CAN_FLY` and a level pitch until a flight lands it, a teleport
+or a new world puts it down, or the server takes can-fly away. Then it
+falls, as a client's body falls: the can-fly ack is its last packet in the
+air (no `FLYING`, so the server's fall start is that height), a heartbeat
+every 500ms carries `MOVEMENTFLAG_FALLING`, the fall's clock (`fallTime`)
+and the jump block (zspeed, sin, cos, xyspeed: 0, the facing, 0), and where
+the core's own fall curve (`Movement::computeFallElevation`, Feather Fall
+included) meets the surface under it (the edge drop's surface reads,
+`path_incomplete` above) it sends `MSG_MOVE_FALL_LAND`, which the server
+charges as any fall (`Player::HandleFall`; a dismount at height can kill),
+or `MSG_MOVE_START_SWIM` into deep water. The landing is served as
+`WB_SELF_MOVE` (cause `fall`). A flight running when it happens ends
+`interrupted` where it was. While the body falls a `move_to` is refused
+`falling` (acked with `moveId` alone, nothing sent), `face` is refused
+`409 falling` and `stop` sends nothing: a packet with no fall clock would
+move the server's fall start (`Player::UpdateFallInformationIfNeed`).
+
 #### stop
 
 Stop moving (sends `MSG_MOVE_STOP` where the character currently is). Always
 acks `200 { "ok": true, "action": "stop" }`; if a move was in
 progress it additionally ends with a `WB_MOVE_RESULT` status `stopped`, or
 `rooted` (or `stunned`) with no packet when a root has already stopped it. While the client
-moves another unit the stop is that unit's ("Vehicles and possession").
+moves another unit the stop is that unit's ("Vehicles and possession"). A
+stop mid-flight leaves the body hovering where it stopped, and a stop while
+the body falls sends nothing (Flying, above).
 
 Request: `{ "token": "run-abc123", "action": "stop" }`
 
@@ -599,6 +653,8 @@ Additional errors: `400 {"ok":false,"error":"missing_face_target","action":"face
 `409 {"ok":false,"error":"stunned"}` (the unit the client moves is stunned:
 a stunned client cannot turn, Roots below; nothing sent; a root alone does
 not refuse it),
+`409 {"ok":false,"error":"falling"}` (the body is falling, Flying above;
+nothing sent),
 `409 {"ok":false,"error":"moving"}` (stop first, or supersede with `move_to`),
 `409 {"ok":false,"error":"controlling"}` (the core holds a mover for this
 client that is not in the character's map, "Vehicles and possession" below;
@@ -1237,14 +1293,16 @@ the `u32` the handler reads and never uses (1 set, 0 unset). Every movement
 packet and ack after carries the flags, since the core replaces its record of
 them with each packet's; one the server dropped without a packet is stripped
 on arrival (`ReadMovementInfo` removes each without its aura). Two
-deliberate gaps, until the walker can live the state: `MOVEMENTFLAG_CAN_FLY`
-is kept but never sent, the can-fly ack included (it is still sent: it tells
-observers and clears the pending flight change), because the core's
-pathfinder plans `move_to` on the character and, with the flag held
-(`Player::CanFly`), stops settling route points on the ground
-(`WorldObject::UpdateAllowedPositionZ`) and takes a straight-line shortcut
-where the start or target is more than 7y off the mesh (`PathGenerator`),
-while the walker has no flight; and `MOVEMENTFLAG_WATERWALKING` is dropped
+deliberate gaps: `MOVEMENTFLAG_CAN_FLY` is kept but sent only while the
+body is in the air after a flight of the character took off (Flying, under
+`move_to`), with `FLYING` beside it, acks included; on the ground it is not
+sent, the can-fly ack included (it is still sent: it tells observers and
+clears the pending flight change), because the core's pathfinder plans a
+ground `move_to` on the character and, with the flag held
+(`Player::CanFly` reads the packets' flags), stops settling route points on
+the ground (`WorldObject::UpdateAllowedPositionZ`) and takes a straight-line
+shortcut where the start or target is more than 7y off the mesh
+(`PathGenerator`), while a ground walk only walks; and `MOVEMENTFLAG_WATERWALKING` is dropped
 from every packet that swims, since the walker swims a water-walking body
 under the surface (below) and no client sends the two together. The
 `SMSG_SPLINE_MOVE_` twins of the first three (sent while the client does not
@@ -1513,13 +1571,13 @@ session's own identity). Their `opcodeId`s are outside the real opcode range.
 
 | opcode | id | `data` fields |
 |---|---|---|
-| `WB_MOVE_PROGRESS` | 0xFF02 | `{ "moveId": <number>, "pos": { "x","y","z","o" }, "pathLength": <f>, "etaMs": <u64>, "mover": <guid-string>?, "flight": true? }` — at most 1/s while moving; `mover` only on a walk of another unit (a vehicle, a possessed unit: "Vehicles and possession"), whose position `pos` then is, and `flight` only when that unit's leg is flown; `pathLength` is the length in yards of the route the move walks (the resolved polyline, 3D), and `etaMs` how long the module's walker takes over it at the speeds it read at dispatch (move_to, "Walk time"), both the same on every event of the move; `etaMs` is absent when no speed could be read |
-| `WB_MOVE_RESULT` | 0xFF01 | `{ "moveId": <number>, "status": <str>, "pos": { "x","y","z","o" }, "meshZ": <f?>, "reachedPos": { "x","y","z" }? }` — `meshZ` only on `arrived` when the mesh z differed from the request; `reachedPos` on `path_incomplete` and `drop`; `"pathLength": <f>` and `"etaMs": <u64>` on the verdict of any move that was dispatched and walked (a refusal at planning has neither), the route's length in yards and its walk time as on `WB_MOVE_PROGRESS`; `"dz": <f>, "target": { "x","y","z" }` only on `drop`, plus `"safeFall": <u32>` when the character's own fall-height reduction (`SPELL_AURA_SAFE_FALL`, the client's buff frame) is non-zero, and `"surfaceZ": <f>` only when the step's foot lies under the ground surface at its x,y (the step is then refused forced or not); `"nearest": { "x","y","z" } | null` only on `target_off_mesh` (the walkable mesh point nearest the request within 20y, or `null` when none is); `"onTransport": { "guid": <guid-string>, "entry": <u32> }` when the character ended the move aboard a transport; `"mover": <guid-string>` on any verdict of a walk of another unit (and on `controlling`, the unit the core holds), with `pos` that unit's, and `"flight": true` when its leg was flown ("Vehicles and possession") |
+| `WB_MOVE_PROGRESS` | 0xFF02 | `{ "moveId": <number>, "pos": { "x","y","z","o" }, "pathLength": <f>, "etaMs": <u64>, "mover": <guid-string>?, "flight": true? }` — at most 1/s while moving; `mover` only on a walk of another unit (a vehicle, a possessed unit: "Vehicles and possession"), whose position `pos` then is, and `flight` only when the leg is flown (that unit's, or the character's own: move_to, "Flying"); `pathLength` is the length in yards of the route the move walks (the resolved polyline, 3D), and `etaMs` how long the module's walker takes over it at the speeds it read at dispatch (move_to, "Walk time"), both the same on every event of the move; `etaMs` is absent when no speed could be read |
+| `WB_MOVE_RESULT` | 0xFF01 | `{ "moveId": <number>, "status": <str>, "pos": { "x","y","z","o" }, "meshZ": <f?>, "reachedPos": { "x","y","z" }? }` — `meshZ` only on `arrived` when the mesh z differed from the request; `reachedPos` on `path_incomplete` and `drop`; `"pathLength": <f>` and `"etaMs": <u64>` on the verdict of any move that was dispatched and walked (a refusal at planning has neither), the route's length in yards and its walk time as on `WB_MOVE_PROGRESS`; `"dz": <f>, "target": { "x","y","z" }` only on `drop`, plus `"safeFall": <u32>` when the character's own fall-height reduction (`SPELL_AURA_SAFE_FALL`, the client's buff frame) is non-zero, and `"surfaceZ": <f>` only when the step's foot lies under the ground surface at its x,y (the step is then refused forced or not); `"nearest": { "x","y","z" } | null` only on `target_off_mesh` (the walkable mesh point nearest the request within 20y, or `null` when none is); `"onTransport": { "guid": <guid-string>, "entry": <u32> }` when the character ended the move aboard a transport; `"mover": <guid-string>` on any verdict of a walk of another unit (and on `controlling`, the unit the core holds), with `pos` that unit's, and `"flight": true` when the leg was flown, that unit's or the character's own ("Vehicles and possession"; move_to, "Flying") |
 | `WB_RIDE_PROGRESS` | 0xFF05 | `{ "transportGuid": <guid-string>, "transportEntry": <u32>, "pos": { "x","y","z","o" } }` — at most 1/s while the character rides a transport and is not walking; the server-side position the transport carried it to |
 | `WB_TRANSPORT_PROGRESS` | 0xFF06 | `{ "guid": <guid-string>, "entry": <u32>, "pos": { "x","y","z","o" }, "progressMs": <u32>, "periodMs": <u32?>, "docked": <bool?>, "inRange": <bool?> }` — at most 1/s per session, one per transport on the character's map whose create block the session has received and that is within the map's visibility range of the character in 2D (`Map::GetVisibilityRange()`, the core's `Visibility.Distance.*` for the map — 100y on continents and 170y in instances by default — the distance the core sends every other object at; transports alone are sent map-wide) or is carrying it; a transport that leaves the range gets one last report with `"inRange": false` and no `docked` (its position as it left), then none until it is back: the car's current position on its `TransportAnimation.dbc` path (what a client animates locally from `pathProgress`), the clock and period, and `docked` when the keyframe segment the clock is on has no displacement (the car is dwelling at a platform; absent for transports without an animation path) |
 | `WB_AREATRIGGER` | 0xFF04 | `{ "triggerId": <u32>, "moveId": <number>, "pos": { "x","y","z","o" } }` — the character entered an `AreaTrigger.dbc` volume and `CMSG_AREATRIGGER` was sent for it (see below); `moveId` is the `move_to` that crossed into it, 0 when no move did (a taxi landing, a transport carrying the character, a teleport's arrival) |
 | `WB_PORTALS` | 0xFF0A | `{ "mapId": <u32>, "portals": [{ "triggerId": <u32>, "x", "y", "z", "toMap": <u32>, "toMapName"?: <str>, "toInstanceType"?: <u32> }] }` — the map-transition portals in view: every `AreaTrigger.dbc` volume on the character's map whose `areatrigger_teleport` row leads to another map, within the map's visibility range of the character in 2D (`Map::GetVisibilityRange()`, the range `WB_TRANSPORT_PROGRESS` uses). `x`,`y`,`z` is the volume's centre from the client's DBC; `toMap` is the map it leads to, named and typed from the client's `Map.dbc` as on `WB_AREA` (both absent for a map the table has no row for); the arrival point is never served. Tested at most once a second and sent only when the set or the map changes, the whole current set each time (`[]` once the last one is out of range); sent again after a reattach's `WB_SESSION_STATE`. A dungeon entrance is scenery and a trigger volume, never an object, so nothing else names it |
-| `WB_SELF_MOVE` | 0xFF09 | `{ "opcode": "MSG_MOVE_FALL_LAND", "cause": "taxi_landing", "pos": { "x","y","z","o" }, "fromZ": <f> }` — a movement packet the module sent for the character outside any `move_to`, as a client's own physics would: today only the drop from a taxi flight's last spline point (`fromZ`) to the ground under it (`pos`), see "Taxi landing" below |
+| `WB_SELF_MOVE` | 0xFF09 | `{ "opcode": "MSG_MOVE_FALL_LAND", "cause": "taxi_landing", "pos": { "x","y","z","o" }, "fromZ": <f> }` — a movement packet the module sent for the character outside any `move_to`, as a client's own physics would: the drop from a taxi flight's last spline point (`fromZ`) to the ground under it (`pos`), cause `taxi_landing`, see "Taxi landing" below; and the landing of a fall from the air after the server took can-fly away mid-air, cause `fall` (`fromZ` the height it fell from; `opcode` `MSG_MOVE_START_SWIM` when it came down in deep water), see move_to, "Flying" |
 | `WB_AREA` | 0xFF07 | `{ "mapId": <u32>, "mapName"?: <str>, "instanceType"?: <u32>, "zoneId": <u32>, "zoneName": <str>, "areaId": <u32>, "areaName": <str> }` — the zone and subzone the character is in, named as the client names them, and the map it is on with the client's `Map.dbc` name and `InstanceType` for it (0 the open world, 1 a party dungeon, 2 a raid, 3 a battleground, 4 an arena; both absent when the table has no row for the map, never a guessed 0); once when the character enters the world and once per change of either area id, of the map or of the instance, whatever moved it (walking, a teleport, a map transfer). A transfer always sends one, with the new map's `mapId` and `instanceType`, even when both area ids stay the same: the Deadmines portal does, the mine outside on map 0 and map 36 inside being zone and area 1581 alike. See "Zone and area" below. |
 | `WB_TALENT_TREE` | 0xFF08 | the class talent frame, the answer to the `talent_tree` action; shape under "Spellbook, cooldowns, talents" below |
 | `WB_SESSION_STATE` | 0xFF03 | `{ "character": <str>, "guid": <guid-string>, "inWorld": true, "map": <n>, "x": <f>, "y": <f>, "z": <f>, "o": <f>, "level": <n>, "mapName"?, "instanceType"?, "zoneId", "zoneName", "areaId", "areaName", "replay"?: true }` — emitted once per WS subscribe to an already-in-world session and once per same-token `POST /session` on such a session; a subscribe that asked with `replay=1` gets it with `replay: true` and the reattach replay after it, on that socket alone (reattach semantics in the `/events` section above). Strictly client-visible facts: what `SMSG_LOGIN_VERIFY_WORLD` plus the session's own identity would carry, plus the same map and zone/area fields as `WB_AREA` so a reattached client starts where the stream cannot re-emit. |
@@ -1726,6 +1784,10 @@ at the top of this document.
   character left the map for a non-teleport reason); `pos` is where the
   character actually is.
 - `stopped` — a `stop` action ended the move.
+- `falling` — the character's body is falling (move_to, "Flying"): a
+  refusal, nothing sent, no `pathLength`. Move once it has landed.
+- `cannot_fly` — `fly` was asked of a character the server has not told
+  it can fly: a refusal, nothing sent, no `pathLength`.
 - `superseded` — a newer `move_to` replaced this move.
 - `controlling` — the core holds a mover for this client (a vehicle, a
   possessed unit: "Vehicles and possession", below), named by `mover`

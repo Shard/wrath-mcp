@@ -5979,7 +5979,7 @@ namespace WrathBench
         // The character's own flight, its can-fly taken away mid-air (the
         // tap cleared airborne and owes the fall, AnswerMoveFlag): the flight
         // stops where it is and TickArcs flies the fall from there.
-        if (m.flying && !m.moverGuid && !s.airborne.load())
+        if (m.flying && !m.moverGuid && !m.stopping && !s.airborne.load())
         {
             FinishMove(s, "interrupted");
             return;

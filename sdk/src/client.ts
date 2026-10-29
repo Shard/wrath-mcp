@@ -732,6 +732,7 @@ export const KNOWN_ERROR_CODES = [
   "missing_face_target",
   "moving",
   "stunned",
+  "falling",
   // guid-taking actions
   "missing_guid",
   "invalid_guid",
@@ -834,6 +835,8 @@ const ERROR_CODE_HINTS: Record<string, string> = {
     "await sdk.stop() and then face, or walk toward what you want to face",
   // Only face sends it: a stunned client cannot turn (a rooted one can).
   stunned: "you are stunned (state.self.stunned) and cannot turn until it wears off; nothing was sent",
+  // Only face sends it: a falling body turns nothing until it lands.
+  falling: "you are falling and cannot turn until you land; nothing was sent",
   missing_guid:
     "this action needs a guid argument — get one from state.nearbyUnits() or state.closest(...)",
   missing_position: "move_to needs finite x, y and z numbers",
@@ -1062,6 +1065,17 @@ export interface MoveToOptions {
    * `surfaceZ`).
    */
   force?: boolean;
+  /**
+   * Fly the leg: a straight line to the point at its z, at flight speed, for
+   * a character the server has told it can fly (a flying mount where flying
+   * is allowed, a flight form). Without it a character that can fly still
+   * walks wherever the ground has a route, and flies only when it has none
+   * (`flight: true` on the result), or when it is already in the air after
+   * a flight that ended there. A flight ends on the ground when the point is
+   * on it, else in the air. Refused `cannot_fly` for a character that
+   * cannot fly; nothing is sent.
+   */
+  fly?: boolean;
 }
 
 /**
@@ -1302,6 +1316,10 @@ export const MOVE_HINTS: Readonly<Record<string, (point: MovePoint, data: MoveRe
   // the root stopped does. A stun is the same under its own name (`stunned`).
   rooted: (_p, d) => (d.pathLength === undefined ? ROOTED_MOVE_HINT : ROOTED_WALK_HINT),
   stunned: (_p, d) => (d.pathLength === undefined ? STUNNED_MOVE_HINT : STUNNED_WALK_HINT),
+  // The body is in the air on a fall (module/PROTOCOL.md, `falling`), or a
+  // flight was asked of a character that cannot fly (`cannot_fly`).
+  falling: () => FALLING_MOVE_HINT,
+  cannot_fly: () => CANNOT_FLY_HINT,
   // The client moves another unit (module/PROTOCOL.md, `controlling`): a
   // refusal carries no route, a walk the handover ended does.
   controlling: (_p, d) => (d.pathLength === undefined ? CONTROLLING_MOVE_HINT : CONTROLLING_WALK_HINT),
@@ -1366,6 +1384,16 @@ const STUNNED_MOVE_HINT =
 
 /** `stunned`, mid-walk: a stun stopped a walk where the character stood. Proposed wording. */
 const STUNNED_WALK_HINT = "a stun stopped you mid-walk where you stand; you cannot move or turn until it wears off.";
+
+/** `falling`: the body is falling and steers nothing until it lands. Proposed wording. */
+const FALLING_MOVE_HINT =
+  "you are falling (you lost the ability to fly in the air) and cannot move until you land; the move was not sent. " +
+  "Move again once state.self.position shows you on the ground.";
+
+/** `cannot_fly`: `fly` for a character the server has not said can fly. Proposed wording. */
+const CANNOT_FLY_HINT =
+  "{ fly: true } needs a character that can fly (on a flying mount where flying is allowed, or in a flight form); " +
+  "this one cannot, so nothing was sent. Move without fly to walk.";
 
 /**
  * `controlling`, refused: the server holds a mover for this client (a
@@ -1607,16 +1635,24 @@ const MOVE_LEAVES_NO_STOP: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * A `rooted` or `stunned` verdict that refused the move: the module sent
- * nothing, and the verdict carries no route (`pathLength`), which a walk the
- * root stopped does. Like the planning refusals it moved nothing and is
- * remembered for a repeat (`MOVE_REJECTION_MEMO_MS`: a root outlasts the
- * window), but it sends no stop: the module's root ack already told the
- * server the character stands still, and a rooted client sends nothing.
+ * A refusal before planning (`EARLY_REFUSALS`: `rooted`, `stunned`,
+ * `falling`, `cannot_fly`): the module sent nothing, and the verdict carries
+ * no route (`pathLength`), which a walk the root stopped does. Like the
+ * planning refusals it moved nothing and is remembered for a repeat
+ * (`MOVE_REJECTION_MEMO_MS`: a root outlasts the window), but it sends no
+ * stop: the module's root ack already told the server the character stands
+ * still, a rooted client sends nothing, and a falling one has no run to stop.
  */
 function rootedRefusal(data: MoveResultData): boolean {
-  return (data.status === "rooted" || data.status === "stunned") && data.pathLength === undefined;
+  return EARLY_REFUSALS.has(data.status) && data.pathLength === undefined;
 }
+
+/**
+ * The statuses the module answers before planning, nothing sent: a root's,
+ * a falling body's and a flight the character cannot make. Read with no
+ * `pathLength`; a walk a root stopped carries one.
+ */
+const EARLY_REFUSALS: ReadonlySet<string> = new Set(["rooted", "stunned", "falling", "cannot_fly"]);
 
 /** A verdict that moved nothing: a refusal at planning, or a root's. */
 function refusedUnmoved(data: MoveResultData): boolean {
@@ -4784,7 +4820,7 @@ export class WrathClient {
    * and with a `hint` when that route is far longer than the straight line
    * (`longRouteNote`): a portal 30y away across a cliff can be a 600y walk.
    */
-  moveToAsync(target: MoveTarget, options: { force?: boolean } = {}): Promise<MoveToAsyncResponse> {
+  moveToAsync(target: MoveTarget, options: { force?: boolean; fly?: boolean } = {}): Promise<MoveToAsyncResponse> {
     const resolved = resolveMoveTarget(target, this.state, "moveTo");
     if ("unknown" in resolved) {
       this.noteActionHint("moveToAsync", "unknown_target", resolved.unknown);
@@ -4810,7 +4846,7 @@ export class WrathClient {
       const d = e.data as MoveResultData;
       if (!early.has(d.moveId)) early.set(d.moveId, d);
     });
-    return this.postMoveTo(resolved.point, resolved.guid, options.force === true)
+    return this.postMoveTo(resolved.point, resolved.guid, options.force === true, options.fly === true)
       .then(async ({ ack, etaMs }): Promise<MoveToAsyncResponse> => {
         this.watchAsyncMove(ack.moveId, resolved.point, epoch, origin);
         // The ack and the event travel on different sockets, so the refusal
@@ -4919,6 +4955,7 @@ export class WrathClient {
     point: MovePoint,
     guid?: string,
     force = false,
+    fly = false,
   ): Promise<{ ack: MoveToResponse; etaMs: number | undefined }> {
     // Any dispatch supersedes a remembered refusal, whichever call made it:
     // what comes back is the verdict now.
@@ -4937,6 +4974,7 @@ export class WrathClient {
         z: point.z,
         ...(guid !== undefined ? { guid } : {}),
         ...(force ? { force: true } : {}),
+        ...(fly ? { fly: true } : {}),
       },
       moveToResponseSchema,
     ).catch((err: unknown) => {
@@ -7941,7 +7979,7 @@ export class WrathClient {
     // Dispatch and wait for the verdict; issued once, and a second time with
     // `force` when the first answer is a `drop` the fall estimate allows.
     const issue = async (force: boolean): Promise<StreamEvent> => {
-      const { ack } = await this.postMoveTo(point, resolved.guid, force);
+      const { ack } = await this.postMoveTo(point, resolved.guid, force, options.fly === true);
       // The match is the moveId within the current session epoch, and the buffer
       // is searched: a result can land while the POST response is still in
       // flight (an immediate `target_off_mesh` does exactly that). No `sinceSeq` bound —
@@ -10079,11 +10117,11 @@ export class WrathClient {
       await this.face(point);
     } catch (e) {
       // Swallow ONLY the load-bearing refusals (409 while a move is active,
-      // or while stunned, which a fight's next tick outlasts): anything
-      // else — no_session, session_gone, transport loss — must surface so a
-      // dead session fails the fight fast instead of burning its timeout on
-      // invisible re-face ticks.
-      if (e instanceof WrathRequestError && (e.code === "moving" || e.code === "stunned")) return;
+      // while stunned, which a fight's next tick outlasts, or while in the
+      // air): anything else — no_session, session_gone, transport loss —
+      // must surface so a dead session fails the fight fast instead of
+      // burning its timeout on invisible re-face ticks.
+      if (e instanceof WrathRequestError && (e.code === "moving" || e.code === "stunned" || e.code === "falling")) return;
       throw e;
     }
   }
