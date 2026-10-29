@@ -34,7 +34,8 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   model, `flight: true` on the result. The ground stays the default: a leg
   is flown when `moveTo(p, { fly: true })` asks (`move_to` `fly`), when the
   body is already in the air, or when the ground has no route to the point
-  (no route, no mesh, an end off it, a climb). A flight that ends on the
+  (no route, no mesh, an end off it, a climb) and a clear line would land
+  on it; otherwise the ground's verdict is unchanged. A flight that ends on the
   ground lands; one that ends in the air hovers there. When the server takes
   can-fly away in the air (a dismount, a no-fly zone) the body falls as a
   client's does and lands with `MSG_MOVE_FALL_LAND`, which the server

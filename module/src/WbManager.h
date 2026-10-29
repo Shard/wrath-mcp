@@ -723,8 +723,8 @@ namespace WrathBench
         // it, heartbeats on the way and MSG_MOVE_FALL_LAND (or
         // MSG_MOVE_START_SWIM) where it comes down, reported as WB_SELF_MOVE.
         void TickArcs(int64_t nowMs);
-        void StartArc(BenchSession& s, Unit* mover, char const* cause, float vx, float vy, float vz,
-            uint32 moveFlags, FallInfo const& jump, int64_t nowMs);
+        void StartArc(BenchSession& s, Unit* mover, char const* cause, float x, float y, float z, float o,
+            float vx, float vy, float vz, uint32 moveFlags, FallInfo const& jump, int64_t nowMs);
         void TickRiders(int64_t nowMs);
         void TickTransports(int64_t nowMs);
         void FinishMove(BenchSession& s, char const* status);

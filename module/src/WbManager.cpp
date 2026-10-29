@@ -3159,6 +3159,20 @@ namespace WrathBench
         return g;
     }
 
+    // Whether the end of the character's own flight at (x, y, z) is on the
+    // ground: solid ground (SurfaceUnder: terrain, vmap or a game object's
+    // floor, not water) within FLIGHT_LAND_TOLERANCE under or over it. Such
+    // a flight lands (TickMover); any other ends in the air. `ground` is the
+    // surface found, INVALID_HEIGHT for none.
+    static bool FlightEndLands(Unit* mover, float x, float y, float z, float* ground)
+    {
+        bool climb = false;
+        *ground = SurfaceUnder(mover, x, y, z + FLIGHT_LAND_TOLERANCE, 2.0f * FLIGHT_LAND_TOLERANCE, &climb);
+        if (climb || *ground <= INVALID_HEIGHT || std::fabs(*ground - z) > FLIGHT_LAND_TOLERANCE)
+            return false;
+        return !WaterPoseAt(mover, x, y, *ground).swimming;
+    }
+
     void Manager::TryEdgeDrop(Unit* mover, std::vector<WbVec> const& partial, float x, float y, float z, float reqZ,
         bool force, PathResolve& r)
     {
@@ -4053,12 +4067,14 @@ namespace WrathBench
         // The flight fallback: a character that can fly, refused a ground
         // route because the mesh has none to the point (no route, no mesh, an
         // end or a start off it, or a climb no client walks up), flies the
-        // straight line instead, judged as any flight. Not for a downward
-        // ledge (`drop` with a negative step: a ground route that only asks
-        // for `force`), nor `too_far`, which a flight is held to as well.
-        // When the line is refused too, the verdict is the flight's (where it
-        // was clear, `flight: true`): a character with wings is told to fly
-        // higher, not to find a ramp. Audited as `op: "move_fly_fallback"`.
+        // straight line instead — only when the line is clear and ends on the
+        // ground, where the flight lands (FlightEndLands). Otherwise the
+        // ground's verdict stands as it was: the fallback only ever turns a
+        // refusal into an arrival, and never leaves a character that did not
+        // ask to fly hovering in the air. Not for a downward ledge (`drop`
+        // with a negative step: a ground route that only asks for `force`),
+        // nor `too_far`, which a flight is held to as well. Audited as
+        // `op: "move_fly_fallback"` with both answers and whether it was taken.
         if (!flying && ownCanFly && r.status != nullptr)
         {
             std::string const ground = r.status;
@@ -4068,11 +4084,17 @@ namespace WrathBench
             {
                 PathResolve flight;
                 planFlight(flight);
+                float landZ = INVALID_HEIGHT;
+                bool const lands = flight.status == nullptr && FlightEndLands(mover, x, y, z, &landZ);
                 Audit(*s, "action", Json::Writer().Add("op", "move_fly_fallback").Add("moveId", moveId)
-                    .Add("ground", ground).Add("flight", flight.status ? flight.status : "ok").Str());
-                r = std::move(flight);
-                flying = true;
-                transportLeg = false;
+                    .Add("ground", ground).Add("flight", flight.status ? flight.status : "ok")
+                    .Add("taken", lands).Str());
+                if (lands)
+                {
+                    r = std::move(flight);
+                    flying = true;
+                    transportLeg = false;
+                }
             }
         }
         // The resolved polyline, at dispatch, so a diagnosis reads the route
@@ -5677,14 +5699,14 @@ namespace WrathBench
         }
     }
 
-    void Manager::StartArc(BenchSession& s, Unit* mover, char const* cause, float vx, float vy, float vz,
-        uint32 moveFlags, FallInfo const& jump, int64_t nowMs)
+    void Manager::StartArc(BenchSession& s, Unit* mover, char const* cause, float x, float y, float z, float o,
+        float vx, float vy, float vz, uint32 moveFlags, FallInfo const& jump, int64_t nowMs)
     {
         ArcState& a = s.arc;
         a = ArcState{};
         a.cause = cause;
-        a.x0 = mover->GetPositionX(); a.y0 = mover->GetPositionY(); a.z0 = mover->GetPositionZ();
-        a.o = mover->GetOrientation();
+        a.x0 = x; a.y0 = y; a.z0 = z;
+        a.o = o;
         a.vx = vx; a.vy = vy; a.vz = vz;
         a.slowFall = mover->HasFeatherFallAura();
         a.moveFlags = moveFlags;
@@ -5747,7 +5769,8 @@ namespace WrathBench
                 FallInfo jump;
                 jump.sinAngle = std::sin(player->GetOrientation());
                 jump.cosAngle = std::cos(player->GetOrientation());
-                StartArc(*s, player, "fall", 0.0f, 0.0f, 0.0f, MOVEMENTFLAG_NONE, jump, nowMs);
+                StartArc(*s, player, "fall", player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(),
+                    player->GetOrientation(), 0.0f, 0.0f, 0.0f, MOVEMENTFLAG_NONE, jump, nowMs);
             }
             if (!a.active)
                 continue;
@@ -5981,7 +6004,17 @@ namespace WrathBench
         // stops where it is and TickArcs flies the fall from there.
         if (m.flying && !m.moverGuid && !m.stopping && !s.airborne.load())
         {
+            // From the walker's point, which the can-fly ack carried: the
+            // server's is the last heartbeat's, up to a heartbeat behind.
+            float const fx = m.curX, fy = m.curY, fz = m.curZ, fo = m.curO;
             FinishMove(s, "interrupted");
+            if (s.pendingFall.exchange(false))
+            {
+                FallInfo jump;
+                jump.sinAngle = std::sin(fo);
+                jump.cosAngle = std::cos(fo);
+                StartArc(s, mover, "fall", fx, fy, fz, fo, 0.0f, 0.0f, 0.0f, MOVEMENTFLAG_NONE, jump, nowMs);
+            }
             return;
         }
 
@@ -6183,12 +6216,8 @@ namespace WrathBench
             // the next flight or a lost can-fly lets it fall.
             if (m.flying && !m.moverGuid)
             {
-                bool climb = false;
-                float const ground = SurfaceUnder(mover, m.destX, m.destY, m.destZ + FLIGHT_LAND_TOLERANCE,
-                    2.0f * FLIGHT_LAND_TOLERANCE, &climb);
-                WaterPose const water = ground > INVALID_HEIGHT ? WaterPoseAt(mover, m.destX, m.destY, ground) : WaterPose{};
-                bool const lands = !climb && ground > INVALID_HEIGHT && !water.swimming
-                    && std::fabs(ground - m.destZ) <= FLIGHT_LAND_TOLERANCE;
+                float ground = INVALID_HEIGHT;
+                bool const lands = FlightEndLands(mover, m.destX, m.destY, m.destZ, &ground);
                 if (lands)
                 {
                     m.curZ = ground;

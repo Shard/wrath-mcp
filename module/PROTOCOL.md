@@ -590,13 +590,16 @@ The leg is flown only
   sent) when the character has not been told it can fly;
 - when the character is already in the air: a flight that ended there,
   which no ground route starts from;
-- or when the ground has no route to the point: a walk refused
-  `path_incomplete`, `target_off_mesh`, `start_off_mesh`, `no_mesh` or a
-  climb (`drop` with a positive `dz`) is flown instead, and when the line is
-  refused too the verdict is the flight's, with `flight: true` (audited as
-  `op: "move_fly_fallback"` with both answers). A downward ledge (`drop`,
-  negative `dz`) is not: the ground has a route, which `force` takes, and
-  `too_far` holds a flight too.
+- or when the ground has no route to the point and the flight would land
+  on it: a walk refused `path_incomplete`, `target_off_mesh`,
+  `start_off_mesh`, `no_mesh` or a climb (`drop` with a positive `dz`) is
+  flown instead when the line is clear and its end is on the ground (the
+  landing test below). Otherwise the ground's verdict stands unchanged, so
+  the fallback only turns a refusal into an arrival and never leaves a
+  character that did not ask to fly in the air (audited as
+  `op: "move_fly_fallback"` with both answers and `taken`). A downward
+  ledge (`drop`, negative `dz`) is not flown: the ground has a route, which
+  `force` takes; and `too_far` holds a flight too.
 
 The packets are a client's (unverified against a capture; every flight
 opcode goes to `HandleMovementOpcodes` as a run does, `Opcodes.cpp`, so the

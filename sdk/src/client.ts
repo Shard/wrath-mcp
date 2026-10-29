@@ -1070,10 +1070,11 @@ export interface MoveToOptions {
    * a character the server has told it can fly (a flying mount where flying
    * is allowed, a flight form). Without it a character that can fly still
    * walks wherever the ground has a route, and flies only when it has none
-   * (`flight: true` on the result), or when it is already in the air after
-   * a flight that ended there. A flight ends on the ground when the point is
-   * on it, else in the air. Refused `cannot_fly` for a character that
-   * cannot fly; nothing is sent.
+   * and the point is on the ground (`flight: true` on the result), or when
+   * it is already in the air after a flight that ended there. A flight ends
+   * on the ground when the point is on it, else in the air, where every
+   * later move flies too until one lands. Refused `cannot_fly` for a
+   * character that cannot fly; nothing is sent.
    */
   fly?: boolean;
 }
