@@ -1153,6 +1153,8 @@ export type MoveResult =
       readonly dz?: undefined;
       readonly surfaceZ?: undefined;
       readonly nearest?: undefined;
+      readonly mover?: undefined;
+      readonly flight?: undefined;
       /** Why the target resolved to nothing, and what to pass instead. */
       readonly hint: string;
     }
