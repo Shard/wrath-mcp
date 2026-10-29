@@ -2044,11 +2044,19 @@ Served in `SMSG_UPDATE_OBJECT` `fields` alongside the existing set:
   3.3.5 layout: two u32s of packed u16 objective counters); inventory as
   `invSlot<n>Lo`/`invSlot<n>Hi` u32 guid halves, n 0-22 = equipment + bag
   slots, 23-38 = backpack slots, 39-66 = bank slots, 67-73 = bank bag slots,
-  86-117 = keyring slots, 118-149 = currency token slots (the core's
-  numbering, `PLAYER_FIELD_INV_SLOT_HEAD` through
-  `PLAYER_FIELD_CURRENCYTOKEN_SLOT_1`). The vendor buyback slots between the
-  bank bags and the keyring (74-85) are not served. The SDK reassembles guids
+  74-85 = vendor buyback slots, 86-117 = keyring slots, 118-149 = currency
+  token slots (the core's numbering, `PLAYER_FIELD_INV_SLOT_HEAD` through
+  `PLAYER_FIELD_CURRENCYTOKEN_SLOT_1`, contiguous). The SDK reassembles guids
   and joins them to item create blocks; its `inventory` view stops at 73.
+  The buyback slots are the vendor window's buyback tab: an item sold is
+  moved into one (`Player::AddItemToBuyBackSlot`), keeping the item object the
+  client already holds (a part-stack sale creates a new one), and the slot
+  number is what `CMSG_BUYBACK_ITEM` (raw: `u64 vendor guid, u32 slot`) names.
+  Beside them `buybackPrice<n>`, n 0-11, the copper each costs to buy back
+  (`PLAYER_FIELD_BUYBACK_PRICE_1`, slot 74 + n). The reattach replay does
+  not re-create a buyback item's object (the core's own create builder skips
+  those slots), so after a reattach a slot filled earlier reads with a guid
+  and no entry.
 - items and containers: `stackCount`, `durability`, `maxDurability`,
   `itemFlags`, `ownerLo`/`ownerHi`, `containedLo`/`containedHi`; the random
   property and the enchantment slots, PUBLIC fields every client in range

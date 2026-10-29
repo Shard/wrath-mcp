@@ -6888,20 +6888,26 @@ namespace WrathBench
                     f.Add("quest" + std::to_string(rel / 5) + offName[rel % 5], v);
                     return true;
                 }
-                // Equipment/bag/backpack/bank/keyring/currency item guids as
-                // lo/hi u32 halves keyed by inventory slot (0-22 equipment+bags,
-                // 23-38 backpack, 39-66 bank, 67-73 bank bags, 86-117 keyring,
-                // 118-149 currency tokens — the core's slot numbering, the
-                // fields are contiguous). The vendor buyback slots between them
-                // (74-85) are not served. Halves stay u32 JSON numbers; the
-                // SDK joins them into guids. Bank slots since; keyring and
-                // currency since, which the server counts toward a quest's
-                // items (`Player::GetItemCount`).
-                if ((index >= PLAYER_FIELD_INV_SLOT_HEAD && index < PLAYER_FIELD_BANKBAG_SLOT_1 + 14) ||
-                    (index >= PLAYER_FIELD_KEYRING_SLOT_1 && index < PLAYER_FIELD_CURRENCYTOKEN_SLOT_1 + 64))
+                // Equipment/bag/backpack/bank/buyback/keyring/currency item
+                // guids as lo/hi u32 halves keyed by inventory slot (0-22
+                // equipment+bags, 23-38 backpack, 39-66 bank, 67-73 bank bags,
+                // 74-85 vendor buyback, 86-117 keyring, 118-149 currency
+                // tokens — the core's slot numbering, the fields are
+                // contiguous). Halves stay u32 JSON numbers; the SDK joins
+                // them into guids. The buyback slots are the vendor's buyback
+                // tab, and the slot number is what CMSG_BUYBACK_ITEM names.
+                if (index >= PLAYER_FIELD_INV_SLOT_HEAD && index < PLAYER_FIELD_CURRENCYTOKEN_SLOT_1 + 64)
                 {
                     uint32 rel = index - PLAYER_FIELD_INV_SLOT_HEAD;
                     f.Add("invSlot" + std::to_string(rel / 2) + (rel % 2 ? "Hi" : "Lo"), v);
+                    return true;
+                }
+                // What buying each buyback slot back costs, in copper
+                // (PLAYER_FIELD_BUYBACK_PRICE_1, PRIVATE): the price the
+                // buyback tab shows beside the item. n 0-11 is slot 74 + n.
+                if (index >= PLAYER_FIELD_BUYBACK_PRICE_1 && index < PLAYER_FIELD_BUYBACK_PRICE_1 + 12)
+                {
+                    f.Add("buybackPrice" + std::to_string(index - PLAYER_FIELD_BUYBACK_PRICE_1), v);
                     return true;
                 }
             }

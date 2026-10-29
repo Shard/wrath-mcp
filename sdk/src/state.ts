@@ -917,6 +917,23 @@ export interface WornBag {
   readonly name: string | undefined;
 }
 
+/**
+ * One occupied slot of the vendor window's buyback tab: an item this character
+ * sold, which `CMSG_BUYBACK_ITEM` (raw: `[{ guid: vendor }, { u32: slot }]`,
+ * at a vendor) buys back for `price`. `slot` is the core's 74-85, the number
+ * that packet names. The same three-way join as `bag()`: after a reattach a
+ * slot filled earlier has a guid and no `itemId` (the replay does not
+ * re-create the item), as a client that dialled in again would hold it.
+ */
+export interface BuybackItem extends ItemInstance {
+  readonly slot: number;
+  readonly guid: GuidKey;
+  readonly itemId: number | undefined;
+  readonly count: number | undefined;
+  /** Copper to buy it back (`PLAYER_FIELD_BUYBACK_PRICE_1`); `undefined` until observed. */
+  readonly price: number | undefined;
+}
+
 /** The whole carried inventory — backpack plus worn bags — as `bag()` reports it. */
 export interface BagContents {
   readonly items: readonly BagSlotItem[];
@@ -1695,6 +1712,7 @@ export interface StateSnapshot {
   readonly group: GroupState | undefined;
   readonly mailbox: MailboxState | undefined;
   readonly bank: BankContents;
+  readonly buyback: readonly BuybackItem[];
   readonly trade: TradeState | undefined;
   readonly lastSeq: number;
   readonly eventCount: number;
@@ -2738,6 +2756,35 @@ export class StateCache {
     return { guid: this.bankGuid?.value, items, bags, freeSlots: totalSlots - items.length, totalSlots };
   }
 
+  // -------------------------------------------------------------- buyback
+
+  /**
+   * The vendor buyback tab: what this character sold and can buy back, in
+   * slot order (74-85, the slot `CMSG_BUYBACK_ITEM` names), each with the
+   * price the tab shows. Empty until a sale; the server keeps twelve, the
+   * oldest giving way to the next sale.
+   */
+  buyback(): BuybackItem[] {
+    const out: BuybackItem[] = [];
+    for (let slot = BUYBACK_FIRST_SLOT; slot <= BUYBACK_LAST_SLOT; slot++) {
+      const lo = this.self.fields.get(`invSlot${slot}Lo`);
+      const hi = this.self.fields.get(`invSlot${slot}Hi`);
+      if (!lo && !hi) continue;
+      const guid = formatGuid((BigInt(hi?.value ?? 0) << 32n) | BigInt((lo?.value ?? 0) >>> 0));
+      if (guid === "0") continue;
+      const item = this.nearby.get(guid);
+      out.push({
+        slot,
+        guid,
+        itemId: item?.entry?.value,
+        ...this.itemInstance(item),
+        count: item?.fields.get("stackCount")?.value,
+        price: this.self.fields.get(`buybackPrice${slot - BUYBACK_FIRST_SLOT}`)?.value,
+      });
+    }
+    return out;
+  }
+
   // ---------------------------------------------------------------- trade
 
   /** The trade window, or `undefined` until any trade packet. */
@@ -3064,6 +3111,7 @@ export class StateCache {
       group: this.group(),
       mailbox: this.mailbox(),
       bank: this.bank(),
+      buyback: this.buyback(),
       trade: this.tradeState,
       lastSeq: this.lastSeq,
       eventCount: this.eventCount,
@@ -5334,11 +5382,14 @@ const QUEST_ID_FIELD = /^quest\d+Id$/;
 /** Equipment + bags are 0-22, backpack 23-38 (PROTOCOL.md). */
 /**
  * The last `invSlot<n>` this view reads: the bank bags. Older modules stop at
- * 38; newer ones also serve the keyring (86-117) and currency tokens
- * (118-149), which no view lists; only a collect objective's count reads them
- * (`carriedItems`).
+ * 38; newer ones also serve the vendor buyback slots (74-85, `buyback()`), the
+ * keyring (86-117) and currency tokens (118-149), which no view lists; only a
+ * collect objective's count reads the last two (`carriedItems`).
  */
 const INVENTORY_LAST_SLOT = 73;
+/** The vendor buyback slots' `invSlot<n>` (`BUYBACK_SLOT_START`, `BUYBACK_SLOT_END - 1`). */
+const BUYBACK_FIRST_SLOT = 74;
+const BUYBACK_LAST_SLOT = 85;
 /** The keyring's first and the currency tokens' last `invSlot<n>` (`KEYRING_SLOT_START`, `CURRENCYTOKEN_SLOT_END - 1`). */
 const KEYRING_FIRST_SLOT = 86;
 const CURRENCY_LAST_SLOT = 149;

@@ -547,11 +547,11 @@ export type MessageChatData = z.infer<typeof messageChatDataSchema>;
  *
  * The quest/combat extension's two *indexed* field families are deliberately
  * left to that passthrough rather than spelled out: `quest<0-24><Id|State|
- * CountsLo|CountsHi|Time>` and `invSlot<0-73, 86-149><Lo|Hi>` are 401 keys
+ * CountsLo|CountsHi|Time>` and `invSlot<0-149><Lo|Hi>` are 425 keys
  * whose consumers are the state cache's quest-log and inventory folds and the
  * runner's trace recorder, which read them by name out of the field record.
  * Enumerating them here would buy a typed `fields.quest3Id` nobody wants and
- * 401 lines of schema to keep in step with the module.
+ * 425 lines of schema to keep in step with the module.
  */
 export const updateFieldsSchema = z.looseObject({
   // all objects

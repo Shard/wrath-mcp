@@ -173,6 +173,7 @@ export type {
   ReputationEntry,
   ReputationRank,
   BankContents,
+  BuybackItem,
   GroupMember,
   GroupState,
   MailEntry,
