@@ -24,7 +24,8 @@ trajectories; a harness such as WrathBench plugs those in through its hooks.
 - The C++ module stays thin: packet bridge and event tap only. Game semantics
   live in TypeScript.
 - What the SDK and the core tools show a model is governed by WrathBench's
-  `docs/METHODOLOGY.md` ("The model surface") alone; this repository carries no
+  [`docs/METHODOLOGY.md`](https://github.com/Shard/WrathBench/blob/master/docs/METHODOLOGY.md)
+  ("The model surface") alone; this repository carries no
   copy of those rules. Read it before changing anything a model sees: helpers,
   hints, error text, `sdk/API.md`, core-tool descriptions.
 - `sdk/API.md` is generated (`bun run docs:api`); never edit it by hand.
@@ -42,7 +43,8 @@ trajectories; a harness such as WrathBench plugs those in through its hooks.
 module/        C++ AzerothCore module: HTTP/WS bridge into WorldSession
 sdk/           Bun/TypeScript SDK over the module
 mcp/           Snippet sandbox, MCP server and core tools over the SDK
-docs/          CONTRACTS.md, the stack's specification with module/PROTOCOL.md
+docs/          CONTRACTS.md, the stack's specification with module/PROTOCOL.md;
+               ARCHITECTURE.md, how the pieces fit and the harness hooks
 scripts/       Repository checks (the stack boundary)
 ```
 
@@ -57,9 +59,10 @@ scripts/       Repository checks (the stack boundary)
 
 ## How to work
 
-- Read the relevant doc before touching a component: `module/README.md` and
-  `module/PROTOCOL.md` for the wire, `sdk/README.md` for the SDK, `mcp/README.md`
-  for the sandbox and tools, `docs/CONTRACTS.md` for what an agent may see and do.
+- Read the relevant doc before touching a component: `docs/ARCHITECTURE.md` for
+  structure and the harness hooks, `module/README.md` and `module/PROTOCOL.md`
+  for the wire, `sdk/README.md` for the SDK, `mcp/README.md` for the sandbox
+  and tools, `docs/CONTRACTS.md` for what an agent may see and do.
 - Checks, all fixture-based and green from a bare clone after
   `bun install --frozen-lockfile`: `bun test`, `bun run typecheck`,
   `bun run boundary`, `bun run docs:api:check`. Bun strips types without
@@ -68,8 +71,9 @@ scripts/       Repository checks (the stack boundary)
   (`scripts/boundary.ts`). sdk/ never imports mcp/, and mcp/ reaches the SDK
   through `@wrathbench/sdk` at an exported entry point.
 - A `module/` change cannot be verified here: it ships through a WrathBench
-  pin bump and is proven by WrathBench's smoke suite against a live stack
-  (`CONTRIBUTING.md`).
+  pin bump and is proven by WrathBench's smoke suite
+  ([`infra/smoke/`](https://github.com/Shard/WrathBench/tree/master/infra/smoke))
+  against a live stack (`CONTRIBUTING.md`).
 
 ## Style
 

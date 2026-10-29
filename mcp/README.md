@@ -4,15 +4,16 @@ The agent surface over `@wrathbench/sdk`: a confined, persistent snippet
 sandbox holding one SDK client per session, an MCP server, one tool
 dispatcher, and the five core tools — `run_snippet`, `recent_events`,
 `state_summary`, `write_scratchpad` and `edit_scratchpad`. With `sdk/` and
-`module/` it is the stack described in `sdk/README.md` ("The stack"), whose
-specification is `docs/CONTRACTS.md` and `module/PROTOCOL.md`. It knows nothing
-of episodes, scores or trajectories; a harness plugs those in through its hooks
-(`docs/ARCHITECTURE.md`, "The stack and the benchmark").
+`module/` it is the stack the root `README.md` describes, whose specification
+is `docs/CONTRACTS.md` and `module/PROTOCOL.md`. It knows nothing of episodes,
+scores or trajectories; a harness plugs those in through its hooks
+(`docs/ARCHITECTURE.md`, "The stack and a harness").
 
 ## Quickstart
 
-With a worldserver running the module (`sdk/README.md`, "Quickstart") and Bun
-1.4 with `bun install` at the repo root:
+With a worldserver running the module (root `README.md`, "Building the module
+into a worldserver") and Bun 1.4 with `bun install --frozen-lockfile` at the
+repo root:
 
 ```bash
 WRATHBENCH_MODULE_URL=http://127.0.0.1:8086 \
@@ -26,7 +27,8 @@ with the port secret and hands the sandbox only that; the scratchpad and the
 client cache live in `--dir` (default `$TMPDIR/wrathbench-mcp/<token>`), so a
 restart keeps both. Sandbox notices (a restart, a background fault) ride the
 next tool result. The sandbox needs Linux 6.7 or later — Landlock with TCP
-rules — and refuses to start without it.
+rules — and refuses to start without it; what it confines and what it leaves
+to the deployment's network policy is `docs/ARCHITECTURE.md` ("The sandbox").
 
 ## Pieces
 
