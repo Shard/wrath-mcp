@@ -640,8 +640,8 @@ export interface SelfState extends UnitFieldsState {
    * cleared by the same spell's own `SMSG_SPELL_GO` (it went off) or
    * `SMSG_SPELL_FAILURE` (it was interrupted). A refusal (`SMSG_CAST_FAILED`)
    * of a second cast leaves the running one standing, as it does on the
-   * server. An instant cast never sets it, and a channel does not either: the
-   * channel packets (`MSG_CHANNEL_START` / `MSG_CHANNEL_UPDATE`) are not served.
+   * server. An instant cast never sets it, and a channel does not either: a
+   * channel starts after its spell's `SMSG_SPELL_GO` and shows in `channeling`.
    */
   casting: Observed<{ readonly spellId: number; readonly name: string | undefined; readonly endsAt: number }> | undefined;
   /**
