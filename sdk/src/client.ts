@@ -1342,6 +1342,9 @@ const CONTROLLING_WALK_HINT =
 /** `UNIT_NPC_FLAG_SPELLCLICK` (AzerothCore `UnitDefines.h`): the unit takes `CMSG_SPELLCLICK`; cleared while its seats are full. */
 const UNIT_NPC_FLAG_SPELLCLICK = 0x0100_0000;
 
+/** `TARGET_FLAG_DEST_LOCATION` (`SpellDefines.h`): the SpellCastTargets mask bit for a ground point. */
+const TARGET_FLAG_DEST_LOCATION = 0x40;
+
 /** `interrupted` when the verdict found the character dead. */
 const MOVE_DIED_HINT =
   "the move stopped because the character died. A corpse cannot move: sdk.repop() releases the spirit, and a ghost can walk.";
@@ -6823,12 +6826,15 @@ export class WrathClient {
   }
 
   /**
-   * Have the pet cast one of its own spells, by name (`state.pet().spells`,
-   * case-insensitive exact, else a unique substring) or by id, at a unit or at
-   * nothing. The pet frame's button: `CMSG_PET_ACTION` with the spell.
+   * Have the pet — or the vehicle or possessed unit the character controls,
+   * whose bar `state.pet()` then is — cast one of its own spells, by name
+   * (`state.pet().spells`, case-insensitive exact, else a unique substring)
+   * or by id, at a unit, at a ground point (a cannon's shot) or at nothing.
+   * The pet frame's button, `CMSG_PET_ACTION` with the spell, for a unit or
+   * no target; `CMSG_PET_CAST_SPELL` with the point for a ground target.
    * Ack-only; a refusal arrives as `SMSG_PET_CAST_FAILED`.
    */
-  async petCast(spell: string | number, target?: GuidOrUnit): Promise<WithResolved<PetActionResult>> {
+  async petCast(spell: string | number, target?: GuidOrUnit | MovePoint): Promise<WithResolved<PetActionResult>> {
     const pet = this.petGuidOrRefuse("petCast");
     if ("refusal" in pet) return pet.refusal;
     const book = this.state.pet()?.spells ?? [];
@@ -6856,6 +6862,28 @@ export class WrathClient {
         `castable rows in state.pet().spells are the ones with passive: false`);
     }
     if (target === undefined) return this.petAction(pet.guid, known.spellId, 0x81, "0");
+    if (typeof target === "object" && !("guid" in target)) {
+      // A ground target (a cannon's shot, a vehicle's area spell): the bar's
+      // button cannot carry a point, so the cast is `CMSG_PET_CAST_SPELL`, the
+      // opcode a client sends from a controlled unit's bar with a cursor
+      // target — u64 caster, u8 cast count, u32 spell, u8 cast flags, then
+      // SpellCastTargets as `CMSG_CAST_SPELL` carries them
+      // (`SpellCastTargets::Read`): TARGET_FLAG_DEST_LOCATION, a packed
+      // transport guid of 0 and the point. The handler takes it for a pet or a
+      // charmed/possessed unit alike (`HandlePetCastSpellOpcode`).
+      const ack = await this.raw("CMSG_PET_CAST_SPELL", [
+        { guid: pet.guid },
+        { u8: 1 },
+        { u32: known.spellId },
+        { u8: 0 },
+        { u32: TARGET_FLAG_DEST_LOCATION },
+        { packedGuid: "0" },
+        { f32: target.x },
+        { f32: target.y },
+        { f32: target.z },
+      ]);
+      return { ok: true, status: "sent", ack };
+    }
     return this.byName(target, "petCast(spell, target)", (guid) => this.petAction(pet.guid, known.spellId, 0x81, guid));
   }
 

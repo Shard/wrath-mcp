@@ -4613,13 +4613,18 @@ export class StateCache {
         // overwrite the arrival with where the character left from.
         const d = event.data as { pos: PositionData; status?: string; mover?: GuidKey };
         // A walk of another unit (`mover`: the vehicle or possessed unit the
-        // client moves) is that unit's position, folded onto it in view. The
-        // character rides a vehicle it sits in, so its own position follows
-        // that one; a possessed unit flies off while the character stands.
+        // client moves) is that unit's position, folded onto it while it is
+        // in view (never conjured: a unit the server destroyed stays gone).
+        // The character rides a vehicle it sits in, so its own position
+        // follows that one; a possessed unit flies off while the character
+        // stands. A `controlling` refusal names the unit but its `pos` is
+        // the character's, so nothing is folded from it.
         if (d.mover !== undefined && !this.isSelfGuid(d.mover)) {
-          this.upsertNearby(d.mover, event.seq, (obj) => {
-            obj.position = { value: { x: d.pos.x, y: d.pos.y, z: d.pos.z, o: d.pos.o }, seq: event.seq, ts: event.ts };
-          });
+          if (d.status === "controlling") return;
+          const unit = this.nearby.get(d.mover);
+          if (unit !== undefined) {
+            unit.position = { value: { x: d.pos.x, y: d.pos.y, z: d.pos.z, o: d.pos.o }, seq: event.seq, ts: event.ts };
+          }
           if (this.self.vehicle?.value.guid !== d.mover) return;
         }
         // The character moving under its own control is off any server

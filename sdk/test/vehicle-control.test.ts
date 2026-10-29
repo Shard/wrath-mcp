@@ -345,4 +345,55 @@ describe("driving the mover: verdicts and positions of another unit", () => {
     client.close();
     await stub.stop();
   });
+
+  test("a verdict naming a unit no longer in view conjures no entry and still parses with its pos", () => {
+    const cache = replay([...loginSequence, selfCreate, frame(20, "WB_MOVE_RESULT", { moveId: 1, status: "arrived", mover: VEHICLE_GUID, pos: { x: 5, y: 6, z: 7, o: 0 } })]);
+    expect(cache.nearby.has(VEHICLE_GUID)).toBe(false);
+    expect(cache.self.position?.value).toMatchObject({ x: -1234.5, y: 987.25 });
+    expect(cache.anomalies).toEqual([]);
+  });
+
+  test("a controlling refusal names the unit but folds nothing: its pos is the character's", () => {
+    const at = { x: -1300, y: 900, z: 60, o: 2 };
+    const cache = replay([...loginSequence, selfCreate, nearbyUnit(20, VEHICLE_GUID), frame(21, "WB_MOVE_RESULT", { moveId: 1, status: "controlling", mover: VEHICLE_GUID, pos: at })]);
+    expect(cache.nearby.get(VEHICLE_GUID)?.position?.value).toEqual({ x: 0, y: 0, z: 0, o: 0 });
+    expect(cache.self.position?.value).toMatchObject({ x: -1234.5, y: 987.25 });
+  });
+});
+
+describe("petCast at a ground point: the controlled unit's bar with a cursor target", () => {
+  const petBar = (seq: number, guid: string) =>
+    frame(seq, "SMSG_PET_SPELLS", {
+      guid,
+      removed: false,
+      family: 0,
+      durationMs: 0,
+      reactState: 0,
+      commandState: 0,
+      flags: 0x800,
+      actionBar: [],
+      spells: [{ spellId: 52435, active: 0x81, autocast: false, name: "Cannon Shot" }],
+      cooldowns: [],
+    });
+
+  test("sends CMSG_PET_CAST_SPELL with TARGET_FLAG_DEST_LOCATION and the point", async () => {
+    const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate, petBar(20, VEHICLE_GUID)]) });
+    const client = await inWorld(stub);
+    await client.events.waitForOpcode("SMSG_PET_SPELLS", { timeout: 2000 });
+    const res = await client.petCast("Cannon Shot", { x: 1, y: 2, z: 3 });
+    expect(res).toMatchObject({ ok: true, status: "sent" });
+    const at = await untilAction(stub, "raw");
+    expect(stub.actions[at]).toMatchObject({ action: "raw", opcode: "CMSG_PET_CAST_SPELL" });
+    const payload = stub.actions[at]?.payload as string;
+    const le = (n: number, w: number) => Array.from({ length: w }, (_, i) => ((n >> (8 * i)) & 0xff).toString(16).padStart(2, "0")).join("");
+    const f32 = (v: number) => {
+      const dv = new DataView(new ArrayBuffer(4));
+      dv.setFloat32(0, v, true);
+      return Array.from(new Uint8Array(dv.buffer), (b) => b.toString(16).padStart(2, "0")).join("");
+    };
+    const guidHex = BigInt(VEHICLE_GUID).toString(16).padStart(16, "0").match(/../g)!.reverse().join("");
+    expect(payload).toBe(`${guidHex}01${le(52435, 4)}00${le(0x40, 4)}00${f32(1)}${f32(2)}${f32(3)}`);
+    client.close();
+    await stub.stop();
+  });
 });
