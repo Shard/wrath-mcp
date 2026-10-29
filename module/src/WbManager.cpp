@@ -1196,6 +1196,13 @@ namespace WrathBench
             float x = (float)req.GetDouble("x"), y = (float)req.GetDouble("y");
             PushTask([this, token, hasO, o, hasXY, x, y, ack]() { DoFace(token, hasO, o, hasXY, x, y, ack); });
         }
+        else if (action == "jump")
+        {
+            // Optional: jump forward at the run speed, as a running client
+            // jumps; in place without it.
+            bool forward = req.GetBool("forward");
+            PushTask([this, token, forward, ack]() { DoJump(token, forward, ack); });
+        }
         else
         {
             // Single-opcode actions (2026-08 quest/combat extension). Validate
@@ -1748,8 +1755,9 @@ namespace WrathBench
     // [SWIMMING or FLYING: f32 pitch,] fallTime u32[, FALLING: f32 zspeed,
     // f32 sinAngle, f32 cosAngle, f32 xyspeed]; the fall's clock and jump
     // block only on a packet sent from an arc, `fall`, with FALLING set:
-    // TickArcs and the acks sent while the body is on one; every other
-    // packet carries fallTime 0 and no block). The time is the session's own "client"
+    // MSG_MOVE_JUMP, CMSG_MOVE_KNOCK_BACK_ACK, TickArcs' heartbeats and the
+    // acks sent while the body is on one; every other packet carries
+    // fallTime 0 and no block). The time is the session's own "client"
     // clock (ClientMSTime), the one CMSG_TIME_SYNC_RESP reports, so the
     // server's time sync translates it to server time on every relay. When
     // the point is on a transport the packet says so the way a client's would:
@@ -4317,6 +4325,68 @@ namespace WrathBench
             .Add("orientation", (double)target).Str()});
     }
 
+    // The jump a client makes on its jump key: MSG_MOVE_JUMP (0x0BB,
+    // HandleMovementOpcodes) where the body stands, FALLING with the jump
+    // block (zspeed -JUMP_VELOCITY, the facing's sin and cos, xyspeed the run
+    // speed forward or 0 in place), fallTime 0, then the arc (TickArcs):
+    // heartbeats and MSG_MOVE_FALL_LAND where it comes down, reported as
+    // WB_SELF_MOVE cause `jump`. JUMP_VELOCITY is the client's own launch
+    // speed (7.955547 y/s, the figure stock clients put in MSG_MOVE_JUMP's
+    // jump block; no core path defines it, so it is the client's constant
+    // here): with the core's gravity the apex is v^2/2g, about 1.64y, under
+    // the drop guard's 2y, so a jump never clears a step the walker refuses
+    // as a climb. Refused, nothing sent (409): `controlling` while the client
+    // moves another unit, `falling` on an arc, `flying` in the air,
+    // `rooted`, `moving` during a walk (stop first), `swimming` in water (a
+    // swimmer's jump key rises; not modelled), `on_transport` aboard one (the
+    // arc is not carried by the deck).
+    static constexpr float JUMP_VELOCITY = 7.955547f;
+
+    void Manager::DoJump(std::string token, bool forward, std::shared_ptr<std::promise<HttpReply>> ack)
+    {
+        auto s = FindByToken(token);
+        Player* player = CheckActionSession(s, ack);
+        if (!player)
+            return;
+        auto refuse = [&](char const* error) {
+            Audit(*s, "action", Json::Writer().Add("op", "jump").Add("forward", forward).Add("refused", error).Str());
+            ack->set_value({409, Json::Writer().Add("ok", false).Add("error", error).Str()});
+        };
+        if (ActiveMover(player) != static_cast<Unit*>(player))
+            return refuse("controlling");
+        if (s->arc.active || s->pendingFall.load())
+            return refuse("falling");
+        if (s->airborne.load())
+            return refuse("flying");
+        if (RootedFor(*s, player, player))
+            return refuse("rooted");
+        if (s->move.active)
+            return refuse("moving");
+        if (player->IsInWater())
+            return refuse("swimming");
+        if (player->GetTransport() || player->GetVehicle())
+            return refuse("on_transport");
+
+        float const o = player->GetOrientation();
+        float const run = forward ? player->GetSpeed(MOVE_RUN) : 0.0f;
+        FallInfo jump;
+        jump.zspeed = -JUMP_VELOCITY;
+        jump.sinAngle = std::sin(o);
+        jump.cosAngle = std::cos(o);
+        jump.xyspeed = run;
+        uint32 const flags = forward ? uint32(MOVEMENTFLAG_FORWARD) : uint32(MOVEMENTFLAG_NONE);
+        float const x = player->GetPositionX(), y = player->GetPositionY(), z = player->GetPositionZ();
+        StartArc(*s, player, "jump", x, y, z, o, std::cos(o) * run, std::sin(o) * run, JUMP_VELOCITY, flags, jump, NowMs());
+        SendMovePacket(*s, player, MSG_MOVE_JUMP, flags, x, y, z, o, nullptr, &jump);
+        Audit(*s, "action", Json::Writer().Add("op", "jump").Add("forward", forward)
+            .Raw("pos", PosJson(x, y, z, o)).Str());
+        Json::Writer w;
+        w.Add("ok", true).Add("action", "jump");
+        if (s->arc.hasLanding)
+            w.Add("etaMs", uint64_t(s->arc.landMs));
+        ack->set_value({200, w.Str()});
+    }
+
     // Parse a guid request field (decimal string, see PROTOCOL.md u64 note).
     static uint64_t ParseGuid(Json::Value const& req, char const* key)
     {
@@ -5714,7 +5784,58 @@ namespace WrathBench
         Audit(s, "action", w.Str());
     }
 
-    // The arcs' tick. A fall a lost can-fly left (pendingFall) starts here,
+    // A knockback's answer (OnKnockBackPacket), on the world tick after the
+    // server sent it, as a client answers on its next frame: a walk in
+    // progress ends `knocked_back` (no stop: the body is thrown, and the ack
+    // is its next packet), the ack leaves from where the body is (the
+    // walker's point, an arc's point, else the server's), and the arc flies
+    // the launch the packet gave: across at speedXY along (vcos, vsin), up
+    // at speedZ (the packet's zspeed negated). A body hovering after a
+    // flight is not thrown (a flying client's knockback is not modelled):
+    // the ack restates where it hovers, which the handler takes as any
+    // packet.
+    void Manager::AnswerKnockBack(BenchSession& s, Player* player, BenchSession::PendingKnock const& k, int64_t nowMs)
+    {
+        MoveState& m = s.move;
+        float x = player->GetPositionX(), y = player->GetPositionY(), z = player->GetPositionZ();
+        float o = player->GetOrientation();
+        if (m.active && !m.moverGuid && !m.inFall)
+        {
+            x = m.curX; y = m.curY; z = m.curZ; o = m.curO;
+        }
+        else if (s.arc.active)
+        {
+            FallInfo now;
+            ArcPoseNow(s, nowMs, now);
+            WbVec const at = ArcPointAt(s.arc, now.timeMs);
+            x = at.x; y = at.y; z = at.z; o = s.arc.o;
+        }
+        uint64_t const moveId = m.active ? m.moveId : 0;
+        if (m.active)
+            FinishMove(s, "knocked_back");
+        s.arc.active = false;
+        bool const hover = s.airborne.load();
+        FallInfo jump;
+        jump.zspeed = k.zspeed;
+        jump.sinAngle = k.vsin;
+        jump.cosAngle = k.vcos;
+        jump.xyspeed = k.speedXY;
+        WorldPacket* p = new WorldPacket(CMSG_MOVE_KNOCK_BACK_ACK, 8 + 4 + 4 + 2 + 4 + 16 + 4 + 4 + 16);
+        *p << player->GetPackGUID();
+        *p << uint32(k.counter);
+        AppendMovementInfo(*p, s, player, MOVEMENTFLAG_NONE, x, y, z, o, nullptr, hover ? nullptr : &jump);
+        s.ws->QueuePacket(p);
+        Audit(s, "action", Json::Writer().Add("op", "knockback_ack").Add("counter", k.counter)
+            .Add("vcos", (double)k.vcos).Add("vsin", (double)k.vsin).Add("speedXY", (double)k.speedXY)
+            .Add("zspeed", (double)k.zspeed).Add("moveId", moveId).Add("hover", hover)
+            .Raw("pos", PosJson(x, y, z, o)).Str());
+        if (!hover)
+            StartArc(s, player, "knockback", x, y, z, o, k.vcos * k.speedXY, k.vsin * k.speedXY, -k.zspeed,
+                MOVEMENTFLAG_NONE, jump, nowMs);
+    }
+
+    // The arcs' tick. A knockback the server sent (pendingKnock) is answered
+    // first (AnswerKnockBack). A fall a lost can-fly left (pendingFall) starts here,
     // from where the server has the body, with no velocity: the flight it
     // may have ended stopped it (TickMover ends that walk `interrupted`
     // first). In flight, a heartbeat every 500 ms as a client sends one,
@@ -5734,8 +5855,7 @@ namespace WrathBench
         {
             std::lock_guard<std::mutex> lock(_sessMutex);
             for (auto& [token, s] : _byToken)
-                if (!s->tearingDown.load() && s->phase.load() == BenchSession::P_INWORLD
-                    && (s->arc.active || s->pendingFall.load()))
+                if (!s->tearingDown.load() && s->phase.load() == BenchSession::P_INWORLD)
                     sessions.push_back(s);
         }
         for (auto& s : sessions)
@@ -5749,6 +5869,13 @@ namespace WrathBench
                 continue;
             }
             ArcState& a = s->arc;
+            BenchSession::PendingKnock knock;
+            {
+                std::lock_guard<std::mutex> lock(s->answerMutex);
+                std::swap(knock, s->pendingKnock);
+            }
+            if (knock.has)
+                AnswerKnockBack(*s, player, knock, nowMs);
             if (s->pendingFall.exchange(false))
             {
                 if (s->move.active)
@@ -5772,7 +5899,10 @@ namespace WrathBench
             {
                 a.active = false;
                 WbVec const& l = a.landing;
-                uint32 const flags = (a.moveFlags & ~uint32(MOVEMENTFLAG_FALLING)) | (a.intoWater ? MOVEMENTFLAG_SWIMMING : 0);
+                // Down and still: a running jump's forward key is not held
+                // past the landing, so the server does not keep the body
+                // running (a cast after it would fail SPELL_FAILED_MOVING).
+                uint32 const flags = a.intoWater ? uint32(MOVEMENTFLAG_SWIMMING) : uint32(MOVEMENTFLAG_NONE);
                 uint16 const opcode = a.intoWater ? MSG_MOVE_START_SWIM : MSG_MOVE_FALL_LAND;
                 char const* name = a.intoWater ? "MSG_MOVE_START_SWIM" : "MSG_MOVE_FALL_LAND";
                 SendMovePacket(*s, player, opcode, flags, l.x, l.y, l.z, a.o, FindTransportAt(player->GetMap(), l.x, l.y, l.z));
@@ -6884,6 +7014,49 @@ namespace WrathBench
             .Raw("pos", PosJson(a.x, a.y, a.z, a.o)).Str());
     }
 
+    // Knockbacks. Unit::KnockbackFrom (a knockback spell's effect, and
+    // Unit::JumpTo) sends a unit its client controls SMSG_MOVE_KNOCK_BACK
+    // (0x0EF): packGUID, the u32 movement counter, then the launch as
+    // f32 vcos, f32 vsin (the direction away from the source,
+    // Position::GetSinCos), f32 speedXY and f32 -speedZ (negative upward,
+    // the client's jump convention). The client flies the arc and answers
+    // CMSG_MOVE_KNOCK_BACK_ACK (0x0F0), which WorldSession::
+    // HandleMoveKnockBackAck reads as packGUID, a u32 it skips, and a
+    // MovementInfo: FALLING with the jump block (zspeed, sinAngle, cosAngle,
+    // xyspeed: the packet's -speedZ, vsin, vcos, speedXY), fallTime 0, where
+    // the body leaves from. The handler applies it (ProcessMovementInfo,
+    // which does not move the fall start for this opcode) and relays
+    // MSG_MOVE_KNOCK_BACK to the set; the arc's heartbeats and its
+    // MSG_MOVE_FALL_LAND are TickArcs'. Kept here for the next world tick,
+    // as the speed changes are: the arc is simulated against the map there,
+    // and a walk in progress ends `knocked_back` first. Only the
+    // character's own guid while it is its own mover and on no seat: a
+    // vehicle's or a possessed unit's knockback stays unanswered (the server
+    // then keeps that unit in place, as before).
+    void Manager::OnKnockBackPacket(BenchSession& s, WorldSession* ws, WorldPacket const& packet)
+    {
+        Player* player = ws->GetPlayer();
+        if (!player || s.activeMover.load() != 0 || player->GetVehicle())
+            return;
+        BenchSession::PendingKnock k;
+        uint64 guid = 0;
+        try
+        {
+            WorldPacket p(packet);
+            p.readPackGUID(guid);
+            p >> k.counter >> k.vcos >> k.vsin >> k.speedXY >> k.zspeed;
+        }
+        catch (std::exception const&)
+        {
+            return; // a short packet (ByteBufferException): nothing to answer
+        }
+        if (guid != player->GetGUID().GetRawValue())
+            return;
+        k.has = true;
+        std::lock_guard<std::mutex> lock(s.answerMutex);
+        s.pendingKnock = k;
+    }
+
     // The world tick's half of the deferred answers (BenchSession::
     // pendingAnswers), in the order the server asked. A time-sync response
     // carries the counter and the client clock (ClientMSTime) now, stamped
@@ -7475,6 +7648,10 @@ namespace WrathBench
             OnRootPacket(*s, ws, opcode, packet);
 
         // Forced speed changes: the client's ack, which is what tells observers.
+        // A knockback: the client's ack and the arc it flies (OnKnockBackPacket).
+        if (opcode == SMSG_MOVE_KNOCK_BACK)
+            OnKnockBackPacket(*s, ws, packet);
+
         if (SpeedChangeAckOpcode(opcode))
             OnSpeedChangePacket(*s, ws, opcode, packet);
 
