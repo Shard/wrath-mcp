@@ -287,10 +287,13 @@ namespace WrathBench
         // the character's own (which stand while it sits on a seat): whether
         // that unit is rooted, from the ROOT its create block carried at the
         // handover and the root packets for its guid since (OnRootPacket),
-        // and the movement-state flags it has been told it has (its own flags
-        // at the handover: can-fly, flying, no gravity, hover, water walking,
-        // feather fall; then the SMSG_MOVE_* packets for its guid,
-        // OnMoveFlagPacket). Written on tap threads, read on the world thread.
+        // and the movement-state flags it has been told it has (the flags its
+        // create block and spline packets carried, read at the handover:
+        // can-fly, no gravity, hover, water walking, feather fall — never
+        // FLYING, which the core adds to a possessed flyer without a packet
+        // and the walk sets itself while it flies; then the SMSG_MOVE_*
+        // packets for its guid, OnMoveFlagPacket). Written on tap threads,
+        // read on the world thread.
         std::atomic<bool> moverRooted{false};
         std::atomic<uint32_t> moverMoveFlags{0};
 

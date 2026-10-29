@@ -88,8 +88,9 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   guid and kept as its own state; a seated passenger's root and
   movement-state acks carry the seat's transport block, so an ack during
   the boarding spline no longer takes it off the seat in the server's
-  record. The walk's drift guard scales with the pace, so a flight is not
-  ended `interrupted` for outrunning a runner's tolerance. The status
+  record. The walk's drift guard scales with the pace for a flight or a walk
+  of another unit, so a flight is not ended `interrupted` for outrunning a
+  runner's tolerance; the character's own walk keeps its 15y. The status
   `controlling` is kept for the one case no packet can drive — the core
   holds a mover that is not in the character's map — and for a walk that
   control changes hands under. Before this change the server silently

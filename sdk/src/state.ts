@@ -4621,9 +4621,10 @@ export class StateCache {
         // the character's, so nothing is folded from it.
         if (d.mover !== undefined && !this.isSelfGuid(d.mover)) {
           if (d.status === "controlling") return;
-          const unit = this.nearby.get(d.mover);
-          if (unit !== undefined) {
-            unit.position = { value: { x: d.pos.x, y: d.pos.y, z: d.pos.z, o: d.pos.o }, seq: event.seq, ts: event.ts };
+          if (this.nearby.has(d.mover)) {
+            this.upsertNearby(d.mover, event.seq, (obj) => {
+              obj.position = { value: { x: d.pos.x, y: d.pos.y, z: d.pos.z, o: d.pos.o }, seq: event.seq, ts: event.ts };
+            });
           }
           if (this.self.vehicle?.value.guid !== d.mover) return;
         }

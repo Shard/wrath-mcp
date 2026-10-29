@@ -1806,11 +1806,16 @@ namespace WrathBench
             moveFlags |= s.moverMoveFlags.load();
         if (transport)
             moveFlags |= MOVEMENTFLAG_ONTRANSPORT;
-        bool const flying = (moveFlags & MOVEMENTFLAG_FLYING) != 0;
-        // The walk's swim state only when the walk drives this unit (an ack
-        // for the character while a vehicle is walked reads the character's).
+        // The walk's swim and flight state only when the walk drives this unit
+        // (an ack for the character while a vehicle is walked reads the
+        // character's). FLYING is the walk's own, as a client's physics set it
+        // on an airborne can-fly unit: no packet tells the client (the core
+        // adds it to a possessed flyer in place, Unit::SetCharmedBy).
         bool const walkIsThis = s.move.active
             && (s.move.moverGuid ? mover->GetGUID().GetRawValue() == s.move.moverGuid : own);
+        if (walkIsThis && s.move.flying)
+            moveFlags |= MOVEMENTFLAG_FLYING;
+        bool const flying = (moveFlags & MOVEMENTFLAG_FLYING) != 0;
         bool const swimming = !transport && !flying && (walkIsThis ? s.move.swimming : mover->IsInWater());
         if (swimming)
             moveFlags = (moveFlags | MOVEMENTFLAG_SWIMMING) & ~uint32(MOVEMENTFLAG_WATERWALKING);
@@ -3801,7 +3806,7 @@ namespace WrathBench
         // the packets for its guid since (BenchSession::moverMoveFlags), never
         // from the creature's template.
         bool const flying = mover != player
-            && (s->moverMoveFlags.load() & (MOVEMENTFLAG_CAN_FLY | MOVEMENTFLAG_FLYING | MOVEMENTFLAG_DISABLE_GRAVITY)) != 0;
+            && (s->moverMoveFlags.load() & (MOVEMENTFLAG_CAN_FLY | MOVEMENTFLAG_DISABLE_GRAVITY)) != 0;
 
         // Resolve the request against the server's mmaps (the one sanctioned
         // navmesh use, docs/CONTRACTS.md "Pathing") into either a walkable
@@ -5809,13 +5814,13 @@ namespace WrathBench
         // runs before a turn report (below), which restarts the interval: on a
         // bending route at a mount's speed turns can come faster than 500ms,
         // and the check must not wait on a heartbeat that never falls due.
-        // The tolerance follows the pace: the server's position is the last
-        // packet's, up to a heartbeat (500 ms) plus a map update behind the
-        // walker, so a fast mover (a flight at several times run speed) is
-        // legitimately farther from its walker than a runner. 15y at a run
-        // (7 y/s: ~4y of lag and the rest margin), and from there 0.8 s of
-        // the pace plus 10y, which is the same 15y up to 6.25 y/s.
-        float const driftTolerance = std::max(15.0f, pace * 0.8f + 10.0f);
+        // The character's own walk keeps the 15y it always had. A flight, or
+        // a walk of another unit, follows the pace: the server's position is
+        // the last packet's, up to a heartbeat (500 ms) plus a map update
+        // behind the walker, so a mover at several times run speed is
+        // legitimately farther from its walker than a runner — 0.8 s of the
+        // pace plus 10y, never under 15.
+        float const driftTolerance = (m.flying || m.moverGuid) ? std::max(15.0f, pace * 0.8f + 10.0f) : 15.0f;
         auto drifted = [&]() -> bool
         {
             if (mover->GetExactDist2d(m.curX, m.curY) <= driftTolerance)
@@ -6693,15 +6698,21 @@ namespace WrathBench
             // The unit's state as this client now holds it: rooted when its
             // create block carried ROOT (a spline root set before the
             // handover, when no client controlled it), and the
-            // movement-state flags its block carried (a flying creature's
-            // can-fly and flying, a hover, its water walking); the packets
-            // for its guid keep both from here (OnRootPacket, OnMoveFlagPacket).
+            // movement-state flags its create block and spline packets
+            // carried (a flying creature's can-fly or no gravity, a hover,
+            // its water walking, its feather fall: each set by a core
+            // function that sends the set/unset to the set while no client
+            // controls the unit). Not FLYING: the core adds it to a possessed
+            // flyer in place (Unit::SetCharmedBy) and tells no client, so the
+            // walk sets it on its own packets while it flies, as a client's
+            // physics do (AppendMovementInfo). The packets for its guid keep
+            // both from here (OnRootPacket, OnMoveFlagPacket).
             if (guid != self)
             {
                 Unit* unit = ObjectAccessor::GetUnit(*player, ObjectGuid(guid));
                 s.moverRooted.store(unit && unit->m_movementInfo.HasMovementFlag(MOVEMENTFLAG_ROOT));
                 s.moverMoveFlags.store(!unit ? 0 : unit->m_movementInfo.GetMovementFlags()
-                    & uint32(MOVEMENTFLAG_CAN_FLY | MOVEMENTFLAG_FLYING | MOVEMENTFLAG_DISABLE_GRAVITY | MOVEMENTFLAG_HOVER
+                    & uint32(MOVEMENTFLAG_CAN_FLY | MOVEMENTFLAG_DISABLE_GRAVITY | MOVEMENTFLAG_HOVER
                         | MOVEMENTFLAG_WATERWALKING | MOVEMENTFLAG_FALLING_SLOW));
             }
             WorldPacket* p = new WorldPacket(CMSG_SET_ACTIVE_MOVER, 8);

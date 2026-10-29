@@ -1316,9 +1316,11 @@ events name it (`mover`, with `pos` the unit's). A ground mover (a steed) is
 walked over the mesh as the character is, planned from the unit's own
 position and collision height at its run speed, with the same ledge, water
 and turn rules; a flying mover (the Eye of Acherus: a unit whose create
-block, or a `SMSG_MOVE_SET_CAN_FLY` for its guid since, carried the flight
-flags — can-fly, flying or no gravity — which is how a client knows, never
-the creature's template) is flown, as a client flies it, in a straight line
+block and spline packets, or a `SMSG_MOVE_SET_CAN_FLY` for its guid since,
+carried can-fly or no gravity — which is how a client knows, never the
+creature's template; the FLYING bit the core adds to a possessed flyer in
+place, `Unit::SetCharmedBy`, reaches no client, so the walk sets it on its
+own packets while it flies, as a client's physics do) is flown, as a client flies it, in a straight line
 at the z asked for and at its flight speed (`flight: true` on the ack's
 siblings, the progress events and the verdict), the line judged against the
 geometry a client has — models and game objects by the map's line of sight
@@ -1330,8 +1332,9 @@ unit's own `FLYING | CAN_FLY` ride its packets (the core keeps them once the
 mover has its fly aura, `ReadMovementInfo`, and strips them until then). The
 walk's drift guard (the walker ending a move `interrupted` when the server's
 position falls more than a tolerance behind the walker's, checked each
-heartbeat) scales with the pace: 15y up to 6.25 y/s, then 0.8 s of the pace
-plus 10y, since the server's position is the last heartbeat's. The unit's root packets
+heartbeat) keeps its 15y for the character's own walk and, for a flight or
+a walk of another unit, follows the pace — 0.8 s of it plus 10y, never under
+15 — since the server's position is the last heartbeat's. The unit's root packets
 (`SMSG_FORCE_MOVE_ROOT` with its guid, `Unit::SendMoveRoot` to the
 controlling client) and movement-state changes are answered with its guid
 and kept as its own state, apart from the character's, which stands while
