@@ -40,25 +40,24 @@ path and no backward compatibility with callers that send none.
 
 No reply names the caller's token. It is the caller's own opaque session id,
 so an echo tells it nothing, and a reply on the session surface flows into
-snippet results and from there into trajectories and the published feed; only
+snippet results and from there into whatever a harness records or publishes; only
 the operator-only `POST /lease` and `DELETE /lease` replies carry it, to pair
 a secret with its token.
 
 Two credential classes:
 
 - **Operator** — the bearer is the *port secret*, `WrathBench.Secret`
-  (`AC_WRATH_BENCH_SECRET` on the worldserver, from `WRATHBENCH_MODULE_SECRET` —
-  a Secret key on the cluster, the operator's `.env` under compose;
-  docs/RUNBOOK.md "Secrets"). May use every route
-  with any token. Held by the runner host process, the fleet supervisor and the
-  smoke scripts; never by the snippet child (the sandbox strips it from the
-  child's environment).
+  (`AC_WRATH_BENCH_SECRET` in the worldserver's environment; callers read the
+  same value as `WRATHBENCH_MODULE_SECRET`). May use every route
+  with any token. Held by the process that hosts the sandbox (`mcp/src/main.ts`
+  or a harness's own host) and by operator tooling; never by the snippet child
+  (the sandbox strips it from the child's environment).
 - **Session** — the bearer is a *lease secret*, a 64-hex-character random value
   the module issued on `POST /lease` for exactly one token. It authenticates
   `POST /session`, `POST /action`, `DELETE /session` and the `/events` upgrade
   for that token alone (`403 token_mismatch` for any other), plus `GET /health`.
   Everything else — leasing, `/characters`, `/character-delete` — is
-  `403 operator_only`. This is what the runner hands the snippet child, so a
+  `403 operator_only`. This is what the sandbox host hands the snippet child, so a
   snippet in run A holds no credential that reaches run B.
 
 The lease is what binds a token to an account and a character:
@@ -83,8 +82,9 @@ The lease is what binds a token to an account and a character:
 
 A method and target the module does not serve is `404 not_found`, after
 authentication and after the operator-only check — which is also how a caller
-tells a module build that predates a route from one that refuses it: the runner
-reads `404 not_found` on `POST /lease` as "this module has no leasing" and runs
+tells a module build that predates a route from one that refuses it: the stack's
+lease helper (`leaseRunSecret`, `mcp/src/module-auth.ts`) reads `404 not_found`
+on `POST /lease` as "this module has no leasing" and runs
 without a session secret, where `403 operator_only` would mean the route is
 there and the credential is wrong.
 
@@ -114,7 +114,7 @@ serves no `protocol` predates the field and speaks `1`. The build identity
 
 Module and world status. Either credential class, no body.
 
-Two views. Callers on that network — the runner and, through
+Two views. Callers on that network — the sandbox host and, through
 it, the snippet sandbox — get liveness plus build identity: `ok`, `module`,
 `worldStopped`, `worldLoaded`, `build`, `startedAtMs`, `uptimeMs`, `protocol`,
 with `sessions` / `droppedPackets` / `droppedPacketsLive` present but zeroed
@@ -123,9 +123,10 @@ with `sessions` / `droppedPackets` / `droppedPacketsLive` present but zeroed
 session count and the drop census describe module internals and other runs'
 sessions, which the observation contract never serves to a snippet. The full
 view below is served only to loopback callers — an operator inside the
-worldserver container, with the port secret the container already holds, e.g.
-`bun wb server health` (`infra/module-health.sh`, a perl probe exec'd into the
-worldserver pod: the image has no curl).
+worldserver container, with the port secret the container already holds (for
+example WrathBench's
+[`infra/module-health.sh`](https://github.com/Shard/WrathBench/blob/master/infra/module-health.sh), a
+perl probe exec'd into the worldserver's container, whose image has no curl).
 
 Operator (loopback) response `200`:
 ```json
@@ -156,16 +157,15 @@ Operator (loopback) response `200`:
   alone decide), `loadedAfterMs` (this process's age when the verdict was
   taken) and `dbRestarted`. Server internals no client sees, like the drop
   census, so never on the network view.
-- `build` — the wrathbench repo's `git describe --tags --always --dirty` at
-  image build time, compiled into the module from the `WRATHBENCH_BUILD`
-  docker build-arg (`infra/build-images.sh` supplies it, and a compose build
-  takes it from the shell; see `module/mod-wrathbench.cmake`). `"unknown"` when the image was built without
-  it. Served to every caller: it is ops identity, not game
-  state, and lets the fleet gate, trajectories and the dashboard name *which*
-  server they talked to.
+- `build` — the build identity the builder passed as `-DWRATHBENCH_BUILD` at
+  CMake time, compiled into the module (`module/mod-wrathbench.cmake`);
+  WrathBench passes its repository's `git describe --tags --always --dirty`.
+  `"unknown"` when the build was given none. Served to every caller: it is ops
+  identity, not game state, and lets a deployment gate, a run's records or a
+  dashboard name *which* server they talked to.
 - `startedAtMs` — worldserver process start, epoch milliseconds (captured at
   static initialisation). `build` + `startedAtMs` together identify "this
-  build, this boot"; the fleet's preflight gate keys on exactly that pair.
+  build, this boot" (WrathBench's preflight gate keys on exactly that pair).
 - `uptimeMs` — milliseconds since `startedAtMs`. Telemetry, not identity.
 - `protocol` — the wire protocol version this build speaks, an integer (see
   "Versioning" below). Served to every caller; the SDK reads it on `connect`.
@@ -192,11 +192,11 @@ is shorter than this process's by more than a few seconds, i.e. MySQL
 restarted during the load. The core logs a query that lost its connection and
 carries on with that table empty, so without this a database restart in the
 middle of the load serves a world with no creatures under an `ok` health.
-Every reader that keys on `ok` (the fleet's preflight gate, both deploy
-windows' health waits, the smokes) waits on such a server rather than smoking
-or spawning against it, and the chart's startup probe passes only on a `200`
-here, so Kubernetes restarts the worldserver rather than starting it
-(infra/chart/wrathbench/templates/worldserver.yaml).
+Every reader that keys on `ok` waits on such a server rather than acting
+against it, and a startup probe that passes only on a `200` here has the
+orchestrator restart the worldserver rather than start it (WrathBench's chart
+does this,
+[`worldserver.yaml`](https://github.com/Shard/WrathBench/blob/master/infra/chart/wrathbench/templates/worldserver.yaml)).
 
 ### POST /session
 
@@ -287,9 +287,10 @@ Errors:
 Create reclaims a permitted account. `POST /session` on an account
 that passed the allowlist **always takes ownership** instead of dead-ending on a
 stale/leaked session — the invariant is one account = one job = one live
-episode (enforced by the fleet's duplicate-account guard and the roster's
-account-busy guard), so any session found holding the account at create time is
-stale, and reclaiming it is correct, not a race:
+session, which the deployment keeps (WrathBench's fleet enforces it with a
+duplicate-account guard and an account-busy guard), so any session found
+holding the account at create time is stale, and reclaiming it is correct, not
+a race:
 - Same token, already in world for the **same** account+character: returns
   success idempotently and emits one plain `WB_SESSION_STATE` (the reattach
   replay is a subscribe's to ask for; "/events" below); it does
@@ -740,15 +741,15 @@ Revokes the token's lease secret; a live session under the token is untouched.
 
 Operator only (`403 operator_only` for a session-class caller).
 `{ "token": <str>, "account"?: <str> }` → `200 { "ok": true, "enum": { "count": <number>, "characters": [ { "guid", "name", "race", "class", "gender", "level" }, ... ] } }`.
-A parked utility session (never enters world) answers with the decoded `SMSG_CHAR_ENUM` for the account — the same data a client's character-select screen shows. Exists for the runner's episode hygiene (list-then-delete leftover characters); errors mirror `/character-delete` (`missing_token`, `token_in_use`, `account_not_permitted`, `unknown_account`, `account_in_use` when a live session holds the account, `504 timeout`).
+A parked utility session (never enters world) answers with the decoded `SMSG_CHAR_ENUM` for the account — the same data a client's character-select screen shows. Exists for a harness's housekeeping between sessions (list-then-delete leftover characters); errors mirror `/character-delete` (`missing_token`, `token_in_use`, `account_not_permitted`, `unknown_account`, `account_in_use` when a live session holds the account, `504 timeout`).
 
 ### POST /character-delete
 
 Operator only (`403 operator_only` for a session-class caller; the snippet
 child therefore cannot delete any character, its own included — a fresh start
-is the operator's episode reset, not the model's). Delete a character by name
-through the real `CMSG_CHAR_DELETE` path. Needed because per-episode fresh
-characters accumulate against the realm's 10-characters-per-account
+is the operator's reset, not the agent's). Delete a character by name
+through the real `CMSG_CHAR_DELETE` path. Needed because a fresh character per
+session accumulates against the realm's 10-characters-per-account
 cap. The module stands up a short-lived parked session, authenticates, walks
 the character list, sends `CMSG_CHAR_DELETE` for the matching name, and tears
 the session down. Cannot run while another session is live on the same account
@@ -756,7 +757,7 @@ the session down. Cannot run while another session is live on the same account
 ~a minute after logout the core still tracks an offline session for the
 character and `CMSG_CHAR_DELETE` is silently ignored (no response packet), which
 surfaces here as `504 timeout` — callers should retry until `deleted` comes
-back (`deleteFixtureCharacters` in `infra/smoke/lib/fixture.ts` shows the pattern).
+back (the SDK's `deleteCharacter` does exactly that).
 
 Request:
 ```json
@@ -772,7 +773,7 @@ thread's scan is only a fast-path pre-filter), so a delete racing a
 `POST /session` for the same account within one world tick is decided
 deterministically: a `POST /character-delete` that finds another token on the
 account gets `409 account_owned_by_other_token` — character-delete never evicts a
-running episode. A `POST /session` create, by contrast, reclaims (see the create
+running session. A `POST /session` create, by contrast, reclaims (see the create
 reclaim note above): it tears the other session down and takes ownership rather
 than returning `account_in_use`, so a create never produces `account_in_use`.
 `POST /session` and `POST /characters` apply the same allowlist. Minimal ownership gate for the per-run account scheme;
@@ -1214,7 +1215,7 @@ not need it, docs/CONTRACTS.md):
   number per session)
 - players additionally: `playerFlags` (served as the raw integer; the module
   names no bit off it. The SDK decodes `PLAYER_FLAGS_GHOST` and
-  `PLAYER_FLAGS_RESTING` runner-side — a naming of already-served
+  `PLAYER_FLAGS_RESTING` SDK-side — a naming of already-served
   data, not a new tap)
 - game objects: `goDisplayId`, `goFlags`, `goFaction`, `goLevel`, `goState`,
   `goType`
@@ -1878,7 +1879,7 @@ allowlisted and no auction reply is tapped (deferred, with the dungeon finder,
 guilds, battlegrounds, glyphs, dual spec and equipment sets, until
 single-player play is validated; docs/CONTRACTS.md).
 
-Achievements and flight paths (issue #8 first half):
+Achievements and flight paths ([Shard/WrathBench#8](https://github.com/Shard/WrathBench/issues/8) first half):
 
 | opcode | id | `data` fields |
 |---|---|---|
@@ -2071,8 +2072,8 @@ event served is appended as:
 `payload` for `event` is the exact event object sent on the WebSocket; for
 `action` it is a short record of the dispatched opcode. The ground truth for
 the wire while it is kept: an operational record the deployment prunes by age
-(docs/CONTRACTS.md "Audit"); the per-run record that stays is the trajectory's
-`actions` record. The day's file is opened at session create and held, in
+(docs/CONTRACTS.md "Audit"); the record that stays is whatever a harness keeps
+from the sandbox's action log (docs/ARCHITECTURE.md, "The action log"). The day's file is opened at session create and held, in
 append mode; the first record after a UTC day boundary closes it and opens the
 next day's, only ever forward, so a session reopened later under the same
 token appends to that day's file and a past day's file gets no further write.
