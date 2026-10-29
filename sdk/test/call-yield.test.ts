@@ -50,6 +50,7 @@ describe("a call that sends nothing still crosses the event loop", () => {
       "acceptResurrection with no offer": () => client.acceptResurrection(),
       "equipItem with nothing by that name": () => client.equipItem("Nothing By This Name"),
       "readItem with nothing by that name": () => client.readItem("Nothing By This Name"),
+      "questAreas for a quest not in the log": () => client.questAreas(QUEST_ID),
       "bankDeposit with no bank open": () => client.bankDeposit("Nothing By This Name"),
       "mailList with no mailbox (rejects)": () => client.mailList(),
       "petAttack with no pet": () => client.petAttack(CREATURE_GUID),

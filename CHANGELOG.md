@@ -69,6 +69,11 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   empties the window under the item's guid as `lootCorpse` empties a corpse's
   and answers `looted`, `none_stored` or `empty` with what reached the bag, or
   `refused` with the `InventoryResult` (a locked lockbox).
+- Quest objective areas: `CMSG_QUEST_POI_QUERY` on the raw allowlist and
+  `SMSG_QUEST_POI_QUERY_RESPONSE` as an event, the polygons a client's world
+  map and quest tracker draw for each quest in the log. The SDK's
+  `questAreas()` asks for them and keeps them in `state.questPois`;
+  `docs/CONTRACTS.md` records them as served.
 
 ### Changed
 

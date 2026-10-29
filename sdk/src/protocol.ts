@@ -1189,6 +1189,37 @@ export const questQueryResponseDataSchema = z.looseObject({
 });
 export type QuestQueryResponseData = z.infer<typeof questQueryResponseDataSchema>;
 
+/**
+ * One objective area of a quest, as `SMSG_QUEST_POI_QUERY_RESPONSE` carries it:
+ * the shape a client shades on its world map. `objectiveIndex` -1 marks
+ * where the quest is turned in; any other value is the objective the area is
+ * for, served raw. `points` are the polygon's corners in world x/y,
+ * the frame `moveTo` takes, with no z. `worldMapAreaId` and `floor` name the
+ * client's map page (`WorldMapArea.dbc`), not a zone id; `priority` and
+ * `flags` are served raw.
+ */
+export const questPoiSchema = z.looseObject({
+  poiId: z.number(),
+  objectiveIndex: z.number(),
+  map: z.number(),
+  worldMapAreaId: z.number(),
+  floor: z.number(),
+  priority: z.number(),
+  flags: z.number(),
+  points: z.array(z.looseObject({ x: z.number(), y: z.number() })),
+});
+export type QuestPoi = z.infer<typeof questPoiSchema>;
+
+/**
+ * `SMSG_QUEST_POI_QUERY_RESPONSE`: the answer to `CMSG_QUEST_POI_QUERY`, one
+ * row per distinct quest id asked, in no particular order. `pois` is empty
+ * both for a quest not in the log and for one the server has no areas for.
+ */
+export const questPoiQueryResponseDataSchema = z.looseObject({
+  quests: z.array(z.looseObject({ questId: z.number(), pois: z.array(questPoiSchema) })),
+});
+export type QuestPoiQueryResponseData = z.infer<typeof questPoiQueryResponseDataSchema>;
+
 /** One row of a questgiver's list, in either of the two shapes that carry it. */
 export const offeredQuestSchema = z.looseObject({
   questId: z.number(),
@@ -1900,6 +1931,7 @@ export const eventDataSchemas = {
   SMSG_QUESTGIVER_STATUS: questGiverStatusDataSchema,
   SMSG_QUESTGIVER_STATUS_MULTIPLE: questGiverStatusMultipleDataSchema,
   SMSG_QUEST_QUERY_RESPONSE: questQueryResponseDataSchema,
+  SMSG_QUEST_POI_QUERY_RESPONSE: questPoiQueryResponseDataSchema,
   SMSG_QUESTGIVER_QUEST_LIST: questGiverQuestListDataSchema,
   SMSG_QUESTGIVER_QUEST_DETAILS: questGiverQuestDetailsDataSchema,
   SMSG_QUESTGIVER_REQUEST_ITEMS: questGiverRequestItemsDataSchema,

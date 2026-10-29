@@ -100,6 +100,8 @@ import {
   type QuestGiverStatusData,
   type QuestGiverStatusMultipleData,
   type QuestQueryResponseData,
+  type QuestPoi,
+  type QuestPoiQueryResponseData,
   type MoveUpdateData,
   type PositionData,
   type ResurrectRequestData,
@@ -1994,6 +1996,15 @@ export class StateCache {
   readonly quests = new Map<number, Observed<QuestInfo>>();
 
   /**
+   * questId -> the quest's objective areas, from `SMSG_QUEST_POI_QUERY_RESPONSE`
+   * (what `questAreas()` asks for, and what a client's world map and quest
+   * tracker draw). Never pruned, and an empty answer never replaces a
+   * non-empty one: the areas are the quest's, and the server answers empty
+   * for a quest that has left the log as for one that has no areas.
+   */
+  readonly questPois = new Map<number, Observed<readonly QuestPoi[]>>();
+
+  /**
    * Quest ids an `SMSG_QUESTUPDATE_COMPLETE` credited with their exploration
    * or event objective. Held only while the quest stays in the log: a quest
    * that leaves it (turned in, abandoned) is forgotten, so a re-accept starts
@@ -3608,6 +3619,14 @@ export class StateCache {
           seq: event.seq,
           ts: event.ts,
         });
+        return;
+      }
+      case "SMSG_QUEST_POI_QUERY_RESPONSE": {
+        const d = event.data as QuestPoiQueryResponseData;
+        for (const q of d.quests) {
+          if (q.pois.length === 0 && (this.questPois.get(q.questId)?.value.length ?? 0) > 0) continue;
+          this.questPois.set(q.questId, { value: q.pois, seq: event.seq, ts: event.ts });
+        }
         return;
       }
       case "SMSG_INITIAL_SPELLS": {
