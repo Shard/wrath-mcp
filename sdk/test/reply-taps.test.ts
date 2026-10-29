@@ -33,6 +33,18 @@ describe("reply and observation taps decode", () => {
     ["SMSG_SPELLORDAMAGE_IMMUNE", { casterGuid: SELF_GUID, targetGuid: CREATURE_GUID, spellId: 133, rank: 1, name: "Test Bolt" }],
     ["SMSG_ENVIRONMENTAL_DAMAGE_LOG", { victimGuid: SELF_GUID, type: 2, amount: 120, resist: 0, absorb: 0 }],
     ["SMSG_SPELL_DELAYED", { casterGuid: SELF_GUID, delayMs: 500 }],
+    ["SMSG_EMOTE", { guid: CREATURE_GUID, emoteId: 4 }],
+    ["SMSG_TEXT_EMOTE", { guid: CREATURE_GUID, textEmote: 78, emoteNum: 0, targetName: "Fenwick" }],
+    ["SMSG_TEXT_EMOTE", { guid: CREATURE_GUID, textEmote: 78, emoteNum: 0, targetName: "" }],
+    // The tail by notice type: a player (joined), two (kicked), a name (invited),
+    // the join and leave of our own, a mode change, and a notice with no tail.
+    ["SMSG_CHANNEL_NOTIFY", { type: 0, channel: "General - Elwynn Forest", guid: CREATURE_GUID }],
+    ["SMSG_CHANNEL_NOTIFY", { type: 18, channel: "Trade", guid: CREATURE_GUID, byGuid: SELF_GUID }],
+    ["SMSG_CHANNEL_NOTIFY", { type: 29, channel: "Trade", playerName: "Fenwick" }],
+    ["SMSG_CHANNEL_NOTIFY", { type: 2, channel: "General", flags: 0x18, channelId: 1 }],
+    ["SMSG_CHANNEL_NOTIFY", { type: 3, channel: "General", channelId: 1, constant: true }],
+    ["SMSG_CHANNEL_NOTIFY", { type: 12, channel: "Trade", guid: SELF_GUID, oldFlags: 0, flags: 2 }],
+    ["SMSG_CHANNEL_NOTIFY", { type: 5, channel: "Trade" }],
   ])("%s", (opcode, data) => {
     expect(isKnownOpcode(opcode)).toBe(true);
     expect(parse(frame(1, opcode, data)).data).toEqual(data);

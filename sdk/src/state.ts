@@ -1526,6 +1526,8 @@ export interface TransportState {
 export interface GossipMenuOption {
   readonly optionId: number;
   readonly text: string;
+  /** Choosing it takes a typed code: pass `gossipSelect` a `code`. */
+  readonly coded: boolean;
 }
 
 /**
@@ -4688,18 +4690,19 @@ export class StateCache {
         return;
       }
       case "SMSG_GOSSIP_MESSAGE": {
-        // The open menu for this NPC. Only `optionId`/`text` are folded — the
-        // two fields `gossipSelect` resolves against; the quests ride the same
-        // packet and are read straight off the event by the quest helpers.
+        // The open menu for this NPC. Only `optionId`/`text`/`coded` are
+        // folded — what `gossipSelect` resolves and checks against; the quests
+        // ride the same packet and are read straight off the event by the
+        // quest helpers.
         const d = event.data as {
           guid: GuidKey;
           menuId: number;
-          options: readonly { optionId: number; text: string }[];
+          options: readonly { optionId: number; text: string; coded?: boolean }[];
         };
         this.gossipMenus.set(d.guid, {
           guid: d.guid,
           menuId: d.menuId,
-          options: d.options.map((o) => ({ optionId: o.optionId, text: o.text })),
+          options: d.options.map((o) => ({ optionId: o.optionId, text: o.text, coded: o.coded === true })),
           seq: event.seq,
           ts: event.ts,
         });

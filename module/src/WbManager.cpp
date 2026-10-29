@@ -4316,6 +4316,17 @@ namespace WrathBench
             p = new WorldPacket(CMSG_GOSSIP_SELECT_OPTION, 16);
             *p << uint64(guid) << uint32(menuId) << uint32(optionId);
             auditW.Add("menuId", menuId).Add("optionId", optionId);
+            // A coded option (SMSG_GOSSIP_MESSAGE's boxCoded flag) has the
+            // client's text box follow as a cstring; the core reads it only
+            // when the menu item is coded (WorldSession::
+            // HandleGossipSelectOptionOpcode, MiscHandler.cpp), so it is sent
+            // only when given.
+            if (req.Has("code"))
+            {
+                std::string code = req.GetString("code");
+                *p << code;
+                auditW.Add("code", code);
+            }
         }
         else if (action == "quest_list")
         {
@@ -8571,6 +8582,93 @@ namespace WrathBench
                     w.Add("name", who);
                     break;
                 }
+                // A unit's one-shot emote, to everyone in range
+                // (Unit::HandleEmoteCommand, Unit.cpp, and
+                // WorldPackets::Chat::Emote::Write, ChatPackets.cpp): u32
+                // emote id, the emoting unit's raw u64 guid. Creatures and
+                // players alike.
+                case SMSG_EMOTE:
+                {
+                    name = "SMSG_EMOTE";
+                    uint32 emoteId; uint64 guid; p >> emoteId >> guid;
+                    w.AddGuid("guid", (uint64_t)guid).Add("emoteId", emoteId);
+                    break;
+                }
+                // A player's text emote ("/wave", "/bow") to every player in
+                // listen range, the emoter included (Acore::EmoteChatBuilder,
+                // ChatHandler.cpp): the emoter's raw u64 guid, u32 text emote
+                // id (an EmotesText.dbc row), u32 emote number (as the client
+                // sent it), u32 target-name length, then the target's name as
+                // a cstring, or a single 0 byte when there is none (a
+                // one-character name is also written as none).
+                case SMSG_TEXT_EMOTE:
+                {
+                    name = "SMSG_TEXT_EMOTE";
+                    uint64 guid; uint32 textEmote, emoteNum, nameLen;
+                    p >> guid >> textEmote >> emoteNum >> nameLen;
+                    std::string target; p >> target;
+                    w.AddGuid("guid", (uint64_t)guid).Add("textEmote", textEmote)
+                     .Add("emoteNum", emoteNum).Add("targetName", target);
+                    break;
+                }
+                // A channel notice (Channel::MakeNotifyPacket and its Make*
+                // callers, Channel.cpp; ChannelMgr::MakeNotOnPacket): u8
+                // ChatNotify type, the channel's name as a cstring, then a
+                // tail that depends on the type, served by its shape: `guid`
+                // (joined, left, password or owner changed, announcements,
+                // moderation, already a member, invite, voice), `guid` and
+                // `byGuid` (kicked, banned, unbanned: the target, then who
+                // did it), `playerName` (not found, owner, not banned,
+                // invited, invite banned), a join's `flags` and `channelId`,
+                // a leave's `channelId` and `constant`, and a mode change's
+                // `guid`, `oldFlags` and `flags`.
+                case SMSG_CHANNEL_NOTIFY:
+                {
+                    name = "SMSG_CHANNEL_NOTIFY";
+                    uint8 type; std::string channel; p >> type >> channel;
+                    w.Add("type", (uint32)type).Add("channel", channel);
+                    auto guidAt = [&](char const* key) {
+                        uint64 g; p >> g; w.AddGuid(key, (uint64_t)g);
+                    };
+                    switch (type)
+                    {
+                        case 0x02: // CHAT_YOU_JOINED_NOTICE: u8 flags, u32 channel id, u32 0
+                        {
+                            uint8 flags; uint32 channelId; p >> flags >> channelId;
+                            w.Add("flags", (uint32)flags).Add("channelId", channelId);
+                            break;
+                        }
+                        case 0x03: // CHAT_YOU_LEFT_NOTICE: u32 channel id, u8 constant
+                        {
+                            uint32 channelId; uint8 constant; p >> channelId >> constant;
+                            w.Add("channelId", channelId).Add("constant", constant != 0);
+                            break;
+                        }
+                        case 0x0C: // CHAT_MODE_CHANGE_NOTICE: guid, u8 old flags, u8 new flags
+                        {
+                            guidAt("guid");
+                            uint8 oldFlags, flags; p >> oldFlags >> flags;
+                            w.Add("oldFlags", (uint32)oldFlags).Add("flags", (uint32)flags);
+                            break;
+                        }
+                        case 0x00: case 0x01: case 0x07: case 0x08: case 0x0D: case 0x0E:
+                        case 0x0F: case 0x10: case 0x17: case 0x18: case 0x22: case 0x23:
+                            guidAt("guid");
+                            break;
+                        case 0x12: case 0x14: case 0x15: // kicked, banned, unbanned
+                            guidAt("guid");
+                            guidAt("byGuid");
+                            break;
+                        case 0x09: case 0x0B: case 0x16: case 0x1D: case 0x1E:
+                        {
+                            std::string playerName; p >> playerName;
+                            w.Add("playerName", playerName);
+                            break;
+                        }
+                        default: break; // no tail
+                    }
+                    break;
+                }
                 case SMSG_NAME_QUERY_RESPONSE:
                 {
                     name = "SMSG_NAME_QUERY_RESPONSE";
@@ -10472,8 +10570,10 @@ namespace WrathBench
                         p >> index >> icon >> coded >> boxMoney;
                         std::string text, boxText; p >> text >> boxText;
                         if (i) options += ',';
+                        // `coded`: choosing it takes a typed code
+                        // (gossip_select's `code`).
                         options += Json::Writer().Add("optionId", index).Add("icon", (uint32)icon)
-                            .Add("text", text).Str();
+                            .Add("text", text).Add("coded", coded != 0).Str();
                     }
                     options += "]";
                     uint32 questCount; p >> questCount;

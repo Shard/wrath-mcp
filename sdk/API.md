@@ -132,7 +132,7 @@ stream.) Then, on the client:
 | `cancelCast` | `cancelCast(spellId): Promise<ActionResponse>` | Cancel a cast in progress. |
 | `interact` | `interact(target: GuidOrUnit): Promise<ActionResponse>` | Use a gameobject — chest, door, quest object. |
 | `gossipHello` | `gossipHello(target: GuidOrUnit): Promise<ActionResponse>` | Open an NPC's gossip menu. |
-| `gossipSelect` | `gossipSelect(guid: GuidOrUnit, option: string | number) | gossipSelect(guid, menuId, optionId): Promise<ActionResponse>` | Choose a gossip option by visible text (from the last observed menu) or by numeric ids. |
+| `gossipSelect` | `gossipSelect(guid: GuidOrUnit, option: string | number, code?: string) | gossipSelect(guid, menuId, optionId, code?): Promise<ActionResponse>` | Choose a gossip option by visible text (from the last observed menu) or by numeric ids. An option the menu marks `coded` takes the typed text as `code`. |
 | `questList` | `questList(guid: GuidOrUnit): Promise<ActionResponse>` | Ask an NPC for its quest list. |
 | `questDetails` | `questDetails(guid: GuidOrUnit, questId): Promise<ActionResponse>` | Request a quest's text. |
 | `questAccept` | `questAccept(guid: GuidOrUnit, questId): Promise<ActionResponse>` | Accept a quest (prefer acceptQuestFrom, which confirms). |

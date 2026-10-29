@@ -128,7 +128,7 @@ const CLIENT_RAW: readonly Row[] = [
   { name: "cancelCast", sig: "cancelCast(spellId): Promise<ActionResponse>", purpose: "Cancel a cast in progress." },
   { name: "interact", sig: "interact(target: GuidOrUnit): Promise<ActionResponse>", purpose: "Use a gameobject — chest, door, quest object." },
   { name: "gossipHello", sig: "gossipHello(target: GuidOrUnit): Promise<ActionResponse>", purpose: "Open an NPC's gossip menu." },
-  { name: "gossipSelect", sig: "gossipSelect(guid: GuidOrUnit, option: string | number) | gossipSelect(guid, menuId, optionId): Promise<ActionResponse>", purpose: "Choose a gossip option by visible text (from the last observed menu) or by numeric ids." },
+  { name: "gossipSelect", sig: "gossipSelect(guid: GuidOrUnit, option: string | number, code?: string) | gossipSelect(guid, menuId, optionId, code?): Promise<ActionResponse>", purpose: "Choose a gossip option by visible text (from the last observed menu) or by numeric ids. An option the menu marks `coded` takes the typed text as `code`." },
   { name: "questList", sig: "questList(guid: GuidOrUnit): Promise<ActionResponse>", purpose: "Ask an NPC for its quest list." },
   { name: "questDetails", sig: "questDetails(guid: GuidOrUnit, questId): Promise<ActionResponse>", purpose: "Request a quest's text." },
   { name: "questAccept", sig: "questAccept(guid: GuidOrUnit, questId): Promise<ActionResponse>", purpose: "Accept a quest (prefer acceptQuestFrom, which confirms)." },
