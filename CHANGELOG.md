@@ -71,11 +71,25 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   spline). The module answers a control handover as a client does
   (`CMSG_SET_ACTIVE_MOVER`, `CMSG_MOVE_NOT_ACTIVE_MOVER`) and reports the end
   of a boarding or exit spline (`CMSG_MOVE_SPLINE_DONE`), audited as
-  `active_mover` and `spline_done`. Driving the controlled unit is not in
-  this change: `move_to` and `face` while the client moves another unit are
-  refused with the new status `controlling` (a `WB_MOVE_RESULT` naming the
-  `mover`; a walk the handover ends reads the same), where before the
-  server silently dropped the walk and it ended `interrupted`.
+  `active_mover` and `spline_done`.
+- Driving the controlled unit (module/PROTOCOL.md, "Vehicles and
+  possession", Driving). While a vehicle's driving seat or a possession
+  makes another unit the client's mover, `move_to`, `stop` and `face` are
+  that unit's: its guid on every packet, its position, speed, map and water
+  the walk's, and `mover` naming it on the progress events and the verdict
+  (whose `pos` is the unit's; the SDK folds it onto the unit in view, and
+  onto the character too when it sits in that vehicle). A ground unit is
+  walked over the mesh as the character is; a flying unit (the Eye of
+  Acherus) is flown in a straight line at the z asked for and at its flight
+  speed, judged against the map's line of sight and the terrain and refused
+  `path_incomplete` at the last clear point when it runs into either
+  (`flight: true` on the verdict; `moveTo`'s hint says to fly higher or
+  around). The unit's root and movement-state packets are answered with its
+  guid and kept as its own state. The status `controlling` is kept for the
+  one case no packet can drive — the core holds a mover that is not in the
+  character's map — and for a walk that control changes hands under. Before
+  this change the server silently dropped such a walk and it ended
+  `interrupted`.
 - Unit state flags named, from the `unitFlags` and `dynamicFlags` the module
   already serves (no wire change): `units()` rows carry `inCombat`,
   `stunned`, `skinnable`, `lootable`, `tapped` and `tappedByYou` (the client's
