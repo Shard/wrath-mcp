@@ -7,7 +7,9 @@ surface the module serves today: session lifecycle, the action set of
 event stream.
 
 Transport: plain HTTP/1.1 and RFC6455 WebSocket on `WrathBench.BindAddress:Port`
-(default `0.0.0.0:8086`), reachable only from inside the deployment's private network.
+(default `127.0.0.1:8086`, loopback only). A deployment that serves callers on
+other hosts sets the bind address itself, and keeps the port on a private
+network nothing publishes beyond them: it carries bearer secrets in the clear.
 All request and response bodies are JSON (`Content-Type: application/json`).
 
 Two error channels, deliberately separated (docs/CONTRACTS.md):
@@ -88,11 +90,11 @@ on `POST /lease` as "this module has no leasing" and runs
 without a session secret, where `403 operator_only` would mean the route is
 there and the credential is wrong.
 
-The module never logs a secret, and the worldserver log never carries a token:
-it names a session by `tok:` and the first 8 hex characters of the token's
-SHA-256, enough to correlate one session's lines and no more. (The per-session
-audit log is keyed by token; "Audit log" below.) `POST /lease` is the only
-response that carries a secret. Secrets are compared in constant time. With
+The module never logs a secret, and neither the worldserver log nor the audit
+log carries a token: both name a session by `tok:` and the first 8 hex
+characters of the token's SHA-256, enough to correlate one session's lines and
+no more, and the audit files are named by the first 16 ("Audit log" below).
+`POST /lease` is the only response that carries a secret. Secrets are compared in constant time. With
 `WrathBench.Secret` unset or shorter than 32 characters the module does not
 listen at all (logged at ERROR), so a mis-deployed worldserver is unreachable
 rather than open.
@@ -102,9 +104,14 @@ rather than open.
 The protocol has a version of its own, an integer the module serves as
 `protocol` on `GET /health` (today `1`). It moves only for a change an existing
 SDK would misread — a field that changes meaning or type, a shape or status
-that goes away. An addition (a new action, a new event, a new field) leaves it
-alone: every reader of this protocol ignores what it does not know, which is
-why the SDK's schemas are loose.
+that goes away. An addition (a new action, a new event, a new field, a new
+error code) leaves it alone: every reader of this protocol ignores what it does
+not know, which is why the SDK's schemas are loose and an error code is a bare
+string. The audit log ("Audit log" below) is an operational record on the
+worldserver's disk, outside the wire: no SDK reads it, so a change to its
+layout does not move `protocol`, which would only make every SDK refuse a
+module it drives correctly. Such a change is named in the release's changelog
+(`CHANGELOG.md`), which is where an operator's tooling learns of it.
 
 The SDK states the protocol versions it can drive (`MODULE_PROTOCOL_VERSIONS`
 in `sdk/src/version.ts`) and checks the module's on `connect`, refusing one it
@@ -254,9 +261,9 @@ Errors:
 - `400 {"ok":false,"error":"missing_character"}`
 - `400 {"ok":false,"error":"weak_token","received":<len>,"minimum":32,"hint":...}` —
   the token is shorter than 32 characters. The token is not the credential
-  (the lease secret is; "Authentication" above) but it still keys every session,
-  audit file and event stream, so a guessable one lets an operator-class caller
-  collide with another run by accident. Checked before the session is
+  (the lease secret is; "Authentication" above) but it still keys every session
+  and event stream, and through its hash every audit file, so a guessable one
+  lets an operator-class caller collide with another run by accident. Checked before the session is
   registered. `POST /lease` applies the same floor; the `/characters` and
   `/character-delete` utility surfaces do not (they park at character-select and
   are operator-only anyway).
@@ -277,6 +284,15 @@ Errors:
 - `403 {"ok":false,"error":"account_not_permitted"}` — `account` is not on the
   `WrathBench.Accounts` allowlist.
 - `400 {"ok":false,"error":"unknown_account"}`
+- `403 {"ok":false,"error":"gm_account"}` — the account holds a security level
+  above player (`account_access.gmlevel` greater than 0 on any realm). The
+  module serves player accounts only: a session runs at its account's level,
+  and the stock chat handler runs a GM's dot commands, so a GM account would
+  make `say` a door to the server's command set, which no player's client has.
+  Checked first, before any reclaim, so a refused create disturbs no other
+  session. `POST /characters` and `POST /character-delete` refuse the same
+  accounts the same way. Give the module dedicated accounts made with
+  `account create`, which are players unless someone raises them.
 - `400 {"ok":false,"error":"socket_setup_failed"}`
 - `502 {"ok":false,"error":"char_create_failed_code_<N>"}` — game-level
   char-create rejection (N is the `SMSG_CHAR_CREATE` result code); also surfaced as
@@ -745,7 +761,7 @@ Revokes the token's lease secret; a live session under the token is untouched.
 
 Operator only (`403 operator_only` for a session-class caller).
 `{ "token": <str>, "account"?: <str> }` → `200 { "ok": true, "enum": { "count": <number>, "characters": [ { "guid", "name", "race", "class", "gender", "level" }, ... ] } }`.
-A parked utility session (never enters world) answers with the decoded `SMSG_CHAR_ENUM` for the account — the same data a client's character-select screen shows. Exists for a harness's housekeeping between sessions (list-then-delete leftover characters); errors mirror `/character-delete` (`missing_token`, `token_in_use`, `account_not_permitted`, `unknown_account`, `account_in_use` when a live session holds the account, `504 timeout`).
+A parked utility session (never enters world) answers with the decoded `SMSG_CHAR_ENUM` for the account — the same data a client's character-select screen shows. Exists for a harness's housekeeping between sessions (list-then-delete leftover characters); errors mirror `/character-delete` (`missing_token`, `token_in_use`, `account_not_permitted`, `unknown_account`, `gm_account`, `account_in_use` when a live session holds the account, `504 timeout`).
 
 ### POST /character-delete
 
@@ -785,7 +801,7 @@ per-character credentials are the fuller fix.)
 
 Success `200`: `{ "ok": true, "character": "Benchy", "deleted": true }`
 Errors: `400 missing_token`, `400 missing_character`, `409 token_in_use`,
-`403 account_not_permitted`, `409 account_owned_by_other_token`,
+`403 account_not_permitted`, `403 gm_account`, `409 account_owned_by_other_token`,
 `400 unknown_account`, `400 account_in_use`, `400 character_not_found`,
 `502 char_delete_failed_code_<N>` (N is the `SMSG_CHAR_DELETE` result code,
 e.g. guild leader / arena captain refusals), `504 timeout`.
@@ -804,6 +820,18 @@ Request:
 
 Success `200`: `{ "ok": true }`
 Errors: `400 missing_token`, `404 no_session`, `401 unauthorized`, `403 token_mismatch`.
+
+What ends a session: this, a create that reclaims its account ("POST /session"
+above), and the worldserver stopping. Nothing else does. Closing every
+`/events` socket of a token does not, by design: a subscriber's socket is not
+the session's lifetime. The SDK's stream reconnects on its own after a drop
+and must find the character where it was; a restarted sandbox child
+subscribes again (with `replay=1`) to the session its predecessor left; a
+subscriber opens `/events` before the session exists; and a token may have
+several subscribers at once. A caller that goes away without this call — a
+process killed, a host lost — leaves its character in the world until one of
+the three ends it, and there is no idle reaper. The standalone MCP server
+(`mcp/src/main.ts`) makes this call on a clean exit.
 
 ## WebSocket /events?token=...
 
@@ -2067,12 +2095,21 @@ Served in `SMSG_UPDATE_OBJECT` `fields` alongside the existing set:
 ## Audit log
 
 Per session and UTC day, a JSONL file at
-`WrathBench.AuditDir/<token>.<YYYY-MM-DD>.jsonl` (the token sanitized to
-`[A-Za-z0-9_-]`, every other byte `_`). Every action dispatched and every
-event served is appended as:
+`WrathBench.AuditDir/<fingerprint>.<YYYY-MM-DD>.jsonl`, where `<fingerprint>`
+is the first 16 lowercase hex characters of the SHA-256 of the session's token
+(its bytes as sent). Every action dispatched and every event served is
+appended as:
 ```json
-{ "ts": 1755792000123, "session": "run-abc123", "kind": "action"|"event", "payload": { ... } }
+{ "ts": 1755792000123, "session": "tok:3f2a9c1e", "kind": "action"|"event", "payload": { ... } }
 ```
+`session` is the session's tag, `tok:` and the first 8 of those hex
+characters: the name the worldserver log gives it, and a prefix of its file's
+name. Neither a file name nor a record carries the token. An operator holding a
+token finds its files with `printf %s "$TOKEN" | sha256sum | cut -c1-16`. The
+file name takes 16 characters where the tag takes 8 because a name must be
+unique across every session the directory holds over its retention window; at
+8, two of ten thousand sessions share one about one time in a hundred, and
+their records would interleave in one file unnoticed.
 `payload` for `event` is the exact event object sent on the WebSocket; for
 `action` it is a short record of the dispatched opcode. The ground truth for
 the wire while it is kept: an operational record the deployment prunes by age
@@ -2083,6 +2120,10 @@ next day's, only ever forward, so a session reopened later under the same
 token appends to that day's file and a past day's file gets no further write.
 The retention pass rests on that: a past day's file is deletable once it is
 quiet for the window, whatever the server's start.
+
+A create that reclaims an account ("POST /session") logs one `action` record
+on the evicted session's file, `op: "session_reclaimed"` with the `account`
+and the reclaiming session's tag, `bySession`.
 
 The reattach replay ("/events", above) logs one `action` record,
 `op: "reattach_replay"` with the `objects` restated and whether it was
