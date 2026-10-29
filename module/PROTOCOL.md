@@ -790,8 +790,9 @@ desyncs the mover), session lifecycle (login, logout, character create/delete),
 every opcode that already has an action (one audited path per opcode), and
 anything GM-gated or teleport-shaped. Answers to raw actions reach the agent
 only through the event whitelist: the pet, party, mail, bank and trade
-replies are whitelisted; the rest have none yet, which is
-exactly the evidence the hatch exists to produce.
+replies are whitelisted, as are those to `CMSG_NPC_TEXT_QUERY`,
+`CMSG_TAXINODE_STATUS_QUERY`, `CMSG_PLAYED_TIME` and `CMSG_QUERY_TIME`; the
+rest have none yet, which is exactly the evidence the hatch exists to produce.
 
 ### POST /lease
 
@@ -1727,10 +1728,13 @@ Combat:
 | `SMSG_SPELL_GO` | 0x132 | compact: `{ "casterGuid", "spellId", "hitGuids": [<guid-string>], "misses": [{ "guid", "reason": <u8> }], "runesBefore"?, "runesAfter"?, "runesSpent"?: [{ "index", "passed" }] }` — the rune fields only on a player's cast carrying `CAST_FLAG_RUNE_LIST` (a Death Knight's rune spend or rune activation; `Spell::SendSpellGo`): the ready-rune bit masks before and after the cast (bit n is rune slot n) and, per rune spent, the part of its cooldown passed, 0-255. It is the one packet that says which runes a cast spent; read past the cast targets and the power left, in a guard of its own so a surprise drops the rune fields alone |
 | `SMSG_CAST_FAILED` | 0x130 | `{ "spellId", "result": <u8> }` (SpellCastResult code) |
 | `SMSG_SPELL_FAILURE` | 0x133 | `{ "casterGuid", "spellId", "result": <u8> }` |
+| `SMSG_SPELL_DELAYED` | 0x1E2 | `{ "casterGuid", "delayMs" }` — a cast in range pushed back by damage (`Spell::Delayed`); the client's cast bar, and `state.self.casting.endsAt` for our own, move back by `delayMs`. A channel's pushback is `MSG_CHANNEL_UPDATE` |
 | `SMSG_PERIODICAURALOG` | 0x24E | compact: `{ "targetGuid", "casterGuid", "spellId", "auraType": <u32>, "amount" }` |
 | `SMSG_SPELLNONMELEEDAMAGELOG` | 0x250 | `{ "targetGuid", "casterGuid", "spellId", "rank"?, "name"?, "damage", "overkill", "schoolMask": <u8>, "absorb", "resist", "blocked", "hitInfo": <u32>, "crit": <bool> }` — one direct spell hit (`Unit::SendSpellNonMeleeDamageLog`, and the reflect form `SendSpellNonMeleeReflectLog`); `schoolMask` is the `SpellSchoolMask` bit set (1 physical, 2 holy, 4 fire, 8 nature, 16 frost, 32 shadow, 64 arcane), `hitInfo` the raw `SpellHitType` and `crit` its `SPELL_HIT_TYPE_CRIT` bit; `physicalLog`, the unused byte and the debug flag are consumed |
 | `SMSG_SPELLHEALLOG` | 0x150 | `{ "targetGuid", "casterGuid", "spellId", "rank"?, "name"?, "amount", "overheal", "absorb", "crit": <bool> }` — one direct heal (`Unit::SendHealSpellLog`); `amount` is the whole heal, `overheal` the part past full health |
 | `SMSG_SPELLENERGIZELOG` | 0x151 | `{ "targetGuid", "casterGuid", "spellId", "rank"?, "name"?, "powerType": <u32>, "amount" }` — one power gain from a spell (`Unit::SendEnergizeSpellLog`); `powerType` 0 mana, 1 rage, 2 focus, 3 energy, 4 happiness, 5 runes, 6 runic power |
+| `SMSG_SPELLORDAMAGE_IMMUNE` | 0x263 | `{ "casterGuid", "targetGuid", "spellId", "rank"?, "name"? }` — "Immune" in the combat log (`Unit::SendSpellDamageImmune`): the target was immune to the caster's spell; the debug-format byte is consumed |
+| `SMSG_ENVIRONMENTAL_DAMAGE_LOG` | 0x1FC | `{ "victimGuid", "type": <u8>, "amount", "resist", "absorb" }` — damage from the world (`Player::EnvironmentalDamage`): `type` 0 fatigue, 1 drowning, 2 falling (a fall into the void is sent as 2), 3 lava, 4 slime, 5 fire |
 | `SMSG_AURA_UPDATE` | 0x496 | `{ "targetGuid", "auras": [<aura>] }` |
 | `SMSG_UPDATE_COMBO_POINTS` | 0x39D | `{ "targetGuid", "points": <u8> }` — the combo points held and on whom (`"0"` for no one); `Unit::SendComboPoints`, to the player alone, on every change |
 | `SMSG_CONVERT_RUNE` | 0x486 | `{ "index": <u8>, "runeType": <u8> }` — Death Knight rune slot 0-5 became `RuneType` 0 blood, 1 unholy, 2 frost, 3 death (`Player::ConvertRune`). `SMSG_RESYNC_RUNES` and `SMSG_ADD_RUNE_POWER` have no caller at the pinned commit; readiness rides `SMSG_SPELL_GO` |
@@ -1822,6 +1826,7 @@ Quests and gossip (quest/gossip text served as the client would show it):
 | `SMSG_QUESTGIVER_QUEST_INVALID` | 0x18F | `{ "reason": <u32> }` — why a quest cannot be taken (`Player::SendCanTakeQuestResponse`, from `CanTakeQuest` on an accept or on a quest-start item's query): the raw `QuestFailedReason` (0 requirements not met, 1 level too low, 6 wrong race, 7 already done, 12 one timed quest at a time, 13/18 already in the log, 21 missing items, 23 not enough money, 26/29 daily limits). The quest is not named; nothing is added to the log |
 | `SMSG_GOSSIP_MESSAGE` | 0x17D | `{ "guid", "menuId", "textId", "options": [{ "optionId", "icon", "text" }], "quests": [{ "questId", "icon", "level", "title" }] }` |
 | `SMSG_GOSSIP_COMPLETE` | 0x17E | `{}` |
+| `SMSG_NPC_TEXT_UPDATE` | 0x180 | `{ "textId", "texts": [{ "probability": <float>, "text", "textFemale", "language" }] }` — the gossip window's body text, the answer to a raw `CMSG_NPC_TEXT_QUERY` (`u32 textId, u64 npc guid`) on the `textId` `SMSG_GOSSIP_MESSAGE` names (`WorldSession::HandleNpcTextQueryOpcode`). Of the eight slots, those with text are served; a client shows one, picked by `probability`, the male or female form by the reader's gender, `$N` being the reader's name. An unknown id answers the core's "Greetings $N" default. The emote animations are consumed |
 
 Loot, vendor, inventory:
 
@@ -2004,6 +2009,8 @@ Achievements and flight paths ([Shard/WrathBench#8](https://github.com/Shard/Wra
 | `SMSG_ALL_ACHIEVEMENT_DATA` | 0x47D | `{ "count", "achievements": [ <same achievement object> ] }` — sent to self once during login: every achievement already earned. Only the completed block (to its 0xFFFFFFFF terminator) is decoded; the criteria-progress block that follows is consumed and not served |
 | `SMSG_ACTIVATETAXIREPLY` | 0x1AE | `{ "reply": <u32>, "ok": <bool> }` — the answer to `CMSG_ACTIVATETAXI[EXPRESS]` (raw). `ActivateTaxiReply`: 0 ok, 1 server error, 2 no such path, 3 not enough money, 4 too far away, 5 no vendor nearby, 6 not visited, 7 busy, 8 mounted, 9 shapeshifted, 10 moving, 11 same node, 12 not standing |
 | `SMSG_SHOWTAXINODES` | 0x1A9 | `{ "showWindow": <bool>, "guid", "currentNode": <u32>, "currentNodeName"?: <str>, "currentPos"?: { "map": <u32>, "x","y","z" }, "mask": [<u32> × 14], "known": [{ "nodeId": <u32>, "name"?: <str>, "map"?: <u32>, "x"?, "y"?, "z"? }] }` — the flight master's window (`WorldSession::SendTaxiMenu`), sent when the taxi option of the master's gossip menu is chosen: the leading u32 (1 = show), the master's guid, the node it stands at, and the character's taximask verbatim (`TaxiMaskSize` 14 words; node *n* is bit `(n-1)%32` of word `(n-1)/32`). `known` is that mask decoded — the nodes this character has visited, the only destinations the server will sell (and only one flight path away: `CMSG_ACTIVATETAXI` to a farther one gets no reply) — each named and placed as the client names and draws it from its own `TaxiNodes.dbc` row (the name, map and position are absent together when the file is not loaded). Only the mask's nodes are served: a client's flight map draws the nodes it has discovered. No route or fare is served |
+| `SMSG_TAXINODE_STATUS` | 0x1AB | `{ "guid", "known": <bool> }` — whether this character has discovered the node of flight master `guid`, its map icon: the answer to raw `CMSG_TAXINODE_STATUS_QUERY` (`u64 guid`; `WorldSession::SendTaxiStatus`), for every flight master in view (`Player::SendTaxiNodeStatusMultiple`), and after a discovery |
+| `SMSG_NEW_TAXI_PATH` | 0x1AF | `{}` — a flight path was learned (`WorldSession::SendLearnNewTaxiNode`, `SendDiscoverNewTaxiNode`) |
 
 `date` is the wire's packed bitfield (`AppendPackedTime`: `(year-2000)<<24 |
 month<<20 | (day-1)<<14 | weekday<<11 | hour<<6 | minute`); `time` is its
@@ -2059,6 +2066,14 @@ as the absence of an answer, never as a status. `SMSG_PLAYERBINDERROR` exists
 in the opcode table but the core never sends it (`STATUS_NEVER`, no builder),
 so nothing stands in for it; likewise `SMSG_RESURRECT_FAILED`, so a
 resurrection the server ignores is told by its absence too.
+
+Client queries and proficiencies:
+
+| opcode | id | `data` fields |
+|---|---|---|
+| `SMSG_PLAYED_TIME` | 0x1CD | `{ "totalSec", "levelSec", "show": <bool> }` — the answer to raw `CMSG_PLAYED_TIME` (`u8 show`): time played in total and at this level |
+| `SMSG_QUERY_TIME_RESPONSE` | 0x1CF | `{ "serverTime", "dailyResetInSec" }` — the answer to raw `CMSG_QUERY_TIME` (empty): the server's clock in unix seconds and the seconds until the daily quests reset |
+| `SMSG_SET_PROFICIENCY` | 0x127 | `{ "itemClass": <u8>, "subclassMask" }` — the item subclasses this character can use for one item class, 2 weapon or 4 armour, the whole mask each time (`Player::SendProficiency`, on learning a proficiency; the reattach replay re-sends both) |
 
 #### Death
 
