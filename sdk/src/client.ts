@@ -92,6 +92,8 @@ import {
   type QuestGiverOfferRewardData,
   type QuestGiverStatusData,
   type QuestGiverStatusMultipleData,
+  type QuestPoi,
+  type QuestPoiQueryResponseData,
   type RawField,
   type RawPayload,
   type SessionResponse,
@@ -3176,6 +3178,25 @@ export type ReadItemResult =
 
 export interface ReadItemOptions {
   /** How long to wait for each server answer (the read ack, the pages), in ms. Default 10000. */
+  timeout?: number;
+}
+
+/**
+ * The outcome of `questAreas`. `answered` lists each quest asked with its
+ * objective areas (`pois`, empty when the server has none for it).
+ * `no_quests` is an empty quest log; `not_in_log` names a quest the log does
+ * not hold, which the server would answer with nothing.
+ */
+export type QuestAreasResult =
+  | {
+      readonly ok: true;
+      readonly status: "answered";
+      readonly quests: readonly { readonly questId: number; readonly title: string | undefined; readonly pois: readonly QuestPoi[] }[];
+    }
+  | { readonly ok: false; readonly status: "no_quests" | "not_in_log"; readonly hint: string };
+
+export interface QuestAreasOptions {
+  /** How long to wait for each server answer, in ms. Default 10000. */
   timeout?: number;
 }
 
@@ -9131,6 +9152,54 @@ export class WrathClient {
       options.timeout ?? 60_000,
       `quest ${questId} objectives to read complete in the quest log`,
     );
+  }
+
+  /**
+   * The objective areas of quests in the log, as a client's world map and
+   * quest tracker draw them: `CMSG_QUEST_POI_QUERY` for the quests asked
+   * (every quest in the log when none is named), answered by
+   * `SMSG_QUEST_POI_QUERY_RESPONSE` and kept in `state.questPois`. Each area
+   * is a polygon of world x/y points (no z) on `map`, the frame `moveTo`
+   * takes; `objectiveIndex` -1 is where the quest is turned in. A quest the
+   * server has no areas for comes back with `pois: []`.
+   */
+  async questAreas(questIds?: number | readonly number[], options: QuestAreasOptions = {}): Promise<QuestAreasResult> {
+    const timeout = options.timeout ?? 10_000;
+    const log = this.state.questLog;
+    const inLog = new Set(log.map((q) => q.questId));
+    const asked = questIds === undefined ? [...inLog] : [...new Set(typeof questIds === "number" ? [questIds] : questIds)];
+    if (asked.length === 0) {
+      const hint = "questAreas: the quest log is empty — there is nothing to ask the server about";
+      this.noteActionHint("questAreas", "no_quests", hint);
+      return { ok: false, status: "no_quests", hint };
+    }
+    const missing = asked.filter((id) => !inLog.has(id));
+    if (missing.length > 0) {
+      const hint =
+        `questAreas: quest ${missing.join(", ")} is not in the quest log, and the server answers only for quests the log holds — ` +
+        `state.questLog lists them`;
+      this.noteActionHint("questAreas", "not_in_log", hint);
+      return { ok: false, status: "not_in_log", hint };
+    }
+    // Every id is in the log, which holds at most MAX_QUEST_LOG_SIZE (25), the
+    // most one query may name (WorldSession::HandleQuestPOIQuery drops a longer
+    // one unanswered), so one query always covers the ask.
+    const sinceSeq = this.events.recent(1)[0]?.seq;
+    await this.raw("CMSG_QUEST_POI_QUERY", [{ u32: asked.length }, ...asked.map((id) => ({ u32: id }))]);
+    const reply = await this.waitEvent(
+      (e) =>
+        (sinceSeq === undefined || e.seq > sinceSeq) &&
+        isEvent(e, "SMSG_QUEST_POI_QUERY_RESPONSE") &&
+        !isDecodeError(e.data) &&
+        asked.every((id) => (e.data as QuestPoiQueryResponseData).quests.some((q) => q.questId === id)),
+      { timeout, description: `the objective areas of quest ${asked.join(", ")} (SMSG_QUEST_POI_QUERY_RESPONSE)` },
+    );
+    const answered = new Map((reply.data as QuestPoiQueryResponseData).quests.map((q) => [q.questId, q.pois] as const));
+    return {
+      ok: true,
+      status: "answered",
+      quests: asked.map((questId) => ({ questId, title: this.state.quests.get(questId)?.value.title, pois: answered.get(questId) ?? [] })),
+    };
   }
 
   /**

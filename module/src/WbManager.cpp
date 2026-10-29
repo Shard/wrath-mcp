@@ -1064,6 +1064,10 @@ namespace WrathBench
         { "CMSG_PAGE_TEXT_QUERY", CMSG_PAGE_TEXT_QUERY },
         // player-written item text — a mailed letter (body u64 item guid)
         { "CMSG_ITEM_TEXT_QUERY", CMSG_ITEM_TEXT_QUERY },
+        // a quest's objective areas, as the world map and quest tracker ask
+        // for them (body u32 count <= MAX_QUEST_LOG_SIZE, u32 questId x
+        // count); answered with SMSG_QUEST_POI_QUERY_RESPONSE
+        { "CMSG_QUEST_POI_QUERY", CMSG_QUEST_POI_QUERY },
         { "CMSG_PLAYED_TIME", CMSG_PLAYED_TIME },
         { "CMSG_QUERY_TIME", CMSG_QUERY_TIME },
         { "CMSG_SET_WATCHED_FACTION", CMSG_SET_WATCHED_FACTION },
@@ -9077,6 +9081,53 @@ namespace WrathBench
                      .Add("title", title).Add("objectives", objectives).Add("details", details)
                      .Add("areaDescription", areaDescription).Add("completedText", completedText)
                      .Raw("requiredNpcOrGo", reqNpcOrGo).Raw("requiredItems", reqItems);
+                    break;
+                }
+                // The objective areas a client draws on its world map and
+                // quest tracker: the answer to CMSG_QUEST_POI_QUERY
+                // (WorldSession::HandleQuestPOIQuery, QueryHandler.cpp:411).
+                // u32 quest count, then per quest u32 questId, u32 POI count
+                // and per POI u32 id, i32 objective index, u32 map, u32
+                // WorldMapArea id, u32 floor, u32 priority, u32 flags (the
+                // core's Unk3/Unk4, quest_poi's Priority/Flags), u32 point
+                // count, (i32 x, i32 y) x points. Served whole: every field is
+                // one the client receives. The handler dedupes the ids
+                // through an unordered_set, so the order is not the ask's,
+                // and a quest not in the log answers a count of 0 exactly as
+                // a quest with no areas does.
+                case SMSG_QUEST_POI_QUERY_RESPONSE:
+                {
+                    name = "SMSG_QUEST_POI_QUERY_RESPONSE";
+                    uint32 questCount; p >> questCount;
+                    std::string quests = "[";
+                    for (uint32 i = 0; i < questCount; ++i)
+                    {
+                        uint32 questId, poiCount; p >> questId >> poiCount;
+                        std::string pois = "[";
+                        for (uint32 j = 0; j < poiCount; ++j)
+                        {
+                            uint32 poiId; int32 objectiveIndex;
+                            uint32 mapId, worldMapAreaId, floorId, priority, flags, pointCount;
+                            p >> poiId >> objectiveIndex >> mapId >> worldMapAreaId >> floorId >> priority >> flags >> pointCount;
+                            std::string points = "[";
+                            for (uint32 k = 0; k < pointCount; ++k)
+                            {
+                                int32 px, py; p >> px >> py;
+                                if (k) points += ',';
+                                points += Json::Writer().Add("x", px).Add("y", py).Str();
+                            }
+                            points += "]";
+                            if (j) pois += ',';
+                            pois += Json::Writer().Add("poiId", poiId).Add("objectiveIndex", objectiveIndex)
+                                .Add("map", mapId).Add("worldMapAreaId", worldMapAreaId).Add("floor", floorId)
+                                .Add("priority", priority).Add("flags", flags).Raw("points", points).Str();
+                        }
+                        pois += "]";
+                        if (i) quests += ',';
+                        quests += Json::Writer().Add("questId", questId).Raw("pois", pois).Str();
+                    }
+                    quests += "]";
+                    w.Raw("quests", quests);
                     break;
                 }
                 case SMSG_QUESTGIVER_QUEST_LIST:
