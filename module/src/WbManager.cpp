@@ -8558,7 +8558,8 @@ namespace WrathBench
                 // Whether this character has discovered the flight master's
                 // node (WorldSession::SendTaxiStatus, the answer to
                 // CMSG_TAXINODE_STATUS_QUERY; Player::SendTaxiNodeStatusMultiple
-                // for every flight master in view; and after a discovery):
+                // once at login, after the add to map, for every flight
+                // master then in view; and after a discovery):
                 // u64 flight master guid, u8 1 known / 0 not. The flight
                 // master's map icon.
                 case SMSG_TAXINODE_STATUS:
