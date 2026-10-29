@@ -103,6 +103,49 @@ describe("fly: the character's own flight", () => {
   });
 });
 
+describe("the flight state (WB_FLIGHT_STATE)", () => {
+  const flightState = (seq: number, canFly: boolean, airborne: boolean) =>
+    JSON.stringify({ seq, opcode: "WB_FLIGHT_STATE", opcodeId: 0xff0c, ts: TS + seq, data: { canFly, airborne } });
+
+  test("folds onto state.self.canFly and state.self.airborne", async () => {
+    const { stub, client, done } = await session();
+    expect(client.state.self.canFly).toBeUndefined();
+    stub.push(flightState(30, true, true));
+    await client.events.waitFor((e) => e.opcode === "WB_FLIGHT_STATE", { timeout: 1000 });
+    expect(client.state.self.canFly?.value).toBe(true);
+    expect(client.state.self.airborne?.value).toBe(true);
+    await done();
+  });
+
+  test("dismount while airborne is refused with nothing sent", async () => {
+    const { stub, client, done } = await session();
+    stub.push(flightState(30, true, true));
+    await client.events.waitFor((e) => e.opcode === "WB_FLIGHT_STATE", { timeout: 1000 });
+    const r = await client.dismount();
+    expect(r).toMatchObject({ ok: false, status: "airborne" });
+    expect(r.ok ? "" : r.hint).toMatch(/Land first: moveTo a point on the ground/);
+    expect(stub.actions.filter((a) => a.action === "raw")).toHaveLength(0);
+    await done();
+  });
+
+  test("a ground refusal says fly is available only when the character can fly, and never flies on its own", async () => {
+    const { stub, client, done } = await session();
+    const off = client.moveTo({ x: 5810, y: 650, z: 700 }, { timeout: 2000 });
+    stub.push(result(1, 30, "target_off_mesh", { nearest: null }));
+    expect((await off).hint).not.toMatch(/fly: true/);
+    stub.push(flightState(31, true, false));
+    await client.events.waitFor((e) => e.opcode === "WB_FLIGHT_STATE", { timeout: 1000 });
+    const again = client.moveTo({ x: 5820, y: 660, z: 700 }, { timeout: 2000 });
+    stub.push(result(2, 32, "path_incomplete"));
+    const r = await again;
+    expect(r).toMatchObject({ ok: false, status: "path_incomplete" });
+    expect(r.hint).toMatch(/moveTo\(p, \{ fly: true \}\)/);
+    // Neither request asked to fly.
+    expect(stub.actions.filter((a) => a.action === "move_to").every((a) => a.fly === undefined)).toBe(true);
+    await done();
+  });
+});
+
 describe("the landing of a fall", () => {
   const parse = (f: unknown): GameEvent => {
     const parsed = parseEventFrame(JSON.stringify(f));

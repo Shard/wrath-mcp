@@ -588,18 +588,17 @@ The leg is flown only
 - when the request says so: optional `fly` (boolean), refused before
   planning with status `cannot_fly` (acked with `moveId` alone, nothing
   sent) when the character has not been told it can fly;
-- when the character is already in the air: a flight that ended there,
-  which no ground route starts from;
-- or when the ground has no route to the point and the flight would land
-  on it: a walk refused `path_incomplete`, `target_off_mesh`,
-  `start_off_mesh`, `no_mesh` or a climb (`drop` with a positive `dz`) is
-  flown instead when the line is clear and its end is on the ground (the
-  landing test below). Otherwise the ground's verdict stands unchanged, so
-  the fallback only turns a refusal into an arrival and never leaves a
-  character that did not ask to fly in the air (audited as
-  `op: "move_fly_fallback"` with both answers and `taken`). A downward
-  ledge (`drop`, negative `dz`) is not flown: the ground has a route, which
-  `force` takes; and `too_far` holds a flight too.
+- or when the character is already in the air: a flight that ended there,
+  which no ground route starts from.
+
+Never on its own (operator decision): a ground walk the mesh refuses
+(`path_incomplete`, `target_off_mesh`, a climb, …) stays a refusal for a
+character that can fly, whose SDK hint then says `{ fly: true }` is there.
+A flight the caller did not ask for could stop short of its landing (a stop,
+a superseding move, a root, the drift guard) and leave the body hovering
+over a drop that a later dismount or a no-fly zone would fall from. The
+module serves the state as `WB_FLIGHT_STATE` (`canFly`, `airborne`), and the
+SDK's `dismount` refuses while airborne. `too_far` holds a flight too.
 
 The packets are a client's (unverified against a capture; every flight
 opcode goes to `HandleMovementOpcodes` as a run does, `Opcodes.cpp`, so the
@@ -1581,6 +1580,7 @@ session's own identity). Their `opcodeId`s are outside the real opcode range.
 | `WB_AREATRIGGER` | 0xFF04 | `{ "triggerId": <u32>, "moveId": <number>, "pos": { "x","y","z","o" } }` — the character entered an `AreaTrigger.dbc` volume and `CMSG_AREATRIGGER` was sent for it (see below); `moveId` is the `move_to` that crossed into it, 0 when no move did (a taxi landing, a transport carrying the character, a teleport's arrival) |
 | `WB_PORTALS` | 0xFF0A | `{ "mapId": <u32>, "portals": [{ "triggerId": <u32>, "x", "y", "z", "toMap": <u32>, "toMapName"?: <str>, "toInstanceType"?: <u32> }] }` — the map-transition portals in view: every `AreaTrigger.dbc` volume on the character's map whose `areatrigger_teleport` row leads to another map, within the map's visibility range of the character in 2D (`Map::GetVisibilityRange()`, the range `WB_TRANSPORT_PROGRESS` uses). `x`,`y`,`z` is the volume's centre from the client's DBC; `toMap` is the map it leads to, named and typed from the client's `Map.dbc` as on `WB_AREA` (both absent for a map the table has no row for); the arrival point is never served. Tested at most once a second and sent only when the set or the map changes, the whole current set each time (`[]` once the last one is out of range); sent again after a reattach's `WB_SESSION_STATE`. A dungeon entrance is scenery and a trigger volume, never an object, so nothing else names it |
 | `WB_SELF_MOVE` | 0xFF09 | `{ "opcode": "MSG_MOVE_FALL_LAND", "cause": "taxi_landing", "pos": { "x","y","z","o" }, "fromZ": <f> }` — a movement packet the module sent for the character outside any `move_to`, as a client's own physics would: the drop from a taxi flight's last spline point (`fromZ`) to the ground under it (`pos`), cause `taxi_landing`, see "Taxi landing" below; and the landing of a fall from the air after the server took can-fly away mid-air, cause `fall` (`fromZ` the height it fell from; `opcode` `MSG_MOVE_START_SWIM` when it came down in deep water), see move_to, "Flying" |
+| `WB_FLIGHT_STATE` | 0xFF0C | `{ "canFly": <bool>, "airborne": <bool> }` — the flight state this client holds (move_to, "Flying"): `canFly` the server's word for the character's own guid (`SMSG_MOVE_SET_CAN_FLY` / `SMSG_MOVE_UNSET_CAN_FLY`), `airborne` its body in the air after a flight that ended there. Sent when either changes, at every `SMSG_NEW_WORLD` and `SMSG_LOGIN_VERIFY_WORLD` (both false until the server restates can-fly), and in the reattach replay before `WB_REPLAY_DONE` |
 | `WB_AREA` | 0xFF07 | `{ "mapId": <u32>, "mapName"?: <str>, "instanceType"?: <u32>, "zoneId": <u32>, "zoneName": <str>, "areaId": <u32>, "areaName": <str> }` — the zone and subzone the character is in, named as the client names them, and the map it is on with the client's `Map.dbc` name and `InstanceType` for it (0 the open world, 1 a party dungeon, 2 a raid, 3 a battleground, 4 an arena; both absent when the table has no row for the map, never a guessed 0); once when the character enters the world and once per change of either area id, of the map or of the instance, whatever moved it (walking, a teleport, a map transfer). A transfer always sends one, with the new map's `mapId` and `instanceType`, even when both area ids stay the same: the Deadmines portal does, the mine outside on map 0 and map 36 inside being zone and area 1581 alike. See "Zone and area" below. |
 | `WB_TALENT_TREE` | 0xFF08 | the class talent frame, the answer to the `talent_tree` action; shape under "Spellbook, cooldowns, talents" below |
 | `WB_SESSION_STATE` | 0xFF03 | `{ "character": <str>, "guid": <guid-string>, "inWorld": true, "map": <n>, "x": <f>, "y": <f>, "z": <f>, "o": <f>, "level": <n>, "mapName"?, "instanceType"?, "zoneId", "zoneName", "areaId", "areaName", "replay"?: true }` — emitted once per WS subscribe to an already-in-world session and once per same-token `POST /session` on such a session; a subscribe that asked with `replay=1` gets it with `replay: true` and the reattach replay after it, on that socket alone (reattach semantics in the `/events` section above). Strictly client-visible facts: what `SMSG_LOGIN_VERIFY_WORLD` plus the session's own identity would carry, plus the same map and zone/area fields as `WB_AREA` so a reattached client starts where the stream cannot re-emit. |

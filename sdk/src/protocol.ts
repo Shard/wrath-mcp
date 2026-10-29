@@ -990,6 +990,19 @@ export const selfMoveDataSchema = z.looseObject({
 export type SelfMoveData = z.infer<typeof selfMoveDataSchema>;
 
 /**
+ * Module-synthesized: the flight state this client holds. `canFly` is the
+ * server's word (`SMSG_MOVE_SET_CAN_FLY` / `_UNSET_` for our own guid: a
+ * flying mount where flying is allowed, a flight form); `airborne` is our
+ * body in the air after a flight that ended there, hovering. Sent when either
+ * changes, at every new world and in the reattach replay.
+ */
+export const flightStateDataSchema = z.looseObject({
+  canFly: z.boolean(),
+  airborne: z.boolean(),
+});
+export type FlightStateData = z.infer<typeof flightStateDataSchema>;
+
+/**
  * Module-synthesized: where a transport the session has been sent (a tram
  * car, a boat) is right now, at most once a second, while it is within the
  * map's visibility range of the character (the core's
@@ -2197,6 +2210,7 @@ export const eventDataSchemas = {
   WB_MOVE_RESULT: moveResultDataSchema,
   WB_RIDE_PROGRESS: rideProgressDataSchema,
   WB_SELF_MOVE: selfMoveDataSchema,
+  WB_FLIGHT_STATE: flightStateDataSchema,
   WB_TRANSPORT_PROGRESS: transportProgressDataSchema,
   WB_PORTALS: portalsDataSchema,
   ...moveOpcodeSchemas,

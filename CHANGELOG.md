@@ -32,11 +32,13 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   possessed flyer is: a straight line at the z asked for, at its flight
   speed, refused `path_incomplete` where the line runs into terrain or a
   model, `flight: true` on the result. The ground stays the default: a leg
-  is flown when `moveTo(p, { fly: true })` asks (`move_to` `fly`), when the
-  body is already in the air, or when the ground has no route to the point
-  (no route, no mesh, an end off it, a climb) and a clear line would land
-  on it; otherwise the ground's verdict is unchanged. A flight that ends on the
-  ground lands; one that ends in the air hovers there. When the server takes
+  is flown only when `moveTo(p, { fly: true })` asks (`move_to` `fly`) or
+  the body is already in the air; a ground refusal stays a refusal, its
+  hint naming `{ fly: true }` for a character that can fly. A flight that
+  ends on the ground lands; one that ends in the air hovers there. The
+  module serves the state as `WB_FLIGHT_STATE`, read as
+  `state.self.canFly` and `state.self.airborne`, and `dismount()` refuses
+  while airborne (`status: "airborne"`: land first). When the server takes
   can-fly away in the air (a dismount, a no-fly zone) the body falls as a
   client's does and lands with `MSG_MOVE_FALL_LAND`, which the server
   charges, reported as `WB_SELF_MOVE` with cause `fall`. New move statuses

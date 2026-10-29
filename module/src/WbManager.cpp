@@ -1833,9 +1833,12 @@ namespace WrathBench
             moveFlags |= MOVEMENTFLAG_FLYING;
         bool const flying = (moveFlags & MOVEMENTFLAG_FLYING) != 0;
         // A body on an arc is falling: FALLING and the jump block, never
-        // with FLYING (ReadMovementInfo strips FALLING beside CAN_FLY).
+        // with FLYING (ReadMovementInfo strips FALLING beside CAN_FLY). No
+        // FALLING without the block: the layout would then want one.
         if (fall && !flying)
             moveFlags |= MOVEMENTFLAG_FALLING;
+        else
+            moveFlags &= ~uint32(MOVEMENTFLAG_FALLING);
         bool const falling = (moveFlags & MOVEMENTFLAG_FALLING) != 0;
         // A caller's SWIMMING (an arc landing in water, TickArcs) stands for
         // the swim the packet starts, pitch and all.
@@ -3173,6 +3176,22 @@ namespace WrathBench
         return !WaterPoseAt(mover, x, y, *ground).swimming;
     }
 
+    // The flight state this client holds and the module serves
+    // (WB_FLIGHT_STATE): whether the server has told it the character can fly
+    // (stateMoveFlags' CAN_FLY) and whether its body is in the air after a
+    // flight (airborne). Emitted when either changes, and with `force` at a
+    // new world and in the reattach replay. From the tap or the world thread.
+    void Manager::NoteFlightState(BenchSession& s, bool force)
+    {
+        bool const canFly = (s.stateMoveFlags.load() & MOVEMENTFLAG_CAN_FLY) != 0;
+        bool const airborne = s.airborne.load();
+        uint8 const now = uint8((canFly ? 1 : 0) | (airborne ? 2 : 0));
+        uint8 const before = s.flightStateSent.exchange(now);
+        if (!force && before == now)
+            return;
+        EmitEvent(s, "WB_FLIGHT_STATE", 0xFF0C, Json::Writer().Add("canFly", canFly).Add("airborne", airborne).Str());
+    }
+
     void Manager::TryEdgeDrop(Unit* mover, std::vector<WbVec> const& partial, float x, float y, float z, float reqZ,
         bool force, PathResolve& r)
     {
@@ -3899,13 +3918,13 @@ namespace WrathBench
         // The character itself flies the same way (PROTOCOL.md, "Flying"),
         // known the same way: the server has told this client it can fly
         // (SMSG_MOVE_SET_CAN_FLY: a flying mount, the flight form), never the
-        // DB. Only when there is no ground route, when the caller asks
-        // (`fly`), or when the body is already in the air (airborne: a flight
-        // that ended there), which no ground route starts from: the ground
-        // route is the default, and the fallback below takes a flight only
-        // where the mesh has none.
+        // DB. Only when the caller asks (`fly`), or when the body is already
+        // in the air (airborne: a flight that ended there), which no ground
+        // route starts from. Never on its own: a ground refusal stays a
+        // refusal (operator decision), since a flight the caller did not ask
+        // for and did not see could leave the body hovering over a drop.
         bool const ownCanFly = mover == player && (s->stateMoveFlags.load() & MOVEMENTFLAG_CAN_FLY) != 0;
-        bool flying = mover != player
+        bool const flying = mover != player
             ? (s->moverMoveFlags.load() & (MOVEMENTFLAG_CAN_FLY | MOVEMENTFLAG_DISABLE_GRAVITY)) != 0
             : ownCanFly && (fly || s->airborne.load());
         auto planFlight = [&](PathResolve& out) {
@@ -4064,39 +4083,6 @@ namespace WrathBench
                 }
             }
         }
-        // The flight fallback: a character that can fly, refused a ground
-        // route because the mesh has none to the point (no route, no mesh, an
-        // end or a start off it, or a climb no client walks up), flies the
-        // straight line instead — only when the line is clear and ends on the
-        // ground, where the flight lands (FlightEndLands). Otherwise the
-        // ground's verdict stands as it was: the fallback only ever turns a
-        // refusal into an arrival, and never leaves a character that did not
-        // ask to fly hovering in the air. Not for a downward ledge (`drop`
-        // with a negative step: a ground route that only asks for `force`),
-        // nor `too_far`, which a flight is held to as well. Audited as
-        // `op: "move_fly_fallback"` with both answers and whether it was taken.
-        if (!flying && ownCanFly && r.status != nullptr)
-        {
-            std::string const ground = r.status;
-            bool const noRoute = ground == "path_incomplete" || ground == "target_off_mesh" || ground == "start_off_mesh"
-                || ground == "no_mesh" || (ground == "drop" && r.hasDrop && r.dropDz > 0.0f);
-            if (noRoute)
-            {
-                PathResolve flight;
-                planFlight(flight);
-                float landZ = INVALID_HEIGHT;
-                bool const lands = flight.status == nullptr && FlightEndLands(mover, x, y, z, &landZ);
-                Audit(*s, "action", Json::Writer().Add("op", "move_fly_fallback").Add("moveId", moveId)
-                    .Add("ground", ground).Add("flight", flight.status ? flight.status : "ok")
-                    .Add("taken", lands).Str());
-                if (lands)
-                {
-                    r = std::move(flight);
-                    flying = true;
-                    transportLeg = false;
-                }
-            }
-        }
         // The resolved polyline, at dispatch, so a diagnosis reads the route
         // the mesh chose instead of reconstructing it from heartbeats.
         Audit(*s, "action", Json::Writer().Add("op", "move_path").Add("moveId", moveId)
@@ -4217,6 +4203,7 @@ namespace WrathBench
             Audit(*s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_START_ASCEND")
                 .Add("moveId", moveId).Add("cause", "takeoff")
                 .Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO)).Str());
+            NoteFlightState(*s);
         }
 
         SendMovePacket(*s, mover, MSG_MOVE_START_FORWARD, MOVEMENTFLAG_FORWARD, m.curX, m.curY, m.curZ, m.curO,
@@ -6222,6 +6209,7 @@ namespace WrathBench
                 {
                     m.curZ = ground;
                     s.airborne.store(false);
+                    NoteFlightState(s);
                 }
                 Audit(s, "action", Json::Writer().Add("op", "move_flight_end").Add("moveId", m.moveId)
                     .Add("landed", lands).Add("groundZ", (double)ground).Str());
@@ -6525,6 +6513,7 @@ namespace WrathBench
             s->arc.active = false;
             s->airborne.store(false);
             s->pendingFall.store(false);
+            NoteFlightState(*s);
 
             char const* opcodeName;
             if (player->IsBeingTeleportedNear())
@@ -7100,6 +7089,8 @@ namespace WrathBench
         // is that height), and the world tick flies the fall (TickArcs).
         if (self && c.flag == MOVEMENTFLAG_CAN_FLY && !c.apply && s.airborne.exchange(false))
             s.pendingFall.store(true);
+        if (self && c.flag == MOVEMENTFLAG_CAN_FLY)
+            NoteFlightState(s);
         Unit* unit = self ? static_cast<Unit*>(player) : ObjectAccessor::GetUnit(*player, ObjectGuid(guid));
         if (!unit || static_cast<Unit*>(player->m_mover) != unit)
             return;
@@ -7463,9 +7454,11 @@ namespace WrathBench
         if (opcode == SMSG_NEW_WORLD || opcode == SMSG_LOGIN_VERIFY_WORLD)
         {
             s->stateMoveFlags.store(0);
-            // A body arrives in a new world standing where the server put it.
+            // A body arrives in a new world standing where the server put it,
+            // told it can fly again only if it still can (the aura's restate).
             s->airborne.store(false);
             s->pendingFall.store(false);
+            NoteFlightState(*s, true);
             // The character is its own mover again once it is in the map
             // (Player::SendInitialPacketsAfterAddToMap, SetMover(this)), and
             // no boarding spline survives a map change.
@@ -8038,6 +8031,9 @@ namespace WrathBench
             failed = true;
             LOG_ERROR("module", "wrathbench: reattach replay for {} stopped after {} objects: {}", TokenTag(s.token), objects, e.what());
         }
+
+        // The client-held flight state no server packet restates.
+        NoteFlightState(s, true);
 
         Json::Writer w;
         w.Add("objects", objects);

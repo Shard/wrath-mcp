@@ -324,6 +324,9 @@ namespace WrathBench
         // tick starts its fall (TickArcs). Set on the tap, taken on the world
         // thread.
         std::atomic<bool> pendingFall{false};
+        // The flight state last served as WB_FLIGHT_STATE (NoteFlightState):
+        // bit 0 can-fly, bit 1 airborne. Tap and world thread.
+        std::atomic<uint8_t> flightStateSent{0};
         // The arc the body is on (world thread; read by the acks from the tap
         // as s.move is, see AnswerForceRoot).
         ArcState arc;
@@ -723,6 +726,9 @@ namespace WrathBench
         // it, heartbeats on the way and MSG_MOVE_FALL_LAND (or
         // MSG_MOVE_START_SWIM) where it comes down, reported as WB_SELF_MOVE.
         void TickArcs(int64_t nowMs);
+        // Serve WB_FLIGHT_STATE (can-fly, airborne) when it changed, or always
+        // with `force`. Tap threads and the world thread.
+        void NoteFlightState(BenchSession& s, bool force = false);
         void StartArc(BenchSession& s, Unit* mover, char const* cause, float x, float y, float z, float o,
             float vx, float vy, float vz, uint32 moveFlags, FallInfo const& jump, int64_t nowMs);
         void TickRiders(int64_t nowMs);

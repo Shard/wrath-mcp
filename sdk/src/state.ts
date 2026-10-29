@@ -696,6 +696,16 @@ export interface SelfState extends UnitFieldsState {
    */
   mounted: Observed<boolean> | undefined;
   /**
+   * Whether the server has told this client the character can fly (a flying
+   * mount where flying is allowed, a flight form: `SMSG_MOVE_SET_CAN_FLY`),
+   * which `moveTo(p, { fly: true })` needs; and whether the body is in the
+   * air after a flight that ended there, hovering, where every move flies
+   * until one lands it and a dismount would drop it from that height. From
+   * the module's `WB_FLIGHT_STATE`; undefined until the first one.
+   */
+  canFly: Observed<boolean> | undefined;
+  airborne: Observed<boolean> | undefined;
+  /**
    * Our own channel in progress, as the client's channel bar shows it: set by
    * an own `MSG_CHANNEL_START` (which follows the spell's `SMSG_SPELL_GO`, so
    * a channel never shows in `casting`), `endsAt` being that packet's `ts`
@@ -2185,6 +2195,8 @@ export class StateCache {
     inCombat: undefined,
     stunned: undefined,
     mounted: undefined,
+    canFly: undefined,
+    airborne: undefined,
     channeling: undefined,
     comboPoints: undefined,
     runes: undefined,
@@ -4609,6 +4621,12 @@ export class StateCache {
         const d = event.data as { guid: GuidKey };
         this.forget(d.guid);
         if (this.self.totems.some((t) => t.guid === d.guid)) this.self.totems = this.self.totems.filter((t) => t.guid !== d.guid);
+        return;
+      }
+      case "WB_FLIGHT_STATE": {
+        const d = event.data as { canFly: boolean; airborne: boolean };
+        this.self.canFly = { value: d.canFly, seq: event.seq, ts: event.ts };
+        this.self.airborne = { value: d.airborne, seq: event.seq, ts: event.ts };
         return;
       }
       case "WB_MOVE_PROGRESS":

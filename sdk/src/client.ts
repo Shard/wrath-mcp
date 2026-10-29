@@ -1068,12 +1068,11 @@ export interface MoveToOptions {
   /**
    * Fly the leg: a straight line to the point at its z, at flight speed, for
    * a character the server has told it can fly (a flying mount where flying
-   * is allowed, a flight form). Without it a character that can fly still
-   * walks wherever the ground has a route, and flies only when it has none
-   * and the point is on the ground (`flight: true` on the result), or when
-   * it is already in the air after a flight that ended there. A flight ends
-   * on the ground when the point is on it, else in the air, where every
-   * later move flies too until one lands. Refused `cannot_fly` for a
+   * is allowed, a flight form: `state.self.canFly`). Without it the character
+   * walks, and a ground refusal stays a refusal, unless it is already in the
+   * air after a flight that ended there (`state.self.airborne`), when every
+   * move flies. A flight ends on the ground when the point is on it, else in
+   * the air, hovering, until a flight lands it. Refused `cannot_fly` for a
    * character that cannot fly; nothing is sent.
    */
   fly?: boolean;
@@ -1654,6 +1653,9 @@ function rootedRefusal(data: MoveResultData): boolean {
  * `pathLength`; a walk a root stopped carries one.
  */
 const EARLY_REFUSALS: ReadonlySet<string> = new Set(["rooted", "stunned", "falling", "cannot_fly"]);
+
+/** The ground's own refusals a flight could answer (a climb only, of the drops), for the fly note in `moveRecipe`. */
+const GROUND_REFUSALS: ReadonlySet<string> = new Set(["path_incomplete", "target_off_mesh", "start_off_mesh", "no_mesh", "drop"]);
 
 /** A verdict that moved nothing: a refusal at planning, or a root's. */
 function refusedUnmoved(data: MoveResultData): boolean {
@@ -3793,7 +3795,7 @@ export interface DismountOptions {
  */
 export type DismountResult =
   | { readonly ok: true; readonly status: "dismounted" }
-  | { readonly ok: false; readonly status: "not_mounted" | "in_flight" | "unconfirmed"; readonly hint: string };
+  | { readonly ok: false; readonly status: "not_mounted" | "in_flight" | "airborne" | "unconfirmed"; readonly hint: string };
 
 /**
  * The outcome of `spellClick`, as a value. `sent` is the ack: the server
@@ -4930,11 +4932,17 @@ export class WrathClient {
    */
   private moveRecipe(status: string, point: MovePoint, data: MoveResultData, judged?: DropJudgement): string | undefined {
     if (status === "interrupted" && this.isCorpse()) return MOVE_DIED_HINT;
-    return (
+    const recipe =
       (status === "target_off_mesh" ? transportDockHint(this.state, point) : undefined) ??
       (status === "drop" && judged !== undefined ? dropRefusalHint(point, data, judged) : undefined) ??
-      MOVE_HINTS[status]?.(point, data)
-    );
+      MOVE_HINTS[status]?.(point, data);
+    // A ground refusal for a character that can fly: the flight is the
+    // caller's to ask for, never taken on its own (operator decision).
+    const noGround = GROUND_REFUSALS.has(status) && !(status === "drop" && (data.dz === undefined || data.dz < 0));
+    if (recipe !== undefined && noGround && data.flight !== true && this.state.self.canFly?.value === true) {
+      return `${recipe} You can fly here (state.self.canFly): moveTo(p, { fly: true }) flies a straight line to the point.`;
+    }
+    return recipe;
   }
 
   /**
@@ -9311,6 +9319,16 @@ export class WrathClient {
       const hint = "on a flight path: the rider stays mounted until the landing (state.self.taxiFlight turns false)";
       this.noteActionHint("dismount", "in_flight", hint);
       return { ok: false, status: "in_flight", hint };
+    }
+    // Hovering after a flight: off the mount the body falls from here, and
+    // the server charges the fall. Refused with nothing sent (operator
+    // decision); a flight to a ground point lands first.
+    if (this.state.self.airborne?.value === true) {
+      const hint =
+        "you are in the air on your flying mount (state.self.airborne); dismounting here drops you from this height. " +
+        "Land first: moveTo a point on the ground, then dismount. Nothing was sent.";
+      this.noteActionHint("dismount", "airborne", hint);
+      return { ok: false, status: "airborne", hint };
     }
     if (this.state.self.mounted?.value === false) {
       const hint = "not mounted (state.self.mounted is false); nothing was sent";
