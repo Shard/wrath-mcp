@@ -7,9 +7,11 @@ would send, and the packets the server sends back come out as JSON events. The
 SDK (`../sdk/`) is its only intended caller; the runner and the smoke scripts
 reach the module through the SDK.
 
-Licensed GPL-2.0-or-later; see `LICENSE`. All other original WrathBench code
-and documentation are MIT under the root `LICENSE`. AzerothCore remains under
-its own upstream licence; see `../THIRD-PARTY-NOTICES.md`.
+The module source is MIT; see `LICENSE`. The one exception is
+`src/WbNavRecast.cpp`, an altered version of Recast Navigation code that
+keeps its zlib notice in the file. MIT covers the source only: a worldserver
+built with the module remains under AzerothCore's own upstream licence; see
+`../THIRD-PARTY-NOTICES.md`.
 
 ## What it does
 
