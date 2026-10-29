@@ -61,8 +61,8 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   `shapeshiftForm`; `units()` rows carry `sitting` and the form's name,
   `state.self` `standState`, `sitting` and `shapeshiftForm`); our own
   character sheet (stats, armour, resistances, attack power, crit, block,
-  dodge and parry; `state.self.stats`), rested XP (`state.self.restedXp`) and
-  the explored-areas mask (`exploredZones<n>` in `fields`); the glyph slots on
+  dodge and parry; `state.self.stats`) and rested XP (`state.self.restedXp`);
+  the glyph slots on
   `SMSG_TALENTS_INFO` (`state.talents().glyphs`); and
   `SMSG_EXPLORATION_EXPERIENCE`.
 - Dismount: `state.self.mounted` (`UNIT_FLAG_MOUNT` on self, no wire change)

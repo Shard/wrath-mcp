@@ -2155,10 +2155,9 @@ Served in `SMSG_UPDATE_OBJECT` `fields` alongside the existing set:
   reach its owner too — and the floats `blockPct`, `dodgePct`, `parryPct`,
   `critPct`, `rangedCritPct` and `spellCritPct0`-`6` (per school, 0
   physical .. 6 arcane); `restedXp` (`PLAYER_REST_STATE_EXPERIENCE`, the rested
-  bonus pool); `exploredZones0`-`127` (`PLAYER_EXPLORED_ZONES_1`, the
-  explored-areas bitmask a client's world map reveals from, raw per u32: bit b
-  of word n is the `AreaTable.dbc` row whose exploration bit is n × 32 + b);
-  the skill pane as raw fields
+  bonus pool; the explored-areas mask, `PLAYER_EXPLORED_ZONES_1`, is not
+  served until it has a compact, named shape: 128 raw words would ride every
+  self update); the skill pane as raw fields
   `skill<slot><Off>` with slot 0-127 (`PLAYER_SKILL_INFO_1_1`, three packed
   u32s per line) and Off one of `Id`/`Step` (low/high u16 of the first),
   `Value`/`Max` (the second), `TempBonus`/`PermBonus` (the third, as signed

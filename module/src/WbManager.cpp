@@ -7180,15 +7180,6 @@ namespace WrathBench
                 // Rested XP (PLAYER_REST_STATE_EXPERIENCE, PRIVATE): the
                 // bonus pool the XP bar shades.
                 if (index == PLAYER_REST_STATE_EXPERIENCE) { f.Add("restedXp", v); return true; }
-                // The explored-areas bitmask a client's world map reveals
-                // from (PLAYER_EXPLORED_ZONES_1, 128 x u32, PRIVATE): served
-                // raw per word, the quest-log idiom; bit b of word n is the
-                // AreaTable.dbc row whose exploration bit is n x 32 + b.
-                if (index >= PLAYER_EXPLORED_ZONES_1 && index < PLAYER_EXPLORED_ZONES_1 + PLAYER_EXPLORED_ZONES_SIZE)
-                {
-                    f.Add("exploredZones" + std::to_string(index - PLAYER_EXPLORED_ZONES_1), v);
-                    return true;
-                }
                 // Skills: 128 lines x 3 packed u32s, PRIVATE
                 // to self. Served raw per field the way the quest log is, plus
                 // the client's SkillLine.dbc name beside each id so the SDK
