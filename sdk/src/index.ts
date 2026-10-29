@@ -47,6 +47,7 @@ export type {
   MoveToAsyncResponse,
   QuestAcceptResult,
   QuestOptions,
+  UseItemOptions,
   QuestOfferRow,
   QuestRewardChoice,
   QuestsAvailableResult,

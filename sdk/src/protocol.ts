@@ -247,7 +247,7 @@ export type ActionRequest =
   | { token: string; action: "sell_item"; guid: string; itemGuid: string; count?: number }
   | { token: string; action: "repair_all"; guid: string }
   | { token: string; action: "equip_item"; bag: number; slot: number }
-  | { token: string; action: "use_item"; bag: number; slot: number; targetGuid?: string }
+  | { token: string; action: "use_item"; bag: number; slot: number; targetGuid?: string; glyphSlot?: number }
   | { token: string; action: "destroy_item"; bag: number; slot: number; count?: number }
   // trainer extension
   | { token: string; action: "trainer_list"; guid: string }

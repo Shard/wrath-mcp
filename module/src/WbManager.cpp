@@ -3901,6 +3901,14 @@ namespace WrathBench
             uint8 bag = static_cast<uint8>(req.GetInt("bag"));
             uint8 slot = static_cast<uint8>(req.GetInt("slot"));
             uint64_t target = ParseGuid(req, "targetGuid");
+            // The glyph slot a client's glyph frame sends with a glyph (the
+            // u32 after the item guid; 0 for every other item). The server
+            // drops anything past its six slots (MAX_GLYPH_SLOT_INDEX) as a
+            // missing item, so that is refused here, before dispatch; the
+            // slot's level lock and glyph type stay the server's to judge.
+            int64_t glyphSlot = req.GetInt("glyphSlot", 0);
+            if (glyphSlot < 0 || glyphSlot >= MAX_GLYPH_SLOT_INDEX)
+                return err(400, "invalid_glyph_slot");
             // The client fills the item guid and on-use spell id from its own
             // inventory + item cache; the module reads the same client-visible
             // state from the live item.
@@ -3924,7 +3932,7 @@ namespace WrathBench
                 // in-progress check skips a 0 the same way.
                 p = new WorldPacket(CMSG_USE_ITEM, 1 + 1 + 1 + 4 + 8 + 4 + 1 + 4 + 9);
                 *p << uint8(bag) << uint8(slot) << uint8(s->NextCastCount()) << uint32(spellId);
-                *p << uint64(item->GetGUID().GetRawValue()) << uint32(0) << uint8(0);
+                *p << uint64(item->GetGUID().GetRawValue()) << uint32(glyphSlot) << uint8(0);
                 if (target)
                 {
                     *p << uint32(0x0002);                        // TARGET_FLAG_UNIT
@@ -3951,6 +3959,8 @@ namespace WrathBench
                 return err(400, "item_not_usable");
             auditW.Add("bag", (uint32)bag).Add("slot", (uint32)slot).Add("spellId", spellId)
                 .AddGuid("itemGuid", item->GetGUID().GetRawValue()).Add("startQuest", startQuest);
+            if (spellId && glyphSlot)
+                auditW.Add("glyphSlot", (uint32)glyphSlot);
         }
         else if (action == "destroy_item")
         {

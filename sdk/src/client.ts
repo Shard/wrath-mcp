@@ -2208,6 +2208,17 @@ export interface QuestOptions {
   timeout?: number;
 }
 
+/** Options for `useItem`. */
+export interface UseItemOptions extends QuestOptions {
+  /**
+   * For a glyph: the glyph slot to inscribe it into, 0-5 — the index a
+   * client's glyph frame sends with the glyph. Default 0. The server refuses a
+   * slot this character's level has not unlocked, or one of the other glyph
+   * type, with `SMSG_CAST_FAILED`.
+   */
+  glyphSlot?: number;
+}
+
 /**
  * The outcome of asking a questgiver for a quest.
  *
@@ -2912,6 +2923,9 @@ function isOwnInventoryFailure(d: InventoryChangeFailureData, guid: string | und
   if (d.result === 0) return false;
   return d.itemGuid === undefined || guid === undefined || guidKey(d.itemGuid) === guid;
 }
+
+/** A character's glyph slots (`MAX_GLYPH_SLOT_INDEX`): `useItem`'s `glyphSlot` is 0 to one less. */
+const GLYPH_SLOTS = 6;
 
 /** Inventory slots below this are equipment and bag slots; 23-38 are backpack. */
 const BACKPACK_FIRST_SLOT = 23;
@@ -5203,12 +5217,16 @@ export class WrathClient {
    * item guid stands where an NPC guid would (2026-08-30, the Tome of
    * Divinity defect).
    */
-  async useItem(bagOrName: number | string, slot?: number | GuidOrUnit, targetGuid?: GuidOrUnit, options: QuestOptions = {}): Promise<WithResolved<UseItemResult>> {
+  async useItem(bagOrName: number | string, slot?: number | GuidOrUnit, targetGuid?: GuidOrUnit, options: UseItemOptions = {}): Promise<WithResolved<UseItemResult>> {
     // `useItem("Healing Potion", guid)`: with a name, the second argument
     // cannot be a slot, so the guid it holds is the target.
     if (typeof bagOrName === "string" && slot !== undefined) {
       targetGuid = slot as GuidOrUnit;
       slot = undefined;
+    }
+    const glyphSlot = options.glyphSlot;
+    if (glyphSlot !== undefined && !(Number.isInteger(glyphSlot) && glyphSlot >= 0 && glyphSlot < GLYPH_SLOTS)) {
+      throw new TypeError(`useItem(..., { glyphSlot }): glyphSlot is a glyph slot 0-${GLYPH_SLOTS - 1} (got ${JSON.stringify(glyphSlot)})`);
     }
     const where = resolveItemSlot(this.state.bag().items, bagOrName, slot as number | undefined, "useItem(bagOrName, slot?)", "state.bag()");
     if ("refusal" in where) throw new TypeError(where.refusal);
@@ -5224,6 +5242,7 @@ export class WrathClient {
         bag,
         slot,
         targetGuid: targetGuid === undefined ? undefined : this.targetGuid(targetGuid, "useItem(..., targetGuid)"),
+        ...(glyphSlot === undefined ? {} : { glyphSlot }),
       });
     } catch (err) {
       // A bare item_not_usable cannot be told apart from "the slot shifted
