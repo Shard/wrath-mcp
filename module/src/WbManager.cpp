@@ -6773,6 +6773,40 @@ namespace WrathBench
             f.Add(key + "Text", e->description[0]);
     }
 
+    // A unit's faction template (UNIT_FIELD_FACTIONTEMPLATE, PUBLIC) is a
+    // FactionTemplate.dbc row the client reads to colour the unit hostile,
+    // neutral or friendly: its Faction.dbc faction, flags, the faction-group
+    // masks (its own, those it befriends, those it fights), the explicit
+    // enemy and friend factions, and whether that faction keeps a reputation
+    // (Faction.dbc reputationListID, -1 when not) with, for one that does,
+    // the faction's race/class base reputation table (the client's own
+    // Faction.dbc base for a faction the reputation list does not carry).
+    // Served beside the id the
+    // way a skill's name rides beside its id; the SDK does the client's
+    // arithmetic with the character's own reputation. `factionRow` names the
+    // template the row describes, so a template with no row never leaves an
+    // earlier template's row standing for it. Every field is served, zeros
+    // included, so a changed template overwrites every earlier one.
+    static void AppendFactionTemplate(Json::Writer& f, uint32 id)
+    {
+        FactionTemplateEntry const* t = sFactionTemplateStore.LookupEntry(id);
+        if (!t)
+            return;
+        FactionEntry const* fe = sFactionStore.LookupEntry(t->faction);
+        f.Add("factionRow", id).Add("factionRowFaction", t->faction).Add("factionRowFlags", t->factionFlags)
+         .Add("factionRowGroup", t->ourMask).Add("factionRowFriendGroup", t->friendlyMask)
+         .Add("factionRowEnemyGroup", t->hostileMask)
+         .Add("factionRowRepIndex", fe ? fe->reputationListID : -1);
+        for (uint32 i = 0; i < MAX_FACTION_RELATIONS; ++i)
+            f.Add("factionRowEnemy" + std::to_string(i), t->enemyFaction[i])
+             .Add("factionRowFriend" + std::to_string(i), t->friendFaction[i]);
+        if (fe && fe->CanHaveReputation())
+            for (uint32 i = 0; i < 4; ++i)
+                f.Add("factionRowBaseRace" + std::to_string(i), fe->BaseRepRaceMask[i])
+                 .Add("factionRowBaseClass" + std::to_string(i), fe->BaseRepClassMask[i])
+                 .Add("factionRowBaseRep" + std::to_string(i), fe->BaseRepValue[i]);
+    }
+
     static bool AppendNamedField(Json::Writer& f, uint8 typeId, uint32 index, uint32 v,
         PendingGuids& g, uint32* entryOut, uint32* petNumberOut)
     {
@@ -6819,7 +6853,7 @@ namespace WrathBench
                 case UNIT_FIELD_HEALTH:          f.Add("health", v); return true;
                 case UNIT_FIELD_MAXHEALTH:       f.Add("maxHealth", v); return true;
                 case UNIT_FIELD_LEVEL:           f.Add("level", v); return true;
-                case UNIT_FIELD_FACTIONTEMPLATE: f.Add("faction", v); return true;
+                case UNIT_FIELD_FACTIONTEMPLATE: f.Add("faction", v); AppendFactionTemplate(f, v); return true;
                 case UNIT_FIELD_FLAGS:
                     // taxiFlight names UNIT_FLAG_TAXI_FLIGHT (0x00100000) off
                     // the same field: the client's own "on a flight path"

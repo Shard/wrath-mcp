@@ -208,6 +208,8 @@ export type {
   UnitFilter,
   UnitPosition,
   UnitView,
+  UnitReaction,
+  FactionTemplateRow,
   WorldPosition,
 } from "./state";
 

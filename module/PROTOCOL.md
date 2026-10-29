@@ -1246,6 +1246,23 @@ not need it, docs/CONTRACTS.md):
   `petNumber` (UNIT_FIELD_PETNUMBER; on first sight of a unit with a non-zero
   one the module issues the `CMSG_PET_NAME_QUERY` a client does, once per
   number per session)
+- units and players, beside `faction` (the `UNIT_FIELD_FACTIONTEMPLATE`
+  id): that template's FactionTemplate.dbc row, which a client reads to
+  colour the unit hostile, neutral or friendly — `factionRow` (the template
+  id the row describes; absent when the client data has no such row),
+  `factionRowFaction` (its Faction.dbc faction), `factionRowFlags`,
+  `factionRowGroup` / `factionRowFriendGroup` / `factionRowEnemyGroup` (the
+  faction-group masks: its own, those it befriends, those it fights),
+  `factionRowEnemy0`..`3` and `factionRowFriend0`..`3` (explicit enemy and
+  friend factions), and `factionRowRepIndex` (the faction's Faction.dbc
+  `reputationListID`, -1 when it keeps no reputation). For a faction that
+  keeps one, also `factionRowBaseRace0`..`3`, `factionRowBaseClass0`..`3`
+  and `factionRowBaseRep0`..`3`, its Faction.dbc base reputation table (the
+  standing of a faction the login reputation list leaves out). Client-cache
+  knowledge served beside the id the way skill names are; every key is
+  re-served whenever `faction` is, so a changed template overwrites the row.
+  The SDK does the client's arithmetic (`UnitView.reaction`) with the
+  character's own row and reputation pane
 - players additionally: `playerFlags` (served as the raw integer; the module
   names no bit off it. The SDK decodes `PLAYER_FLAGS_GHOST` and
   `PLAYER_FLAGS_RESTING` SDK-side — a naming of already-served
