@@ -13,7 +13,7 @@
  * existing SDK would misread; additions to the protocol do not move it.
  */
 
-export const SDK_VERSION = "0.1.0";
+export const SDK_VERSION = "0.2.0";
 
 /** The module protocol versions this SDK can drive. */
 export const MODULE_PROTOCOL_VERSIONS: readonly number[] = [1];

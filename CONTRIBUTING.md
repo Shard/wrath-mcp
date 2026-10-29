@@ -63,4 +63,29 @@ checks against any worldserver you run yourself.
 Describe the change in the pull request itself: what it does and why, against
 the issue it lands on. A change to the wire is a change to `module/PROTOCOL.md`
 in the same pull request; its "Versioning" section says when the `protocol`
-number moves.
+number moves. A change anyone using the stack would notice also gets a line in
+`CHANGELOG.md`, under the version it ships in.
+
+## Versioning
+
+The stack follows [semantic versioning](https://semver.org/). `@wrathbench/sdk`
+and `@wrathbench/mcp` release together at one version (`SDK_VERSION`,
+`sdk/package.json`, `mcp/package.json`, `MCP_PACKAGE_VERSION`), and that
+version covers the module built from the same commit:
+
+- **Major** for a breaking change: something that worked stops working, or
+  works differently, without the user changing anything on their side. That
+  includes the module's configuration defaults, its error answers and the
+  layout of its audit log, not only the TypeScript surface.
+- **Minor** for a feature or an addition: a new method, helper, action, event
+  or option that leaves everything existing as it was.
+- **Patch** for a fix: behaviour brought back to what the documentation
+  already says.
+
+Before 1.0 the same meanings apply to `0.MINOR.PATCH`. Every release has a
+`CHANGELOG.md` entry, and what an operator must change on their side is
+listed there under its own heading.
+
+The module's wire has its own integer, `protocol` on `GET /health`, which
+moves only for a change an existing SDK would misread (`module/PROTOCOL.md`,
+"Versioning"); the stack's version moving says nothing about it.
