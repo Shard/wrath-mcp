@@ -4236,6 +4236,81 @@ describe("client: gossipSelect by observed option text", () => {
     await stub.stop();
   });
 
+  describe("coded options", () => {
+    const codedMenu = (seq: number): string =>
+      JSON.stringify({
+        seq,
+        opcode: "SMSG_GOSSIP_MESSAGE",
+        opcodeId: 0x17d,
+        ts: 1_700_000_000_000 + seq,
+        data: {
+          guid: CREATURE_GUID,
+          menuId: 9,
+          textId: 100,
+          options: [
+            { optionId: 0, icon: 0, text: "Browse", coded: false },
+            { optionId: 1, icon: 0, text: "Enter the passphrase", coded: true },
+          ],
+          quests: [],
+        },
+      });
+
+    async function withCodedMenu() {
+      const stub = startStub({ onConnect: () => combatWorld() });
+      const client = await inWorld(stub);
+      stub.push(codedMenu(200));
+      await client.events.waitForOpcode("SMSG_GOSSIP_MESSAGE", { timeout: 2000 });
+      return { stub, client };
+    }
+
+    test("a code rides the action for a coded option, by text and by id", async () => {
+      const { stub, client } = await withCodedMenu();
+      await client.gossipSelect(CREATURE_GUID, "passphrase", "open sesame");
+      expect(stub.actions.at(-1)).toMatchObject({ action: "gossip_select", menuId: 9, optionId: 1, code: "open sesame" });
+      await client.gossipSelect(CREATURE_GUID, 1, "second try");
+      expect(stub.actions.at(-1)).toMatchObject({ menuId: 9, optionId: 1, code: "second try" });
+      client.close();
+      await stub.stop();
+    });
+
+    test("a coded option with no code rejects and dispatches nothing", async () => {
+      const { stub, client } = await withCodedMenu();
+      const before = stub.actions.length;
+      await expect(client.gossipSelect(CREATURE_GUID, "passphrase")).rejects.toThrow(/takes a code and none was given/);
+      expect(stub.actions.length).toBe(before);
+      client.close();
+      await stub.stop();
+    });
+
+    test("a code on an option that is not coded rejects and dispatches nothing", async () => {
+      const { stub, client } = await withCodedMenu();
+      const before = stub.actions.length;
+      await expect(client.gossipSelect(CREATURE_GUID, "Browse", "x")).rejects.toThrow(/does not take a code/);
+      expect(stub.actions.length).toBe(before);
+      client.close();
+      await stub.stop();
+    });
+
+    test("a plain option sends no code field", async () => {
+      const { stub, client } = await withCodedMenu();
+      await client.gossipSelect(CREATURE_GUID, "Browse");
+      expect(stub.actions.at(-1)).not.toHaveProperty("code");
+      client.close();
+      await stub.stop();
+    });
+
+    test("the raw form takes the code as its last argument and sends it as given", async () => {
+      const stub = startStub({ onConnect: () => combatWorld() });
+      const client = await inWorld(stub);
+      await client.gossipSelect(CREATURE_GUID, 9, 1, "open sesame");
+      expect(stub.actions.at(-1)).toMatchObject({ action: "gossip_select", menuId: 9, optionId: 1, code: "open sesame" });
+      await client.gossipSelect(CREATURE_GUID, 9, 0);
+      expect(stub.actions.at(-1)).not.toHaveProperty("code");
+      client.close();
+      await stub.stop();
+    });
+  });
+
   test("with no menu open, the by-text form rejects with a pointer to gossipHello", async () => {
     const stub = startStub({ onConnect: () => combatWorld() });
     const client = await inWorld(stub);

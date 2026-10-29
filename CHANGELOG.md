@@ -162,6 +162,19 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   target). Cast-failure hints name the item or the point and say what the
   item-target codes mean (`wrong_pet_food`, `cant_be_disenchanted`,
   `item_gone`, …).
+- Gossip options that take a code. `SMSG_GOSSIP_MESSAGE` options carry
+  `coded`, and `boxMoney` (copper) and `boxText` (the confirm text a client
+  shows first), each left out when 0 or empty; the menu fold in
+  `state.lastGossip(guid).options[]` carries them too. `gossip_select` takes an optional `code`, appended to
+  `CMSG_GOSSIP_SELECT_OPTION` as the core reads it for a coded menu item. In
+  the SDK `gossipSelect(guid, option, code?)` and
+  `gossipSelect(guid, menuId, optionId, code?)`; the by-text form refuses a
+  coded option without a code, and a code on one that is not coded, with
+  nothing sent.
+- Inbound emotes and channel notices: `SMSG_EMOTE` (a unit's one-shot emote),
+  `SMSG_TEXT_EMOTE` (a player's text emote, with the target's name as the
+  packet carries it) and `SMSG_CHANNEL_NOTIFY` (a channel notice: its type,
+  the channel and the type's tail).
 
 ### Changed
 

@@ -5338,20 +5338,54 @@ export class WrathClient {
    * the next call is obvious. A menu is only ever read from the
    * `SMSG_GOSSIP_MESSAGE`/`SMSG_GOSSIP_COMPLETE` fold; the server is not
    * queried.
+   *
+   * An option the menu marks `coded` (`state.lastGossip(guid).options[].coded`)
+   * takes the text a client's box would send as the trailing `code`. The
+   * convenience form refuses a coded option with no code, and a code on an
+   * option that is not coded; the raw form sends what it is given.
    */
-  gossipSelect(guid: GuidOrUnit, option: string | number): Promise<WithResolved<ActionResponse>>;
-  gossipSelect(guid: GuidOrUnit, menuId: number, optionId: number): Promise<WithResolved<ActionResponse>>;
-  async gossipSelect(guid: GuidOrUnit, a: string | number, b?: number): Promise<WithResolved<ActionResponse>> {
+  gossipSelect(guid: GuidOrUnit, option: string | number, code?: string): Promise<WithResolved<ActionResponse>>;
+  gossipSelect(guid: GuidOrUnit, menuId: number, optionId: number, code?: string): Promise<WithResolved<ActionResponse>>;
+  async gossipSelect(
+    guid: GuidOrUnit,
+    a: string | number,
+    b?: number | string,
+    c?: string,
+  ): Promise<WithResolved<ActionResponse>> {
     return this.byName(guid, "gossipSelect(guid, ...)", (id) => {
-      if (b !== undefined) {
+      if (typeof b === "number") {
         // Raw form: caller supplied both menuId and optionId.
-        return this.action({ action: "gossip_select", guid: id, menuId: a as number, optionId: b });
+        return this.action({
+          action: "gossip_select",
+          guid: id,
+          menuId: a as number,
+          optionId: b,
+          ...(c !== undefined ? { code: c } : {}),
+        });
       }
       // Convenience form: resolve against the last observed menu. `async`, so a
       // bad option is a rejected promise like every other helper, not a
       // synchronous throw.
-      const { menuId, optionId } = this.resolveGossipOption(id, a);
-      return this.action({ action: "gossip_select", guid: id, menuId, optionId });
+      const { menuId, optionId, coded } = this.resolveGossipOption(id, a);
+      if (coded && b === undefined) {
+        throw new TypeError(
+          `gossipSelect(guid, ${JSON.stringify(a)}): option ${optionId} takes a code and none was given — ` +
+            `pass it as the last argument, gossipSelect(guid, option, code).`,
+        );
+      }
+      if (!coded && b !== undefined) {
+        throw new TypeError(
+          `gossipSelect(guid, ${JSON.stringify(a)}, code): option ${optionId} does not take a code; ` +
+            `the server would ignore it. Select it without one.`,
+        );
+      }
+      return this.action({
+        action: "gossip_select",
+        guid: id,
+        menuId,
+        optionId,
+        ...(b !== undefined ? { code: b } : {}),
+      });
     });
   }
 
@@ -9748,7 +9782,7 @@ export class WrathClient {
    * menu, no match, an ambiguous text, or an id that is not on the menu, each
    * message listing the options.
    */
-  private resolveGossipOption(guid: string, option: string | number): { menuId: number; optionId: number } {
+  private resolveGossipOption(guid: string, option: string | number): { menuId: number; optionId: number; coded: boolean } {
     const menu = this.state.lastGossip(guidKey(guid));
     if (!menu) {
       throw new TypeError(
@@ -9766,10 +9800,10 @@ export class WrathClient {
             `Options are: ${list}.`,
         );
       }
-      return { menuId: menu.menuId, optionId: found.optionId };
+      return { menuId: menu.menuId, optionId: found.optionId, coded: found.coded };
     }
     const hit = resolveName(option, menu.options, (o) => o.text);
-    if (hit.kind === "one") return { menuId: menu.menuId, optionId: hit.value.optionId };
+    if (hit.kind === "one") return { menuId: menu.menuId, optionId: hit.value.optionId, coded: hit.value.coded };
     if (hit.kind === "none") {
       throw new TypeError(
         `gossipSelect(guid, ${JSON.stringify(option)}): no option on the menu currently open for ${guid} ` +

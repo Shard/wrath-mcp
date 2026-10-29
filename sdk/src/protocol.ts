@@ -246,7 +246,7 @@ export type ActionRequest =
   | { token: string; action: "cancel_cast"; spellId: number }
   | { token: string; action: "interact"; guid: string }
   | { token: string; action: "gossip_hello"; guid: string }
-  | { token: string; action: "gossip_select"; guid: string; menuId: number; optionId: number }
+  | { token: string; action: "gossip_select"; guid: string; menuId: number; optionId: number; code?: string }
   | { token: string; action: "quest_list"; guid: string }
   | { token: string; action: "quest_details"; guid: string; questId: number }
   | { token: string; action: "quest_accept"; guid: string; questId: number }
@@ -530,6 +530,57 @@ export type NotificationData = z.infer<typeof notificationDataSchema>;
 /** Chat to a named player found nobody by that name online: the name as it was sent. */
 export const chatPlayerNotFoundDataSchema = z.looseObject({ name: z.string() });
 export type ChatPlayerNotFoundData = z.infer<typeof chatPlayerNotFoundDataSchema>;
+
+/**
+ * `SMSG_EMOTE`: a unit's one-shot emote, creature or player, to everyone in
+ * range. `emoteId` is the animation id the client plays.
+ */
+export const emoteDataSchema = z.looseObject({
+  guid: guidSchema,
+  emoteId: z.number(),
+});
+export type EmoteData = z.infer<typeof emoteDataSchema>;
+
+/**
+ * `SMSG_TEXT_EMOTE`: a player's text emote ("/wave") as the players in range
+ * read it, the emoter included. `textEmote` is the client's `EmotesText` row
+ * id, `emoteNum` the number the emoter's client sent, `targetName` the
+ * target's name as the packet carries it (empty when none).
+ */
+export const textEmoteDataSchema = z.looseObject({
+  guid: guidSchema,
+  textEmote: z.number(),
+  emoteNum: z.number(),
+  targetName: z.string(),
+});
+export type TextEmoteData = z.infer<typeof textEmoteDataSchema>;
+
+/**
+ * `SMSG_CHANNEL_NOTIFY`: a channel notice. `type` is the core's `ChatNotify`:
+ * 0 joined, 1 left, 2 you joined, 3 you left, 4 wrong password, 5 not a
+ * member, 6 not a moderator, 7 password changed, 8 owner changed, 9 player not
+ * found, 10 not the owner, 11 channel owner, 12 mode change, 13/14
+ * announcements on/off, 15/16 moderation on/off, 17 muted, 18 kicked, 19
+ * banned (you), 20 player banned, 21 player unbanned, 22 player not banned,
+ * 23 already a member, 24 invite, 25 invite wrong faction, 26 wrong faction,
+ * 27 invalid name, 28 not moderated, 29 player invited, 30 invite banned, 31
+ * throttled, 32 not in area, 33 not in LFG, 34/35 voice on/off. The tail is
+ * what that type carries: `guid` (and `byGuid` for kicked, banned and
+ * unbanned) or `playerName`; a join's `flags` and `channelId`; a leave's
+ * `channelId` and `constant`; a mode change's `guid`, `oldFlags` and `flags`.
+ */
+export const channelNotifyDataSchema = z.looseObject({
+  type: z.number(),
+  channel: z.string(),
+  guid: guidSchema.optional(),
+  byGuid: guidSchema.optional(),
+  playerName: z.string().optional(),
+  flags: z.number().optional(),
+  oldFlags: z.number().optional(),
+  channelId: z.number().optional(),
+  constant: z.boolean().optional(),
+});
+export type ChannelNotifyData = z.infer<typeof channelNotifyDataSchema>;
 
 export const nameQueryResponseDataSchema = z.looseObject({
   guid: guidSchema,
@@ -1462,6 +1513,12 @@ export const gossipOptionSchema = z.looseObject({
   optionId: z.number(),
   icon: z.number(),
   text: z.string(),
+  /** Choosing this option takes a typed code (`gossipSelect`'s `code`). */
+  coded: z.boolean().optional(),
+  /** Copper the option costs, which a client confirms first. Absent when 0. */
+  boxMoney: z.number().optional(),
+  /** The confirm text a client shows before the option is taken. Absent when empty. */
+  boxText: z.string().optional(),
 });
 export type GossipOption = z.infer<typeof gossipOptionSchema>;
 
@@ -2119,6 +2176,9 @@ export const eventDataSchemas = {
   SMSG_NAME_QUERY_RESPONSE: nameQueryResponseDataSchema,
   SMSG_MESSAGECHAT: messageChatDataSchema,
   SMSG_CHAT_PLAYER_NOT_FOUND: chatPlayerNotFoundDataSchema,
+  SMSG_EMOTE: emoteDataSchema,
+  SMSG_TEXT_EMOTE: textEmoteDataSchema,
+  SMSG_CHANNEL_NOTIFY: channelNotifyDataSchema,
   // movement / observation extension
   SMSG_UPDATE_OBJECT: updateObjectDataSchema,
   SMSG_DESTROY_OBJECT: destroyObjectDataSchema,
