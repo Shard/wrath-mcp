@@ -6,22 +6,28 @@
  * log, and a plain rendering of events and state where a harness would put
  * its own context rendering (`CoreToolRender`).
  *
- *   bun mcp/src/main.ts [--token <session-token>] [--account <name>] [--dir <state-dir>]
+ *   bun mcp/src/main.ts [--account <name>] [--dir <state-dir>] [--token-file <path> | --token <session-token>]
  *
  * Environment: `WRATHBENCH_MODULE_URL` (default `http://127.0.0.1:8086`) and
  * `WRATHBENCH_MODULE_SECRET`, the module's port secret, which this process
  * uses to lease a session secret for the token and never hands the sandbox.
- * The scratchpad and the client cache live in `--dir` (default
- * `$TMPDIR/wrathbench-mcp/<token>`), so a restart of this server keeps both.
+ * The scratchpad, the client cache and the token itself (`token`, mode 0600)
+ * live in `--dir` (default `$TMPDIR/wrathbench-mcp/<fingerprint>`, mode 0700),
+ * so `--dir` alone resumes the session with both. The token is never printed:
+ * stderr names the session by its tag and the state directory by its path.
+ *
+ * A clean exit — stdin closing, SIGINT or SIGTERM — logs the character out and
+ * releases the lease. A killed process leaves the character in the world until
+ * a create on its account reclaims it (module/PROTOCOL.md, "POST /session").
  */
 
 import { randomBytes } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EventSummary } from "./sandbox/ipc";
 import { compactJson } from "./jsonsafe";
-import { leaseRunSecret } from "./module-auth";
+import { leaseRunSecret, logoutSession, releaseSessionSecret, tokenFingerprint, tokenTag } from "./module-auth";
 import { SecretRedactor } from "./redact";
 import { CLIENT_CACHE_FILE, ClientCacheStore } from "./sandbox/client-cache";
 import { SandboxHost } from "./sandbox/host";
@@ -69,19 +75,77 @@ export function withNotices(
   return { ...result, text: secrets.scrub(`${result.text}\n${block}`) };
 }
 
+/** The file in the state directory that holds the session token. */
+export const TOKEN_FILE = "token";
+
+/** A token file's token: its first line, trimmed; undefined when it holds none. */
+function readToken(path: string): string | undefined {
+  const t = readFileSync(path, "utf8").split("\n")[0]!.trim();
+  return t.length > 0 ? t : undefined;
+}
+
+/**
+ * The session token and the state directory it lives in. The token is
+ * `--token`, else the first line of `--token-file`, else the one a `--dir`
+ * already holds, else a fresh random one. Neither path nor argv need carry it
+ * after the first start: `--dir` resumes. The directory is created 0700 and
+ * the token written into it 0600, both set explicitly because a mode given at
+ * creation does not change what already exists.
+ */
+export function resolveSession(o: { token?: string; tokenFile?: string; dir?: string; tmp?: string }): { token: string; dir: string; tokenPath: string } {
+  const held = o.dir !== undefined && existsSync(join(o.dir, TOKEN_FILE)) ? readToken(join(o.dir, TOKEN_FILE)) : undefined;
+  const fromFile = o.tokenFile !== undefined ? readToken(o.tokenFile) : undefined;
+  if (o.tokenFile !== undefined && fromFile === undefined) throw new Error("--token-file holds no token");
+  // Random by default: the token names the session, and with the leased
+  // secret it is what authenticates the sandbox's calls.
+  const token = o.token ?? fromFile ?? held ?? randomBytes(16).toString("hex");
+  const dir = o.dir ?? join(o.tmp ?? tmpdir(), "wrathbench-mcp", tokenFingerprint(token));
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  chmodSync(dir, 0o700);
+  const tokenPath = join(dir, TOKEN_FILE);
+  writeFileSync(tokenPath, `${token}\n`, { mode: 0o600 });
+  chmodSync(tokenPath, 0o600);
+  return { token, dir, tokenPath };
+}
+
+/**
+ * The clean exit, once however many ways it is asked for: stop the sandbox,
+ * log the character out and release the lease, each bounded, with the port
+ * secret, so a wedged child cannot hold the character in the world.
+ */
+export function sessionShutdown(o: {
+  sandbox: Pick<SandboxHost, "stop">;
+  moduleUrl: string;
+  token: string;
+  env?: Record<string, string | undefined>;
+  fetch?: typeof fetch;
+}): () => Promise<void> {
+  let done: Promise<void> | undefined;
+  return () =>
+    (done ??= (async () => {
+      await Promise.race([o.sandbox.stop().catch(() => {}), Bun.sleep(5_000)]);
+      const call = { moduleUrl: o.moduleUrl, token: o.token, ...(o.env !== undefined ? { env: o.env } : {}), ...(o.fetch !== undefined ? { fetch: o.fetch } : {}) };
+      await logoutSession(call);
+      await releaseSessionSecret(call);
+    })());
+}
+
 async function main(): Promise<void> {
   const argv = Bun.argv.slice(2);
   const flag = (name: string): string | undefined => {
     const i = argv.indexOf(`--${name}`);
     return i >= 0 ? argv[i + 1] : undefined;
   };
-  // Random by default: the token names the session, and with the leased
-  // secret it is what authenticates the sandbox's calls.
-  const token = flag("token") ?? randomBytes(16).toString("hex");
+  const tokenFlag = flag("token");
+  const tokenFile = flag("token-file");
+  const dirFlag = flag("dir");
+  const { token, dir, tokenPath } = resolveSession({
+    ...(tokenFlag !== undefined ? { token: tokenFlag } : {}),
+    ...(tokenFile !== undefined ? { tokenFile } : {}),
+    ...(dirFlag !== undefined ? { dir: dirFlag } : {}),
+  });
   const account = flag("account");
   const moduleUrl = process.env["WRATHBENCH_MODULE_URL"] ?? "http://127.0.0.1:8086";
-  const dir = flag("dir") ?? join(tmpdir(), "wrathbench-mcp", token);
-  mkdirSync(dir, { recursive: true });
 
   const secrets = new SecretRedactor();
   const lease = await leaseRunSecret({ moduleUrl, token, ...(account !== undefined ? { account } : {}) }, secrets);
@@ -121,9 +185,22 @@ async function main(): Promise<void> {
     },
     { serverVersion: MCP_PACKAGE_VERSION },
   );
-  console.error(`[wrathbench-mcp] token ${token} — state in ${dir}`);
+  const shutdown = sessionShutdown({ sandbox, moduleUrl, token });
+  let signalled = false;
+  const onSignal = (code: number) => () => {
+    // A second signal does not wait for the first one's logout.
+    if (signalled) process.exit(code);
+    signalled = true;
+    void shutdown().finally(() => process.exit(code));
+  };
+  process.on("SIGINT", onSignal(130));
+  process.on("SIGTERM", onSignal(143));
+  console.error(
+    `[wrathbench-mcp] session ${tokenTag(token)}, state in ${dir}; its token is in ${tokenPath} (mode 0600), and --dir ${dir} resumes it`,
+  );
   await serveStdio(server);
-  await sandbox.stop();
+  await shutdown();
+  process.exit(0);
 }
 
 if (import.meta.main) {

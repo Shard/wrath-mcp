@@ -19,7 +19,36 @@
  * port secret is a misconfiguration the launch must surface, not paper over.
  */
 
+import { createHash } from "node:crypto";
+
 export const MODULE_SECRET_ENV = "WRATHBENCH_MODULE_SECRET";
+
+/** The lowercase hex SHA-256 of the token's bytes, as the module hashes it. */
+function tokenDigest(token: string): string {
+  return createHash("sha256").update(token, "utf8").digest("hex");
+}
+
+/**
+ * How the module names a session wherever its token must not appear: `tok:`
+ * and the first 8 hex characters of the token's SHA-256 (module/PROTOCOL.md,
+ * "Authentication"). The worldserver log and every audit record carry it.
+ * Enough to correlate one session's lines, and no more.
+ */
+export function tokenTag(token: string): string {
+  return `tok:${tokenDigest(token).slice(0, 8)}`;
+}
+
+/**
+ * The first 16 hex characters of the token's SHA-256: the stem of the
+ * session's audit files (`<fingerprint>.<YYYY-MM-DD>.jsonl`, module/PROTOCOL.md
+ * "Audit log") and of the standalone server's state directory. Its first 8
+ * are `tokenTag`'s, so a log line's tag is a prefix of its file's name. Longer
+ * than the tag because a file name must stay unique across every session the
+ * audit directory holds, where the tag only tells one session's lines apart.
+ */
+export function tokenFingerprint(token: string): string {
+  return tokenDigest(token).slice(0, 16);
+}
 
 /** The port secret, or undefined when the environment carries none. */
 export function moduleSecret(env: Record<string, string | undefined> = process.env): string | undefined {
@@ -112,6 +141,25 @@ export async function leaseRunSecret(
   const lease = await leaseSessionSecret(o);
   sink.redact(lease.secret);
   return lease;
+}
+
+/**
+ * Best effort: log the token's character out (`DELETE /session` with the port
+ * secret, the operator class, so it works however wedged the sandbox child
+ * is). The same disconnect a client's makes; the core saves the character.
+ * Never throws; a token with no session is `404 no_session`, which is fine.
+ */
+export async function logoutSession(o: Omit<LeaseOptions, "account">): Promise<void> {
+  try {
+    await (o.fetch ?? fetch)(`${o.moduleUrl}/session`, {
+      method: "DELETE",
+      headers: { "content-type": "application/json", ...moduleAuthHeaders(o.env ?? process.env) },
+      body: JSON.stringify({ token: o.token }),
+      signal: AbortSignal.timeout(5_000),
+    });
+  } catch {
+    // the module is gone or slow: a reclaiming create takes the account over
+  }
 }
 
 /** Best effort: forget the token's lease at the end of a run. Never throws. */

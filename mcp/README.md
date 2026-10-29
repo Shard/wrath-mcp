@@ -18,15 +18,26 @@ repo root:
 ```bash
 WRATHBENCH_MODULE_URL=http://127.0.0.1:8086 \
 WRATHBENCH_MODULE_SECRET=<the module's port secret> \
-  bun mcp/src/main.ts --account <an allowed account> [--token <t>] [--dir <state-dir>]
+  bun mcp/src/main.ts --account <an allowed account> [--dir <state-dir>] [--token-file <path> | --token <t>]
 ```
 
 That is an MCP server over stdio serving the core tools: point an MCP-capable
 agent at it as its server command. It leases a session secret for its token
-with the port secret and hands the sandbox only that; the scratchpad and the
-client cache live in `--dir` (default `$TMPDIR/wrathbench-mcp/<token>`), so a
-restart keeps both. Sandbox notices (a restart, a background fault) ride the
-next tool result. The sandbox needs Linux 6.7 or later — Landlock with TCP
+with the port secret and hands the sandbox only that. The scratchpad, the
+client cache and the token itself live in the state directory, `--dir`
+(default `$TMPDIR/wrathbench-mcp/<fingerprint>`, created mode 0700, the token
+in its `token` file, mode 0600), so `--dir` alone resumes the same session
+with both; `--token-file` or `--token` names a token instead. The token is never
+printed: stderr names the session by its tag (`tok:<8 hex>`, the name the
+worldserver log and the audit log give it) and the state directory by its
+path. Sandbox notices (a restart, a background fault) ride the next tool
+result.
+
+Stdin closing, SIGINT or SIGTERM is a clean exit: the sandbox stops, the
+character is logged out (`DELETE /session`) and the lease released, each with
+the port secret and each bounded, and a second signal exits at once. A process
+killed outright leaves the character in the world until a create on its
+account reclaims it (`module/PROTOCOL.md`, "DELETE /session"). The sandbox needs Linux 6.7 or later — Landlock with TCP
 rules — and refuses to start without it; what it confines and what it leaves
 to the deployment's network policy is `docs/ARCHITECTURE.md` ("The sandbox").
 
