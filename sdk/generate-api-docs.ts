@@ -158,7 +158,7 @@ const CLIENT_RAW: readonly Row[] = [
   { name: "petCast", sig: "petCast(spellNameOrId, target?: GuidOrUnit): Promise<PetActionResult>", purpose: "Have the pet cast one of its own spells (state.pet().spells, by name or by id) at a unit or at nothing; the server's refusal arrives as SMSG_PET_CAST_FAILED, while unknown_spell / ambiguous_spell / passive_spell mean nothing was sent." },
   { name: "petDismiss", sig: "petDismiss(): Promise<PetActionResult>", purpose: "Send the pet away: a hunter casts Dismiss Pet (the pet can be called back), any other pet is abandoned (a demon or temporary summon just goes). state.pet() is undefined once the bar is removed." },
   { name: "declineGroupInvite", sig: "declineGroupInvite(): Promise<RawActionResponse>", purpose: "Decline the pending invitation." },
-  { name: "raw", sig: "raw(opcode: string, payload?: hex | Uint8Array | RawField[]): Promise<RawActionResponse>", purpose: "Escape hatch: send one allowlisted CMSG_* opcode with a body you build — a field list like [{ u32: 5 }, { guid: unit.guid }, { cstring: \"x\" }] is packed little-endian for you; field kinds are u8, u16, u32, i32, f32, u64 (decimal string), guid, packedGuid, cstring (NUL-terminated) and bytes (hex). The allowlist is the module's — ordinary client opcodes no sdk method sends (talents, the other chat types and emotes, item moves and buyback, cancelling an aura, channel or auto-repeat, sheathing, stand state, declining a resurrection, taxi node status); an opcode off it is refused as opcode_not_allowed with a hint, nothing sent. The answer arrives on sdk.events only if its opcode is whitelisted there." },
+  { name: "raw", sig: "raw(opcode: string, payload?: hex | Uint8Array | RawField[]): Promise<RawActionResponse>", purpose: "Escape hatch: send one allowlisted CMSG_* opcode with a body you build — a field list like [{ u32: 5 }, { guid: unit.guid }, { cstring: \"x\" }] is packed little-endian for you; field kinds are u8, u16, u32, i32, f32, u64 (decimal string), guid, packedGuid, cstring (NUL-terminated) and bytes (hex). The allowlist is the module's — ordinary client opcodes no sdk method sends (committing previewed talents (learnTalent sends CMSG_LEARN_TALENT for a single one), the other chat types and emotes, item moves and buyback, cancelling an aura, channel or auto-repeat, sheathing, stand state, declining a resurrection, taxi node status); an opcode off it is refused as opcode_not_allowed with a hint, nothing sent. The answer arrives on sdk.events only if its opcode is whitelisted there." },
 ];
 
 // ---------------------------------------------------------------- state rows
@@ -439,7 +439,11 @@ the dungeon entrances and exits in view, \`[{ triggerId, map, x, y, z, to: { id,
 name, instanceType } }]\`, each the centre of the portal and the map it leads
 to; walking into one takes you through — graveyard — where the spirit was
 released, \`{ map, x, y, z, zone?, area? }\`, zone and area named once you have
-stood there — casting — your own cast in progress, \`{ spellId, name, endsAt }\`
+stood there — corpse — where your body lies while dead, \`{ map, x, y, z,
+source, instanceMap? }\`, source "corpse_query" (the server's answer, the
+marker a client draws) or "death_spot" (where you died, until that answer
+lands), instanceMap present when the corpse is inside a dungeon and x, y, z are
+its entrance; undefined while alive — casting — your own cast in progress, \`{ spellId, name, endsAt }\`
 (endsAt epoch ms), from its SMSG_SPELL_START until its SMSG_SPELL_GO or
 SMSG_SPELL_FAILURE, the cast bar a client draws; a channel never shows here
 — health,
