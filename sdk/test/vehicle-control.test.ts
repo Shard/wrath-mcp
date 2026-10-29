@@ -361,6 +361,67 @@ describe("driving the mover: verdicts and positions of another unit", () => {
   });
 });
 
+describe("a possessed unit's bar: spells on the buttons, none in the list", () => {
+  // The possess form (Player::PossessSpellInitialize) as the Eye of Acherus
+  // smoke saw it live: four buttons typed ACT_PASSIVE (0x01), spells [].
+  const possessBar = (seq: number, guid: string) =>
+    frame(seq, "SMSG_PET_SPELLS", {
+      guid,
+      removed: false,
+      family: 0,
+      durationMs: 0,
+      reactState: 0,
+      commandState: 0,
+      flags: 0,
+      actionBar: [
+        { slot: 0, type: 1, spellId: 51859, autocast: false, rank: 1, name: "Siphon of Acherus" },
+        { slot: 1, type: 1, spellId: 51904, autocast: false, rank: 1, name: "Summon Ghouls On Scarlet Crusade" },
+        { slot: 2, type: 1 },
+        { slot: 4, type: 1, spellId: 52694, autocast: false, rank: 1, name: "Recall Eye of Acherus" },
+      ],
+      spells: [],
+      cooldowns: [],
+    });
+
+  test("state.pet().spells carries the buttons' spells as castable, and petSpell finds them by name", () => {
+    const cache = replay([...loginSequence, selfCreate, possessBar(20, VEHICLE_GUID)]);
+    const pet = cache.pet();
+    expect(pet?.guid).toBe(VEHICLE_GUID);
+    expect(pet?.spells.map((s) => [s.spellId, s.name, s.passive])).toEqual([
+      [51859, "Siphon of Acherus", false],
+      [51904, "Summon Ghouls On Scarlet Crusade", false],
+      [52694, "Recall Eye of Acherus", false],
+    ]);
+    expect(cache.petSpell("Recall Eye of Acherus")?.spellId).toBe(52694);
+  });
+
+  test("a spell both listed and on a button is one entry, the list's", () => {
+    const both = frame(20, "SMSG_PET_SPELLS", {
+      guid: VEHICLE_GUID,
+      removed: false,
+      actionBar: [{ slot: 0, type: 0xc1, spellId: 3110, autocast: true, name: "Firebolt" }],
+      spells: [{ spellId: 3110, active: 0xc1, autocast: true, name: "Firebolt" }],
+      cooldowns: [],
+    });
+    expect(replay([...loginSequence, selfCreate, both]).pet()?.spells).toHaveLength(1);
+  });
+
+  test("petCast sends the button as the bar carries it: CMSG_PET_ACTION with the 0x01 type", async () => {
+    const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate, possessBar(20, VEHICLE_GUID)]) });
+    const client = await inWorld(stub);
+    await client.events.waitForOpcode("SMSG_PET_SPELLS", { timeout: 2000 });
+    const res = await client.petCast("Recall Eye of Acherus");
+    expect(res).toMatchObject({ ok: true, status: "sent" });
+    const at = await untilAction(stub, "raw");
+    expect(stub.actions[at]).toMatchObject({ action: "raw", opcode: "CMSG_PET_ACTION" });
+    const payload = stub.actions[at]?.payload as string;
+    // u64 pet guid, then u32 (spellId | type << 24) little-endian: 52694 = 0xcdd6, type 0x01.
+    expect(payload.slice(16, 24)).toBe("d6cd0001");
+    client.close();
+    await stub.stop();
+  });
+});
+
 describe("petCast at a ground point: the controlled unit's bar with a cursor target", () => {
   const petBar = (seq: number, guid: string) =>
     frame(seq, "SMSG_PET_SPELLS", {

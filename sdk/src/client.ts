@@ -6908,7 +6908,12 @@ export class WrathClient {
         `${known.name ?? known.spellId} is a passive the pet always has, so there is nothing to cast — the ` +
         `castable rows in state.pet().spells are the ones with passive: false`);
     }
-    if (target === undefined) return this.petAction(pet.guid, known.spellId, 0x81, "0");
+    // The button as the bar carries it (a possessed unit's buttons are typed
+    // ACT_PASSIVE, 0x01, and still cast: `HandlePetActionHelper` takes 0x01,
+    // 0x81 and 0xC1 alike); a spell only in the `spells` list is sent as a
+    // castable button, 0x81.
+    const button = this.state.pet()?.actionBar.find((b) => b.spellId === known.spellId)?.type ?? 0x81;
+    if (target === undefined) return this.petAction(pet.guid, known.spellId, button, "0");
     if (typeof target === "object" && !("guid" in target)) {
       // A ground target (a cannon's shot, a vehicle's area spell): the bar's
       // button cannot carry a point, so the cast is `CMSG_PET_CAST_SPELL`, the
@@ -6931,7 +6936,7 @@ export class WrathClient {
       ]);
       return { ok: true, status: "sent", ack };
     }
-    return this.byName(target, "petCast(spell, target)", (guid) => this.petAction(pet.guid, known.spellId, 0x81, guid));
+    return this.byName(target, "petCast(spell, target)", (guid) => this.petAction(pet.guid, known.spellId, button, guid));
   }
 
   /**

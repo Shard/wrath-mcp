@@ -68,6 +68,12 @@ export interface PetState {
   readonly reactState: number;
   readonly commandState: number;
   readonly actionBar: readonly PetActionBarButton[];
+  /**
+   * Every spell the bar offers: the `spells` list the packet carries, plus
+   * the spell buttons on the bar it does not list — a possessed unit's (the
+   * Eye of Acherus) and a vehicle's bars list none and put everything on
+   * the buttons. `passive` is the list's word; a button is castable.
+   */
   readonly spells: readonly PetSpellEntry[];
   readonly cooldowns: readonly { readonly spellId: number; readonly cooldownMs: number; readonly categoryCooldownMs: number }[];
   readonly seq: number;
