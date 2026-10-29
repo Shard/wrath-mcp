@@ -3069,6 +3069,20 @@ export class StateCache {
       autocast: sp.autocast,
       passive: sp.active === 0x01,
     }));
+    // The bar's own spell buttons, for the spells the `spells` list does not
+    // carry: a possessed unit's and a vehicle's bars list no spells at all
+    // (`Player::PossessSpellInitialize`, `VehicleSpellInitialize`) and put
+    // everything castable on the buttons — the possess form with the button
+    // type `ACT_PASSIVE` (0x01), which the handler casts like any other
+    // (`HandlePetActionHelper`); a true passive is cast on the unit at the
+    // handover and never sits on the bar. So a button is castable whatever
+    // its type, and `passive` here is the `spells` list's word alone.
+    const listed = new Set(spells.map((s) => s.spellId));
+    for (const b of bar.actionBar ?? []) {
+      if (b.spellId === undefined || listed.has(b.spellId)) continue;
+      listed.add(b.spellId);
+      spells.push({ spellId: b.spellId, name: b.name, rank: b.rank, autocast: b.autocast === true, passive: false });
+    }
     return {
       guid: bar.guid,
       name: petNumber === undefined ? undefined : this.petNames.get(petNumber),

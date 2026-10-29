@@ -183,6 +183,13 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Fixed
 
+- `state.pet().spells` carries the bar's own spell buttons beside the
+  packet's `spells` list, and `petCast` sends a button as the bar types it.
+  A possessed unit's bar (the Eye of Acherus, `Player::PossessSpellInitialize`)
+  and a vehicle's list no spells and put everything castable on the buttons
+  — the possess form typed `ACT_PASSIVE`, which the handler casts like any
+  other — so `petSpell("Recall Eye of Acherus")` found nothing and the Eye
+  could not be recalled (the eye-of-acherus smoke, live).
 - `module/PROTOCOL.md` said swap and split are off the raw allowlist; they are
   on it.
 - `sdk/API.md`: `raw`'s row said no SDK method sends the talent opcodes, though
