@@ -7035,6 +7035,13 @@ namespace WrathBench
                  .Add("factionRowBaseRep" + std::to_string(i), fe->BaseRepValue[i]);
     }
 
+    // An update field the core keeps as a float, read from its u32 bits.
+    static double FloatOf(uint32 v)
+    {
+        float fv; std::memcpy(&fv, &v, 4);
+        return (double)fv;
+    }
+
     static bool AppendNamedField(Json::Writer& f, uint8 typeId, uint32 index, uint32 v,
         PendingGuids& g, uint32* entryOut, uint32* petNumberOut)
     {
@@ -7094,6 +7101,23 @@ namespace WrathBench
                     // reading, nothing the server adds (issue #8).
                     f.Add("unitFlags", v).Add("taxiFlight", (v & UNIT_FLAG_TAXI_FLIGHT) != 0); return true;
                 case UNIT_FIELD_DISPLAYID:       f.Add("displayId", v); return true;
+                // Stand state, byte 0 of UNIT_FIELD_BYTES_1 (PUBLIC;
+                // UnitStandStateType: 0 stand, 1 sit, 3 sleep, 7 dead, 8
+                // kneel, ...), and shapeshift form, byte 3 of
+                // UNIT_FIELD_BYTES_2 (PUBLIC; ShapeshiftForm, 0 none): unpacked
+                // like UNIT_FIELD_BYTES_0, the rest of both words dropped.
+                case UNIT_FIELD_BYTES_1:         f.Add("standState", v & 0xFF); return true;
+                case UNIT_FIELD_BYTES_2:         f.Add("shapeshiftForm", (v >> 24) & 0xFF); return true;
+                // The character sheet's numbers, PRIVATE/OWNER (so a
+                // character's own, and its pet's): attack power as the core
+                // keeps it, base, signed mods and the float multiplier
+                // (Unit::GetTotalAttackPowerValue: (base + mods) x (1 + mult)).
+                case UNIT_FIELD_ATTACK_POWER:                   f.Add("attackPower", v); return true;
+                case UNIT_FIELD_ATTACK_POWER_MODS:              f.Add("attackPowerMods", (int32)v); return true;
+                case UNIT_FIELD_ATTACK_POWER_MULTIPLIER:        f.Add("attackPowerMultiplier", FloatOf(v)); return true;
+                case UNIT_FIELD_RANGED_ATTACK_POWER:            f.Add("rangedAttackPower", v); return true;
+                case UNIT_FIELD_RANGED_ATTACK_POWER_MODS:       f.Add("rangedAttackPowerMods", (int32)v); return true;
+                case UNIT_FIELD_RANGED_ATTACK_POWER_MULTIPLIER: f.Add("rangedAttackPowerMultiplier", FloatOf(v)); return true;
                 case UNIT_DYNAMIC_FLAGS:         f.Add("dynamicFlags", v); return true;
                 case UNIT_NPC_FLAGS:             f.Add("npcFlags", v); return true;
                 default: break;
@@ -7106,6 +7130,20 @@ namespace WrathBench
             if (index >= UNIT_FIELD_MAXPOWER1 && index < UNIT_FIELD_MAXPOWER1 + 7)
             {
                 f.Add("maxPower" + std::to_string(index - UNIT_FIELD_MAXPOWER1 + 1), v);
+                return true;
+            }
+            // Strength, agility, stamina, intellect, spirit (UNIT_FIELD_STAT0
+            // + n, PRIVATE/OWNER; the totals with buffs, as the sheet shows
+            // them), and armour then the six school resistances
+            // (UNIT_FIELD_RESISTANCES + n, n 0 armour, 1 holy .. 6 arcane).
+            if (index >= UNIT_FIELD_STAT0 && index < UNIT_FIELD_STAT0 + MAX_STATS)
+            {
+                f.Add("stat" + std::to_string(index - UNIT_FIELD_STAT0), (int32)v);
+                return true;
+            }
+            if (index >= UNIT_FIELD_RESISTANCES && index < UNIT_FIELD_RESISTANCES + MAX_SPELL_SCHOOL)
+            {
+                f.Add("resistance" + std::to_string(index - UNIT_FIELD_RESISTANCES), (int32)v);
                 return true;
             }
             if (typeId == TYPEID_PLAYER)
@@ -7125,6 +7163,32 @@ namespace WrathBench
                 // (PLAYER_SELF_RES_SPELL, PRIVATE: a Soulstone, Reincarnation),
                 // what CMSG_SELF_RES casts; 0 when there is none.
                 if (index == PLAYER_SELF_RES_SPELL) { f.Add("selfResSpell", v); return true; }
+                // The character sheet's percentages (PRIVATE floats): block,
+                // dodge, parry, melee and ranged crit, and spell crit per
+                // school (PLAYER_SPELL_CRIT_PERCENTAGE1 + n, n 0 physical ..
+                // 6 arcane).
+                if (index == PLAYER_BLOCK_PERCENTAGE)       { f.Add("blockPct", FloatOf(v)); return true; }
+                if (index == PLAYER_DODGE_PERCENTAGE)       { f.Add("dodgePct", FloatOf(v)); return true; }
+                if (index == PLAYER_PARRY_PERCENTAGE)       { f.Add("parryPct", FloatOf(v)); return true; }
+                if (index == PLAYER_CRIT_PERCENTAGE)        { f.Add("critPct", FloatOf(v)); return true; }
+                if (index == PLAYER_RANGED_CRIT_PERCENTAGE) { f.Add("rangedCritPct", FloatOf(v)); return true; }
+                if (index >= PLAYER_SPELL_CRIT_PERCENTAGE1 && index < PLAYER_SPELL_CRIT_PERCENTAGE1 + MAX_SPELL_SCHOOL)
+                {
+                    f.Add("spellCritPct" + std::to_string(index - PLAYER_SPELL_CRIT_PERCENTAGE1), FloatOf(v));
+                    return true;
+                }
+                // Rested XP (PLAYER_REST_STATE_EXPERIENCE, PRIVATE): the
+                // bonus pool the XP bar shades.
+                if (index == PLAYER_REST_STATE_EXPERIENCE) { f.Add("restedXp", v); return true; }
+                // The explored-areas bitmask a client's world map reveals
+                // from (PLAYER_EXPLORED_ZONES_1, 128 x u32, PRIVATE): served
+                // raw per word, the quest-log idiom; bit b of word n is the
+                // AreaTable.dbc row whose exploration bit is n x 32 + b.
+                if (index >= PLAYER_EXPLORED_ZONES_1 && index < PLAYER_EXPLORED_ZONES_1 + PLAYER_EXPLORED_ZONES_SIZE)
+                {
+                    f.Add("exploredZones" + std::to_string(index - PLAYER_EXPLORED_ZONES_1), v);
+                    return true;
+                }
                 // Skills: 128 lines x 3 packed u32s, PRIVATE
                 // to self. Served raw per field the way the quest log is, plus
                 // the client's SkillLine.dbc name beside each id so the SDK
@@ -8435,10 +8499,31 @@ namespace WrathBench
                             talents += Json::Writer().Add("talentId", talentId).Add("rank", (uint32)rank).Str();
                         }
                         talents += "]";
+                        // The glyph slots, slot = index (MAX_GLYPH_SLOT_INDEX,
+                        // 6): a GlyphProperties.dbc id, 0 for an empty slot,
+                        // with the glyph's spell and its name from the
+                        // client's own GlyphProperties.dbc and Spell.dbc.
                         uint8 glyphCount; p >> glyphCount;
-                        for (uint8 gi = 0; gi < glyphCount; ++gi) { uint16 g; p >> g; }
+                        std::string glyphs = "[";
+                        for (uint8 gi = 0; gi < glyphCount; ++gi)
+                        {
+                            uint16 g; p >> g;
+                            Json::Writer gw;
+                            gw.Add("slot", (uint32)gi).Add("glyphId", (uint32)g);
+                            if (g)
+                                if (GlyphPropertiesEntry const* gp = sGlyphPropertiesStore.LookupEntry(g))
+                                {
+                                    gw.Add("spellId", gp->SpellId);
+                                    if (SpellInfo const* info = sSpellMgr->GetSpellInfo(gp->SpellId))
+                                        if (info->SpellName[0])
+                                            gw.Add("name", info->SpellName[0]);
+                                }
+                            if (gi) glyphs += ',';
+                            glyphs += gw.Str();
+                        }
+                        glyphs += "]";
                         if (si) specs += ',';
-                        specs += Json::Writer().Raw("talents", talents).Str();
+                        specs += Json::Writer().Raw("talents", talents).Raw("glyphs", glyphs).Str();
                     }
                     specs += "]";
                     w.Add("pet", false).Add("unspentPoints", unspent).Add("specCount", (uint32)specCount)
@@ -9184,6 +9269,21 @@ namespace WrathBench
                     break;
                 }
                 // -------------------------------------------------- progress
+                // "Discovered <area>" (Player::SendExplorationExperience,
+                // from CheckAreaExploreAndOutdoor): u32 areaId, u32 XP
+                // awarded (0 at the level cap or for an area worth none).
+                // `areaName` is the client's AreaTable.dbc text, as on
+                // SMSG_BINDPOINTUPDATE.
+                case SMSG_EXPLORATION_EXPERIENCE:
+                {
+                    name = "SMSG_EXPLORATION_EXPERIENCE";
+                    uint32 areaId, xp; p >> areaId >> xp;
+                    auto it = _areaTable.find(areaId);
+                    w.Add("areaId", areaId)
+                     .Add("areaName", it == _areaTable.end() ? std::string() : it->second.name)
+                     .Add("xp", xp);
+                    break;
+                }
                 case SMSG_LOG_XPGAIN:
                 {
                     name = "SMSG_LOG_XPGAIN";

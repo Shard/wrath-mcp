@@ -172,7 +172,7 @@ const CLIENT_RAW: readonly Row[] = [
  * unobserved, never zero.
  */
 const STATE_ROWS: readonly Row[] = [
-  { name: "units", sig: "state.units(filter?: UnitFilter): UnitView[]", purpose: "Scan nearby objects, nearest first; filter by entry, name (string | RegExp), type, alive (true: a unit or player whose health was seen above 0; false: one whose health was seen at 0), maxDistance, npc (true keeps NPCs with any npc flag, false drops them — a filter key only: rows carry roles, never an npc field), role (an NPC role word or a list: \"questGiver\", \"vendor\", \"repair\", \"trainer\", \"flightMaster\", \"innkeeper\", \"spiritHealer\", \"banker\", \"auctioneer\", …), questGiver (the observed marker name: \"available\" offers a quest, \"reward\" takes a turn-in now, \"incomplete\" ends a quest not yet done; true means any marker but \"none\"). Rows carry roles (the NPC's role words from its npc flags — what it is for, never what to do; empty for non-NPCs) and questGiver / questGiverStatus; creatures carry rank (normal, elite, rareelite, worldboss or rare) once their query has answered; units and players carry reaction (\"hostile\", \"neutral\" or \"friendly\": how it regards you, the colour a client gives its name; undefined until known); a player's corpse is a row of type \"corpse\" with dead: true, one per player, and only while it is a corpse: bones (what it turns to once its owner is alive again or has died again) are not rows; game objects are named (\"Mailbox\", \"Subway\") and carry goType (door, chest, mailbox, transport, …), and a transport carries docked (true while the car sits at a platform)." },
+  { name: "units", sig: "state.units(filter?: UnitFilter): UnitView[]", purpose: "Scan nearby objects, nearest first; filter by entry, name (string | RegExp), type, alive (true: a unit or player whose health was seen above 0; false: one whose health was seen at 0), maxDistance, npc (true keeps NPCs with any npc flag, false drops them — a filter key only: rows carry roles, never an npc field), role (an NPC role word or a list: \"questGiver\", \"vendor\", \"repair\", \"trainer\", \"flightMaster\", \"innkeeper\", \"spiritHealer\", \"banker\", \"auctioneer\", …), questGiver (the observed marker name: \"available\" offers a quest, \"reward\" takes a turn-in now, \"incomplete\" ends a quest not yet done; true means any marker but \"none\"). Rows carry roles (the NPC's role words from its npc flags — what it is for, never what to do; empty for non-NPCs) and questGiver / questGiverStatus; creatures carry rank (normal, elite, rareelite, worldboss or rare) once their query has answered; units and players carry reaction (\"hostile\", \"neutral\" or \"friendly\": how it regards you, the colour a client gives its name; undefined until known), sitting (drawn seated) and shapeshiftForm (the form's name — \"cat\", \"bear\", \"ghostWolf\", … — undefined in no form); a player's corpse is a row of type \"corpse\" with dead: true, one per player, and only while it is a corpse: bones (what it turns to once its owner is alive again or has died again) are not rows; game objects are named (\"Mailbox\", \"Subway\") and carry goType (door, chest, mailbox, transport, …), and a transport carries docked (true while the car sits at a platform)." },
   {
     name: "closest",
     sig: "state.closest(filter?): UnitView | undefined",
@@ -193,7 +193,7 @@ const STATE_ROWS: readonly Row[] = [
   { name: "spells", sig: "state.spells(): KnownSpell[]", purpose: "The spellbook the server served: [{ spellId, rank, name }] for every spell the character knows (empty until login's SMSG_INITIAL_SPELLS; kept current by learned/removed/superseded events)." },
   { name: "spell", sig: "state.spell(spellId): KnownSpell | undefined", purpose: "One spellbook row by id; undefined means the character does not know that spell." },
   { name: "cooldowns", sig: "state.cooldowns(now?): SpellCooldown[]", purpose: "Spells still on cooldown: [{ spellId, readyAt (epoch ms, or undefined when the server gave no duration), cooldownMs }]." },
-  { name: "talents", sig: "state.talents(): TalentState | undefined", purpose: "Last SMSG_TALENTS_INFO: { unspentPoints, activeSpec, specCount, talents: [{ talentId, rank (0-based) }] }." },
+  { name: "talents", sig: "state.talents(): TalentState | undefined", purpose: "Last SMSG_TALENTS_INFO: { unspentPoints, activeSpec, specCount, talents: [{ talentId, rank (0-based) }], glyphs: [{ slot, glyphId, spellId, name }] } — glyphId 0 is an empty slot, and slot is what useItem's glyphSlot names." },
   { name: "talentTree", sig: "state.talentTree(): TalentTree | undefined", purpose: "The class talent frame last answered by queryTalentTree, with pointsSpent per talent merged from the latest SMSG_TALENTS_INFO; undefined until queried." },
   { name: "skills", sig: "state.skills(): SkillLine[]", purpose: "The skill pane: [{ skillId, name, value, max, tempBonus, permBonus }] for every skill line the character has (weapons, armor, professions, languages), from the self update fields." },
   { name: "skill", sig: "state.skill(idOrName): SkillLine | undefined", purpose: "One skill line by id or name; undefined when the character lacks it, and also when the name is ambiguous — a read has no way to refuse." },
@@ -243,6 +243,7 @@ const STATE_INTERNAL = new Set([
   "questObjectives",
   "questIdsInLog",
   "publishRunes",
+  "characterStats",
   "carriedItems",
   "seedSelf",
   "adoptOwnCharacter",
@@ -459,7 +460,11 @@ spent runes (they refill on their own and no packet says when) — totems —
 CMSG_TOTEM_DESTROYED takes — mirrorTimers — the breath, fatigue and fire bars,
 \`[{ type, value, max, scale, ts }]\`, value the ms left at ts — proficiency —
 \`{ weaponMask, armorMask }\`, bit n being the item subclass n you can use —
-health,
+standState, sitting and shapeshiftForm — \`{ id, name }\`, \`true\` while
+seated, \`{ id, name }\` with name "none" out of form — stats — the character
+sheet, \`{ strength, agility, stamina, intellect, spirit, armor, resistances,
+attackPower, rangedAttackPower, critPct, rangedCritPct, spellCritPct, blockPct,
+dodgePct, parryPct }\` — restedXp — health,
 targetGuid, mounted — \`state.self.mounted.value\` is true while you ride a
 mount, a flight path included (\`sdk.dismount()\` gets off) — and ghost:
 \`state.self.ghost.value\` is true while your released

@@ -56,8 +56,15 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   already serves (no wire change): `units()` rows carry `inCombat`,
   `stunned`, `skinnable`, `lootable`, `tapped` and `tappedByYou` (the client's
   own readings; undefined until a block carried the field), and
-  `state.self` carries `inCombat` and `stunned`. Stand state, shapeshift form,
-  glyphs, own stats and rested XP need fields the module does not forward yet.
+  `state.self` carries `inCombat` and `stunned`.
+- Stand state and shapeshift form on every unit (`standState`,
+  `shapeshiftForm`; `units()` rows carry `sitting` and the form's name,
+  `state.self` `standState`, `sitting` and `shapeshiftForm`); our own
+  character sheet (stats, armour, resistances, attack power, crit, block,
+  dodge and parry; `state.self.stats`), rested XP (`state.self.restedXp`) and
+  the explored-areas mask (`exploredZones<n>` in `fields`); the glyph slots on
+  `SMSG_TALENTS_INFO` (`state.talents().glyphs`); and
+  `SMSG_EXPLORATION_EXPERIENCE`.
 - Dismount: `state.self.mounted` (`UNIT_FLAG_MOUNT` on self, no wire change)
   and the SDK's `dismount()`, which sends the client's Dismount,
   `CMSG_CANCEL_MOUNT_AURA` (new on the raw allowlist), and answers
