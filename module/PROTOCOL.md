@@ -702,7 +702,9 @@ whose handler does nothing a non-GM client could not do:
   one), `CMSG_EMOTE`, `CMSG_TEXT_EMOTE`
 - inventory: `CMSG_SPLIT_ITEM`, `CMSG_SWAP_ITEM`, `CMSG_SWAP_INV_ITEM`,
   `CMSG_AUTOSTORE_BAG_ITEM`, `CMSG_AUTOEQUIP_ITEM_SLOT`, `CMSG_READ_ITEM`,
-  `CMSG_OPEN_ITEM`, `CMSG_BUYBACK_ITEM`
+  `CMSG_OPEN_ITEM`, `CMSG_BUYBACK_ITEM`, `CMSG_SET_AMMO` (`u32 item id`, 0
+  clears — the ammo slot, which `CMSG_AUTOEQUIP_ITEM` cannot fill; `ammoId`
+  on self reads it back)
 - spell/aura control: `CMSG_CANCEL_AURA`, `CMSG_CANCEL_MOUNT_AURA` (empty
   body — the client's Dismount; `HandleCancelMountAuraOpcode` dismounts and
   removes every mount aura, and answers a character not mounted or in flight
@@ -711,7 +713,10 @@ whose handler does nothing a non-GM client could not do:
   `CMSG_RESURRECT_RESPONSE` (body `u64 caster guid, u8 status` — 1 accepts,
   0 declines — the answer to `SMSG_RESURRECT_REQUEST`; the handler ignores it
   from a living character and an accept that names a caster other than the
-  pending one; the SDK's `acceptResurrection` sends it)
+  pending one; the SDK's `acceptResurrection` sends it), `CMSG_SELF_RES`
+  (empty — a dead character's own resurrection, the spell `selfResSpell` on
+  self names), `CMSG_DISMISS_CRITTER` (`u64 companion guid`),
+  `CMSG_TOTEM_DESTROYED` (`u8 slot`, as `SMSG_TOTEM_CREATED` names it)
 - flight paths: `CMSG_TAXINODE_STATUS_QUERY`, `CMSG_TAXIQUERYAVAILABLENODES`,
   `CMSG_ACTIVATETAXI` (body `u64 guid, u32 fromNode, u32 toNode`; the SDK's
   `activateTaxi` builds it), `CMSG_ACTIVATETAXIEXPRESS` (body `u64 guid,
@@ -1295,7 +1300,10 @@ not need it, docs/CONTRACTS.md):
   PUBLIC owner fields as guid strings — a pet's master; `"0"` when unset) and
   `petNumber` (UNIT_FIELD_PETNUMBER; on first sight of a unit with a non-zero
   one the module issues the `CMSG_PET_NAME_QUERY` a client does, once per
-  number per session)
+  number per session), `channelSpell` and `channelObjectGuid`
+  (UNIT_CHANNEL_SPELL and UNIT_FIELD_CHANNEL_OBJECT, PUBLIC: the spell a unit
+  is channelling and what at, set by `Spell::SendChannelStart` and cleared to
+  0 / `"0"` by the channel's end)
 - units and players, beside `faction` (the `UNIT_FIELD_FACTIONTEMPLATE`
   id): that template's FactionTemplate.dbc row, which a client reads to
   colour the unit hostile, neutral or friendly — `factionRow` (the template
@@ -1716,7 +1724,7 @@ Combat:
 | `SMSG_ATTACKSWING_NOTINRANGE` | 0x145 | `{}` — a ready melee swing was refused: the victim is out of melee range (see the latch note below) |
 | `SMSG_ATTACKSWING_BADFACING` | 0x146 | `{}` — a ready melee swing was refused: the victim is outside the attacker's front arc |
 | `SMSG_SPELL_START` | 0x131 | compact: `{ "casterGuid", "spellId", "castTimeMs", "targetGuid"? }` |
-| `SMSG_SPELL_GO` | 0x132 | compact: `{ "casterGuid", "spellId", "hitGuids": [<guid-string>], "misses": [{ "guid", "reason": <u8> }] }` |
+| `SMSG_SPELL_GO` | 0x132 | compact: `{ "casterGuid", "spellId", "hitGuids": [<guid-string>], "misses": [{ "guid", "reason": <u8> }], "runesBefore"?, "runesAfter"?, "runesSpent"?: [{ "index", "passed" }] }` — the rune fields only on a player's cast carrying `CAST_FLAG_RUNE_LIST` (a Death Knight's rune spend or rune activation; `Spell::SendSpellGo`): the ready-rune bit masks before and after the cast (bit n is rune slot n) and, per rune spent, the part of its cooldown passed, 0-255. It is the one packet that says which runes a cast spent; read past the cast targets and the power left, in a guard of its own so a surprise drops the rune fields alone |
 | `SMSG_CAST_FAILED` | 0x130 | `{ "spellId", "result": <u8> }` (SpellCastResult code) |
 | `SMSG_SPELL_FAILURE` | 0x133 | `{ "casterGuid", "spellId", "result": <u8> }` |
 | `SMSG_PERIODICAURALOG` | 0x24E | compact: `{ "targetGuid", "casterGuid", "spellId", "auraType": <u32>, "amount" }` |
@@ -1724,6 +1732,13 @@ Combat:
 | `SMSG_SPELLHEALLOG` | 0x150 | `{ "targetGuid", "casterGuid", "spellId", "rank"?, "name"?, "amount", "overheal", "absorb", "crit": <bool> }` — one direct heal (`Unit::SendHealSpellLog`); `amount` is the whole heal, `overheal` the part past full health |
 | `SMSG_SPELLENERGIZELOG` | 0x151 | `{ "targetGuid", "casterGuid", "spellId", "rank"?, "name"?, "powerType": <u32>, "amount" }` — one power gain from a spell (`Unit::SendEnergizeSpellLog`); `powerType` 0 mana, 1 rage, 2 focus, 3 energy, 4 happiness, 5 runes, 6 runic power |
 | `SMSG_AURA_UPDATE` | 0x496 | `{ "targetGuid", "auras": [<aura>] }` |
+| `SMSG_UPDATE_COMBO_POINTS` | 0x39D | `{ "targetGuid", "points": <u8> }` — the combo points held and on whom (`"0"` for no one); `Unit::SendComboPoints`, to the player alone, on every change |
+| `SMSG_CONVERT_RUNE` | 0x486 | `{ "index": <u8>, "runeType": <u8> }` — Death Knight rune slot 0-5 became `RuneType` 0 blood, 1 unholy, 2 frost, 3 death (`Player::ConvertRune`). `SMSG_RESYNC_RUNES` and `SMSG_ADD_RUNE_POWER` have no caller at the pinned commit; readiness rides `SMSG_SPELL_GO` |
+| `MSG_CHANNEL_START` | 0x139 | `{ "casterGuid", "spellId", "rank"?, "name"?, "durationMs" }` — a unit in range began a channel (`Spell::SendChannelStart`, after the spell's `SMSG_SPELL_GO`) |
+| `MSG_CHANNEL_UPDATE` | 0x13A | `{ "casterGuid", "timeMs" }` — the channel's time left after a pushback; 0 is its end, interrupted or run out (`Spell::SendChannelUpdate`) |
+| `SMSG_TOTEM_CREATED` | 0x413 | `{ "slot": <u8>, "guid", "durationMs", "spellId", "rank"?, "name"? }` — one of our totems (`Totem::InitStats`): `slot` 0 fire, 1 earth, 2 water, 3 air, the number raw `CMSG_TOTEM_DESTROYED` takes |
+| `SMSG_START_MIRROR_TIMER` | 0x1D9 | `{ "type", "value", "max", "scale": <i32>, "paused": <bool>, "spellId" }` — a breath (1), fatigue (0) or fire (2) bar at `value` of `max` ms, moving by `scale` ms per ms (-1 draining, 10 refilling); `Player::SendMirrorTimer`, sent on a change only. `SMSG_PAUSE_MIRROR_TIMER` has no caller at the pinned commit |
+| `SMSG_STOP_MIRROR_TIMER` | 0x1DB | `{ "type" }` — that bar is gone: refilled, or the character died |
 | `SMSG_AURA_UPDATE_ALL` | 0x495 | same shape, full visible-aura list |
 
 `<aura>` is `{ "slot": <u8>, "spellId": <u32>, "flags"?, "level"?, "stacks"?,
@@ -2106,7 +2121,11 @@ Served in `SMSG_UPDATE_OBJECT` `fields` alongside the existing set:
 
 - players (self only; the server marks these PRIVATE): `money` (copper),
   `xp`, `nextLevelXp`, `talentPoints` (`PLAYER_CHARACTER_POINTS1`, the
-  unspent count); the skill pane as raw fields
+  unspent count), `ammoId` (`PLAYER_AMMO_ID`, the item id of the ammo a
+  ranged weapon fires, 0 for none; raw `CMSG_SET_AMMO` sets it),
+  `selfResSpell` (`PLAYER_SELF_RES_SPELL`, the spell a dead character may
+  resurrect itself with — a Soulstone, Reincarnation — which raw
+  `CMSG_SELF_RES` casts; 0 for none); the skill pane as raw fields
   `skill<slot><Off>` with slot 0-127 (`PLAYER_SKILL_INFO_1_1`, three packed
   u32s per line) and Off one of `Id`/`Step` (low/high u16 of the first),
   `Value`/`Max` (the second), `TempBonus`/`PermBonus` (the third, as signed

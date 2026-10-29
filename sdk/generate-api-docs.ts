@@ -242,6 +242,7 @@ const STATE_INTERNAL = new Set([
   "applyQuestGiverStatus",
   "questObjectives",
   "questIdsInLog",
+  "publishRunes",
   "carriedItems",
   "seedSelf",
   "adoptOwnCharacter",
@@ -448,8 +449,14 @@ marker a client draws) or "death_spot" (where you died, until that answer
 lands), instanceMap present when the corpse is inside a dungeon and x, y, z are
 its entrance; undefined while alive — casting — your own cast in progress, \`{ spellId, name, endsAt }\`
 (endsAt epoch ms), from its SMSG_SPELL_START until its SMSG_SPELL_GO or
-SMSG_SPELL_FAILURE, the cast bar a client draws; a channel never shows here
-— health,
+SMSG_SPELL_FAILURE, the cast bar a client draws; a channel shows in
+channeling, \`{ spellId, name, endsAt, targetGuid }\`, from its MSG_CHANNEL_START
+until its end — comboPoints — \`{ points, targetGuid }\` — runes — a Death
+Knight's six, \`[{ index, type, ready }]\`, ready as of your last cast that
+spent runes (they refill on their own and no packet says when) — totems —
+\`[{ slot, element, guid, spellId, name, expiresAt }]\`, slot being what raw
+CMSG_TOTEM_DESTROYED takes — mirrorTimers — the breath, fatigue and fire bars,
+\`[{ type, value, max, scale, ts }]\`, value the ms left at ts — health,
 targetGuid, mounted — \`state.self.mounted.value\` is true while you ride a
 mount, a flight path included (\`sdk.dismount()\` gets off) — and ghost:
 \`state.self.ghost.value\` is true while your released

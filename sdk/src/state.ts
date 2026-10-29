@@ -89,6 +89,13 @@ import {
   type SpellFailureData,
   type SpellGoData,
   type SpellStartData,
+  type UpdateComboPointsData,
+  type ConvertRuneData,
+  type ChannelStartData,
+  type ChannelUpdateData,
+  type TotemCreatedData,
+  type StartMirrorTimerData,
+  type StopMirrorTimerData,
   type SupersededSpellData,
   type TalentsInfoData,
   type AchievementEarnedData,
@@ -174,6 +181,17 @@ const UNIT_FLAG_MOUNT = 0x0800_0000;
 const UNIT_DYNFLAG_LOOTABLE = 0x0001;
 const UNIT_DYNFLAG_TAPPED = 0x0004;
 const UNIT_DYNFLAG_TAPPED_BY_PLAYER = 0x0008;
+
+/** `RuneType` (AzerothCore `Player.h`) by value, and the slot layout a Death Knight starts with (`runeSlotTypes`). */
+const RUNE_TYPE_NAMES = ["blood", "unholy", "frost", "death"] as const;
+const BASE_RUNE_TYPES: readonly number[] = [0, 0, 1, 1, 2, 2];
+const CLASS_DEATH_KNIGHT = 6;
+
+/** The totem slot `SMSG_TOTEM_CREATED` names, 0-3 (`SummonSlot` less `SUMMON_SLOT_TOTEM_FIRE`). */
+const TOTEM_ELEMENTS = ["fire", "earth", "water", "air"] as const;
+
+/** `MirrorTimerType` (AzerothCore `Player.h`) by value. */
+const MIRROR_TIMER_TYPES = ["fatigue", "breath", "fire"] as const;
 
 /**
  * `PLAYER_FLAGS_RESTING` on 3.3.5a (AzerothCore `Player.h`, `PlayerFlags`) —
@@ -649,6 +667,51 @@ export interface SelfState extends UnitFieldsState {
    */
   mounted: Observed<boolean> | undefined;
   /**
+   * Our own channel in progress, as the client's channel bar shows it: set by
+   * an own `MSG_CHANNEL_START` (which follows the spell's `SMSG_SPELL_GO`, so
+   * a channel never shows in `casting`), `endsAt` being that packet's `ts`
+   * plus the duration (wall-clock ms). A pushback's `MSG_CHANNEL_UPDATE`
+   * moves `endsAt`; the update with no time left, the spell's own
+   * `SMSG_SPELL_FAILURE`, or a self block carrying `channelSpell` 0 ends it.
+   * `targetGuid` is what it is channelled at (`UNIT_FIELD_CHANNEL_OBJECT`),
+   * once a block has carried it.
+   */
+  channeling:
+    | Observed<{ readonly spellId: number; readonly name: string | undefined; readonly endsAt: number; readonly targetGuid: GuidKey | undefined }>
+    | undefined;
+  /**
+   * Combo points (`SMSG_UPDATE_COMBO_POINTS`, sent on every change): how many
+   * and on whom, `targetGuid` undefined when on no one. `undefined` until the
+   * first packet; a login sends none while the count is 0.
+   */
+  comboPoints: Observed<{ readonly points: number; readonly targetGuid: GuidKey | undefined }> | undefined;
+  /**
+   * A Death Knight's six runes by slot (0-1 blood, 2-3 unholy, 4-5 frost):
+   * `type` is the rune's current type (`SMSG_CONVERT_RUNE` changes it, a
+   * death rune included), and `ready` whether it was ready as of the last own
+   * cast that spent runes (`SMSG_SPELL_GO`'s rune list), `undefined` before
+   * one. A spent rune refills on the client's own clock (10 s at base, less
+   * with haste) and no packet says when, so `ready` is that cast's word, at
+   * its `ts`. `undefined` for any other class.
+   */
+  runes: Observed<readonly RuneSlot[]> | undefined;
+  /**
+   * Our totems by slot (`SMSG_TOTEM_CREATED`): `slot` is the number
+   * `CMSG_TOTEM_DESTROYED` takes, `expiresAt` the packet's `ts` plus the
+   * duration (wall-clock ms). A totem leaves when the server destroys its
+   * object (`SMSG_DESTROY_OBJECT`) or another takes its slot; one out of view
+   * when it runs out stays listed, so read `expiresAt`.
+   */
+  totems: readonly TotemSlot[];
+  /**
+   * The breath, fatigue and fire bars a client draws (`SMSG_START_MIRROR_TIMER`
+   * / `SMSG_STOP_MIRROR_TIMER`), by type. Sent on a change only: `value` is
+   * the ms left at `ts`, moving by `scale` ms per ms (-1 draining, 10
+   * refilling); at 0 the drowning or fatigue damage starts. Empty when no bar
+   * is up.
+   */
+  mirrorTimers: readonly MirrorTimer[];
+  /**
    * The last `SMSG_ACTIVATETAXIREPLY` (the answer to a raw `CMSG_ACTIVATETAXI`).
    * Kept because it is the only thing that says a flight was *accepted*; the
    * ride itself shows on `taxiFlight`.
@@ -660,6 +723,43 @@ export interface SelfState extends UnitFieldsState {
    * current word. `undefined` only before the login packet has been seen.
    */
   bindPoint: Observed<BindPoint> | undefined;
+}
+
+/** A Death Knight rune slot (`SelfState.runes`). */
+export interface RuneSlot {
+  readonly index: number;
+  /** `undefined` for a type id the SDK does not know. */
+  readonly type: "blood" | "unholy" | "frost" | "death" | undefined;
+  readonly ready: boolean | undefined;
+}
+
+/** One of our totems (`SelfState.totems`). */
+export interface TotemSlot {
+  /** 0 fire, 1 earth, 2 water, 3 air: what `CMSG_TOTEM_DESTROYED` takes. */
+  readonly slot: number;
+  readonly element: "fire" | "earth" | "water" | "air" | undefined;
+  readonly guid: GuidKey;
+  readonly spellId: number;
+  readonly name: string | undefined;
+  readonly durationMs: number;
+  readonly expiresAt: number;
+  readonly seq: number;
+  readonly ts: number;
+}
+
+/** A breath, fatigue or fire bar (`SelfState.mirrorTimers`). */
+export interface MirrorTimer {
+  readonly type: "fatigue" | "breath" | "fire" | undefined;
+  /** The wire's timer type: 0 fatigue, 1 breath, 2 fire. */
+  readonly typeId: number;
+  /** ms left at `ts`. */
+  readonly value: number;
+  readonly max: number;
+  /** ms gained per ms: -1 draining, 10 refilling. */
+  readonly scale: number;
+  readonly paused: boolean;
+  readonly seq: number;
+  readonly ts: number;
 }
 
 /**
@@ -1948,6 +2048,11 @@ export class StateCache {
     inCombat: undefined,
     stunned: undefined,
     mounted: undefined,
+    channeling: undefined,
+    comboPoints: undefined,
+    runes: undefined,
+    totems: [],
+    mirrorTimers: [],
     taxiReply: undefined,
     bindPoint: undefined,
     health: undefined,
@@ -2012,6 +2117,13 @@ export class StateCache {
    * nothing the new session sends restates the credit.
    */
   private readonly questExplored = new Set<number>();
+
+  /** Our runes' current types by slot, once a convert or the class said this is a Death Knight; the base layout until one converts. */
+  private runeTypes: number[] | undefined;
+  /** The ready-rune mask the last own rune-spending `SMSG_SPELL_GO` left. */
+  private runeReadyMask: number | undefined;
+  /** `UNIT_FIELD_CHANNEL_OBJECT` on our own block, `undefined` for none. */
+  private selfChannelObject: GuidKey | undefined;
 
   /**
    * guid -> slot -> aura. Kept per slot because `SMSG_AURA_UPDATE` is a *slot*
@@ -3489,6 +3601,13 @@ export class StateCache {
           // A fresh login has no dialog open: an old session's offer is gone.
           this.resurrectOffer = undefined;
           this.self.casting = undefined;
+          // Nor a channel, combo points, totems or a mirror bar: a logout
+          // ends all four, and the runes are ready again.
+          this.self.channeling = undefined;
+          this.self.comboPoints = undefined;
+          this.self.totems = [];
+          this.self.mirrorTimers = [];
+          this.runeReadyMask = undefined;
         }
         // The new map's name arrives on its WB_AREA; until then only the id
         // (position.map) is known, so the old map's name is not kept.
@@ -3680,7 +3799,87 @@ export class StateCache {
       case "SMSG_SPELL_GO":
       case "SMSG_SPELL_FAILURE": {
         const d = event.data as SpellGoData | SpellFailureData;
-        if (this.isSelfGuid(d.casterGuid) && this.self.casting?.value.spellId === d.spellId) this.self.casting = undefined;
+        if (!this.isSelfGuid(d.casterGuid)) return;
+        if (this.self.casting?.value.spellId === d.spellId) this.self.casting = undefined;
+        if (event.opcode === "SMSG_SPELL_FAILURE" && this.self.channeling?.value.spellId === d.spellId) this.self.channeling = undefined;
+        const after = (d as SpellGoData).runesAfter;
+        if (event.opcode === "SMSG_SPELL_GO" && after !== undefined) {
+          this.runeReadyMask = after;
+          this.publishRunes(event.seq, event.ts);
+        }
+        return;
+      }
+      case "SMSG_UPDATE_COMBO_POINTS": {
+        const d = event.data as UpdateComboPointsData;
+        this.self.comboPoints = {
+          value: { points: d.points, targetGuid: d.targetGuid === "0" ? undefined : d.targetGuid },
+          seq: event.seq,
+          ts: event.ts,
+        };
+        return;
+      }
+      case "SMSG_CONVERT_RUNE": {
+        const d = event.data as ConvertRuneData;
+        if (d.index < 0 || d.index >= BASE_RUNE_TYPES.length) return;
+        this.runeTypes ??= [...BASE_RUNE_TYPES];
+        this.runeTypes[d.index] = d.runeType;
+        this.publishRunes(event.seq, event.ts);
+        return;
+      }
+      case "MSG_CHANNEL_START": {
+        const d = event.data as ChannelStartData;
+        if (!this.isSelfGuid(d.casterGuid)) return;
+        const name = d.name ?? this.spellBook.get(d.spellId)?.name ?? this.spellNamesSeen.get(d.spellId);
+        this.self.channeling = {
+          value: { spellId: d.spellId, name, endsAt: event.ts + d.durationMs, targetGuid: this.selfChannelObject },
+          seq: event.seq,
+          ts: event.ts,
+        };
+        return;
+      }
+      case "MSG_CHANNEL_UPDATE": {
+        const d = event.data as ChannelUpdateData;
+        if (!this.isSelfGuid(d.casterGuid) || this.self.channeling === undefined) return;
+        this.self.channeling =
+          d.timeMs === 0
+            ? undefined
+            : { value: { ...this.self.channeling.value, endsAt: event.ts + d.timeMs }, seq: event.seq, ts: event.ts };
+        return;
+      }
+      case "SMSG_TOTEM_CREATED": {
+        const d = event.data as TotemCreatedData;
+        const totem: TotemSlot = {
+          slot: d.slot,
+          element: TOTEM_ELEMENTS[d.slot],
+          guid: d.guid,
+          spellId: d.spellId,
+          name: d.name ?? this.spellNamesSeen.get(d.spellId),
+          durationMs: d.durationMs,
+          expiresAt: event.ts + d.durationMs,
+          seq: event.seq,
+          ts: event.ts,
+        };
+        this.self.totems = [...this.self.totems.filter((t) => t.slot !== d.slot), totem].sort((a, b) => a.slot - b.slot);
+        return;
+      }
+      case "SMSG_START_MIRROR_TIMER": {
+        const d = event.data as StartMirrorTimerData;
+        const timer: MirrorTimer = {
+          type: MIRROR_TIMER_TYPES[d.type],
+          typeId: d.type,
+          value: d.value,
+          max: d.max,
+          scale: d.scale,
+          paused: d.paused,
+          seq: event.seq,
+          ts: event.ts,
+        };
+        this.self.mirrorTimers = [...this.self.mirrorTimers.filter((t) => t.typeId !== d.type), timer].sort((a, b) => a.typeId - b.typeId);
+        return;
+      }
+      case "SMSG_STOP_MIRROR_TIMER": {
+        const d = event.data as StopMirrorTimerData;
+        this.self.mirrorTimers = this.self.mirrorTimers.filter((t) => t.typeId !== d.type);
         return;
       }
       case "SMSG_SPELL_COOLDOWN": {
@@ -4194,6 +4393,7 @@ export class StateCache {
       case "SMSG_DESTROY_OBJECT": {
         const d = event.data as { guid: GuidKey };
         this.forget(d.guid);
+        if (this.self.totems.some((t) => t.guid === d.guid)) this.self.totems = this.self.totems.filter((t) => t.guid !== d.guid);
         return;
       }
       case "WB_MOVE_PROGRESS":
@@ -4920,6 +5120,15 @@ export class StateCache {
         }
         continue;
       }
+      // What a unit channels at; only our own is read (`self.channeling`).
+      if (key === "channelObjectGuid") {
+        if (target === this.self && typeof raw === "string") {
+          this.selfChannelObject = raw === "0" ? undefined : raw;
+          const ch = this.self.channeling;
+          if (ch !== undefined) this.self.channeling = { ...ch, value: { ...ch.value, targetGuid: this.selfChannelObject } };
+        }
+        continue;
+      }
       // The skill pane's names ride beside the ids as strings;
       // they live in their own map because `fields` holds numbers only.
       if (target === this.self && typeof raw === "string") {
@@ -5012,6 +5221,11 @@ export class StateCache {
         this.self.stunned = { value: (fields.unitFlags & UNIT_FLAG_STUNNED) !== 0, seq, ts };
         this.self.mounted = { value: (fields.unitFlags & UNIT_FLAG_MOUNT) !== 0, seq, ts };
       }
+      // A channel the server ended without a packet we saw (a reattach, a
+      // dropped frame): the field reads 0 once it is over.
+      if (fields.channelSpell === 0) this.self.channeling = undefined;
+      // A Death Knight has runes from the start, in the base layout.
+      if (fields.class === CLASS_DEATH_KNIGHT && this.self.runes === undefined) this.publishRunes(seq, ts);
       const healthAfter = target.fields.get("health")?.value;
       const pos = this.self.position?.value;
       // The died transition: own health reaching 0 from a living value. Until
@@ -5021,6 +5235,21 @@ export class StateCache {
         this.self.corpse = { value: { map: pos.map, x: pos.x, y: pos.y, z: pos.z, source: "death_spot" }, seq, ts };
       }
     }
+  }
+
+  /** Rebuild `self.runes` from the types and the last ready mask. */
+  private publishRunes(seq: number, ts: number): void {
+    const types = this.runeTypes ?? BASE_RUNE_TYPES;
+    const mask = this.runeReadyMask;
+    this.self.runes = {
+      value: types.map((t, index) => ({
+        index,
+        type: RUNE_TYPE_NAMES[t],
+        ready: mask === undefined ? undefined : ((mask >> index) & 1) === 1,
+      })),
+      seq,
+      ts,
+    };
   }
 
   /**
