@@ -12,9 +12,11 @@
  * kernel answers, not a JavaScript shim. The ruleset (`confinementPlan`):
  *
  *  - Filesystem: reads only where the child legitimately needs them (the Bun
- *    binary and system libraries, `mcp/`, `sdk/`, `node_modules/`, any
- *    directory the host names with `--read=` (a harness's own child
- *    extension, e.g. the runner's `runner/`), the workspace manifests, its own `/proc` entry and a few system-wide `/proc`
+ *    binary and system libraries, the `mcp` and `sdk` packages and the
+ *    `node_modules/` their dependencies are installed in, wherever those are
+ *    (`stackReadPaths`), any directory the host names with `--read=` (a
+ *    harness's own child extension, e.g. the runner's `runner/`), the
+ *    workspace manifests, its own `/proc` entry and a few system-wide `/proc`
  *    files, and five `/dev` nodes). `.env`, the repo root, `$HOME`, `/tmp`,
  *    `/dev/shm` and every other process's `/proc` entry are `EACCES` by any
  *    path.
@@ -61,8 +63,8 @@
  * the container's seccomp profile — only the three `landlock_*` syscalls.
  */
 
-import { closeSync, existsSync, openSync, readSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { closeSync, existsSync, openSync, readFileSync, readSync } from "node:fs";
+import { dirname, join, resolve, sep } from "node:path";
 import { dlopen, FFIType, ptr, read } from "bun:ffi";
 
 // Linux ABI constants (include/uapi/linux/landlock.h, unified syscall table).
@@ -244,8 +246,101 @@ export const PROC_GLOBAL_FILES: readonly string[] = ["meminfo", "stat", "cpuinfo
 /** The /dev nodes the child may open: the null, zero and full sinks and the random sources. */
 export const DEV_NODES: readonly string[] = ["null", "zero", "full", "random", "urandom"];
 
+/** The manifests Bun may read in each directory above a package while it resolves and transpiles. */
+export const MANIFEST_FILES: readonly string[] = ["package.json", "tsconfig.json", "tsconfig.base.json", "bunfig.toml"];
+
+/** Where the stack the child runs is installed, as `stackReadPaths` finds it. */
+export interface StackReadPaths {
+  /** This package's directory, then every workspace package it depends on, transitively (`mcp`, `sdk`). */
+  packages: string[];
+  /** The `node_modules` directories those packages' dependencies are installed in. */
+  nodeModules: string[];
+  /**
+   * The directories from each package's parent up to the install root (the
+   * directory holding `node_modules`), whose `MANIFEST_FILES` are granted:
+   * Bun reads them while resolving (`sdk/tsconfig.json` extends
+   * `../tsconfig.base.json`, the root `package.json` names the workspaces).
+   */
+  manifestDirs: string[];
+}
+
+/** The nearest directory at or above `dir` holding a `package.json`. */
+function packageDirOf(dir: string): string {
+  for (let d = resolve(dir); ; d = dirname(d)) {
+    if (existsSync(join(d, "package.json"))) return d;
+    if (dirname(d) === d) throw new ConfinementError(`no package.json at or above ${dir}`);
+  }
+}
+
+/**
+ * The outermost `node_modules` directory on a resolved path, or null when the
+ * path is not inside one (a workspace package, reached through a symlink that
+ * resolution has already followed). Outermost, not nearest: Bun's isolated
+ * linker stores a package at `<root>/node_modules/.bun/<name>@<v>/node_modules/<name>`
+ * and links every workspace's `node_modules/<name>` there, so the whole
+ * `<root>/node_modules` is what the child reads through.
+ */
+function outermostNodeModules(path: string): string | null {
+  const parts = path.split(sep);
+  const i = parts.indexOf("node_modules");
+  return i < 0 ? null : parts.slice(0, i + 1).join(sep);
+}
+
+/**
+ * The directories the stack's code and its imports are read from, found by
+ * resolving rather than by counting directories, so the same code is right
+ * whether the packages sit at the repository root (`<root>/{mcp,sdk}`) or one
+ * level down in a consumer's checkout (`<root>/wrath-mcp/{mcp,sdk}`, with
+ * `node_modules` hoisted at `<root>`).
+ *
+ * Starting from the package that holds `from` (this file's: `mcp`), each
+ * package's `dependencies` are resolved from its own directory, as the child
+ * will import them. A dependency that resolves (symlinks followed) outside any
+ * `node_modules` is a workspace package and is walked in turn; one inside is
+ * granted through the outermost `node_modules` it sits in. Anything that does
+ * not resolve is a refusal: a ruleset built over a broken install would fail
+ * the child in a less obvious place.
+ */
+export function stackReadPaths(from: string): StackReadPaths {
+  const packages = [packageDirOf(from)];
+  const nodeModules: string[] = [];
+  for (let i = 0; i < packages.length; i++) {
+    const pkg = packages[i]!;
+    const manifest = JSON.parse(readFileSync(join(pkg, "package.json"), "utf8")) as { dependencies?: Record<string, string> };
+    for (const dep of Object.keys(manifest.dependencies ?? {})) {
+      let resolved: string;
+      try {
+        resolved = Bun.resolveSync(dep, pkg);
+      } catch (err) {
+        throw new ConfinementError(`${dep} does not resolve from ${pkg}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      const nm = outermostNodeModules(resolved);
+      if (nm !== null) {
+        if (!nodeModules.includes(nm)) nodeModules.push(nm);
+      } else {
+        const dir = packageDirOf(dirname(resolved));
+        if (!packages.includes(dir)) packages.push(dir);
+      }
+    }
+  }
+  const roots = nodeModules.map((nm) => dirname(nm));
+  const manifestDirs: string[] = [];
+  for (const pkg of packages) {
+    // A package outside every install root (nothing it depends on is in a
+    // node_modules above it) has no manifests above it worth granting.
+    const root = roots.find((r) => pkg.startsWith(r + sep));
+    if (root === undefined) continue;
+    for (let d = dirname(pkg); ; d = dirname(d)) {
+      if (!manifestDirs.includes(d)) manifestDirs.push(d);
+      if (d === root) break;
+    }
+  }
+  return { packages, nodeModules, manifestDirs };
+}
+
 export interface PlanInput {
-  repoRoot: string;
+  /** The stack's packages and install, from `stackReadPaths`. */
+  stack: StackReadPaths;
   bunExe: string;
   moduleUrl: string;
   abi: number;
@@ -276,7 +371,7 @@ export interface PlanInput {
  * itself fails and the wrapper exits.
  */
 export function confinementPlan(input: PlanInput): ConfinementPlan {
-  const { repoRoot, bunExe, moduleUrl, abi } = input;
+  const { stack, bunExe, moduleUrl, abi } = input;
   const exists = input.exists ?? existsSync;
   if (abi < REQUIRED_ABI) {
     throw new ConfinementError(
@@ -317,13 +412,14 @@ export function confinementPlan(input: PlanInput): ConfinementPlan {
   fs.push({ path: bunExe, access: fileRead | ACCESS_FS.EXECUTE });
   const interpreter = input.interpreter === undefined ? elfInterpreter(bunExe) : input.interpreter;
   if (interpreter !== null) fs.push({ path: interpreter, access: fileRead | ACCESS_FS.EXECUTE });
-  // The workspaces the child's code and its imports live in, then whatever the
-  // host named for its own child extension. Never the repo root itself: that
-  // is where `.env` is.
-  for (const d of ["mcp", "sdk", "node_modules"]) fs.push({ path: join(repoRoot, d), access: dirRead });
+  // The packages the child's code and its imports live in, then whatever the
+  // host named for its own child extension, then the manifests above the
+  // packages, file by file. Never the repo root itself, nor any directory
+  // between it and the packages: that is where `.env` is.
+  for (const d of [...stack.packages, ...stack.nodeModules]) fs.push({ path: d, access: dirRead });
   for (const d of input.readDirs ?? []) fs.push({ path: d, access: dirRead });
-  for (const f of ["package.json", "tsconfig.json", "tsconfig.base.json", "bunfig.toml"]) {
-    fs.push({ path: join(repoRoot, f), access: fileRead });
+  for (const dir of stack.manifestDirs) {
+    for (const f of MANIFEST_FILES) fs.push({ path: join(dir, f), access: fileRead });
   }
 
   const net: NetRule[] = [{ port: modulePort(moduleUrl), access: ACCESS_NET.CONNECT_TCP }];
@@ -426,7 +522,6 @@ if (import.meta.main) {
   // exec'd image is `process.execPath` when the child is `bun`, so the same
   // binary that runs the host runs the child.
   const exe = childArgv[0] === "bun" ? process.execPath : (Bun.which(childArgv[0]!) ?? childArgv[0]!);
-  const repoRoot = resolve(dirname(import.meta.path), "..", "..", "..");
   // The same variable, same default, that the child reads for its client, so
   // the port the kernel allows is the port the SDK dials. The host sets it
   // explicitly and spawns this wrapper with `--env-file=/dev/null`, so it is
@@ -434,7 +529,8 @@ if (import.meta.main) {
   const moduleUrl = process.env["WRATHBENCH_MODULE_URL"] ?? "http://worldserver:8086";
   let plan: ConfinementPlan;
   try {
-    plan = confinementPlan({ repoRoot, bunExe: exe, moduleUrl, abi: landlockAbi(), pid: process.pid, readDirs });
+    const stack = stackReadPaths(import.meta.dir);
+    plan = confinementPlan({ stack, bunExe: exe, moduleUrl, abi: landlockAbi(), pid: process.pid, readDirs });
   } catch (err) {
     fail("planning the ruleset", err instanceof Error ? err.message : String(err));
   }

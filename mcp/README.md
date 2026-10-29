@@ -44,11 +44,3 @@ own child entry), and leaves that load nothing else — `./module-auth`,
 `./redact`, `./jsonsafe`, `./scratchpad`, `./client-cache`, `./paths`,
 `./tools` — for processes that run no sandbox. The package releases with the
 SDK at the same version.
-
-## Known issues
-
-- `src/sandbox/confine.ts` takes the repository root to be three directories
-  above itself and grants the child `mcp/`, `sdk/` and `node_modules/` beneath
-  it. That holds in this monorepo and its images; when the stack moves to a
-  repository of its own, the read list has to come from where the packages
-  are actually installed.

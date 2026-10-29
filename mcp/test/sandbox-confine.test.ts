@@ -11,9 +11,11 @@ const REPO = "/srv/wrathbench";
 const BUN = "/home/bun/.bun/bin/bun";
 const LOADER = "/lib64/ld-linux-x86-64.so.2";
 const PID = 4242;
+/** The stack at the repository root, as `stackReadPaths` finds it in this monorepo (sandbox-layout.test.ts resolves real trees). */
+const STACK = { packages: [`${REPO}/mcp`, `${REPO}/sdk`], nodeModules: [`${REPO}/node_modules`], manifestDirs: [REPO] };
 
 function plan(abi: number, moduleUrl = "http://worldserver:8086") {
-  return confinementPlan({ repoRoot: REPO, bunExe: BUN, moduleUrl, abi, pid: PID, interpreter: LOADER, exists: () => true });
+  return confinementPlan({ stack: STACK, bunExe: BUN, moduleUrl, abi, pid: PID, interpreter: LOADER, exists: () => true });
 }
 
 describe("confinementPlan", () => {
@@ -56,7 +58,7 @@ describe("confinementPlan", () => {
       expect(r.access & ACCESS_FS.EXECUTE).toBe(0n);
     }
     // A static bun (no PT_INTERP) grants EXECUTE on the binary alone.
-    const staticPlan = confinementPlan({ repoRoot: REPO, bunExe: BUN, moduleUrl: "http://m:8086", abi: 6, pid: PID, interpreter: null, exists: () => true });
+    const staticPlan = confinementPlan({ stack: STACK, bunExe: BUN, moduleUrl: "http://m:8086", abi: 6, pid: PID, interpreter: null, exists: () => true });
     expect(staticPlan.fs.filter((r) => (r.access & ACCESS_FS.EXECUTE) !== 0n).map((r) => r.path)).toEqual([BUN]);
   });
 
@@ -97,7 +99,7 @@ describe("confinementPlan", () => {
   });
 
   test("missing paths are dropped; the executables are listed whether or not they exist", () => {
-    const p = confinementPlan({ repoRoot: REPO, bunExe: BUN, moduleUrl: "http://m:8086", abi: 6, pid: PID, interpreter: LOADER, exists: (path) => path === "/usr" || path === `${REPO}/mcp` });
+    const p = confinementPlan({ stack: STACK, bunExe: BUN, moduleUrl: "http://m:8086", abi: 6, pid: PID, interpreter: LOADER, exists: (path) => path === "/usr" || path === `${REPO}/mcp` });
     expect(p.fs.map((r) => r.path)).toEqual(["/usr", `${REPO}/mcp`]);
   });
 

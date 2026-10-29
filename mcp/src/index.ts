@@ -74,12 +74,14 @@ export {
   DEV_NODES,
   elfInterpreter,
   landlockAbi,
+  MANIFEST_FILES,
   modulePort,
   PROC_GLOBAL_FILES,
   REQUIRED_ABI,
   SCOPE,
+  stackReadPaths,
 } from "./sandbox/confine";
-export type { ConfinementPlan, FsRule, NetRule, PlanInput } from "./sandbox/confine";
+export type { ConfinementPlan, FsRule, NetRule, PlanInput, StackReadPaths } from "./sandbox/confine";
 export { RepeatFolder } from "./sandbox/log-fold";
 export { REATTACH_REPLAY_WAIT_MS, REATTACH_STATE_WAIT_MS } from "./sandbox/reattach-waits";
 export { compileSnippet, extractPatternNames, scanTopLevelDeclarations } from "./sandbox/rewrite";
