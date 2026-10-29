@@ -1032,6 +1032,13 @@ export const spellFailureDataSchema = z
   .transform(withCastReason);
 export type SpellFailureData = z.infer<typeof spellFailureDataSchema>;
 
+/** `SMSG_SPELL_DELAYED`: a cast in range pushed back by `delayMs` (damage taken while casting). */
+export const spellDelayedDataSchema = z.looseObject({
+  casterGuid: guidSchema,
+  delayMs: z.number(),
+});
+export type SpellDelayedData = z.infer<typeof spellDelayedDataSchema>;
+
 export const periodicAuraLogDataSchema = z.looseObject({
   targetGuid: guidSchema,
   casterGuid: guidSchema,
@@ -1091,6 +1098,29 @@ export const spellEnergizeLogDataSchema = z.looseObject({
   amount: z.number(),
 });
 export type SpellEnergizeLogData = z.infer<typeof spellEnergizeLogDataSchema>;
+
+/** `SMSG_SPELLORDAMAGE_IMMUNE`: "Immune" in the combat log — `targetGuid` was immune to `casterGuid`'s spell. */
+export const spellOrDamageImmuneDataSchema = z.looseObject({
+  casterGuid: guidSchema,
+  targetGuid: guidSchema,
+  spellId: z.number(),
+  rank: z.number().optional(),
+  name: z.string().optional(),
+});
+export type SpellOrDamageImmuneData = z.infer<typeof spellOrDamageImmuneDataSchema>;
+
+/**
+ * `SMSG_ENVIRONMENTAL_DAMAGE_LOG`: damage from the world, not a unit. `type` 0
+ * fatigue, 1 drowning, 2 falling, 3 lava, 4 slime, 5 fire.
+ */
+export const environmentalDamageLogDataSchema = z.looseObject({
+  victimGuid: guidSchema,
+  type: z.number(),
+  amount: z.number(),
+  resist: z.number(),
+  absorb: z.number(),
+});
+export type EnvironmentalDamageLogData = z.infer<typeof environmentalDamageLogDataSchema>;
 
 /**
  * One visible aura slot. `spellId: 0` means the slot was cleared, and then the
@@ -1411,6 +1441,44 @@ export const gossipMessageDataSchema = z.looseObject({
   quests: z.array(offeredQuestSchema),
 });
 export type GossipMessageData = z.infer<typeof gossipMessageDataSchema>;
+
+/**
+ * `SMSG_NPC_TEXT_UPDATE`: the body text of a gossip window, the answer to a raw
+ * `CMSG_NPC_TEXT_QUERY` on the `textId` `SMSG_GOSSIP_MESSAGE` carries. A
+ * client shows one of `texts`, picked by `probability`; `text` is the male
+ * form and `textFemale` the female, and `$N` in either is the reader's name.
+ */
+export const npcTextUpdateDataSchema = z.looseObject({
+  textId: z.number(),
+  texts: z.array(z.looseObject({ probability: z.number(), text: z.string(), textFemale: z.string(), language: z.number() })),
+});
+export type NpcTextUpdateData = z.infer<typeof npcTextUpdateDataSchema>;
+
+/** `SMSG_PLAYED_TIME`: the answer to `CMSG_PLAYED_TIME` — time played in total and at this level, in seconds. */
+export const playedTimeDataSchema = z.looseObject({
+  totalSec: z.number(),
+  levelSec: z.number(),
+  show: z.boolean(),
+});
+export type PlayedTimeData = z.infer<typeof playedTimeDataSchema>;
+
+/** `SMSG_QUERY_TIME_RESPONSE`: the answer to `CMSG_QUERY_TIME` — the server's clock (unix seconds) and the seconds until daily quests reset. */
+export const queryTimeResponseDataSchema = z.looseObject({
+  serverTime: z.number(),
+  dailyResetInSec: z.number(),
+});
+export type QueryTimeResponseData = z.infer<typeof queryTimeResponseDataSchema>;
+
+/**
+ * `SMSG_SET_PROFICIENCY`: the item subclasses this character can use for one
+ * item class (2 weapon, 4 armour), as a bit mask over the subclass ids; the
+ * whole mask each time.
+ */
+export const setProficiencyDataSchema = z.looseObject({
+  itemClass: z.number(),
+  subclassMask: z.number(),
+});
+export type SetProficiencyData = z.infer<typeof setProficiencyDataSchema>;
 
 export const emptyDataSchema = z.looseObject({});
 export type EmptyData = z.infer<typeof emptyDataSchema>;
@@ -1750,6 +1818,13 @@ export const showTaxiNodesDataSchema = z.looseObject({
 });
 export type ShowTaxiNodesData = z.infer<typeof showTaxiNodesDataSchema>;
 
+/** `SMSG_TAXINODE_STATUS`: whether this character has discovered the node of the flight master `guid` (its map icon). */
+export const taxiNodeStatusDataSchema = z.looseObject({
+  guid: guidSchema,
+  known: z.boolean(),
+});
+export type TaxiNodeStatusData = z.infer<typeof taxiNodeStatusDataSchema>;
+
 /**
  * `SMSG_BINDER_CONFIRM`: the innkeeper (`guid`) asks "make this your home?"
  * after the bind gossip option. A client answers yes with
@@ -1990,10 +2065,13 @@ export const eventDataSchemas = {
   SMSG_SPELL_GO: spellGoDataSchema,
   SMSG_CAST_FAILED: castFailedDataSchema,
   SMSG_SPELL_FAILURE: spellFailureDataSchema,
+  SMSG_SPELL_DELAYED: spellDelayedDataSchema,
   SMSG_PERIODICAURALOG: periodicAuraLogDataSchema,
   SMSG_SPELLNONMELEEDAMAGELOG: spellNonMeleeDamageLogDataSchema,
   SMSG_SPELLHEALLOG: spellHealLogDataSchema,
   SMSG_SPELLENERGIZELOG: spellEnergizeLogDataSchema,
+  SMSG_SPELLORDAMAGE_IMMUNE: spellOrDamageImmuneDataSchema,
+  SMSG_ENVIRONMENTAL_DAMAGE_LOG: environmentalDamageLogDataSchema,
   SMSG_AURA_UPDATE: auraUpdateDataSchema,
   SMSG_AURA_UPDATE_ALL: auraUpdateDataSchema,
   // class resources, channels, totems, mirror timers
@@ -2028,6 +2106,7 @@ export const eventDataSchemas = {
   SMSG_QUESTGIVER_QUEST_INVALID: questGiverQuestInvalidDataSchema,
   SMSG_GOSSIP_MESSAGE: gossipMessageDataSchema,
   SMSG_GOSSIP_COMPLETE: emptyDataSchema,
+  SMSG_NPC_TEXT_UPDATE: npcTextUpdateDataSchema,
   // loot, vendor, inventory
   SMSG_LOOT_RESPONSE: lootResponseDataSchema,
   SMSG_LOOT_REMOVED: lootRemovedDataSchema,
@@ -2100,10 +2179,17 @@ export const eventDataSchemas = {
   SMSG_ALL_ACHIEVEMENT_DATA: allAchievementDataSchema,
   SMSG_ACTIVATETAXIREPLY: activateTaxiReplyDataSchema,
   SMSG_SHOWTAXINODES: showTaxiNodesDataSchema,
+  SMSG_TAXINODE_STATUS: taxiNodeStatusDataSchema,
+  // Bodiless: a flight path was learned.
+  SMSG_NEW_TAXI_PATH: emptyDataSchema,
   // innkeeper bind
   SMSG_BINDER_CONFIRM: binderConfirmDataSchema,
   SMSG_BINDPOINTUPDATE: bindPointUpdateDataSchema,
   SMSG_PLAYERBOUND: playerBoundDataSchema,
+  // client queries and proficiencies
+  SMSG_PLAYED_TIME: playedTimeDataSchema,
+  SMSG_QUERY_TIME_RESPONSE: queryTimeResponseDataSchema,
+  SMSG_SET_PROFICIENCY: setProficiencyDataSchema,
   // death
   SMSG_DEATH_RELEASE_LOC: deathReleaseLocDataSchema,
   SMSG_CORPSE_RECLAIM_DELAY: corpseReclaimDelayDataSchema,

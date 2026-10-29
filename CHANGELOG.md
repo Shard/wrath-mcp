@@ -86,6 +86,13 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 - Raw allowlist: `CMSG_SET_AMMO` (with `ammoId`, `PLAYER_AMMO_ID`, on self),
   `CMSG_SELF_RES` (with `selfResSpell`, `PLAYER_SELF_RES_SPELL`, on self),
   `CMSG_DISMISS_CRITTER` and `CMSG_TOTEM_DESTROYED`.
+- Replies to allowlisted raw opcodes that answered nothing: `SMSG_NPC_TEXT_UPDATE`
+  (a gossip window's body text, for `CMSG_NPC_TEXT_QUERY`),
+  `SMSG_TAXINODE_STATUS`, `SMSG_PLAYED_TIME` and `SMSG_QUERY_TIME_RESPONSE`.
+- More of what a client is told: `SMSG_NEW_TAXI_PATH`, `SMSG_SET_PROFICIENCY`
+  (`state.self.proficiency`, re-sent by the reattach replay),
+  `SMSG_SPELLORDAMAGE_IMMUNE`, `SMSG_ENVIRONMENTAL_DAMAGE_LOG` and
+  `SMSG_SPELL_DELAYED` (which moves `state.self.casting.endsAt`).
 
 ### Changed
 

@@ -6788,6 +6788,12 @@ namespace WrathBench
                 for (uint8 i = 0; i < MAX_RUNES; ++i)
                     if (player->GetCurrentRune(i) != player->GetBaseRune(i))
                         player->ConvertRune(i, player->GetCurrentRune(i));
+
+            // The proficiencies the login's passive spells announced, one
+            // SMSG_SET_PROFICIENCY per item class with the whole mask, by
+            // the core's own sender.
+            player->SendProficiency(ITEM_CLASS_WEAPON, player->GetWeaponProficiency());
+            player->SendProficiency(ITEM_CLASS_ARMOR, player->GetArmorProficiency());
         }
         catch (std::exception const& e)
         {
@@ -8043,6 +8049,17 @@ namespace WrathBench
                     w.AddGuid("casterGuid", (uint64_t)caster).Add("spellId", spellId).Add("result", (uint32)result);
                     break;
                 }
+                // A cast pushed back by damage (Spell::Delayed, to every
+                // client in range): caster packGUID, u32 ms added to the
+                // cast. The client's cast bar moves back by it.
+                case SMSG_SPELL_DELAYED:
+                {
+                    name = "SMSG_SPELL_DELAYED";
+                    uint64 caster = 0; p.readPackGUID(caster);
+                    uint32 delayMs; p >> delayMs;
+                    w.AddGuid("casterGuid", (uint64_t)caster).Add("delayMs", delayMs);
+                    break;
+                }
                 case SMSG_PERIODICAURALOG:
                 {
                     name = "SMSG_PERIODICAURALOG";
@@ -8143,6 +8160,34 @@ namespace WrathBench
                      .Add("spellId", spellId);
                     AddSpellFields(w, spellId);
                     w.Add("powerType", powerType).Add("amount", amount);
+                    break;
+                }
+                // "Immune" in the combat log (Unit::SendSpellDamageImmune,
+                // to every client in range): u64 caster, u64 target (both
+                // unpacked), u32 spell, u8 debug-format flag.
+                case SMSG_SPELLORDAMAGE_IMMUNE:
+                {
+                    name = "SMSG_SPELLORDAMAGE_IMMUNE";
+                    uint64 caster, target; uint32 spellId; uint8 debug;
+                    p >> caster >> target >> spellId >> debug;
+                    w.AddGuid("casterGuid", (uint64_t)caster).AddGuid("targetGuid", (uint64_t)target)
+                     .Add("spellId", spellId);
+                    AddSpellFields(w, spellId);
+                    break;
+                }
+                // Falling, drowning, fatigue, lava, slime and fire damage
+                // (Player::EnvironmentalDamage, CombatLogPackets.cpp; to every
+                // client in range): u64 victim, u8 EnviromentalDamage (0
+                // exhausted, 1 drowning, 2 fall, 3 lava, 4 slime, 5 fire; a
+                // fall into the void is sent as 2), u32 amount, u32 resisted,
+                // u32 absorbed.
+                case SMSG_ENVIRONMENTAL_DAMAGE_LOG:
+                {
+                    name = "SMSG_ENVIRONMENTAL_DAMAGE_LOG";
+                    uint64 victim; uint8 type; uint32 amount, resisted, absorbed;
+                    p >> victim >> type >> amount >> resisted >> absorbed;
+                    w.AddGuid("victimGuid", (uint64_t)victim).Add("type", (uint32)type).Add("amount", amount)
+                     .Add("resist", resisted).Add("absorb", absorbed);
                     break;
                 }
                 case SMSG_AURA_UPDATE:
@@ -8510,6 +8555,26 @@ namespace WrathBench
                     w.Raw("mask", mask).Raw("known", known);
                     break;
                 }
+                // Whether this character has discovered the flight master's
+                // node (WorldSession::SendTaxiStatus, the answer to
+                // CMSG_TAXINODE_STATUS_QUERY; Player::SendTaxiNodeStatusMultiple
+                // once at login, after the add to map, for every flight
+                // master then in view; and after a discovery):
+                // u64 flight master guid, u8 1 known / 0 not. The flight
+                // master's map icon.
+                case SMSG_TAXINODE_STATUS:
+                {
+                    name = "SMSG_TAXINODE_STATUS";
+                    uint64 guid; uint8 known; p >> guid >> known;
+                    w.AddGuid("guid", (uint64_t)guid).Add("known", known != 0);
+                    break;
+                }
+                // A flight path learned (WorldSession::SendLearnNewTaxiNode,
+                // SendDiscoverNewTaxiNode): bodiless; the client's "New
+                // flight path discovered".
+                case SMSG_NEW_TAXI_PATH:
+                    name = "SMSG_NEW_TAXI_PATH";
+                    break;
                 // -------------------------------------------- reputation
                 case SMSG_INITIALIZE_FACTIONS:
                 {
@@ -9515,6 +9580,69 @@ namespace WrathBench
                 case SMSG_GOSSIP_COMPLETE:
                     name = "SMSG_GOSSIP_COMPLETE";
                     break;
+                // The gossip window's body text, the answer to
+                // CMSG_NPC_TEXT_QUERY on the textId SMSG_GOSSIP_MESSAGE names
+                // (WorldSession::HandleNpcTextQueryOpcode): u32 textId, then
+                // MAX_GOSSIP_TEXT_OPTIONS (8) x (float probability, string
+                // male text, string female text, u32 language, 3 x (u32
+                // emote delay, u32 emote)). An unknown id answers the core's
+                // "Greetings $N" default. Options with no text are dropped;
+                // the emotes are animation and are consumed.
+                case SMSG_NPC_TEXT_UPDATE:
+                {
+                    name = "SMSG_NPC_TEXT_UPDATE";
+                    uint32 textId; p >> textId;
+                    std::string texts = "[";
+                    bool firstText = true;
+                    for (uint8 i = 0; i < MAX_GOSSIP_TEXT_OPTIONS; ++i)
+                    {
+                        float probability; std::string text0, text1; uint32 language;
+                        p >> probability >> text0 >> text1 >> language;
+                        for (uint8 j = 0; j < MAX_GOSSIP_TEXT_EMOTES; ++j)
+                            { uint32 delay, emote; p >> delay >> emote; }
+                        if (text0.empty() && text1.empty())
+                            continue;
+                        if (!firstText) texts += ',';
+                        firstText = false;
+                        texts += Json::Writer().Add("probability", (double)probability).Add("text", text0)
+                            .Add("textFemale", text1).Add("language", language).Str();
+                    }
+                    texts += "]";
+                    w.Add("textId", textId).Raw("texts", texts);
+                    break;
+                }
+                // ----------------------------------------- client queries
+                // /played (WorldSession::HandlePlayedTime): u32 total and
+                // u32 this-level play time in seconds, u8 whether the client
+                // asked to print it.
+                case SMSG_PLAYED_TIME:
+                {
+                    name = "SMSG_PLAYED_TIME";
+                    uint32 total, level; uint8 show; p >> total >> level >> show;
+                    w.Add("totalSec", total).Add("levelSec", level).Add("show", show != 0);
+                    break;
+                }
+                // The answer to CMSG_QUERY_TIME (WorldSession::
+                // SendTimeQueryResponse): u32 server time (unix seconds),
+                // u32 seconds until the daily quests reset.
+                case SMSG_QUERY_TIME_RESPONSE:
+                {
+                    name = "SMSG_QUERY_TIME_RESPONSE";
+                    uint32 serverTime, dailyResetIn; p >> serverTime >> dailyResetIn;
+                    w.Add("serverTime", serverTime).Add("dailyResetInSec", dailyResetIn);
+                    break;
+                }
+                // The item subclasses this character may use, per item class
+                // (Player::SendProficiency, on learning a proficiency): u8
+                // ItemClass (2 weapon, 4 armour), u32 subclass mask, the
+                // whole mask each time.
+                case SMSG_SET_PROFICIENCY:
+                {
+                    name = "SMSG_SET_PROFICIENCY";
+                    uint8 itemClass; uint32 mask; p >> itemClass >> mask;
+                    w.Add("itemClass", (uint32)itemClass).Add("subclassMask", mask);
+                    break;
+                }
                 // ------------------------------------------------------ loot
                 case SMSG_LOOT_RESPONSE:
                 {

@@ -96,6 +96,8 @@ import {
   type TotemCreatedData,
   type StartMirrorTimerData,
   type StopMirrorTimerData,
+  type SpellDelayedData,
+  type SetProficiencyData,
   type SupersededSpellData,
   type TalentsInfoData,
   type AchievementEarnedData,
@@ -192,6 +194,10 @@ const TOTEM_ELEMENTS = ["fire", "earth", "water", "air"] as const;
 
 /** `MirrorTimerType` (AzerothCore `Player.h`) by value. */
 const MIRROR_TIMER_TYPES = ["fatigue", "breath", "fire"] as const;
+
+/** `ItemClass` (AzerothCore `ItemTemplate.h`): the two classes `SMSG_SET_PROFICIENCY` names. */
+const ITEM_CLASS_WEAPON = 2;
+const ITEM_CLASS_ARMOR = 4;
 
 /**
  * `PLAYER_FLAGS_RESTING` on 3.3.5a (AzerothCore `Player.h`, `PlayerFlags`) —
@@ -640,8 +646,10 @@ export interface SelfState extends UnitFieldsState {
    * cleared by the same spell's own `SMSG_SPELL_GO` (it went off) or
    * `SMSG_SPELL_FAILURE` (it was interrupted). A refusal (`SMSG_CAST_FAILED`)
    * of a second cast leaves the running one standing, as it does on the
-   * server. An instant cast never sets it, and a channel does not either: a
-   * channel starts after its spell's `SMSG_SPELL_GO` and shows in `channeling`.
+   * server. A pushback (`SMSG_SPELL_DELAYED`) moves `endsAt` later by the
+   * delay, as the client's cast bar moves. An instant cast never sets it,
+   * and a channel does not either: a channel starts after its spell's
+   * `SMSG_SPELL_GO` and shows in `channeling`.
    */
   casting: Observed<{ readonly spellId: number; readonly name: string | undefined; readonly endsAt: number }> | undefined;
   /**
@@ -711,6 +719,14 @@ export interface SelfState extends UnitFieldsState {
    * is up.
    */
   mirrorTimers: readonly MirrorTimer[];
+  /**
+   * The item subclasses this character can use (`SMSG_SET_PROFICIENCY`, the
+   * whole mask per item class each time): bit n of `weaponMask` is weapon
+   * subclass n (item class 2), of `armorMask` armour subclass n (class 4),
+   * as an item template's `subclass` numbers them. Each is undefined until
+   * its packet arrived.
+   */
+  proficiency: Observed<{ readonly weaponMask: number | undefined; readonly armorMask: number | undefined }> | undefined;
   /**
    * The last `SMSG_ACTIVATETAXIREPLY` (the answer to a raw `CMSG_ACTIVATETAXI`).
    * Kept because it is the only thing that says a flight was *accepted*; the
@@ -2053,6 +2069,7 @@ export class StateCache {
     runes: undefined,
     totems: [],
     mirrorTimers: [],
+    proficiency: undefined,
     taxiReply: undefined,
     bindPoint: undefined,
     health: undefined,
@@ -3884,6 +3901,27 @@ export class StateCache {
       case "SMSG_STOP_MIRROR_TIMER": {
         const d = event.data as StopMirrorTimerData;
         this.self.mirrorTimers = this.self.mirrorTimers.filter((t) => t.typeId !== d.type);
+        return;
+      }
+      case "SMSG_SPELL_DELAYED": {
+        const d = event.data as SpellDelayedData;
+        const c = this.self.casting;
+        if (!this.isSelfGuid(d.casterGuid) || c === undefined) return;
+        this.self.casting = { value: { ...c.value, endsAt: c.value.endsAt + d.delayMs }, seq: event.seq, ts: event.ts };
+        return;
+      }
+      case "SMSG_SET_PROFICIENCY": {
+        const d = event.data as SetProficiencyData;
+        if (d.itemClass !== ITEM_CLASS_WEAPON && d.itemClass !== ITEM_CLASS_ARMOR) return;
+        const was = this.self.proficiency?.value;
+        this.self.proficiency = {
+          value: {
+            weaponMask: d.itemClass === ITEM_CLASS_WEAPON ? d.subclassMask : was?.weaponMask,
+            armorMask: d.itemClass === ITEM_CLASS_ARMOR ? d.subclassMask : was?.armorMask,
+          },
+          seq: event.seq,
+          ts: event.ts,
+        };
         return;
       }
       case "SMSG_SPELL_COOLDOWN": {
