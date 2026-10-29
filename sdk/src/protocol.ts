@@ -884,6 +884,7 @@ export const MOVE_STATUSES = [
   "stopped",
   "superseded",
   "rooted",
+  "stunned",
   "controlling",
 ] as const;
 export type KnownMoveStatus = (typeof MOVE_STATUSES)[number];

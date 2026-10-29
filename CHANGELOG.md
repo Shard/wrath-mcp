@@ -178,6 +178,15 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Changed
 
+- **A stun is told apart from a root.** While the unit the client moves
+  carries `UNIT_FLAG_STUNNED` (`state.self.stunned` for the character), a
+  `move_to` is refused, and a walk ends, with the new status `stunned` where
+  it said `rooted`, and `face` is refused `409 stunned` with nothing sent: a
+  stunned client neither moves nor turns, a rooted one still turns. A caller
+  that matched `rooted` for a stun matches `stunned` too. `stunned` joins
+  `MOVE_STATUSES` and `KNOWN_ERROR_CODES`; the `rooted` hints now speak of a
+  root alone, and `killTarget`'s re-face shrugs off `stunned` as it does
+  `moving`.
 - The `opcode_not_allowed` hint and `activateTaxi`'s already-mounted refusal
   point at `dismount()` rather than a raw `CMSG_CANCEL_AURA`.
 
