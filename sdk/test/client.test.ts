@@ -1934,9 +1934,10 @@ describe("client: killTarget", () => {
     await stub.stop();
   });
 
-  test.each(["moving", "stunned"])("a face refused %s does not end the fight", async (code) => {
+  test.each(["moving", "stunned", "falling"])("a face refused %s does not end the fight", async (code) => {
     // The module answers `face` with `409 moving` while a move is running,
-    // and `409 stunned` while a stun holds the character. A real client
+    // `409 stunned` while a stun holds the character, and `409 falling` in
+    // the air. A real client
     // faces continuously and cannot fail at it, so the loop has to shrug
     // these off — otherwise every fight dies on a re-face tick.
     const stub = startStub({

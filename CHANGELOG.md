@@ -27,6 +27,24 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Added
 
+- **The character flies.** A character the server has told it can fly
+  (`SMSG_MOVE_SET_CAN_FLY`: a flying mount, a flight form) is flown as a
+  possessed flyer is: a straight line at the z asked for, at its flight
+  speed, refused `path_incomplete` where the line runs into terrain or a
+  model, `flight: true` on the result. The ground stays the default: a leg
+  is flown only when `moveTo(p, { fly: true })` asks (`move_to` `fly`) or
+  the body is already in the air; a ground refusal stays a refusal, its
+  hint naming `{ fly: true }` for a character that can fly. A flight that
+  ends on the ground lands; one that ends in the air hovers there. The
+  module serves the state as `WB_FLIGHT_STATE`, read as
+  `state.self.canFly` and `state.self.airborne`, and `dismount()` refuses
+  while airborne (`status: "airborne"`: land first). When the server takes
+  can-fly away in the air (a dismount, a no-fly zone) the body falls as a
+  client's does and lands with `MSG_MOVE_FALL_LAND`, which the server
+  charges, reported as `WB_SELF_MOVE` with cause `fall`. New move statuses
+  `falling` (a move while the body falls) and `cannot_fly` (`fly` without
+  can-fly), `face`'s `409 falling`, each with a hint; flown legs carry the
+  line's pitch, the Eye of Acherus's included.
 - **The GM opt-in, off by default.** The MCP server's `--allow-gm` or
   `WRATHBENCH_ALLOW_GM=1` (`mcp/README.md`, "GM accounts"), and the SDK's
   `connect({ allowGm: true })`, let a GM account in and pass command chat

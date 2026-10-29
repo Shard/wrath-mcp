@@ -120,6 +120,7 @@ describe("event frames", () => {
       "WB_MOVE_RESULT",
       "WB_RIDE_PROGRESS",
       "WB_SELF_MOVE",
+      "WB_FLIGHT_STATE",
       "WB_TRANSPORT_PROGRESS",
       "WB_PORTALS",
       ...MOVE_OPCODES,
