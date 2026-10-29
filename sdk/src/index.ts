@@ -50,6 +50,8 @@ export type {
   QuestAcceptResult,
   QuestOptions,
   UseItemOptions,
+  CastTargetOptions,
+  ItemTargetRef,
   QuestOfferRow,
   QuestRewardChoice,
   QuestsAvailableResult,

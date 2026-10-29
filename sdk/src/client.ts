@@ -380,6 +380,107 @@ function resolveItemSlot(
   };
 }
 
+/** `INVENTORY_SLOT_BAG_0`: the bag id the item actions take for the backpack and the worn slots. */
+const PLAYER_BAG = 255;
+/** `EQUIPMENT_SLOT_END`: worn slots are 0-18 (main hand 15, off hand 16). */
+const EQUIPMENT_SLOTS = 19;
+
+/** A cast's item and ground targets, resolved (`CastTargetOptions`). */
+interface CastAim {
+  targetItem?: { readonly guid: string; readonly label: string };
+  targetPoint?: MovePoint;
+  resolved?: ResolvedRef;
+}
+
+/** The wire fields a resolved aim adds to `cast_spell` / `use_item`: none when it has neither target. */
+function aimFields(aim: CastAim): { itemTargetGuid?: string; destX?: number; destY?: number; destZ?: number } {
+  return {
+    ...(aim.targetItem === undefined ? {} : { itemTargetGuid: aim.targetItem.guid }),
+    ...(aim.targetPoint === undefined ? {} : { destX: aim.targetPoint.x, destY: aim.targetPoint.y, destZ: aim.targetPoint.z }),
+  };
+}
+
+/**
+ * Resolve a cast's item target to the guid the target block carries. The
+ * candidates are what the character wears (`state.inventory` slots 0-18,
+ * addressed as bag 255) and carries (`state.bag()`); the server looks the
+ * guid up among the caster's own items, so anything else is refused here.
+ * A name goes through the shared `resolveName` and refuses on none or two.
+ */
+function resolveItemTarget(state: StateCache, ref: ItemTargetRef, arg: string): { guid: string; label: string; resolved?: ResolvedRef } {
+  const held = [
+    ...state.inventory
+      .filter((i) => i.slot < EQUIPMENT_SLOTS)
+      .map((i) => ({ bag: PLAYER_BAG, slot: i.slot, guid: i.guid, name: i.name, itemId: i.itemId })),
+    ...state.bag().items,
+  ];
+  const labelOf = (i: { name?: string | undefined; itemId?: number | undefined; guid: string }) =>
+    JSON.stringify(i.name ?? (i.itemId === undefined ? `item ${i.guid}` : `item ${i.itemId}`));
+  const show = (rows: readonly { bag: number; slot: number; name?: string | undefined }[]) =>
+    rows.slice(0, SHOWN_MATCHES).map((i) => `${JSON.stringify(i.name ?? "?")} at bag ${i.bag} slot ${i.slot}`).join(", ") +
+    (rows.length > SHOWN_MATCHES ? `, +${rows.length - SHOWN_MATCHES} more` : "");
+  const where = "what you wear (state.inventory slots 0-18, bag 255) or carry (state.bag())";
+  if (typeof ref === "string" && !GUID_TEXT.test(ref.trim())) {
+    const named = held.filter((i) => i.name !== undefined);
+    const hit = resolveName(ref, named, (i) => i.name);
+    if (hit.kind === "one") {
+      const out = { guid: hit.value.guid, label: labelOf(hit.value) };
+      return isFuzzy(hit.tier) ? { ...out, resolved: { input: ref, name: hit.name, guid: hit.value.guid } } : out;
+    }
+    if (hit.kind === "none") throw new TypeError(`${arg}: nothing in ${where} is named ${JSON.stringify(ref)} — you hold [${show(named)}]`);
+    throw new TypeError(
+      `${arg}: ${JSON.stringify(ref)} matches ${hit.candidates.length} items ([${show(hit.candidates)}]) — pass { bag, slot } of the one you mean`,
+    );
+  }
+  if (ref !== null && typeof ref === "object" && "bag" in ref && typeof ref.bag === "number" && typeof ref.slot === "number") {
+    const at = held.find((i) => i.bag === ref.bag && i.slot === ref.slot);
+    if (at === undefined) throw new TypeError(`${arg}: nothing is observed at bag ${ref.bag} slot ${ref.slot} in ${where}`);
+    return { guid: at.guid, label: labelOf(at) };
+  }
+  const guid = typeof ref === "string" ? ref.trim() : ref !== null && typeof ref === "object" && "guid" in ref ? ref.guid : undefined;
+  if (typeof guid !== "string" || !GUID_TEXT.test(guid)) {
+    throw new TypeError(`${arg} takes an item's name, its guid, or { bag, slot } from ${where}`);
+  }
+  const own = held.find((i) => i.guid === guidKey(guid));
+  if (own === undefined) throw new TypeError(`${arg}: guid ${guid} is not an item in ${where}`);
+  return { guid: own.guid, label: labelOf(own) };
+}
+
+/**
+ * Resolve a cast's ground target to a point: `{ x, y, z }` as given, or a
+ * unit (its guid or name) at its position now, as `state.units()` reports
+ * it. No axis is made up: a point without z is refused, since the ground
+ * height at an arbitrary x, y is nothing a client observes.
+ */
+function resolveCastPoint(state: StateCache, ref: GuidOrUnit | { x: number; y: number; z: number }, arg: string): MovePoint {
+  let target: unknown = ref;
+  if (typeof target === "string" && !GUID_TEXT.test(target.trim())) target = resolveNamedTarget(state, target, arg).guid;
+  const guid = moveTargetGuid(target);
+  if (guid === undefined) {
+    if (target !== null && typeof target === "object") {
+      const { x, y, z } = target as Record<string, unknown>;
+      if (typeof x === "number" && typeof y === "number" && z === undefined) {
+        throw new TypeError(
+          `${arg} needs z as well as x and y; nothing was sent. The ground height at a point is not something ` +
+            `the client observes: take the z of a unit there, or your own (state.self.position)`,
+        );
+      }
+    }
+    assertMovePoint(target, arg);
+    return { x: target.x, y: target.y, z: target.z };
+  }
+  const key = guidKey(guid);
+  const seen = state.nearby.get(key);
+  const at = seen === undefined ? undefined : pointOf(seen)?.value;
+  if (at === undefined) {
+    throw new TypeError(
+      `${arg}: guid ${key} is ${seen === undefined ? "not in view" : "in view but has no observed position yet"}, ` +
+        `so there is no point to cast at; nothing was sent. Pass a unit in view or a point { x, y, z }`,
+    );
+  }
+  return { x: at.x, y: at.y, z: at.z };
+}
+
 /** A one-line description of a rejected target object, for the error message. */
 function showTarget(target: object): string {
   try {
@@ -753,6 +854,9 @@ const ERROR_CODE_HINTS: Record<string, string> = {
   item_not_usable:
     "the module refused use_item for that bag/slot — the item there has no on-use spell, no quest to start and does not open for loot, " +
     "or the slot is empty or shifted (slots move after looting/selling); check state.bag()",
+  no_spell_to_target:
+    "that item has no on-use spell to aim: it starts a quest or opens for loot, and neither takes a targetItem or targetPoint; " +
+    "nothing was sent — use it without them",
   opcode_not_allowed:
     "sdk.raw() sends only the CMSG_* opcodes on the module's raw allowlist, and this one is not on it — " +
     "where an sdk method sends that opcode (castSpell, questAccept, ...) call the method, otherwise it cannot be sent; " +
@@ -2244,8 +2348,39 @@ export interface QuestOptions {
   timeout?: number;
 }
 
+/**
+ * An item the character carries or wears, as a cast's item target: its name,
+ * its guid, `{ bag, slot }` as `state.bag()` lists it, or a worn slot as
+ * `{ bag: 255, slot }` with the `state.inventory` slot (main hand 15, off hand
+ * 16), or a row from either.
+ */
+export type ItemTargetRef = string | { readonly bag: number; readonly slot: number } | { readonly guid: string };
+
+/**
+ * What a cast aims at besides a unit, for `castSpell` and `useItem`. Each is
+ * sent the way a client sends it, in the cast's target block, and the server
+ * judges it.
+ */
+export interface CastTargetOptions {
+  /**
+   * An item to cast on (`TARGET_FLAG_ITEM`), for a spell or item that acts
+   * on another item. Feed Pet on food:
+   * `castSpell(6991, undefined, { targetItem: "Tough Jerky" })`.
+   */
+  targetItem?: ItemTargetRef;
+  /**
+   * A point on the ground to cast at (`TARGET_FLAG_DEST_LOCATION`), for a
+   * spell or item aimed at the ground: `{ x, y, z }`, or a unit (its guid or
+   * name) standing for where it is now.
+   * `castSpell(10, undefined, { targetPoint: { x: -8913.2, y: -136.5, z: 81.9 } })`.
+   * All three axes are needed: nothing a client observes gives the ground
+   * height at an arbitrary x, y.
+   */
+  targetPoint?: GuidOrUnit | { readonly x: number; readonly y: number; readonly z: number };
+}
+
 /** Options for `useItem`. */
-export interface UseItemOptions extends QuestOptions {
+export interface UseItemOptions extends QuestOptions, CastTargetOptions {
   /**
    * For a glyph: the glyph slot to inscribe it into, 0-5 — the index a
    * client's glyph frame sends with the glyph. Default 0. The server refuses a
@@ -2406,8 +2541,25 @@ function onUseSpellOf(state: StateCache, item: BagSlotItem | undefined): number 
   return state.items.get(item.itemId)?.value?.spells?.find((s) => s.trigger === ITEM_SPELLTRIGGER_ON_USE && s.spellId > 0)?.spellId;
 }
 
-/** The hint for a use the server refused before the cast began. */
-function useItemCastFailedHint(label: string, spellId: number, result: number, reason: string | undefined): string {
+/**
+ * The hint for a use the server refused before the cast began. A use aimed
+ * at an item or a point names it, and says what the refusal means.
+ */
+function useItemCastFailedHint(
+  label: string,
+  spellId: number,
+  result: number,
+  reason: string | undefined,
+  aim: CastAim & { targetGuid?: unknown } = {},
+): string {
+  if (aim.targetItem !== undefined || aim.targetPoint !== undefined) {
+    const on = (aim.targetItem === undefined ? "" : ` on ${aim.targetItem.label}`) +
+      (aim.targetPoint === undefined ? "" : ` at ${fmtPoint(aim.targetPoint)}`);
+    const cause = reason === undefined ? undefined : aimedCause({ ...aim, targetGuid: aim.targetGuid === undefined ? undefined : "" }, reason);
+    const meaning = cause === undefined ? undefined : CAST_FAILURE_MEANING[cause];
+    return `${label} was not used${on}: the server refused its spell ${spellId} before the cast began ` +
+      `(${reason ?? `code ${result}`}${meaning === undefined ? "" : `: ${meaning}`})`;
+  }
   if (result === SPELL_FAILED_NOT_READY) {
     return (
       `${label} was not used: the server answered not_ready, so a cooldown is still running: the item's own, ` +
@@ -2422,6 +2574,10 @@ function useItemCastFailedHint(label: string, spellId: number, result: number, r
 interface PendingCast {
   readonly spellId: number;
   readonly targetGuid: string | undefined;
+  /** The item it was aimed at (`targetItem`), with the words a hint names it by. */
+  readonly targetItem?: { readonly guid: string; readonly label: string };
+  /** The point it was aimed at (`targetPoint`). */
+  readonly targetPoint?: MovePoint;
   /** The stream position before the dispatch: a refusal can land before the ack. */
   readonly sinceSeq: number | undefined;
   /** When it was dispatched (epoch ms): a move sent after this is one the cast was standing through. */
@@ -2520,6 +2676,23 @@ const CAST_FAILURE_MEANING: Readonly<Record<string, string>> = {
   target_not_in_party: "the target is not in your party",
   level_requirement: "your level is too low for it",
   no_pet: "you have no pet",
+  // A cast aimed at an item (`targetItem`) or a point (`targetPoint`). The
+  // keys past the core's names are the causes `aimedCause` reads those as.
+  item_gone: "the item it was aimed at is no longer there",
+  item_not_found: "it needs an item to act on (targetItem)",
+  wrong_pet_food: "your pet does not eat that food",
+  food_lowlevel: "that food is too low level for your pet",
+  cant_be_disenchanted: "that item cannot be disenchanted",
+  cant_be_prospected: "that item cannot be prospected",
+  cant_be_milled: "that item cannot be milled",
+  need_more_items: "it needs a bigger stack of that item (prospecting and milling take five)",
+  low_castlevel: "your profession skill is too low for that target",
+  bad_item_target: "this spell cannot take that item",
+  item_not_fit: "that item is not a kind this spell can be used on",
+  bad_point: "this spell cannot be aimed at that point",
+  point_out_of_range: "the point is out of this spell's range",
+  point_too_close: "the point is too close",
+  point_line_of_sight: "something blocks the line of sight to the point",
 };
 
 /**
@@ -2537,6 +2710,7 @@ const CAST_FAILURE_WEAPON_SLOT: Readonly<Record<string, { slot: number; words: s
  * background routine says which cast it was.
  */
 function castFailedHint(state: StateCache, cast: PendingCast, reason: string, cause: string = reason, casting?: string): string {
+  cause = aimedCause(cast, cause);
   if (cause === "bad_targets") cause = badTargetsCause(state, cast);
   const spell = state.spell(cast.spellId)?.name;
   const label = spell === undefined ? `spell ${cast.spellId}` : `${spell} (${cast.spellId})`;
@@ -2546,6 +2720,8 @@ function castFailedHint(state: StateCache, cast: PendingCast, reason: string, ca
     const name = state.nearby.get(key)?.name?.value ?? state.nameOf(key);
     on = ` on ${name ?? cast.targetGuid}`;
   }
+  if (cast.targetItem !== undefined) on += ` on ${cast.targetItem.label}`;
+  if (cast.targetPoint !== undefined) on += ` at ${fmtPoint(cast.targetPoint)}`;
   // Our own cast still running says more than the refusal's own words:
   // the 2026-10-21 mage's routine sent a cast 11 ms after the last one and
   // read not_ready as a cooldown.
@@ -2564,6 +2740,30 @@ function castFailedHint(state: StateCache, cast: PendingCast, reason: string, ca
   // The reason itself is the tally line's status (`castSpell <reason>: …`), so
   // the hint says what it means and names nothing twice.
   return `${label}${on}: ${meaning ?? "the server refused it"}${broken}`;
+}
+
+/**
+ * What a refusal means for a cast aimed at an item or a point and at no
+ * unit: the core answers a target item that does not fit the spell
+ * `equipped_item_class` (`Spell::CheckItems`, `IsFitToSpellRequirements`),
+ * and its range and sight checks measure to the point.
+ */
+function aimedCause(cast: Pick<PendingCast, "targetGuid" | "targetItem" | "targetPoint">, cause: string): string {
+  if (cast.targetGuid !== undefined) return cause;
+  if (cast.targetItem !== undefined) {
+    if (cause === "bad_targets") return "bad_item_target";
+    if (cause === "equipped_item_class") return "item_not_fit";
+  }
+  if (cast.targetPoint !== undefined) {
+    if (cause === "bad_targets") return "bad_point";
+    if (cause === "out_of_range" || cause === "too_close" || cause === "line_of_sight") return `point_${cause}`;
+  }
+  return cause;
+}
+
+/** A ground target as a hint names it: "(x, y, z)" to a tenth of a yard. */
+function fmtPoint(p: MovePoint): string {
+  return `(${fmtXY(p)}, ${p.z.toFixed(1)})`;
 }
 
 /**
@@ -4696,14 +4896,35 @@ export class WrathClient {
    * `SMSG_SPELL_FAILURE` with `reason`. A failure is also tallied as a
    * harness hint (`castSpell <reason>`, naming the spell and the target), so
    * it reaches the model whether a snippet or a background routine cast it.
+   * `options` aims it at an item or a point on the ground instead
+   * (`CastTargetOptions`).
    */
-  castSpell(spellId: number, targetGuid?: GuidOrUnit): Promise<WithResolved<ActionResponse>> {
-    if (targetGuid === undefined) return this.trackedCast(spellId, undefined);
-    return this.byName(targetGuid, "castSpell(spellId, targetGuid)", (guid) => this.trackedCast(spellId, guid));
+  castSpell(spellId: number, targetGuid?: GuidOrUnit, options: CastTargetOptions = {}): Promise<WithResolved<ActionResponse>> {
+    const aim = this.castAim(options, "castSpell");
+    const run = (guid: string | undefined) => this.trackedCast(spellId, guid, aim).then((out) => withResolved(aim, out));
+    if (targetGuid === undefined) return run(undefined);
+    return this.byName(targetGuid, "castSpell(spellId, targetGuid)", run);
+  }
+
+  /**
+   * A cast's item and ground targets, resolved where the caller stands: a
+   * referent that names nothing throws before anything is sent.
+   */
+  private castAim(options: CastTargetOptions, method: string): CastAim {
+    const aim: CastAim = {};
+    if (options.targetItem !== undefined) {
+      const item = resolveItemTarget(this.state, options.targetItem, `${method}(..., { targetItem })`);
+      aim.targetItem = { guid: item.guid, label: item.label };
+      if (item.resolved !== undefined) aim.resolved = item.resolved;
+    }
+    if (options.targetPoint !== undefined) {
+      aim.targetPoint = resolveCastPoint(this.state, options.targetPoint, `${method}(..., { targetPoint })`);
+    }
+    return aim;
   }
 
   /** The `cast_spell` POST, watched for the server's verdict (`castVerdict`). */
-  private async trackedCast(spellId: number, targetGuid: string | undefined): Promise<ActionResponse> {
+  private async trackedCast(spellId: number, targetGuid: string | undefined, aim: CastAim = {}): Promise<ActionResponse> {
     // The two casts the cache can tell will never go off, refused with
     // nothing sent: a dead caster (a body or a ghost; the core answers
     // caster_dead), save Stuck, which may be cast dead (`STUCK_SPELL`), and a
@@ -4723,6 +4944,8 @@ export class WrathClient {
     const cast: PendingCast = {
       spellId,
       targetGuid,
+      ...(aim.targetItem === undefined ? {} : { targetItem: aim.targetItem }),
+      ...(aim.targetPoint === undefined ? {} : { targetPoint: aim.targetPoint }),
       sinceSeq: this.events.recent(1)[0]?.seq,
       sentAt: Date.now(),
       expiresAt: Date.now() + CAST_VERDICT_MS,
@@ -4730,7 +4953,7 @@ export class WrathClient {
     };
     this.pendingCasts.set(spellId, cast);
     try {
-      return await this.dispatchCast(spellId, targetGuid);
+      return await this.dispatchCast(spellId, targetGuid, aim);
     } catch (err) {
       if (this.pendingCasts.get(spellId) === cast) this.pendingCasts.delete(spellId);
       throw err;
@@ -4773,10 +4996,10 @@ export class WrathClient {
   }
 
   /** The bare `cast_spell` POST, for helpers that read the verdict themselves (`openChest`). */
-  private dispatchCast(spellId: number, targetGuid: string | undefined): Promise<ActionResponse> {
+  private dispatchCast(spellId: number, targetGuid: string | undefined, aim: CastAim = {}): Promise<ActionResponse> {
     return targetGuid === undefined
-      ? this.action({ action: "cast_spell", spellId })
-      : this.action({ action: "cast_spell", spellId, targetGuid });
+      ? this.action({ action: "cast_spell", spellId, ...aimFields(aim) })
+      : this.action({ action: "cast_spell", spellId, targetGuid, ...aimFields(aim) });
   }
 
   /**
@@ -5387,6 +5610,11 @@ export class WrathClient {
    * emptied as `lootCorpse` empties a corpse's: the answer is `looted`,
    * `none_stored` or `empty` with what reached the bag, or `refused` with the
    * `InventoryResult` (a locked lockbox).
+   *
+   * `options.targetItem` and `options.targetPoint` aim the item's spell at
+   * another item or a point on the ground (`CastTargetOptions`), a poison on
+   * the main-hand weapon:
+   * `useItem("Instant Poison", undefined, undefined, { targetItem: { bag: 255, slot: 15 } })`.
    */
   async useItem(bagOrName: number | string, slot?: number | GuidOrUnit, targetGuid?: GuidOrUnit, options: UseItemOptions = {}): Promise<WithResolved<UseItemResult>> {
     // `useItem("Healing Potion", guid)`: with a name, the second argument
@@ -5399,8 +5627,12 @@ export class WrathClient {
     if (glyphSlot !== undefined && !(Number.isInteger(glyphSlot) && glyphSlot >= 0 && glyphSlot < GLYPH_SLOTS)) {
       throw new TypeError(`useItem(..., { glyphSlot }): glyphSlot is a glyph slot 0-${GLYPH_SLOTS - 1} (got ${JSON.stringify(glyphSlot)})`);
     }
-    const where = resolveItemSlot(this.state.bag().items, bagOrName, slot as number | undefined, "useItem(bagOrName, slot?)", "state.bag()");
-    if ("refusal" in where) throw new TypeError(where.refusal);
+    const found = resolveItemSlot(this.state.bag().items, bagOrName, slot as number | undefined, "useItem(bagOrName, slot?)", "state.bag()");
+    if ("refusal" in found) throw new TypeError(found.refusal);
+    const aim = this.castAim(options, "useItem");
+    // The used item's own fuzzy match is the one reported; a target item's
+    // only when the used item matched exactly.
+    const where = found.resolved === undefined && aim.resolved !== undefined ? { ...found, resolved: aim.resolved } : found;
     const { bag } = where;
     slot = where.slot;
     const item = this.state.bag().items.find((i) => i.bag === bag && i.slot === slot);
@@ -5432,6 +5664,7 @@ export class WrathClient {
           slot,
           targetGuid: targetGuid === undefined ? undefined : this.targetGuid(targetGuid, "useItem(..., targetGuid)"),
           ...(glyphSlot === undefined ? {} : { glyphSlot }),
+          ...aimFields(aim),
         });
       } catch (err) {
         // A bare item_not_usable cannot be told apart from "the slot shifted
@@ -5448,7 +5681,7 @@ export class WrathClient {
         throw err;
       }
       if (spellId !== undefined && item !== undefined) {
-        const refusal = await this.useItemVerdict(item, spellId, sinceSeq);
+        const refusal = await this.useItemVerdict(item, spellId, sinceSeq, { targetGuid, ...aim });
         if (refusal !== undefined) return withResolved(where, refusal);
       }
       if (opens) return withResolved(where, await this.openedItemLoot(item, sinceSeq, stored, options.timeout ?? 10_000));
@@ -5527,6 +5760,7 @@ export class WrathClient {
     item: BagSlotItem,
     spellId: number,
     sinceSeq: number | undefined,
+    aim: CastAim & { targetGuid?: unknown } = {},
   ): Promise<Extract<UseItemResult, { ok: false }> | undefined> {
     const self = this.state.self.guid;
     const ownCast = (casterGuid: string) => self === undefined || guidKey(casterGuid) === self;
@@ -5549,7 +5783,7 @@ export class WrathClient {
     const label = JSON.stringify(item.name ?? `item ${item.itemId ?? "?"}`);
     if (isEvent(verdict, "SMSG_CAST_FAILED")) {
       const d = verdict.data as CastFailedData;
-      const hint = useItemCastFailedHint(label, spellId, d.result, d.reason);
+      const hint = useItemCastFailedHint(label, spellId, d.result, d.reason, aim);
       this.noteActionHint("useItem", "cast_failed", hint);
       return { ok: false, status: "cast_failed", spellId, result: d.result, reason: d.reason, hint };
     }
@@ -9686,6 +9920,7 @@ export const CLIENT_PLUMBING: ReadonlySet<string> = new Set([
   "openChest",
   "emptyLootWindow",
   "useItemVerdict",
+  "castAim",
   "openedItemLoot",
   "targetRef",
   "byName",

@@ -212,6 +212,18 @@ export interface CreateSessionRequest {
 }
 
 /**
+ * The targets a cast takes beyond a unit, on `cast_spell` and `use_item`: an
+ * item the character holds (`TARGET_FLAG_ITEM`) and a point on the ground
+ * (`TARGET_FLAG_DEST_LOCATION`, all three axes or none).
+ */
+export interface CastTargetFields {
+  itemTargetGuid?: string;
+  destX?: number;
+  destY?: number;
+  destZ?: number;
+}
+
+/**
  * POST /action body. The union widens as PROTOCOL.md grows, and `action` stays
  * the discriminant.
  *
@@ -230,7 +242,7 @@ export type ActionRequest =
   | { token: string; action: "clear_target" }
   | { token: string; action: "attack_start"; guid: string }
   | { token: string; action: "attack_stop" }
-  | { token: string; action: "cast_spell"; spellId: number; targetGuid?: string }
+  | { token: string; action: "cast_spell"; spellId: number; targetGuid?: string } & CastTargetFields
   | { token: string; action: "cancel_cast"; spellId: number }
   | { token: string; action: "interact"; guid: string }
   | { token: string; action: "gossip_hello"; guid: string }
@@ -255,7 +267,7 @@ export type ActionRequest =
   | { token: string; action: "sell_item"; guid: string; itemGuid: string; count?: number }
   | { token: string; action: "repair_all"; guid: string }
   | { token: string; action: "equip_item"; bag: number; slot: number }
-  | { token: string; action: "use_item"; bag: number; slot: number; targetGuid?: string; glyphSlot?: number }
+  | { token: string; action: "use_item"; bag: number; slot: number; targetGuid?: string; glyphSlot?: number } & CastTargetFields
   | { token: string; action: "destroy_item"; bag: number; slot: number; count?: number }
   // trainer extension
   | { token: string; action: "trainer_list"; guid: string }

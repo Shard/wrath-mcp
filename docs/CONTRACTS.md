@@ -33,7 +33,7 @@ The action set:
 - Session: create character (class, race, name), log in, log out.
 - Movement: move to position (client movement packets along a path), stop, face, jump is not required.
 - Targeting: set target, clear target.
-- Combat: start and stop auto-attack, cast spell by id (with optional target), cancel cast.
+- Combat: start and stop auto-attack, cast spell by id (with optional target), cancel cast. A cast, or an item's use, may also carry an item target (`TARGET_FLAG_ITEM`, an item the character holds) and a ground target (`TARGET_FLAG_DEST_LOCATION`, a point the caller gives in full), in the target block a client writes; the server judges both.
 - Interaction: interact with object, open gossip with NPC, select gossip option.
 - Quests: accept quest from questgiver, complete and choose reward, abandon quest. Quest-start items: an item whose template starts a quest and has no on-use spell is not a `CMSG_USE_ITEM` — the core drops spell id 0 as unknown — so `use_item` on it sends what a client's right-click sends, `CMSG_QUESTGIVER_QUERY_QUEST` with the item's own guid as the questgiver, and the accept names the item guid the same way; the server offers with `SMSG_QUESTGIVER_QUEST_DETAILS`. The quest id is the item template's (client-cache knowledge, as the on-use spell id already is).
 - Loot: open loot, take item, take money, take all. Chests: the core ignores `CMSG_GAMEOBJ_USE` on a chest and drops `CMSG_LOOT` on a game object guid, so a chest is opened as a client opens one — `CMSG_CAST_SPELL` of the lock's Opening spell (`SPELL_EFFECT_OPEN_LOCK`) at it, then the same store/money/release sequence.
