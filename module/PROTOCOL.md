@@ -701,7 +701,9 @@ Success `200`: `{ "ok": true, "action": "jump", "etaMs": <u64> }`, `etaMs`
 the arc's time to its landing (absent when none was found). Refused with
 nothing sent, `409 {"ok":false,"error":<code>}`: `controlling` (the client
 moves another unit), `falling` (already on an arc), `flying` (hovering on a
-flying mount, move_to "Flying"), `rooted` (a root or a stun), `moving` (a
+flying mount, move_to "Flying"), `in_flight` (on a taxi flight or a
+server spline: a charge, a scripted jump), `stunned` (StunnedFor),
+`rooted`, `moving` (a
 walk is running: stop first, as for `face`), `swimming` (a swimmer's jump
 key rises in the water, which is not modelled), `on_transport` (aboard a
 transport or a vehicle seat: the arc is not carried by the deck).
@@ -1375,8 +1377,19 @@ off a ledge hurts. The landing is served as `WB_SELF_MOVE` with cause
 `knockback`. A walk in progress ends `knocked_back`, with no stop sent: the
 ack is its next packet. A body hovering after a flight is not thrown (a
 flying client's knockback is not modelled): its ack restates where it
-hovers. A vehicle's or a possessed unit's knockback is left unanswered, as
-before: the server keeps that unit where it stood.
+hovers. Left unanswered, as before (the server keeps the body where it
+stood): a vehicle's or a possessed unit's knockback; one aboard a
+transport (a boat, a zeppelin: the arc would be the transport's moving
+frame's, which is not modelled, and an ack without the transport block
+would take the character off it); and one during a taxi flight or a server
+spline (a charge), the server's own movement, which drops client packets
+until it ends (`VerifyMovementInfo`), so no landing is reported. One
+pending across a teleport or a new world is dropped, never answered at the
+destination. A known gap: the knockback ack does not move the server's
+fall start (`ProcessMovementInfo` skips it for this opcode), so a
+knockback straight after a server spline that ended on lower ground (a
+charge down a slope) is charged from the height of the last packet before
+the spline.
 
 Arcs. A body in the air outside a walk — a jump, a knockback, a fall after
 can-fly is lost (move_to, "Flying") — flies the core's own curve

@@ -64,6 +64,18 @@ describe("jump", () => {
     await done();
   });
 
+  test.each([
+    ["stunned", /stunned.*cannot jump/],
+    ["rooted", /rooted and cannot jump/],
+    ["in_flight", /the server is moving you/],
+  ])("the module's %s refusal is a value with its own hint", async (code, hint) => {
+    const { client, done } = await session(refuse(code));
+    const r = await client.jump();
+    expect(r).toMatchObject({ ok: false, status: code });
+    expect(r.ok ? "" : r.hint).toMatch(hint);
+    await done();
+  });
+
   test("no landing within the timeout is unconfirmed", async () => {
     const { client, done } = await session();
     expect(await client.jump({ timeout: 50 })).toMatchObject({ ok: false, status: "unconfirmed" });

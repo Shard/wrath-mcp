@@ -4337,7 +4337,8 @@ namespace WrathBench
     // the drop guard's 2y, so a jump never clears a step the walker refuses
     // as a climb. Refused, nothing sent (409): `controlling` while the client
     // moves another unit, `falling` on an arc, `flying` in the air,
-    // `rooted`, `moving` during a walk (stop first), `swimming` in water (a
+    // `in_flight` on a taxi or a server spline, `stunned`, `rooted`,
+    // `moving` during a walk (stop first), `swimming` in water (a
     // swimmer's jump key rises; not modelled), `on_transport` aboard one (the
     // arc is not carried by the deck).
     static constexpr float JUMP_VELOCITY = 7.955547f;
@@ -4358,6 +4359,10 @@ namespace WrathBench
             return refuse("falling");
         if (s->airborne.load())
             return refuse("flying");
+        if (player->IsInFlight() || player->HasUnitFlag(UNIT_FLAG_TAXI_FLIGHT) || !player->movespline->Finalized())
+            return refuse("in_flight");
+        if (StunnedFor(player))
+            return refuse("stunned");
         if (RootedFor(*s, player, player))
             return refuse("rooted");
         if (s->move.active)
@@ -5796,6 +5801,15 @@ namespace WrathBench
     // packet.
     void Manager::AnswerKnockBack(BenchSession& s, Player* player, BenchSession::PendingKnock const& k, int64_t nowMs)
     {
+        // The server's own movement holds the body (KnockbackFrom on a taxi
+        // rider or mid-spline): no client answers, and no landing is reported.
+        if (player->IsInFlight() || player->HasUnitFlag(UNIT_FLAG_TAXI_FLIGHT) || !player->movespline->Finalized()
+            || player->GetTransport() || player->GetVehicle())
+        {
+            Audit(s, "action", Json::Writer().Add("op", "knockback_ack").Add("counter", k.counter)
+                .Add("skipped", "server_movement").Str());
+            return;
+        }
         MoveState& m = s.move;
         float x = player->GetPositionX(), y = player->GetPositionY(), z = player->GetPositionZ();
         float o = player->GetOrientation();
@@ -6643,6 +6657,10 @@ namespace WrathBench
             s->arc.active = false;
             s->airborne.store(false);
             s->pendingFall.store(false);
+            {
+                std::lock_guard<std::mutex> lock(s->answerMutex);
+                s->pendingKnock = BenchSession::PendingKnock{};
+            }
             NoteFlightState(*s);
 
             char const* opcodeName;
@@ -7032,11 +7050,18 @@ namespace WrathBench
     // and a walk in progress ends `knocked_back` first. Only the
     // character's own guid while it is its own mover and on no seat: a
     // vehicle's or a possessed unit's knockback stays unanswered (the server
-    // then keeps that unit in place, as before).
+    // then keeps that unit in place, as before). So does one aboard a
+    // transport (a boat, a zeppelin, a tram): the arc would have to be flown
+    // in the transport's moving frame, which the module does not model, and
+    // an ack without the transport block would take the character off it.
+    // A taxi flight or a server spline (a charge, a jump the server drives)
+    // is the server's own movement, which no client packet can interrupt
+    // (VerifyMovementInfo drops them until the spline ends): not answered
+    // either, here and again on the tick (AnswerKnockBack).
     void Manager::OnKnockBackPacket(BenchSession& s, WorldSession* ws, WorldPacket const& packet)
     {
         Player* player = ws->GetPlayer();
-        if (!player || s.activeMover.load() != 0 || player->GetVehicle())
+        if (!player || s.activeMover.load() != 0 || player->GetVehicle() || player->GetTransport())
             return;
         BenchSession::PendingKnock k;
         uint64 guid = 0;
@@ -7628,9 +7653,14 @@ namespace WrathBench
         {
             s->stateMoveFlags.store(0);
             // A body arrives in a new world standing where the server put it,
-            // told it can fly again only if it still can (the aura's restate).
+            // told it can fly again only if it still can (the aura's restate),
+            // and owes no knockback from the old one.
             s->airborne.store(false);
             s->pendingFall.store(false);
+            {
+                std::lock_guard<std::mutex> lock(s->answerMutex);
+                s->pendingKnock = BenchSession::PendingKnock{};
+            }
             NoteFlightState(*s, true);
             // The character is its own mover again once it is in the map
             // (Player::SendInitialPacketsAfterAddToMap, SetMover(this)), and

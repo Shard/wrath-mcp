@@ -3814,7 +3814,8 @@ export interface JumpOptions {
  * down, `fromZ` the height it left from, `swimming` when it came down in
  * deep water. The refusals are the module's, nothing sent: `moving` (a walk
  * is running: stop first), `falling` (already in the air), `flying` (in the
- * air on a flying mount), `rooted`, `swimming`, `on_transport`,
+ * air on a flying mount), `in_flight` (a flight path or a server-driven
+ * move), `stunned`, `rooted`, `swimming`, `on_transport`,
  * `controlling` (the client moves another unit). `unconfirmed`: no landing
  * was reported within the timeout.
  */
@@ -3832,6 +3833,8 @@ export type JumpResult =
         | "moving"
         | "falling"
         | "flying"
+        | "in_flight"
+        | "stunned"
         | "rooted"
         | "swimming"
         | "on_transport"
@@ -3846,7 +3849,9 @@ const JUMP_REFUSALS: Readonly<Record<string, string>> = {
   moving: "a move is running; a jump is made standing: await sdk.stop(), then jump. Nothing was sent.",
   falling: "you are already in the air (a jump, a knockback or a fall); jump again once you have landed. Nothing was sent.",
   flying: "you are in the air on a flying mount; a flyer rises with moveTo(p, { fly: true }) instead. Nothing was sent.",
-  rooted: "you are rooted or stunned and cannot jump until it wears off. Nothing was sent.",
+  rooted: "you are rooted and cannot jump until it wears off. Nothing was sent.",
+  stunned: "you are stunned (state.self.stunned) and cannot jump until it wears off. Nothing was sent.",
+  in_flight: "the server is moving you (a flight path, a charge); jump once it has put you down. Nothing was sent.",
   swimming: "you are swimming; a swimmer cannot jump. Nothing was sent.",
   on_transport: "you are aboard a transport or a vehicle; jump once off it. Nothing was sent.",
   controlling: "you control another unit (state.self.control); it does not jump. Nothing was sent.",
