@@ -5612,9 +5612,7 @@ export class WrathClient {
    * `InventoryResult` (a locked lockbox).
    *
    * `options.targetItem` and `options.targetPoint` aim the item's spell at
-   * another item or a point on the ground (`CastTargetOptions`), a poison on
-   * the main-hand weapon:
-   * `useItem("Instant Poison", undefined, undefined, { targetItem: { bag: 255, slot: 15 } })`.
+   * another item or a point on the ground (`CastTargetOptions`).
    */
   async useItem(bagOrName: number | string, slot?: number | GuidOrUnit, targetGuid?: GuidOrUnit, options: UseItemOptions = {}): Promise<WithResolved<UseItemResult>> {
     // `useItem("Healing Potion", guid)`: with a name, the second argument

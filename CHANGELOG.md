@@ -107,9 +107,10 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   the encoding is unchanged. In the SDK, `castSpell(id, target?, { targetItem,
   targetPoint })` and the same two options on `useItem`: an item by name,
   guid or `{ bag, slot }` (worn slots as bag 255), a point `{ x, y, z }` or a
-  unit at its position. A point without z is refused with nothing sent. This
-  covers Feed Pet, poisons, stones and oils on a weapon, enchanting,
-  Disenchant, Prospecting and Milling, and ground-targeted spells and items.
+  unit at its position. A point without z is refused with nothing sent. These
+  are the target forms Feed Pet, poisons, stones and oils on a weapon,
+  enchanting, Disenchant, Prospecting and Milling, and ground-targeted spells
+  and items use.
   New module errors `invalid_item_target`, `invalid_dest`, `missing_dest` and
   `no_spell_to_target` (an item that starts a quest or opens for loot takes no
   target). Cast-failure hints name the item or the point and say what the
