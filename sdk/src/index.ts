@@ -30,6 +30,8 @@ export type {
   DeleteCharacterOptions,
   DismountOptions,
   DismountResult,
+  JumpOptions,
+  JumpResult,
   SpellClickResult,
   LeaveVehicleOptions,
   LeaveVehicleResult,

@@ -63,9 +63,10 @@ namespace WrathBench
     // A body in the air on a ballistic arc, as a client's physics fly it
     // (world thread only): where it left from, its velocity then, the jump
     // block its packets carry, and where and when the arc meets the ground
-    // (SimulateArc). Today one cause: `fall`, a character left in the air
-    // by a flight when the server takes its ability to fly away (a
-    // dismount, a no-fly zone).
+    // (SimulateArc). Three causes: `fall`, a character left in the air by a
+    // flight when the server takes its ability to fly away (a dismount, a
+    // no-fly zone); `jump`, the jump action; `knockback`, the server's
+    // SMSG_MOVE_KNOCK_BACK.
     struct ArcState
     {
         bool active{false};
@@ -378,6 +379,17 @@ namespace WrathBench
         };
         std::mutex answerMutex;
         std::vector<PendingAnswer> pendingAnswers;
+        // A knockback the server sent the character (SMSG_MOVE_KNOCK_BACK,
+        // OnKnockBackPacket), answered on the next world tick (TickArcs):
+        // the counter and the launch exactly as the packet gave them. Under
+        // answerMutex.
+        struct PendingKnock
+        {
+            bool has{false};
+            uint32_t counter{0};
+            float vcos{1}, vsin{0}, speedXY{0}, zspeed{0};  // zspeed as sent: -speedZ, negative upward
+        };
+        PendingKnock pendingKnock;
 
         // Teleport-ack pacing (world thread only): when the last ack for a
         // still-pending teleport was queued, 0 when none is pending. See
@@ -520,6 +532,7 @@ namespace WrathBench
         void DoMoveTo(std::string token, float x, float y, float z, std::string guid, bool force, bool fly, std::shared_ptr<std::promise<HttpReply>> ack);
         void DoStop(std::string token, std::shared_ptr<std::promise<HttpReply>> ack);
         void DoFace(std::string token, bool hasO, float o, bool hasXY, float x, float y, std::shared_ptr<std::promise<HttpReply>> ack);
+        void DoJump(std::string token, bool forward, std::shared_ptr<std::promise<HttpReply>> ack);
 
         // Outcome of resolving a move_to against the navmesh (world thread).
         // status is nullptr on success, else one of the typed causes in
@@ -753,6 +766,12 @@ namespace WrathBench
         // moment the server sends it. The ack is what tells observers the new
         // speed (HandleForceSpeedChangeAck relays MSG_MOVE_SET_*_SPEED).
         void OnSpeedChangePacket(BenchSession& s, WorldSession* ws, uint16_t opcode, WorldPacket const& packet);
+        // SMSG_MOVE_KNOCK_BACK for the character while it is its own mover
+        // (tap threads): kept as BenchSession::pendingKnock for TickArcs,
+        // which acks it and flies the arc.
+        void OnKnockBackPacket(BenchSession& s, WorldSession* ws, WorldPacket const& packet);
+        // Its world-tick half: CMSG_MOVE_KNOCK_BACK_ACK and the arc.
+        void AnswerKnockBack(BenchSession& s, Player* player, BenchSession::PendingKnock const& k, int64_t nowMs);
 
         // Send the answers the tap queued (BenchSession::pendingAnswers):
         // time-sync responses and speed-change acks, world thread only, for

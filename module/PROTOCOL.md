@@ -354,8 +354,8 @@ The login flow the module performs internally, all through the real handlers:
 
 ### POST /action
 
-Dispatch one action. Supported: `say`, `move_to`, `stop`, `face` (`move_to`,
-`stop`, `face` added in the movement extension; additive), and the
+Dispatch one action. Supported: `say`, `move_to`, `stop`, `face`, `jump` (`move_to`,
+`stop`, `face` added in the movement extension, `jump` after it; additive), and the
 quest/combat extension set (additive): `set_target`, `clear_target`,
 `attack_start`, `attack_stop`, `cast_spell`, `cancel_cast`, `interact`,
 `gossip_hello`, `gossip_select`, `quest_list`, `quest_details`, `quest_accept`,
@@ -673,6 +673,40 @@ eight directions relative to facing, so they cannot hold an arbitrary facing
 along a navmesh path either. A turn that the walk then follows would leave
 the path the module planned. So a `face` mid-walk is refused with nothing
 sent, and the character turns once it stands.
+
+#### jump
+
+Jump, as a client's jump key does, in place or forward. Request:
+`{ "token": "run-abc123", "action": "jump" }`, optional `forward` (boolean):
+jump at the character's run speed along its facing, as a running client
+jumps (turn first with `face`).
+
+The module sends `MSG_MOVE_JUMP` (0x0BB, `HandleMovementOpcodes`) where the
+character stands, with `MOVEMENTFLAG_FALLING` (and `FORWARD` when forward),
+`fallTime` 0 and the jump block `ReadMovementInfo` reads after it: zspeed
+-7.955547 (the stock client's jump launch, negative upward; no core path
+defines it, so it is the client's constant here), sin and cos of the facing,
+and xyspeed (the run speed forward, else 0). The body then flies the arc as
+a client's physics fly it (Arcs, below): a heartbeat every 500ms with the
+fall's clock and the block, and `MSG_MOVE_FALL_LAND` where it comes down
+(`MSG_MOVE_START_SWIM` into deep water), with no moving flag: the landing
+stands the character still. The server charges the landing as any fall
+(`Player::HandleFall`), from the arc's highest reported point. The landing
+is served as `WB_SELF_MOVE` with cause `jump`. With the core's gravity the
+launch rises about 1.64y (v²/2g), under the drop guard's 2y, so a jump never
+clears a step `move_to` refuses as a climb; what it does clear is a step or
+a fence the mesh leaves unjoined but a body can hop.
+
+Success `200`: `{ "ok": true, "action": "jump", "etaMs": <u64> }`, `etaMs`
+the arc's time to its landing (absent when none was found). Refused with
+nothing sent, `409 {"ok":false,"error":<code>}`: `controlling` (the client
+moves another unit), `falling` (already on an arc), `flying` (hovering on a
+flying mount, move_to "Flying"), `in_flight` (on a taxi flight or a
+server spline: a charge, a scripted jump), `stunned` (StunnedFor),
+`rooted`, `moving` (a
+walk is running: stop first, as for `face`), `swimming` (a swimmer's jump
+key rises in the water, which is not modelled), `on_transport` (aboard a
+transport or a vehicle seat: the arc is not carried by the deck).
 
 #### Single-opcode actions (quest/combat extension)
 
@@ -1321,13 +1355,62 @@ Water walking is kept but not lived, a known gap: the walker's water test
 Water Walking, Levitate) is still swum under the surface at swim speed where
 a client runs on it at run speed.
 
-`SMSG_MOVE_KNOCK_BACK` (0x0EF) is not answered: a client's
-`CMSG_MOVE_KNOCK_BACK_ACK` is the start of the arc (`MOVEMENTFLAG_FALLING`
-and the launch velocity, which the handler relays to observers as
-`MSG_MOVE_KNOCK_BACK`), and owes the arc's packets and a `MSG_MOVE_FALL_LAND`
-where the body comes down, which the module would have to simulate (collision
-included). Unanswered, the server keeps the character where it stood and
-observers see no knockback; nothing on the server waits on the ack.
+Knockbacks. `Unit::KnockbackFrom` (a knockback spell's effect; `Unit::JumpTo`
+too) sends a unit its client controls `SMSG_MOVE_KNOCK_BACK` (0x0EF):
+packGUID, the `u32` movement counter, then `f32 vcos`, `f32 vsin` (the
+direction away from the source, `Position::GetSinCos`), `f32 speedXY` and
+`f32 -speedZ` (negative upward). The module answers it for the character's
+own guid while the character is its own mover and on no seat, on the next
+world tick as a client answers on its next frame (module-internal client
+behaviour; the packet is not served): `CMSG_MOVE_KNOCK_BACK_ACK` (0x0F0),
+which `WorldSession::HandleMoveKnockBackAck` reads as packGUID, a `u32` it
+skips (the counter, echoed), and a MovementInfo with
+`MOVEMENTFLAG_FALLING`, `fallTime` 0 and the jump block — zspeed, sinAngle,
+cosAngle, xyspeed: the packet's `-speedZ`, `vsin`, `vcos` and `speedXY` —
+where the body leaves from (the walker's point during a walk, an arc's
+point on one, else the server's). The handler applies it (without moving
+the fall start, `ProcessMovementInfo`) and relays `MSG_MOVE_KNOCK_BACK` to
+the set. The body then flies the launch, across at `speedXY` and up at
+`speedZ` (Arcs, below), and comes down with `MSG_MOVE_FALL_LAND` (or
+`MSG_MOVE_START_SWIM`), which the server charges as any fall: a knockback
+off a ledge hurts. The landing is served as `WB_SELF_MOVE` with cause
+`knockback`. A walk in progress ends `knocked_back`, with no stop sent: the
+ack is its next packet. A body hovering after a flight is not thrown (a
+flying client's knockback is not modelled): its ack restates where it
+hovers. Left unanswered, as before (the server keeps the body where it
+stood): a vehicle's or a possessed unit's knockback; one aboard a
+transport (a boat, a zeppelin: the arc would be the transport's moving
+frame's, which is not modelled, and an ack without the transport block
+would take the character off it); and one during a taxi flight or a server
+spline (a charge), the server's own movement, which drops client packets
+until it ends (`VerifyMovementInfo`), so no landing is reported. One
+pending across a teleport or a new world is dropped, never answered at the
+destination. A known gap: the knockback ack does not move the server's
+fall start (`ProcessMovementInfo` skips it for this opcode), so a
+knockback straight after a server spline that ended on lower ground (a
+charge down a slope) is charged from the height of the last packet before
+the spline.
+
+Arcs. A body in the air outside a walk — a jump, a knockback, a fall after
+can-fly is lost (move_to, "Flying") — flies the core's own curve
+(`Movement::computeFallElevation`: gravity 19.29 y/s² to the terminal
+velocity, Feather Fall's slower one) from its launch, sampled every 50ms
+against the geometry a client has, under the edge drop's rules (`path_incomplete`
+above): the surface under each sample read from just over it (terrain,
+vmap and game-object floors, the water over them), the line between two
+samples clear of models at 1y over the feet and of terrain rising over it.
+It lands where the curve first meets the surface; where it runs into a
+model or a hillside it comes down in the last column it crossed, at the
+time a fall from there takes (the speed it had is not carried: a
+documented simplification). While it is in the air a heartbeat every
+500ms carries `FALLING`, the fall's clock and the jump block (the server
+moves its fall start only up on such a packet,
+`Player::UpdateFallInformationIfNeed`, so a landing is charged from the
+arc's highest reported point), and so does any ack the module sends then
+(root, speed, movement state): a packet with no fall clock would move the
+fall start. Areatriggers are tested at the landing, not in the air.
+Meanwhile `move_to` is refused `falling`, `face` `409 falling`, and `stop`
+sends nothing. A teleport ends the arc where the server puts the body.
 
 Vehicles and possession. A client moves exactly one unit, `Player::m_mover`:
 every movement packet and every root and movement-state ack must carry that
@@ -1579,7 +1662,7 @@ session's own identity). Their `opcodeId`s are outside the real opcode range.
 | `WB_TRANSPORT_PROGRESS` | 0xFF06 | `{ "guid": <guid-string>, "entry": <u32>, "pos": { "x","y","z","o" }, "progressMs": <u32>, "periodMs": <u32?>, "docked": <bool?>, "inRange": <bool?> }` — at most 1/s per session, one per transport on the character's map whose create block the session has received and that is within the map's visibility range of the character in 2D (`Map::GetVisibilityRange()`, the core's `Visibility.Distance.*` for the map — 100y on continents and 170y in instances by default — the distance the core sends every other object at; transports alone are sent map-wide) or is carrying it; a transport that leaves the range gets one last report with `"inRange": false` and no `docked` (its position as it left), then none until it is back: the car's current position on its `TransportAnimation.dbc` path (what a client animates locally from `pathProgress`), the clock and period, and `docked` when the keyframe segment the clock is on has no displacement (the car is dwelling at a platform; absent for transports without an animation path) |
 | `WB_AREATRIGGER` | 0xFF04 | `{ "triggerId": <u32>, "moveId": <number>, "pos": { "x","y","z","o" } }` — the character entered an `AreaTrigger.dbc` volume and `CMSG_AREATRIGGER` was sent for it (see below); `moveId` is the `move_to` that crossed into it, 0 when no move did (a taxi landing, a transport carrying the character, a teleport's arrival) |
 | `WB_PORTALS` | 0xFF0A | `{ "mapId": <u32>, "portals": [{ "triggerId": <u32>, "x", "y", "z", "toMap": <u32>, "toMapName"?: <str>, "toInstanceType"?: <u32> }] }` — the map-transition portals in view: every `AreaTrigger.dbc` volume on the character's map whose `areatrigger_teleport` row leads to another map, within the map's visibility range of the character in 2D (`Map::GetVisibilityRange()`, the range `WB_TRANSPORT_PROGRESS` uses). `x`,`y`,`z` is the volume's centre from the client's DBC; `toMap` is the map it leads to, named and typed from the client's `Map.dbc` as on `WB_AREA` (both absent for a map the table has no row for); the arrival point is never served. Tested at most once a second and sent only when the set or the map changes, the whole current set each time (`[]` once the last one is out of range); sent again after a reattach's `WB_SESSION_STATE`. A dungeon entrance is scenery and a trigger volume, never an object, so nothing else names it |
-| `WB_SELF_MOVE` | 0xFF09 | `{ "opcode": "MSG_MOVE_FALL_LAND", "cause": "taxi_landing", "pos": { "x","y","z","o" }, "fromZ": <f> }` — a movement packet the module sent for the character outside any `move_to`, as a client's own physics would: the drop from a taxi flight's last spline point (`fromZ`) to the ground under it (`pos`), cause `taxi_landing`, see "Taxi landing" below; and the landing of a fall from the air after the server took can-fly away mid-air, cause `fall` (`fromZ` the height it fell from; `opcode` `MSG_MOVE_START_SWIM` when it came down in deep water), see move_to, "Flying" |
+| `WB_SELF_MOVE` | 0xFF09 | `{ "opcode": "MSG_MOVE_FALL_LAND", "cause": "taxi_landing", "pos": { "x","y","z","o" }, "fromZ": <f> }` — a movement packet the module sent for the character outside any `move_to`, as a client's own physics would: the drop from a taxi flight's last spline point (`fromZ`) to the ground under it (`pos`), cause `taxi_landing`, see "Taxi landing" below; and the landing of an arc ("Arcs", below): cause `jump` (the `jump` action), `knockback` (a knockback the server sent), or `fall` (the server took can-fly away mid-air, move_to "Flying"), `fromZ` the height it left from, `opcode` `MSG_MOVE_START_SWIM` when it came down in deep water |
 | `WB_FLIGHT_STATE` | 0xFF0C | `{ "canFly": <bool>, "airborne": <bool> }` — the flight state this client holds (move_to, "Flying"): `canFly` the server's word for the character's own guid (`SMSG_MOVE_SET_CAN_FLY` / `SMSG_MOVE_UNSET_CAN_FLY`), `airborne` its body in the air after a flight that ended there. Sent when either changes, at every `SMSG_NEW_WORLD` and `SMSG_LOGIN_VERIFY_WORLD` (both false until the server restates can-fly), and in the reattach replay before `WB_REPLAY_DONE` |
 | `WB_AREA` | 0xFF07 | `{ "mapId": <u32>, "mapName"?: <str>, "instanceType"?: <u32>, "zoneId": <u32>, "zoneName": <str>, "areaId": <u32>, "areaName": <str> }` — the zone and subzone the character is in, named as the client names them, and the map it is on with the client's `Map.dbc` name and `InstanceType` for it (0 the open world, 1 a party dungeon, 2 a raid, 3 a battleground, 4 an arena; both absent when the table has no row for the map, never a guessed 0); once when the character enters the world and once per change of either area id, of the map or of the instance, whatever moved it (walking, a teleport, a map transfer). A transfer always sends one, with the new map's `mapId` and `instanceType`, even when both area ids stay the same: the Deadmines portal does, the mine outside on map 0 and map 36 inside being zone and area 1581 alike. See "Zone and area" below. |
 | `WB_TALENT_TREE` | 0xFF08 | the class talent frame, the answer to the `talent_tree` action; shape under "Spellbook, cooldowns, talents" below |
@@ -1787,8 +1870,12 @@ at the top of this document.
   character left the map for a non-teleport reason); `pos` is where the
   character actually is.
 - `stopped` — a `stop` action ended the move.
-- `falling` — the character's body is falling (move_to, "Flying"): a
-  refusal, nothing sent, no `pathLength`. Move once it has landed.
+- `falling` — the character's body is in the air on an arc (a jump, a
+  knockback, a fall after losing can-fly: "Arcs", below): a refusal,
+  nothing sent, no `pathLength`. Move once it has landed.
+- `knocked_back` — a knockback threw the character off the walk
+  ("Knockbacks", below); `pos` is where the server had it as the throw
+  began, and the landing follows as `WB_SELF_MOVE` (cause `knockback`).
 - `cannot_fly` — `fly` was asked of a character the server has not told
   it can fly: a refusal, nothing sent, no `pathLength`.
 - `superseded` — a newer `move_to` replaced this move.

@@ -82,6 +82,7 @@ import {
   type AchievementEarnedData,
   type MoveUpdateData,
   type MoveStatus,
+  type SelfMoveData,
   type MoveToResponse,
   type NewWorldData,
   type TransferAbortedData,
@@ -835,8 +836,8 @@ const ERROR_CODE_HINTS: Record<string, string> = {
     "await sdk.stop() and then face, or walk toward what you want to face",
   // Only face sends it: a stunned client cannot turn (a rooted one can).
   stunned: "you are stunned (state.self.stunned) and cannot turn until it wears off; nothing was sent",
-  // Only face sends it: a falling body turns nothing until it lands.
-  falling: "you are falling and cannot turn until you land; nothing was sent",
+  // Only face sends it: a body in the air turns nothing until it lands.
+  falling: "you are in the air (falling) and cannot turn until you land; nothing was sent",
   missing_guid:
     "this action needs a guid argument — get one from state.nearbyUnits() or state.closest(...)",
   missing_position: "move_to needs finite x, y and z numbers",
@@ -1320,6 +1321,8 @@ export const MOVE_HINTS: Readonly<Record<string, (point: MovePoint, data: MoveRe
   // flight was asked of a character that cannot fly (`cannot_fly`).
   falling: () => FALLING_MOVE_HINT,
   cannot_fly: () => CANNOT_FLY_HINT,
+  // A knockback threw the character off its walk (`knocked_back`).
+  knocked_back: () => KNOCKED_BACK_HINT,
   // The client moves another unit (module/PROTOCOL.md, `controlling`): a
   // refusal carries no route, a walk the handover ended does.
   controlling: (_p, d) => (d.pathLength === undefined ? CONTROLLING_MOVE_HINT : CONTROLLING_WALK_HINT),
@@ -1387,8 +1390,13 @@ const STUNNED_WALK_HINT = "a stun stopped you mid-walk where you stand; you cann
 
 /** `falling`: the body is falling and steers nothing until it lands. Proposed wording. */
 const FALLING_MOVE_HINT =
-  "you are falling (you lost the ability to fly in the air) and cannot move until you land; the move was not sent. " +
-  "Move again once state.self.position shows you on the ground.";
+  "you are in the air (a jump, a knockback, or a fall after losing the ability to fly) and cannot move until you " +
+  "land; the move was not sent. Move again once you have landed.";
+
+/** `knocked_back`: a knockback ended the walk. Proposed wording. */
+const KNOCKED_BACK_HINT =
+  "a knockback threw you off this walk; you come down where it threw you (state.self.position updates on the " +
+  "landing). Move again from there once you have landed.";
 
 /** `cannot_fly`: `fly` for a character the server has not said can fly. Proposed wording. */
 const CANNOT_FLY_HINT =
@@ -3793,6 +3801,62 @@ export interface DismountOptions {
  *   the rider mounted until the landing, so nothing was sent.
  * - `unconfirmed`: sent, and no update clearing the mount arrived in time.
  */
+export interface JumpOptions {
+  /** Jump forward at the run speed, as a running client jumps; in place without it. */
+  forward?: boolean;
+  /** How long to wait for the landing, in ms. Default 5000 (a jump is under a second on level ground). */
+  timeout?: number;
+}
+
+/**
+ * The outcome of `jump`, as a value. `landed` is the module's report of the
+ * landing (`WB_SELF_MOVE` cause `jump`): `position` where the body came
+ * down, `fromZ` the height it left from, `swimming` when it came down in
+ * deep water. The refusals are the module's, nothing sent: `moving` (a walk
+ * is running: stop first), `falling` (already in the air), `flying` (in the
+ * air on a flying mount), `in_flight` (a flight path or a server-driven
+ * move), `stunned`, `rooted`, `swimming`, `on_transport`,
+ * `controlling` (the client moves another unit). `unconfirmed`: no landing
+ * was reported within the timeout.
+ */
+export type JumpResult =
+  | {
+      readonly ok: true;
+      readonly status: "landed";
+      readonly position: UnitPosition;
+      readonly fromZ: number;
+      readonly swimming?: true;
+    }
+  | {
+      readonly ok: false;
+      readonly status:
+        | "moving"
+        | "falling"
+        | "flying"
+        | "in_flight"
+        | "stunned"
+        | "rooted"
+        | "swimming"
+        | "on_transport"
+        | "controlling"
+        | "unconfirmed"
+        | (string & {});
+      readonly hint: string;
+    };
+
+/** The module's `jump` refusals (409), as `jump` words them. Proposed wording. */
+const JUMP_REFUSALS: Readonly<Record<string, string>> = {
+  moving: "a move is running; a jump is made standing: await sdk.stop(), then jump. Nothing was sent.",
+  falling: "you are already in the air (a jump, a knockback or a fall); jump again once you have landed. Nothing was sent.",
+  flying: "you are in the air on a flying mount; a flyer rises with moveTo(p, { fly: true }) instead. Nothing was sent.",
+  rooted: "you are rooted and cannot jump until it wears off. Nothing was sent.",
+  stunned: "you are stunned (state.self.stunned) and cannot jump until it wears off. Nothing was sent.",
+  in_flight: "the server is moving you (a flight path, a charge); jump once it has put you down. Nothing was sent.",
+  swimming: "you are swimming; a swimmer cannot jump. Nothing was sent.",
+  on_transport: "you are aboard a transport or a vehicle; jump once off it. Nothing was sent.",
+  controlling: "you control another unit (state.self.control); it does not jump. Nothing was sent.",
+};
+
 export type DismountResult =
   | { readonly ok: true; readonly status: "dismounted" }
   | { readonly ok: false; readonly status: "not_mounted" | "in_flight" | "airborne" | "unconfirmed"; readonly hint: string };
@@ -5046,6 +5110,53 @@ export class WrathClient {
         ? { token: this.token, action: "face", orientation: orientationOrPoint }
         : { token: this.token, action: "face", x: orientationOrPoint.x, y: orientationOrPoint.y };
     return this.request("POST", "/action", body, faceResponseSchema);
+  }
+
+  /**
+   * Jump, as the client's jump key does: in place, or `{ forward: true }` at
+   * the run speed along the facing (turn first with `face`). The module sends
+   * `MSG_MOVE_JUMP` and flies the arc a client's physics fly, and the server
+   * takes the landing as it takes any fall. Waits for the landing and
+   * returns where the body came down. A jump rises about 1.6 yards, so it
+   * does not clear a step `moveTo` refuses as a climb (`drop` with a
+   * positive `dz`, over 2 yards).
+   */
+  async jump(options: JumpOptions = {}): Promise<JumpResult> {
+    const forward = options.forward === true;
+    const epoch = this.events.epoch;
+    const sinceSeq = this.state.lastSeq;
+    try {
+      await this.action({ action: "jump", ...(forward ? { forward: true } : {}) });
+    } catch (e) {
+      if (!(e instanceof WrathRequestError) || JUMP_REFUSALS[e.code] === undefined) throw e;
+      const hint = JUMP_REFUSALS[e.code] as string;
+      this.noteActionHint("jump", e.code, hint);
+      return { ok: false, status: e.code, hint };
+    }
+    let landed: StreamEvent;
+    try {
+      landed = await this.waitEvent(
+        (e) =>
+          e.seq > sinceSeq &&
+          isEvent(e, "WB_SELF_MOVE") &&
+          !isDecodeError(e.data) &&
+          (e.data as SelfMoveData).cause === "jump",
+        { timeout: options.timeout ?? 5_000, epoch, description: "the landing of the jump (WB_SELF_MOVE cause jump)" },
+      );
+    } catch (e) {
+      if (!(e instanceof EventTimeoutError)) throw e;
+      const hint = "no landing was reported for the jump; read state.self.position before jumping again";
+      this.noteActionHint("jump", "unconfirmed", hint);
+      return { ok: false, status: "unconfirmed", hint };
+    }
+    const d = landed.data as SelfMoveData;
+    return {
+      ok: true,
+      status: "landed",
+      position: { x: d.pos.x, y: d.pos.y, z: d.pos.z, o: d.pos.o },
+      fromZ: d.fromZ ?? d.pos.z,
+      ...(d.opcode === "MSG_MOVE_START_SWIM" ? { swimming: true as const } : {}),
+    };
   }
 
   // ------------------------------------- quest/combat actions (one per opcode)
