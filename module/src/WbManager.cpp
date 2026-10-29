@@ -10571,9 +10571,16 @@ namespace WrathBench
                         std::string text, boxText; p >> text >> boxText;
                         if (i) options += ',';
                         // `coded`: choosing it takes a typed code
-                        // (gossip_select's `code`).
-                        options += Json::Writer().Add("optionId", index).Add("icon", (uint32)icon)
-                            .Add("text", text).Add("coded", coded != 0).Str();
+                        // (gossip_select's `code`). `boxMoney` (copper) and
+                        // `boxText` are the cost and the confirm text a client
+                        // shows before the option is taken; left out when 0
+                        // and empty.
+                        Json::Writer opt;
+                        opt.Add("optionId", index).Add("icon", (uint32)icon)
+                            .Add("text", text).Add("coded", coded != 0);
+                        if (boxMoney) opt.Add("boxMoney", boxMoney);
+                        if (!boxText.empty()) opt.Add("boxText", boxText);
+                        options += opt.Str();
                     }
                     options += "]";
                     uint32 questCount; p >> questCount;

@@ -1515,6 +1515,10 @@ export const gossipOptionSchema = z.looseObject({
   text: z.string(),
   /** Choosing this option takes a typed code (`gossipSelect`'s `code`). */
   coded: z.boolean().optional(),
+  /** Copper the option costs, which a client confirms first. Absent when 0. */
+  boxMoney: z.number().optional(),
+  /** The confirm text a client shows before the option is taken. Absent when empty. */
+  boxText: z.string().optional(),
 });
 export type GossipOption = z.infer<typeof gossipOptionSchema>;
 

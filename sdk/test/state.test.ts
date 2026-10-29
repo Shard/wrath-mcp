@@ -1629,7 +1629,7 @@ describe("state cache: the gossip menu fold", () => {
       textId: 1,
       options: [
         { optionId: 0, icon: 0, text: "Train me" },
-        { optionId: 1, icon: 0, text: "Show wares", coded: false },
+        { optionId: 1, icon: 0, text: "Show wares", coded: false, boxMoney: 5000, boxText: "Pay 50 silver?" },
         { optionId: 2, icon: 0, text: "Enter the passphrase", coded: true },
       ],
       quests: [],
@@ -1643,13 +1643,13 @@ describe("state cache: the gossip menu fold", () => {
     data: {},
   });
 
-  test("SMSG_GOSSIP_MESSAGE folds into lastGossip and the snapshot, options and their coded flag", () => {
+  test("SMSG_GOSSIP_MESSAGE folds into lastGossip and the snapshot, options with their coded flag, cost and confirm text", () => {
     const c = StateCache.replay(toEvents([...worldStream, gossipMsg("2002", 70)]), { seed: SEED });
     const menu = c.lastGossip("2002");
     expect(menu?.menuId).toBe(5);
     expect(menu?.options).toEqual([
       { optionId: 0, text: "Train me", coded: false },
-      { optionId: 1, text: "Show wares", coded: false },
+      { optionId: 1, text: "Show wares", coded: false, boxMoney: 5000, boxText: "Pay 50 silver?" },
       { optionId: 2, text: "Enter the passphrase", coded: true },
     ]);
     expect(c.snapshot().gossip.get("2002")?.menuId).toBe(5);

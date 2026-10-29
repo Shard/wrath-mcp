@@ -163,8 +163,9 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   item-target codes mean (`wrong_pet_food`, `cant_be_disenchanted`,
   `item_gone`, …).
 - Gossip options that take a code. `SMSG_GOSSIP_MESSAGE` options carry
-  `coded` (and the menu fold in `state.lastGossip(guid).options[]` too), and
-  `gossip_select` takes an optional `code`, appended to
+  `coded`, and `boxMoney` (copper) and `boxText` (the confirm text a client
+  shows first), each left out when 0 or empty; the menu fold in
+  `state.lastGossip(guid).options[]` carries them too. `gossip_select` takes an optional `code`, appended to
   `CMSG_GOSSIP_SELECT_OPTION` as the core reads it for a coded menu item. In
   the SDK `gossipSelect(guid, option, code?)` and
   `gossipSelect(guid, menuId, optionId, code?)`; the by-text form refuses a

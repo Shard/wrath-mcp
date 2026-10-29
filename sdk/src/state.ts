@@ -1528,6 +1528,10 @@ export interface GossipMenuOption {
   readonly text: string;
   /** Choosing it takes a typed code: pass `gossipSelect` a `code`. */
   readonly coded: boolean;
+  /** Copper the option costs; absent when it is free. */
+  readonly boxMoney?: number;
+  /** The confirm text a client shows before the option is taken; absent when none. */
+  readonly boxText?: string;
 }
 
 /**
@@ -4697,12 +4701,18 @@ export class StateCache {
         const d = event.data as {
           guid: GuidKey;
           menuId: number;
-          options: readonly { optionId: number; text: string; coded?: boolean }[];
+          options: readonly { optionId: number; text: string; coded?: boolean; boxMoney?: number; boxText?: string }[];
         };
         this.gossipMenus.set(d.guid, {
           guid: d.guid,
           menuId: d.menuId,
-          options: d.options.map((o) => ({ optionId: o.optionId, text: o.text, coded: o.coded === true })),
+          options: d.options.map((o) => ({
+            optionId: o.optionId,
+            text: o.text,
+            coded: o.coded === true,
+            ...(o.boxMoney ? { boxMoney: o.boxMoney } : {}),
+            ...(o.boxText ? { boxText: o.boxText } : {}),
+          })),
           seq: event.seq,
           ts: event.ts,
         });
