@@ -12,11 +12,14 @@
 #
 #    WrathBench.Enable
 #        Description: Enable the WrathBench control module (HTTP/WS bridge).
-#        Default:     1 - Enabled
-#                     0 - Disabled
+#                     Off unless set: a worldserver that merely has the module
+#                     built in opens no control port. Set 1 here (or
+#                     AC_WRATH_BENCH_ENABLE=1 in the environment) to turn it on.
+#        Default:     0 - Disabled
+#                     1 - Enabled
 #
 
-WrathBench.Enable = 1
+WrathBench.Enable = 0
 
 #
 #    WrathBench.BindAddress
