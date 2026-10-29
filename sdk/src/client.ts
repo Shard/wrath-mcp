@@ -9188,7 +9188,16 @@ export class WrathClient {
       this.noteActionHint("leaveVehicle", "not_in_vehicle", hint);
       return { ok: false, status: "not_in_vehicle", hint };
     }
-    await this.action({ action: "vehicle_exit" });
+    try {
+      await this.action({ action: "vehicle_exit" });
+    } catch (e) {
+      // The module's own reading disagreed (the seat ended between the cache
+      // and the send): the same value, not a throw.
+      if (!(e instanceof WrathRequestError && e.code === "not_in_vehicle")) throw e;
+      const hint = "not in a vehicle (the module found no seat when the request arrived); nothing was sent";
+      this.noteActionHint("leaveVehicle", "not_in_vehicle", hint);
+      return { ok: false, status: "not_in_vehicle", hint };
+    }
     const off = (): boolean => this.state.self.vehicle === undefined;
     if (!off()) {
       try {
@@ -9227,7 +9236,14 @@ export class WrathClient {
       return { ok: false, status: "not_in_vehicle", hint };
     }
     const sinceSeq = this.state.lastSeq;
-    await this.action({ action: "vehicle_change_seat", seat });
+    try {
+      await this.action({ action: "vehicle_change_seat", seat });
+    } catch (e) {
+      if (!(e instanceof WrathRequestError && e.code === "not_in_vehicle")) throw e;
+      const hint = "not in a vehicle (the module found no seat when the request arrived); nothing was sent";
+      this.noteActionHint("changeSeat", "not_in_vehicle", hint);
+      return { ok: false, status: "not_in_vehicle", hint };
+    }
     const seated = (): boolean => {
       const v = this.state.self.vehicle;
       return v !== undefined && v.value.seat === seat && v.seq > sinceSeq;

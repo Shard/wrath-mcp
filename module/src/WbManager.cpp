@@ -6418,30 +6418,57 @@ namespace WrathBench
             .Raw("pos", PosJson(unit->GetPositionX(), unit->GetPositionY(), unit->GetPositionZ(), unit->GetOrientation())).Str());
     }
 
+    // The packGUID at the head of a packet, read in place (no copy: every
+    // SMSG_MONSTER_MOVE on the map passes OnSelfSpline, and only the
+    // character's own is read further). False on a short packet.
+    static bool PeekPackGUID(WorldPacket const& packet, uint64& guid)
+    {
+        if (packet.size() < 1)
+            return false;
+        uint8 const mask = packet[0];
+        size_t pos = 1;
+        guid = 0;
+        for (uint8 i = 0; i < 8; ++i)
+        {
+            if (!(mask & (uint8(1) << i)))
+                continue;
+            if (pos >= packet.size())
+                return false;
+            guid |= uint64(packet[pos++]) << (i * 8);
+        }
+        return true;
+    }
+
     // The splines a vehicle moves the character on: onto its seat
     // (Vehicle::AddPassenger, MoveSplineInit::SetTransportEnter) and off it
     // (Unit::_ExitVehicle, SetTransportExit), each sent to the character too
     // as SMSG_MONSTER_MOVE_TRANSPORT or SMSG_MONSTER_MOVE. A client reports
     // the end of each with CMSG_MOVE_SPLINE_DONE (packGUID, its MovementInfo,
-    // u32 spline id; TaxiHandler.cpp HandleMoveSplineDoneOpcode), which is
-    // what clears the "expecting a transport change" the core set when it
-    // launched the spline (Player::SetExpectingChangeTransport) and relays
-    // the body's root state to the set. The tap only notes the spline id
-    // (BenchSession::pendingSplineDone); the world tick sends the report
-    // once the core has run the spline to its end (TickSplineDone). Only the
-    // character's own guid, and only the two boarding flags: a taxi's spline
-    // is the server's own flight, ended by the core itself.
+    // u32 spline id; TaxiHandler.cpp HandleMoveSplineDoneOpcode). The core
+    // takes the report only while the character is its own mover — a
+    // passenger seat's boarding, and every exit (RemoveCharmedBy restores the
+    // mover before the exit spline) — and then clears the "expecting a
+    // transport change" it set when it launched the spline
+    // (Player::SetExpectingChangeTransport) and relays the body's root state
+    // to the set; from a driving seat the vehicle is the mover and the report
+    // is dropped (mover->GetGUID() != guid), as a stock client's is. The tap
+    // only notes the spline id (BenchSession::pendingSplineDone); the world
+    // tick sends the report once the core has run the spline to its end
+    // (TickSplineDone). Only the character's own guid, and only the two
+    // boarding flags: a taxi's spline is the server's own flight, ended by
+    // the core itself.
     void Manager::OnSelfSpline(BenchSession& s, WorldSession* ws, uint16_t opcode, WorldPacket const& packet)
     {
         Player* player = ws->GetPlayer();
         if (!player)
             return;
+        uint64 head = 0;
+        if (!PeekPackGUID(packet, head) || head != player->GetGUID().GetRawValue())
+            return;
         try
         {
             WorldPacket p(packet);
             uint64 guid = 0; p.readPackGUID(guid);
-            if (guid != player->GetGUID().GetRawValue())
-                return;
             if (opcode == SMSG_MONSTER_MOVE_TRANSPORT)
             {
                 uint64 transportGuid = 0; p.readPackGUID(transportGuid); // the vehicle: DecodeEvent serves it

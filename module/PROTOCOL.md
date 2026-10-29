@@ -1293,13 +1293,17 @@ with `SMSG_FORCE_MOVE_UNROOT` for the character (acked) and the exit spline,
 `SMSG_MONSTER_MOVE` with `MoveSplineFlag::TransportExit`, served as
 `transportExit: true`. A client reports the end of each of those two
 splines with `CMSG_MOVE_SPLINE_DONE` (0x2C9: packGUID, its MovementInfo, the
-`u32` spline id; `TaxiHandler.cpp` `HandleMoveSplineDoneOpcode`), which is
-what clears the transport change the core expects
+`u32` spline id; `TaxiHandler.cpp` `HandleMoveSplineDoneOpcode`). The core
+takes the report only while the character is its own mover — a passenger
+seat's boarding, and every exit (`RemoveCharmedBy` restores the mover before
+the exit spline) — and then clears the transport change it expects
 (`Player::SetExpectingChangeTransport`) and relays the body's root state;
-the module sends it on the world tick after the core has run the spline to
-its end (`Unit::UpdateSplineMovement`), for its own guid and those two
-splines only (module-internal, audited as `op: "spline_done"`). A taxi's
-spline is the server's own flight and is ended by the core itself.
+from a driving seat the vehicle is the mover and the report is dropped
+(`mover->GetGUID() != guid`), as a stock client's is. The module sends it on
+the world tick after the core has run the spline to its end
+(`Unit::UpdateSplineMovement`), for its own guid and those two splines only
+(module-internal, audited as `op: "spline_done"`). A taxi's spline is the
+server's own flight and is ended by the core itself.
 
 What the module does not do yet: drive the other unit. While the vehicle or
 the possessed unit is the mover, `move_to` and `face` are refused

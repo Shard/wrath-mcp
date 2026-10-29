@@ -229,6 +229,25 @@ describe("client: leaveVehicle and changeSeat", () => {
     await stub.stop();
   });
 
+  test("the module's own not_in_vehicle (the seat ended between the cache and the send) is the same value, not a throw", async () => {
+    const refuse = (action: string) =>
+      action === "vehicle_exit" || action === "vehicle_change_seat"
+        ? new Response(JSON.stringify({ ok: false, error: "not_in_vehicle" }), { status: 409, headers: { "content-type": "application/json" } })
+        : undefined;
+    const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate, board(20, SELF_GUID, 0)]), failAction: refuse });
+    const client = await inWorld(stub);
+    await client.events.waitForOpcode("SMSG_MONSTER_MOVE_TRANSPORT", { timeout: 2000 });
+    const left = await client.leaveVehicle({ timeout: 100 });
+    expect(left).toMatchObject({ ok: false, status: "not_in_vehicle" });
+    if (left.ok) throw new Error("unreachable");
+    expect(left.hint).toContain("the module found no seat");
+    const seated = await client.changeSeat(1, { timeout: 100 });
+    expect(seated).toMatchObject({ ok: false, status: "not_in_vehicle" });
+    expect(client.drainActionHints().map((h) => `${h.action}:${h.status}`)).toEqual(["leaveVehicle:not_in_vehicle", "changeSeat:not_in_vehicle"]);
+    client.close();
+    await stub.stop();
+  });
+
   test("changeSeat refuses when not aboard, and is `unconfirmed` when the server stays silent", async () => {
     const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate]) });
     const client = await inWorld(stub);
