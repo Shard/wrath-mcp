@@ -1,6 +1,6 @@
 # Observation and Action Contracts
 
-These two contracts are what make a server-side control module defensible as a benchmark surface. The module enforces them; the SDK assumes them; the write-up states them.
+These two contracts are what make a server-side control module defensible as a client-equivalent agent surface. The module enforces them; the SDK assumes them; this document states them.
 
 ## Observation contract
 
@@ -14,7 +14,7 @@ Allowed, with the client's limits:
 - Portals in view (operator decision of 2026-10-20, [Shard/WrathBench#276](https://github.com/Shard/WrathBench/issues/276)): the map-transition portals within the map's visibility range (the range every object is sent at). A dungeon entrance or exit is scenery and an area-trigger volume, never a unit or game object, so no packet names it, yet a player sees the portal and knows where it leads. Its position is the volume's centre from the client's own `AreaTrigger.dbc`; its destination is the map the server's `areatrigger_teleport` row names, with that map's `Map.dbc` name and instance type. The operator ruled the destination client-perceivable: what a player sees in the portal and reads off its zone text. Only triggers that lead to another map are served; the arrival point never is, and nothing beyond view range is.
 - Target: what the client shows for the current target.
 - Events: combat log entries, spell results, loot windows, quest updates, gossip menus, vendor lists, chat, death and release, zone changes, errors the client would display.
-- Map knowledge: nothing beyond what the SDK or reference bundle provides. The agent does not get the server navmesh or spawn tables. One bounded exception, operator decision of 2026-10-05: when a `move_to` fails `target_off_mesh`, the result names the walkable point nearest the *requested* point within 20y, or that there is none — a statement about the agent's own guess in a failure hint, the way a client's click-to-ground lands beside a point that is not ground. The agent still cannot query the navmesh: nothing answers a point that was not asked for as a destination, and a sweep of such answers only ever describes the agent's own guesses.
+- Map knowledge: nothing beyond what the SDK provides or a harness supplies as its own reference material. The agent does not get the server navmesh or spawn tables. One bounded exception, operator decision of 2026-10-05: when a `move_to` fails `target_off_mesh`, the result names the walkable point nearest the *requested* point within 20y, or that there is none — a statement about the agent's own guess in a failure hint, the way a client's click-to-ground lands beside a point that is not ground. The agent still cannot query the navmesh: nothing answers a point that was not asked for as a destination, and a sweep of such answers only ever describes the agent's own guesses.
 
 Not allowed, even though the server knows them:
 - Exact mob health when the client would show a percentage.
@@ -39,7 +39,7 @@ The action set:
 - Loot: open loot, take item, take money, take all. Chests: the core ignores `CMSG_GAMEOBJ_USE` on a chest and drops `CMSG_LOOT` on a game object guid, so a chest is opened as a client opens one — `CMSG_CAST_SPELL` of the lock's Opening spell (`SPELL_EFFECT_OPEN_LOCK`) at it, then the same store/money/release sequence.
 - Vendor: list, buy, sell, repair.
 - Inventory: equip item, use item, destroy item.
-- Chat: say. Party chat, yell and whisper are the same `CMSG_MESSAGECHAT` sent through the raw passthrough, which the SDK's `say` builds for its `type` option (the Deadmines eval's coordination channel); the other chat types stay raw until a trajectory earns them a helper.
+- Chat: say. Party chat, yell and whisper are the same `CMSG_MESSAGECHAT` sent through the raw passthrough, which the SDK's `say` builds for its `type` option (the channel a party's agents coordinate on); the other chat types stay raw until a trajectory earns them a helper.
 - Death: release spirit, reclaim corpse, spirit healer resurrection (the graveyard fallback when the corpse is unreachable).
 - Stuck: the Help frame's "I'm stuck", which a client sends as `CMSG_CAST_SPELL` of spell 7355 with no target. Every character knows it and may cast it alive or dead; the server's `Spell::EffectStuck` decides the move (a body is released, a ghost goes to the graveyard nearest it, the living go home by Hearthstone or a few yards over). It is a cast by id, so the action set does not grow; the SDK's `unstuck()` sends it only on a second call (operator decision, 2026-10-28).
 - Trainers: list, buy spell.
@@ -48,7 +48,7 @@ The action set:
 
 Observables added under the same test (each is a packet the client receives): the spellbook (`SMSG_INITIAL_SPELLS`, `SMSG_LEARNED_SPELL`, `SMSG_REMOVED_SPELL`, `SMSG_SUPERCEDED_SPELL`), cooldowns (`SMSG_SPELL_COOLDOWN`, `SMSG_COOLDOWN_EVENT`, `SMSG_CLEAR_COOLDOWN`) and talents (`SMSG_TALENTS_INFO`). Own-teleport arrivals ride the same test (`MSG_MOVE_TELEPORT_ACK`): the server tells a client where it landed after a Hearthstone or graveyard port, so the agent is told too. Spell rank and name ride the spell rows as client-cache (Spell.dbc) knowledge, the same way item-template fields already do. No new observation is involved in the state cache keeping a window open: the vendor list, the trainer list and the loot window are already-whitelisted events, and folding the latest of each into the cache — as the gossip menu and the flight master's window already are — only stops the agent from having to re-ask for what it was already told. The loot window closes on the release the server sends; nothing served closes a vendor or trainer frame, so those read as "last observed" with their seq and ts, never as "open".
 
-Achievements and flight paths ([Shard/WrathBench#8](https://github.com/Shard/WrathBench/issues/8)): `SMSG_ACHIEVEMENT_EARNED`, the login `SMSG_ALL_ACHIEVEMENT_DATA` (completed block only) and `SMSG_ACTIVATETAXIREPLY` are whitelisted, with name and points as client-cache (Achievement.dbc) knowledge, and the flight is the `UNIT_FLAG_TAXI_FLIGHT` bit on self. Flight activation stays raw (`CMSG_ACTIVATETAXI`), and the flight master's window (`SMSG_SHOWTAXINODES`) is whitelisted with node names as client-cache (TaxiNodes.dbc) knowledge. The innkeeper bind rides the same test: `SMSG_BINDER_CONFIRM`, `SMSG_BINDPOINTUPDATE`, `SMSG_PLAYERBOUND` whitelisted, `CMSG_BINDER_ACTIVATE` raw. The node positions those same `TaxiNodes.dbc` rows carry are contract-clean too: they are the client's own cache, drawn on the flight map a client shows, so they pass the test the node names already pass. No decision withholds them, and they are served beside the names on every window (built when the leading freeplay trajectory's flight use asked for them, which is the repo's observed-need rule for surface growth and nothing more); the window carries the mask's nodes only, as a flight map draws what the character has discovered. The route table stays out either way — a chain of hops is the caller's to name, sent as the client's own `CMSG_ACTIVATETAXIEXPRESS` and judged by the server. Achievements and flight use are observed, never inferred: the module never asks the server's achievement manager anything — a run's achievements are what its own packets said — and a flight "ends" when the runner sees the flag flip, because no packet says so and inventing an event for it would be the SDK asserting an outcome the wire never gave. Progress *toward* an achievement is deliberately not tapped: it is not a milestone, and the criteria stream is chatter a client renders and a benchmark has no derivation for.
+Achievements and flight paths ([Shard/WrathBench#8](https://github.com/Shard/WrathBench/issues/8)): `SMSG_ACHIEVEMENT_EARNED`, the login `SMSG_ALL_ACHIEVEMENT_DATA` (completed block only) and `SMSG_ACTIVATETAXIREPLY` are whitelisted, with name and points as client-cache (Achievement.dbc) knowledge, and the flight is the `UNIT_FLAG_TAXI_FLIGHT` bit on self. Flight activation stays raw (`CMSG_ACTIVATETAXI`), and the flight master's window (`SMSG_SHOWTAXINODES`) is whitelisted with node names as client-cache (TaxiNodes.dbc) knowledge. The innkeeper bind rides the same test: `SMSG_BINDER_CONFIRM`, `SMSG_BINDPOINTUPDATE`, `SMSG_PLAYERBOUND` whitelisted, `CMSG_BINDER_ACTIVATE` raw. The node positions those same `TaxiNodes.dbc` rows carry are contract-clean too: they are the client's own cache, drawn on the flight map a client shows, so they pass the test the node names already pass. No decision withholds them, and they are served beside the names on every window (built when an observed trajectory's flight use asked for them, which is the observed-need rule for surface growth and nothing more); the window carries the mask's nodes only, as a flight map draws what the character has discovered. The route table stays out either way — a chain of hops is the caller's to name, sent as the client's own `CMSG_ACTIVATETAXIEXPRESS` and judged by the server. Achievements and flight use are observed, never inferred: the module never asks the server's achievement manager anything — a run's achievements are what its own packets said — and a flight "ends" when the consumer sees the flag flip, because no packet says so and inventing an event for it would be the SDK asserting an outcome the wire never gave. Progress *toward* an achievement is deliberately not tapped: it is not a milestone, and the criteria stream is chatter a client renders and a consumer has no derivation for.
 
 Skills, the talent frame, item tooltips and reputation: the skill pane is the `PLAYER_SKILL_INFO` update fields on self (3.3.5 has no skill opcode) named from `SkillLine.dbc`; the talent frame is a client-local read of `Talent.dbc`/`TalentTab.dbc` answered on request, with the learned ranks staying `SMSG_TALENTS_INFO`'s; the respec is the trainer's `MSG_TALENT_WIPE_CONFIRM` whitelisted and echoed raw; the item tooltip is the rest of `SMSG_ITEM_QUERY_SINGLE_RESPONSE` decoded; reputation is `SMSG_INITIALIZE_FACTIONS`, `SMSG_SET_FACTION_STANDING` and `SMSG_SET_FACTION_VISIBLE` whitelisted, named from `Faction.dbc` with the race/class base a client adds. An item's random property ("of the Bear") is the PUBLIC `ITEM_FIELD_RANDOM_PROPERTIES_ID`, `ITEM_FIELD_PROPERTY_SEED` and enchantment-slot update fields every client in range receives, named from `ItemRandomProperties.dbc` / `ItemRandomSuffix.dbc` / `SpellItemEnchantment.dbc` the way skills are from `SkillLine.dbc`; the suffix's stat amounts are the client's own arithmetic on those fields (allocation × seed / 10000), done in the SDK. All of it is client-cache knowledge over packets the client already receives; nothing here reads server state a client lacks.
 
@@ -70,7 +70,7 @@ The module resolves "move to position" into the client movement packet sequence 
 
 ## Audit
 
-Every observation served and every action dispatched is logged at the module boundary with session id and timestamp, one file per session token and UTC day (module/PROTOCOL.md "Audit log"). It is the ground truth for the wire while it is kept, and it is kept for a window, not for good: by the operator's decision of 2026-10-18, audit and server logs are operational records with a retention of a few days (the chart's `worldserver.logRetention`, default 3), pruned by age and never while a session still writes. The long-lived per-run record of what went on the wire is the runner's own `actions` record in the trajectory ([WrathBench `docs/ARCHITECTURE.md`](https://github.com/Shard/WrathBench/blob/master/docs/ARCHITECTURE.md#runner-buntypescript-mit), "The action log"), which is what a result claim points at.
+Every observation served and every action dispatched is logged at the module boundary with session id and timestamp, one file per session token and UTC day (module/PROTOCOL.md "Audit log"). It is the ground truth for the wire while it is kept, and it is kept for a window, not for good: by the operator's decision of 2026-10-18, audit and server logs are operational records with a retention of a few days (set by the deployment), pruned by age and never while a session still writes. The long-lived per-run record of what went on the wire is the one a harness keeps from the sandbox's action log (`docs/ARCHITECTURE.md`, "The action log"), which is what a result claim points at.
 
 ## Control-surface authentication
 
@@ -78,7 +78,7 @@ Stated precisely so nobody re-derives it the hard way. The control surface is
 a token-bearer one: `POST /action` and `DELETE /session` act on the session
 their token names, and the snippet sandbox can reach the port. Without a
 credential of its own, a snippet in run A could therefore drive or tear down
-run B — across the per-run isolation boundary the harness measures inside.
+run B — across the per-run isolation boundary a harness measures inside.
 
 The floor that closes that (`module/PROTOCOL.md`
 "Authentication" is the authority on the served surface):
@@ -88,7 +88,8 @@ The floor that closes that (`module/PROTOCOL.md`
   route runs, and does not listen at all without a configured secret. There
   is no unauthenticated path and no backward compatibility.
 - **A per-run secret the module issues, before the session exists.** The
-  runner host, holding the port secret, calls `POST /lease` for the run's
+  sandbox host (`mcp/src/main.ts`, or a harness's own), holding the port
+  secret, calls `POST /lease` for the run's
   token and receives a random secret bound to that token and the run's
   account. That secret is the only credential the snippet child gets. It is
   honoured for the token's own `/session`, `/action`, `DELETE /session` and
@@ -106,7 +107,7 @@ The floor that closes that (`module/PROTOCOL.md`
   raw request it assembles, therefore has no credential and no transport.
   Session lifecycle (`createSession`, `deleteSession`/logout) is reachable only
   through the ambient client, bound to this run's own token and account; it was
-  a second, hand-built client opening a session the runner did not follow that
+  a second, hand-built client opening a session the sandbox host did not follow that
   this narrowing closes ([Shard/WrathBench#74](https://github.com/Shard/WrathBench/issues/74)). The kernel's per-port TCP rule still lets
   `node:net`/`Bun.connect` open the module's port, but with no credential to
   read such a connection authenticates nothing.
@@ -128,7 +129,7 @@ The floor that closes that (`module/PROTOCOL.md`
   to a process outside the sandbox. The sandbox refuses to start rather than
   run unconfined. This is the client-fidelity boundary as much as a security
   one: a game client talks to the game server, and a snippet that could reach
-  a database, a dashboard API or an orchestrator would be observing and
+  a database, a harness's own services or an orchestrator would be observing and
   acting through something no client has.
 
   Stated plainly, what the kernel rules do not cover: Landlock's TCP rules
@@ -143,3 +144,7 @@ module serves; it is not caller authentication. What this does not do: it does
 not authenticate the operator's own tooling to anything finer than "holds the
 port secret", and the audit log remains the record of what each token actually
 dispatched.
+
+## Changing the contracts
+
+A widening of either contract is a protocol change here; what it means for a consumer's results is the consumer's to decide.
