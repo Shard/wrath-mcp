@@ -13,6 +13,7 @@
 #include "AccountMgr.h"
 #include "AchievementMgr.h"
 #include "Config.h"
+#include "CryptoHash.h"
 #include "CryptoRandom.h"
 #include "DatabaseEnv.h"
 #include "DBCStores.h"
@@ -408,6 +409,15 @@ namespace WrathBench
     }
 
     // ------------------------------------------------------------- HTTP
+    std::string TokenTag(std::string const& token)
+    {
+        auto const digest = Acore::Crypto::SHA256::GetDigestOf(
+            reinterpret_cast<uint8 const*>(token.data()), token.size());
+        char hex[9];
+        std::snprintf(hex, sizeof(hex), "%02x%02x%02x%02x", digest[0], digest[1], digest[2], digest[3]);
+        return std::string("tok:") + hex;
+    }
+
     // Constant-time equality for secrets. Length is not secret (both sides
     // are module-issued or operator-configured), so a mismatch there returns
     // early; the bytes are compared with OpenSSL's CRYPTO_memcmp.
@@ -589,7 +599,7 @@ namespace WrathBench
             l.secret = secret;
             character = l.character;
         }
-        LOG_INFO("module", "wrathbench: leased token {} to account {}", token, account);
+        LOG_INFO("module", "wrathbench: leased {} to account {}", TokenTag(token), account);
         Json::Writer w;
         w.Add("ok", true).Add("token", token).Add("account", account).Add("secret", secret);
         if (!character.empty())
@@ -1295,8 +1305,8 @@ namespace WrathBench
                     {
                         Audit(*victim, "action", Json::Writer().Add("op", "session_reclaimed")
                             .Add("account", s->account).Add("byToken", s->token).Str());
-                        LOG_INFO("module", "wrathbench: reclaiming leaked account '{}' (session token '{}') for create token '{}'",
-                            s->account, t, s->token);
+                        LOG_INFO("module", "wrathbench: reclaiming leaked account '{}' (session {}) for create {}",
+                            s->account, TokenTag(t), TokenTag(s->token));
                     }
                 }
 
@@ -6511,7 +6521,7 @@ namespace WrathBench
         catch (std::exception const& e)
         {
             failed = true;
-            LOG_ERROR("module", "wrathbench: reattach replay for '{}' stopped after {} objects: {}", s.token, objects, e.what());
+            LOG_ERROR("module", "wrathbench: reattach replay for {} stopped after {} objects: {}", TokenTag(s.token), objects, e.what());
         }
 
         Json::Writer w;
