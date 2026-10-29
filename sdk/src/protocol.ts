@@ -280,6 +280,13 @@ export type ActionRequest =
   | { token: string; action: "learn_preview_talents"; talents: readonly (readonly [number, number])[] }
   /** A client-local read: the class talent tree, answered as `WB_TALENT_TREE` (no packet sent). */
   | { token: string; action: "talent_tree" }
+  // vehicles: the Leave Vehicle button and the vehicle frame's seat click. The
+  // module picks the opcode by whether the character drives the vehicle
+  // (`CMSG_DISMISS_CONTROLLED_VEHICLE` / `CMSG_CHANGE_SEATS_ON_CONTROLLED_VEHICLE`
+  // carry the vehicle's MovementInfo) or rides it (`CMSG_REQUEST_VEHICLE_EXIT`
+  // / `CMSG_REQUEST_VEHICLE_SWITCH_SEAT`).
+  | { token: string; action: "vehicle_exit" }
+  | { token: string; action: "vehicle_change_seat"; seat: number }
   /** The escape hatch: an allowlisted client opcode by name and its body as hex. */
   | { token: string; action: "raw"; opcode: string; payload: string };
 
@@ -826,6 +833,7 @@ export const MOVE_STATUSES = [
   "stopped",
   "superseded",
   "rooted",
+  "controlling",
 ] as const;
 export type KnownMoveStatus = (typeof MOVE_STATUSES)[number];
 /** Widened, so a status this revision does not know still parses. */
@@ -2038,8 +2046,42 @@ export const monsterMoveDataSchema = z.looseObject({
   destination: z.looseObject({ x: z.number(), y: z.number(), z: z.number() }).optional(),
   durationMs: z.number().optional(),
   stopped: z.boolean().optional(),
+  /**
+   * The spline that takes a passenger off its vehicle seat (`Unit::_ExitVehicle`,
+   * `MoveSplineFlag::TransportExit`): for our own guid, how a client learns it
+   * is off the seat. Absent from a module that predates it.
+   */
+  transportExit: z.boolean().optional(),
 });
 export type MonsterMoveData = z.infer<typeof monsterMoveDataSchema>;
+
+/**
+ * `SMSG_MONSTER_MOVE_TRANSPORT`: a spline in a transport's own frame
+ * (`MoveSplineInit::Launch` for a unit aboard one). For our own guid with a
+ * `seat` of 0 or more it is the boarding spline `Vehicle::AddPassenger`
+ * launches onto a vehicle seat, the packet a client learns its vehicle and
+ * seat from; `pos` and `destination` are seat-relative and never a world
+ * position. `seat` is -1 on a transport's deck.
+ */
+export const monsterMoveTransportDataSchema = monsterMoveDataSchema.extend({
+  transportGuid: guidSchema,
+  seat: z.number(),
+});
+export type MonsterMoveTransportData = z.infer<typeof monsterMoveTransportDataSchema>;
+
+/**
+ * `SMSG_CLIENT_CONTROL_UPDATE` (`Player::SetClientControl`): which unit this
+ * client moves and whether it may. A vehicle's driving seat or a possession
+ * hands over the unit (`allowMove` true, the unit's guid); its end hands it
+ * back (`allowMove` false for the unit, then true for our own guid); a fear or
+ * confusion sends our own guid with `allowMove` false and then true. The module
+ * answers it as a client does; this is the observation.
+ */
+export const clientControlUpdateDataSchema = z.looseObject({
+  guid: guidSchema,
+  allowMove: z.boolean(),
+});
+export type ClientControlUpdateData = z.infer<typeof clientControlUpdateDataSchema>;
 
 const moveOpcodeSchemas = Object.fromEntries(
   MOVE_OPCODES.map((op) => [op, moveUpdateDataSchema]),
@@ -2235,6 +2277,10 @@ export const eventDataSchemas = {
   SMSG_CHAR_DELETE: charDeleteDataSchema,
   // creature movement
   SMSG_MONSTER_MOVE: monsterMoveDataSchema,
+  // vehicles and possession: the boarding spline onto a seat, and whose
+  // movement the client owns
+  SMSG_MONSTER_MOVE_TRANSPORT: monsterMoveTransportDataSchema,
+  SMSG_CLIENT_CONTROL_UPDATE: clientControlUpdateDataSchema,
 } as const;
 
 export type KnownOpcode = keyof typeof eventDataSchemas;

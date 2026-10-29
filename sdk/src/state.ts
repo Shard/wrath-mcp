@@ -83,7 +83,9 @@ import {
   type TradeStatusData,
   type TradeStatusExtendedData,
   type LearnedSpellData,
+  type ClientControlUpdateData,
   type MonsterMoveData,
+  type MonsterMoveTransportData,
   type RemovedSpellData,
   type SpellCooldownData,
   type SpellFailureData,
@@ -770,6 +772,25 @@ export interface SelfState extends UnitFieldsState {
   stats: Observed<CharacterStats> | undefined;
   /** Rested XP (`PLAYER_REST_STATE_EXPERIENCE`): the bonus pool the XP bar shades. */
   restedXp: Observed<number> | undefined;
+  /**
+   * Which unit this client moves, from `SMSG_CLIENT_CONTROL_UPDATE`
+   * (`Player::SetClientControl`): `mover` is our own guid, or the vehicle or
+   * possessed unit the server handed over (a vehicle's driving seat, the Eye
+   * of Acherus), and `allowMove` whether it may be moved at all — false while
+   * feared or confused, and between a handover ending and control of the
+   * character returning. The handed-over unit's spells are its control bar,
+   * `pet()`, cast with `petCast`. `undefined` until a control update has
+   * been observed: a client starts in control of itself.
+   */
+  control: Observed<{ readonly mover: GuidKey; readonly allowMove: boolean }> | undefined;
+  /**
+   * The vehicle this character sits in and its seat, from the boarding
+   * spline the server launches onto the seat (`SMSG_MONSTER_MOVE_TRANSPORT`
+   * for our own guid with a seat index); cleared by the exit spline
+   * (`SMSG_MONSTER_MOVE` with `transportExit`) and by a new world. Whether
+   * we drive it is `control` naming its guid. `undefined` when not aboard.
+   */
+  vehicle: Observed<{ readonly guid: GuidKey; readonly seat: number }> | undefined;
   /**
    * The last `SMSG_ACTIVATETAXIREPLY` (the answer to a raw `CMSG_ACTIVATETAXI`).
    * Kept because it is the only thing that says a flight was *accepted*; the
@@ -2165,6 +2186,8 @@ export class StateCache {
     shapeshiftForm: undefined,
     stats: undefined,
     restedXp: undefined,
+    control: undefined,
+    vehicle: undefined,
     taxiReply: undefined,
     bindPoint: undefined,
     health: undefined,
@@ -3740,6 +3763,11 @@ export class StateCache {
         // A flight that crosses a map is flown as one spline per map: the
         // server launches the next one after the transfer.
         this.endSelfSpline();
+        // The character is its own mover again once it is in the map
+        // (`Player::SendInitialPacketsAfterAddToMap`), and no seat survives
+        // a map change; the next control update says the rest.
+        this.self.control = undefined;
+        this.self.vehicle = undefined;
         return;
       }
       case "SMSG_TRANSFER_PENDING": {
@@ -4497,12 +4525,37 @@ export class StateCache {
         else this.auraSlots.set(key, slots);
         return;
       }
+      case "SMSG_CLIENT_CONTROL_UPDATE": {
+        // Which unit we move. Granted: that unit. Withheld for the unit we
+        // were moving (a handover ending) or for ourselves (a fear): we are
+        // our own mover and may not move it, until the grant that follows.
+        const d = event.data as ClientControlUpdateData;
+        const mover = this.self.control?.value.mover ?? this.self.guid;
+        if (d.allowMove) {
+          this.self.control = { value: { mover: d.guid, allowMove: true }, seq: event.seq, ts: event.ts };
+        } else if (mover === undefined || d.guid === mover || this.isSelfGuid(d.guid)) {
+          this.self.control = { value: { mover: this.self.guid ?? d.guid, allowMove: false }, seq: event.seq, ts: event.ts };
+        }
+        return;
+      }
+      case "SMSG_MONSTER_MOVE_TRANSPORT": {
+        // A spline in a transport's frame. Ours with a seat is the boarding
+        // spline onto a vehicle seat; its points are seat-relative, so no
+        // position or spline is folded from it. Another unit's says nothing
+        // a world position could carry either.
+        const d = event.data as MonsterMoveTransportData;
+        if (this.isSelfGuid(d.guid) && d.seat >= 0) {
+          this.self.vehicle = { value: { guid: d.transportGuid, seat: d.seat }, seq: event.seq, ts: event.ts };
+        }
+        return;
+      }
       case "SMSG_MONSTER_MOVE": {
         const d = event.data as MonsterMoveData;
         if (this.isSelfGuid(d.guid)) {
           // Our own character on a server spline: a taxi flight
-          // (`MoveSplineInit::Launch` sends it to the flier too). Never a
-          // nearby object.
+          // (`MoveSplineInit::Launch` sends it to the flier too), or the
+          // exit spline off a vehicle seat. Never a nearby object.
+          if (d.transportExit === true) this.self.vehicle = undefined;
           this.applySelfSpline(d, event.seq, event.ts);
           return;
         }

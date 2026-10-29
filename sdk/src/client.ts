@@ -1249,6 +1249,9 @@ export const MOVE_HINTS: Readonly<Record<string, (point: MovePoint, data: MoveRe
   // A root or a stun (module/PROTOCOL.md, `rooted`): a refusal carries no
   // route, a walk the root stopped does.
   rooted: (_p, d) => (d.pathLength === undefined ? ROOTED_MOVE_HINT : ROOTED_WALK_HINT),
+  // The client moves another unit (module/PROTOCOL.md, `controlling`): a
+  // refusal carries no route, a walk the handover ended does.
+  controlling: (_p, d) => (d.pathLength === undefined ? CONTROLLING_MOVE_HINT : CONTROLLING_WALK_HINT),
   superseded: () =>
     `a newer moveTo replaced this one and is the move walking now. It came from this run's own code: another ` +
     `routine, a snippet, or a helper's walk (killTarget's approach). Retrying on superseded cancels that newer ` +
@@ -1298,6 +1301,23 @@ const ROOTED_MOVE_HINT = "you are rooted or stunned and cannot move until it wea
  * stood. Proposed wording, for the operator's approval.
  */
 const ROOTED_WALK_HINT = "a root or stun stopped you mid-walk where you stand; you cannot move until it wears off.";
+
+/**
+ * `controlling`, refused: the client moves another unit (a vehicle's driving
+ * seat, a possession), which the walker does not drive yet, and sent nothing.
+ */
+const CONTROLLING_MOVE_HINT =
+  "you are controlling another unit (state.self.control.mover: a vehicle's driving seat or a possessed unit) and " +
+  "moveTo does not drive it yet; the move was not sent. Its spells are on state.pet() (petCast); leaveVehicle() " +
+  "returns control from a vehicle, and a possession ends with its own spell or on its own.";
+
+/** `controlling`, mid-walk: control passed to another unit and the walk ended where the character stood. */
+const CONTROLLING_WALK_HINT =
+  "control passed to another unit mid-walk (state.self.control.mover) and the walk ended where you stand; " +
+  "moveTo does not drive that unit yet.";
+
+/** `UNIT_NPC_FLAG_SPELLCLICK` (AzerothCore `UnitDefines.h`): the unit takes `CMSG_SPELLCLICK`; cleared while its seats are full. */
+const UNIT_NPC_FLAG_SPELLCLICK = 0x0100_0000;
 
 /** `interrupted` when the verdict found the character dead. */
 const MOVE_DIED_HINT =
@@ -3664,6 +3684,54 @@ export interface DismountOptions {
 export type DismountResult =
   | { readonly ok: true; readonly status: "dismounted" }
   | { readonly ok: false; readonly status: "not_mounted" | "in_flight" | "unconfirmed"; readonly hint: string };
+
+/**
+ * The outcome of `spellClick`, as a value. `sent` is the ack: the server
+ * casts the unit's spellclick spell at the character (`Unit::HandleSpellClick`)
+ * or does nothing, silently, and what follows is observed — a seat as
+ * `state.self.vehicle`, a driving seat or a possession as
+ * `state.self.control`. `no_spellclick`: the unit in view carries no
+ * spellclick flag (nothing to click, or its seats are full); nothing was sent.
+ */
+export type SpellClickResult =
+  | { readonly ok: true; readonly status: "sent"; readonly ack: RawActionResponse }
+  | { readonly ok: false; readonly status: "no_spellclick"; readonly hint: string };
+
+export interface LeaveVehicleOptions {
+  /** How long to wait for the exit spline, in ms. Default 5000. */
+  timeout?: number;
+}
+
+/**
+ * The outcome of `leaveVehicle`, as a value. `left` is the exit spline
+ * observed (`state.self.vehicle` cleared) after the send.
+ *
+ * - `not_in_vehicle`: `state.self.vehicle` is undefined; nothing was sent.
+ * - `unconfirmed`: sent, and no exit spline arrived in time — the seat may
+ *   not allow leaving (the server logs that and sends nothing), or the
+ *   vehicle is mid-script.
+ */
+export type LeaveVehicleResult =
+  | { readonly ok: true; readonly status: "left" }
+  | { readonly ok: false; readonly status: "not_in_vehicle" | "unconfirmed"; readonly hint: string };
+
+export interface ChangeSeatOptions {
+  /** How long to wait for the new seat's boarding spline, in ms. Default 5000. */
+  timeout?: number;
+}
+
+/**
+ * The outcome of `changeSeat`, as a value. `seated` is the boarding spline
+ * for the seat asked for observed (`state.self.vehicle.seat`) after the send.
+ *
+ * - `not_in_vehicle`: `state.self.vehicle` is undefined; nothing was sent.
+ * - `unconfirmed`: sent, and no boarding spline for that seat arrived in
+ *   time — the seat is taken, the current seat's flags forbid switching, or
+ *   there is no such seat (the server refuses all three silently).
+ */
+export type ChangeSeatResult =
+  | { readonly ok: true; readonly status: "seated"; readonly seat: number }
+  | { readonly ok: false; readonly status: "not_in_vehicle" | "unconfirmed"; readonly hint: string };
 
 export interface BindOptions {
   /** How long to wait for each of the three server answers (menu, confirm, bind point), in ms. Default 10000. */
@@ -9074,6 +9142,112 @@ export class WrathClient {
       "no update clearing the mount arrived after CMSG_CANCEL_MOUNT_AURA; read state.self.mounted before trying " +
       "again (the server answers a character that is not mounted with only a system line)";
     this.noteActionHint("dismount", "unconfirmed", hint);
+    return { ok: false, status: "unconfirmed", hint };
+  }
+
+  /**
+   * Click a unit's spellclick — the vehicle cursor on a mount with seats, a
+   * cannon, a cart, a quest's steed: `CMSG_SPELLCLICK` with the unit's guid,
+   * which the server answers by casting the unit's spellclick spell at the
+   * character (`Unit::HandleSpellClick`; a vehicle's ride aura seats it) or
+   * by doing nothing, silently (out of range, a condition unmet). Ack-only:
+   * a seat shows as `state.self.vehicle` from the boarding spline, a driving
+   * seat or a possession as `state.self.control` naming the unit, whose
+   * spells are then on `state.pet()` (cast with `petCast`). Refused before
+   * anything is sent when the unit in view carries no spellclick flag
+   * (`no_spellclick`: nothing to click, or its seats are full).
+   */
+  spellClick(target: GuidOrUnit): Promise<WithResolved<SpellClickResult>> {
+    return this.byName(target, "spellClick(guid)", async (guid): Promise<SpellClickResult> => {
+      const flags = this.state.nearby.get(guid)?.fields.get("npcFlags")?.value;
+      if (flags !== undefined && (flags & UNIT_NPC_FLAG_SPELLCLICK) === 0) {
+        const hint =
+          `${guid} has no spellclick (UNIT_NPC_FLAG_SPELLCLICK is off on its npcFlags): nothing to click, or its ` +
+          `seats are full; nothing was sent. A unit that takes the click lists "spellClick" in its state.units() roles.`;
+        this.noteActionHint("spellClick", "no_spellclick", hint);
+        return { ok: false, status: "no_spellclick", hint };
+      }
+      const ack = await this.raw("CMSG_SPELLCLICK", [{ guid }]);
+      return { ok: true, status: "sent", ack };
+    });
+  }
+
+  /**
+   * Leave the vehicle the character sits in, the way the Leave Vehicle
+   * button does (`vehicle_exit`: `CMSG_DISMISS_CONTROLLED_VEHICLE` from the
+   * driving seat, which hands the vehicle's last position back, else
+   * `CMSG_REQUEST_VEHICLE_EXIT`), and wait for the exit spline that clears
+   * `state.self.vehicle`. Not aboard, nothing is sent (`not_in_vehicle`). A
+   * possessed unit (the Eye of Acherus) is not a vehicle: it is left with its
+   * own recall spell on `state.pet()`, or when the possession ends.
+   */
+  async leaveVehicle(options: LeaveVehicleOptions = {}): Promise<LeaveVehicleResult> {
+    const aboard = this.state.self.vehicle;
+    if (aboard === undefined) {
+      const hint = "not in a vehicle (state.self.vehicle is undefined); nothing was sent";
+      this.noteActionHint("leaveVehicle", "not_in_vehicle", hint);
+      return { ok: false, status: "not_in_vehicle", hint };
+    }
+    await this.action({ action: "vehicle_exit" });
+    const off = (): boolean => this.state.self.vehicle === undefined;
+    if (!off()) {
+      try {
+        await this.waitEvent(() => off(), {
+          timeout: options.timeout ?? 5000,
+          description: "the exit spline off the vehicle seat (SMSG_MONSTER_MOVE with transportExit for our own guid)",
+        });
+      } catch (e) {
+        if (!(e instanceof EventTimeoutError)) throw e;
+      }
+    }
+    if (off()) return { ok: true, status: "left" };
+    const hint =
+      `no exit spline arrived after the request to leave ${aboard.value.guid} (seat ${aboard.value.seat}); the seat ` +
+      "may not allow leaving (the server logs that and sends nothing) or the vehicle is mid-script. Read " +
+      "state.self.vehicle before trying again.";
+    this.noteActionHint("leaveVehicle", "unconfirmed", hint);
+    return { ok: false, status: "unconfirmed", hint };
+  }
+
+  /**
+   * Move to another seat of the vehicle the character sits in, the vehicle
+   * frame's seat click (`vehicle_change_seat`:
+   * `CMSG_CHANGE_SEATS_ON_CONTROLLED_VEHICLE` from the driving seat, else
+   * `CMSG_REQUEST_VEHICLE_SWITCH_SEAT`), and wait for the boarding spline
+   * that puts `state.self.vehicle.seat` at `seat`. Seats are the 0-based
+   * indices of the vehicle's seats; the server refuses a taken seat, one the
+   * current seat's flags forbid leaving for, and one that does not exist,
+   * all silently (`unconfirmed`). Not aboard, nothing is sent.
+   */
+  async changeSeat(seat: number, options: ChangeSeatOptions = {}): Promise<ChangeSeatResult> {
+    const aboard = this.state.self.vehicle;
+    if (aboard === undefined) {
+      const hint = "not in a vehicle (state.self.vehicle is undefined); nothing was sent";
+      this.noteActionHint("changeSeat", "not_in_vehicle", hint);
+      return { ok: false, status: "not_in_vehicle", hint };
+    }
+    const sinceSeq = this.state.lastSeq;
+    await this.action({ action: "vehicle_change_seat", seat });
+    const seated = (): boolean => {
+      const v = this.state.self.vehicle;
+      return v !== undefined && v.value.seat === seat && v.seq > sinceSeq;
+    };
+    if (!seated()) {
+      try {
+        await this.waitEvent(() => seated(), {
+          timeout: options.timeout ?? 5000,
+          description: `the boarding spline onto seat ${seat} (SMSG_MONSTER_MOVE_TRANSPORT for our own guid)`,
+        });
+      } catch (e) {
+        if (!(e instanceof EventTimeoutError)) throw e;
+      }
+    }
+    if (seated()) return { ok: true, status: "seated", seat };
+    const hint =
+      `no boarding spline onto seat ${seat} of ${aboard.value.guid} arrived; the seat is taken, seat ${aboard.value.seat} ` +
+      "does not allow switching, or there is no such seat (the server refuses all three silently). Read " +
+      "state.self.vehicle before trying again.";
+    this.noteActionHint("changeSeat", "unconfirmed", hint);
     return { ok: false, status: "unconfirmed", hint };
   }
 

@@ -564,12 +564,21 @@ character rooted, a `move_to` is refused before planning with status `rooted`,
 acked with `moveId` alone like any refusal, and nothing is sent, not even the
 redirect's stop; a walk still running then ends `rooted` first.
 
+While the client moves another unit (a vehicle's driving seat, a possession:
+"Vehicles and possession", below), a `move_to` is refused the same way with
+status `controlling`, `mover` naming the unit, and a walk still running ends
+`controlling` first: the server drops every movement packet that carries the
+character's own guid (`HandleMovementOpcodes` reads `Player::m_mover`), and the
+walker does not drive the other unit yet.
+
 #### stop
 
 Stop moving (sends `MSG_MOVE_STOP` where the character currently is). Always
 acks `200 { "ok": true, "action": "stop" }`; if a move was in
 progress it additionally ends with a `WB_MOVE_RESULT` status `stopped`, or
-`rooted` with no packet when a root has already stopped it.
+`rooted` with no packet when a root has already stopped it. Nothing is sent
+while the client moves another unit (`controlling`, above): the server would
+drop it.
 
 Request: `{ "token": "run-abc123", "action": "stop" }`
 
@@ -584,7 +593,9 @@ or `{ "token": "run-abc123", "action": "face", "x": -8900.0, "y": -130.0 }`
 
 Success `200`: `{ "ok": true, "action": "face", "orientation": 1.57 }`
 Additional errors: `400 {"ok":false,"error":"missing_face_target","action":"face","param":"orientation or x,y"}`,
-`409 {"ok":false,"error":"moving"}` (stop first, or supersede with `move_to`).
+`409 {"ok":false,"error":"moving"}` (stop first, or supersede with `move_to`),
+`409 {"ok":false,"error":"controlling"}` (the client moves another unit,
+"Vehicles and possession" below; nothing sent).
 
 The refusal while moving is the client's own limit, not a module shortcut. A
 walk is sent as forward running (`MOVEMENTFLAG_FORWARD`, with the orientation
@@ -650,12 +661,14 @@ them: `{ "ok": true, "action": "<name>" }`.
 | `repop` | — | `CMSG_REPOP_REQUEST` | release spirit while dead |
 | `reclaim_corpse` | `guid?` | `CMSG_RECLAIM_CORPSE` | resurrect at corpse; handler resolves the player's own corpse, guid optional. Refusals are silent (further than 39y, delay not elapsed, other map, no corpse); the SDK reads them off the corpse-query answer below |
 | `spirit_healer_activate` | `guid` | `CMSG_SPIRIT_HEALER_ACTIVATE` | graveyard resurrection fallback; no dedicated response opcode — the outcome arrives through already-served events (health update fields, res-sickness aura) |
+| `vehicle_exit` | — | `CMSG_DISMISS_CONTROLLED_VEHICLE` or `CMSG_REQUEST_VEHICLE_EXIT` | the client's Leave Vehicle. From the driving seat (the vehicle is the client's mover, "Vehicles and possession" below) the client hands the vehicle's last MovementInfo back: packGUID of the vehicle and a MovementInfo (`VehicleHandler.cpp` `HandleDismissControlledVehicle` applies it and exits); from any other seat the bodiless `CMSG_REQUEST_VEHICLE_EXIT` (`HandleRequestVehicleExit`, which exits only from a seat whose flags allow it and logs the rest silently). `409 not_in_vehicle` when the character sits in none, nothing sent. The exit is observed as the exit spline (`SMSG_MONSTER_MOVE` with `transportExit`). The audit row names the `opcode` and the `vehicleGuid` |
+| `vehicle_change_seat` | `seat` | `CMSG_CHANGE_SEATS_ON_CONTROLLED_VEHICLE` or `CMSG_REQUEST_VEHICLE_SWITCH_SEAT` | the vehicle frame's seat click, `seat` the 0-based seat index. From the driving seat: packGUID of the vehicle, its MovementInfo, packGUID of the unit whose seat is wanted (the vehicle itself) and the `i8` seat; from any other seat: packGUID of the vehicle and the `i8` seat. Both reach `HandleChangeSeatsOnControlledVehicle`, which refuses a seat whose flags forbid switching, a taken seat and a seat that does not exist, all silently; the new seat is observed as its boarding spline (`SMSG_MONSTER_MOVE_TRANSPORT`). `409 not_in_vehicle`; `400 missing_seat`. The audit row names the `opcode`, the `vehicleGuid` and the `seat` |
 
 Validation errors (all `400`): `missing_guid`, `missing_option`,
 `missing_quest_id` (also for `quest_query`), `missing_reward_index`, `missing_spell_id`,
 `missing_slot`, `missing_item`, `missing_item_guid`, `missing_bag_slot`,
 `missing_talent`, `missing_talents`, `invalid_talents`, `missing_dest`,
-`invalid_item_target`, `invalid_dest`, `no_spell_to_target`, and for `raw`:
+`invalid_item_target`, `invalid_dest`, `no_spell_to_target`, `missing_seat`, and for `raw`:
 `missing_opcode`, `opcode_not_allowed`, `invalid_payload`, `payload_too_large`.
 
 Every `missing_*` reply from `POST /action` echoes what it was about:
@@ -785,6 +798,15 @@ whose handler does nothing a non-GM client could not do:
 - corpse: `MSG_CORPSE_QUERY` (empty body) — re-ask where the corpse is; the
   module already asks once per death on the client's behalf (see "Death"), and
   the answer is whitelisted
+- vehicles: `CMSG_SPELLCLICK` (`u64 guid` — the click on a unit's spellclick,
+  the vehicle cursor; `SpellHandler.cpp` `HandleSpellClick` casts the unit's
+  `npc_spellclick_spells` spell at the character, a vehicle's ride aura
+  among them, and does nothing silently for a unit out of range or whose
+  conditions fail; the SDK's `spellClick` sends it), `CMSG_PLAYER_VEHICLE_ENTER`
+  (`u64 player guid` — board another player's vehicle; `HandleEnterPlayerVehicle`
+  takes raid members within interaction range only). Leaving and changing
+  seat are actions (`vehicle_exit`, `vehicle_change_seat`): both carry the
+  client's own MovementInfo
 
 Deliberately absent: movement opcodes (the module drives them; a stray one
 desyncs the mover), session lifecycle (login, logout, character create/delete),
@@ -1227,6 +1249,66 @@ where the body comes down, which the module would have to simulate (collision
 included). Unanswered, the server keeps the character where it stood and
 observers see no knockback; nothing on the server waits on the ack.
 
+Vehicles and possession. A client moves exactly one unit, `Player::m_mover`:
+every movement packet and every root and movement-state ack must carry that
+unit's guid or the handler drops it (`HandleMovementOpcodes`,
+`HandleMoveRootAck`, `HandleMoveFlagChangeOpcode`; the speed-change acks are
+the exception, accepted for the character's own guid alone, so a controlled
+unit's forced speed change is never acked by any client). The server tells
+the client which unit that is with `SMSG_CLIENT_CONTROL_UPDATE` (0x159;
+`Player::SetClientControl`): a packGUID and a `u8`, 1 when the client may
+move the unit, 0 when not. A vehicle's driving seat (`Vehicle::AddPassenger`
+on a seat with `VEHICLE_SEAT_FLAG_CAN_CONTROL`, `Unit::SetCharmedBy`
+`CHARM_TYPE_VEHICLE`) and a possession (`CHARM_TYPE_POSSESS`, the Eye of
+Acherus) send `(unit, 1)` and make the unit the mover, then the unit's
+control bar as `SMSG_PET_SPELLS` under the unit's guid
+(`Player::VehicleSpellInitialize` / `PossessSpellInitialize`, "Pets" below;
+the bar is cast from with `CMSG_PET_CAST_SPELL` and `CMSG_PET_ACTION`, raw,
+as a pet's is); the end of either (`Unit::RemoveCharmedBy`) sends
+`(unit, 0)`, `(character, 1)`, makes the character the mover again and
+removes the bar (guid 0). A fear or confusion sends `(character, 0)` and
+`(character, 1)` with no mover change; login and every far teleport make the
+character its own mover without a packet
+(`Player::SendInitialPacketsAfterAddToMap`). The packet is served as an event
+(the movement table below), and the module keeps the mover as a client does
+and answers each update the way a stock client does (module-internal client
+behaviour, audited as `op: "active_mover"`, never an agent action and not on
+the raw allowlist): `CMSG_SET_ACTIVE_MOVER` (0x26A, `u64 guid`) for a unit
+it may now move, which `HandleSetActiveMoverOpcode` only checks against the
+mover, and `CMSG_MOVE_NOT_ACTIVE_MOVER` (0x2D1, packGUID and a MovementInfo
+of the unit as it stands) for a unit it stops moving, whose MovementInfo
+`HandleMoveNotActiveMover` keeps only while that unit is still the mover.
+
+Boarding is `CMSG_SPELLCLICK` (raw, above): the seat's ride aura
+(`SPELL_AURA_CONTROL_VEHICLE`) puts the character on the seat, and the
+server sends the character `SMSG_ON_CANCEL_EXPECTED_RIDE_VEHICLE_AURA`
+(bodiless, not served), `SMSG_BREAK_TARGET`, a root (`SMSG_FORCE_MOVE_ROOT`
+for a passenger seat, acked as any root; `SMSG_SPLINE_MOVE_ROOT` once a
+driving seat has made the vehicle the mover) and the boarding spline,
+`SMSG_MONSTER_MOVE_TRANSPORT` (0x2AE) for the character's own guid: packGUID
+of the character, packGUID of the vehicle, the `i8` seat, then the
+`SMSG_MONSTER_MOVE` body in the vehicle's frame — how a client learns which
+vehicle, and which seat, it sits in. Leaving (`vehicle_exit`, above) ends
+with `SMSG_FORCE_MOVE_UNROOT` for the character (acked) and the exit spline,
+`SMSG_MONSTER_MOVE` with `MoveSplineFlag::TransportExit`, served as
+`transportExit: true`. A client reports the end of each of those two
+splines with `CMSG_MOVE_SPLINE_DONE` (0x2C9: packGUID, its MovementInfo, the
+`u32` spline id; `TaxiHandler.cpp` `HandleMoveSplineDoneOpcode`), which is
+what clears the transport change the core expects
+(`Player::SetExpectingChangeTransport`) and relays the body's root state;
+the module sends it on the world tick after the core has run the spline to
+its end (`Unit::UpdateSplineMovement`), for its own guid and those two
+splines only (module-internal, audited as `op: "spline_done"`). A taxi's
+spline is the server's own flight and is ended by the core itself.
+
+What the module does not do yet: drive the other unit. While the vehicle or
+the possessed unit is the mover, `move_to` and `face` are refused
+`controlling` and `stop` sends nothing (above), the root and movement-state
+packets for the unit's guid are not answered, and the unit's own speed and
+flight flags are not carried. The vehicle's spells are still cast from its
+bar, and a seat that moves nothing (a cannon, a mine car the server drives)
+is driven by nothing.
+
 Every timestamp the module sends as the client's (the movement packets, the
 acks, `CMSG_TIME_SYNC_RESP`) reads one clock of the session's own,
 milliseconds since the session was created, as a client's clock is its own and
@@ -1582,6 +1664,11 @@ at the top of this document.
   character actually is.
 - `stopped` — a `stop` action ended the move.
 - `superseded` — a newer `move_to` replaced this move.
+- `controlling` — the client moves another unit (a vehicle's driving seat, a
+  possession: "Vehicles and possession", below), named by `mover`
+  (guid-string), and the walker does not drive it yet. A refusal carries no
+  `pathLength` and sent nothing; a walk the handover ended carries its
+  `pathLength` and ended where the character stood, as `rooted` does.
 - `rooted` — a root or a stun holds the character (Roots, below). A
   refusal: the `move_to` arrived while the character was rooted and nothing
   was sent; it carries no `pathLength`. A walk the root stopped: the root ack
@@ -2112,7 +2199,9 @@ Creature movement:
 
 | opcode | id | `data` fields |
 |---|---|---|
-| `SMSG_MONSTER_MOVE` | 0x0DD | `{ "guid", "pos": {x,y,z}, "destination": {x,y,z}, "durationMs" }` or `{ "guid", "pos", "stopped": true }` |
+| `SMSG_MONSTER_MOVE` | 0x0DD | `{ "guid", "pos": {x,y,z}, "destination": {x,y,z}, "durationMs", "transportExit": true? }` or `{ "guid", "pos", "stopped": true }` — `transportExit` only on the spline that takes a passenger off a vehicle seat (`MoveSplineFlag::TransportExit`, `Unit::_ExitVehicle`): for the character's own guid, how a client learns it is off the seat |
+| `SMSG_MONSTER_MOVE_TRANSPORT` | 0x2AE | `{ "guid", "transportGuid", "seat": <i8>, "pos": {x,y,z}, "destination": {x,y,z}, "durationMs" }` or with `"stopped": true` — a spline in a transport's own frame (`MoveSplineInit::Launch` for a unit aboard one), `seat` -1 on a transport's deck and the seat index on a vehicle. For the character's own guid with a seat it is the boarding spline onto a vehicle seat ("Vehicles and possession", above): which vehicle, which seat. `pos` and `destination` are transport-relative, never a world position |
+| `SMSG_CLIENT_CONTROL_UPDATE` | 0x159 | `{ "guid", "allowMove": <bool> }` — which unit this client moves and whether it may (`Player::SetClientControl`; "Vehicles and possession", above). The module answers it as a client does |
 
 `SMSG_MONSTER_MOVE` is deliberately reduced to destination + duration: the
 spline path points the client receives are consumed and dropped, because

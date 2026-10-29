@@ -52,6 +52,30 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   against the character's own and its reputation.
 - `use_item` takes `glyphSlot` (0-5), the slot a client's glyph frame sends
   with a glyph; `useItem(..., { glyphSlot })` in the SDK.
+- Vehicles and possession, the observation and the seat half
+  (module/PROTOCOL.md, "Vehicles and possession"). Events:
+  `SMSG_CLIENT_CONTROL_UPDATE` (which unit the client moves), the boarding
+  spline `SMSG_MONSTER_MOVE_TRANSPORT` (vehicle and seat) and `transportExit`
+  on `SMSG_MONSTER_MOVE`; the SDK folds them into `state.self.control`
+  (`mover`, `allowMove`) and `state.self.vehicle` (`guid`, `seat`), and the
+  controlled unit's bar is `state.pet()` as before, cast from with `petCast`.
+  Actions: `vehicle_exit` and `vehicle_change_seat`, which send the
+  controlled-vehicle opcode (`CMSG_DISMISS_CONTROLLED_VEHICLE`,
+  `CMSG_CHANGE_SEATS_ON_CONTROLLED_VEHICLE`, each with the vehicle's
+  MovementInfo) from the driving seat and the passenger one
+  (`CMSG_REQUEST_VEHICLE_EXIT`, `CMSG_REQUEST_VEHICLE_SWITCH_SEAT`) from any
+  other; `CMSG_SPELLCLICK` and `CMSG_PLAYER_VEHICLE_ENTER` on the raw
+  allowlist. In the SDK: `spellClick(target)` (refused `no_spellclick` when
+  the unit in view has no spellclick flag), `leaveVehicle()` (`left` on the
+  exit spline) and `changeSeat(seat)` (`seated` on the new seat's boarding
+  spline). The module answers a control handover as a client does
+  (`CMSG_SET_ACTIVE_MOVER`, `CMSG_MOVE_NOT_ACTIVE_MOVER`) and reports the end
+  of a boarding or exit spline (`CMSG_MOVE_SPLINE_DONE`), audited as
+  `active_mover` and `spline_done`. Driving the controlled unit is not in
+  this change: `move_to` and `face` while the client moves another unit are
+  refused with the new status `controlling` (a `WB_MOVE_RESULT` naming the
+  `mover`; a walk the handover ends reads the same), where before the
+  server silently dropped the walk and it ended `interrupted`.
 - Unit state flags named, from the `unitFlags` and `dynamicFlags` the module
   already serves (no wire change): `units()` rows carry `inCombat`,
   `stunned`, `skinnable`, `lootable`, `tapped` and `tappedByYou` (the client's

@@ -254,6 +254,8 @@ describe("event frames", () => {
       "MSG_CORPSE_QUERY",
       "SMSG_CHAR_DELETE",
       "SMSG_MONSTER_MOVE",
+      "SMSG_MONSTER_MOVE_TRANSPORT",
+      "SMSG_CLIENT_CONTROL_UPDATE",
     ]);
     expect(isKnownOpcode("SMSG_MESSAGECHAT")).toBe(true);
     expect(isKnownOpcode("SMSG_UPDATE_OBJECT")).toBe(true);
