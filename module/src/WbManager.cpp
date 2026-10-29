@@ -1,19 +1,9 @@
 /*
  * This file is part of mod-wrathbench, an AzerothCore module.
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: MIT
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
- * more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program. If not, see <http://www.gnu.org/licenses/>.
+ * Copyright (c) 2026 Mark Beukers
+ * Licensed under the MIT License; see LICENSE in the module's root.
  */
 
 #include "WbManager.h"
@@ -4349,23 +4339,12 @@ namespace WrathBench
         }
         w.Add("standing", standing);
         // The client adds its own Faction.dbc base for the character's race
-        // and class (ReputationMgr::GetBaseReputation is the same arithmetic
-        // over the same masks); `reputation` is what the pane shows and what
-        // the Neutral/Friendly/... rank is read off.
+        // and class, the base the server reads off the same masks
+        // (ReputationMgr::GetBaseReputation); `reputation` is what the pane
+        // shows and what the Neutral/Friendly/... rank is read off.
         if (fe && player)
         {
-            uint32 raceMask = player->getRaceMask();
-            uint32 classMask = player->getClassMask();
-            int32 base = 0;
-            for (int i = 0; i < 4; ++i)
-            {
-                if ((fe->BaseRepRaceMask[i] & raceMask || (fe->BaseRepRaceMask[i] == 0 && fe->BaseRepClassMask[i] != 0))
-                    && (fe->BaseRepClassMask[i] & classMask || fe->BaseRepClassMask[i] == 0))
-                {
-                    base = fe->BaseRepValue[i];
-                    break;
-                }
-            }
+            int32 base = player->GetReputationMgr().GetBaseReputation(fe);
             w.Add("base", base).Add("reputation", base + standing);
         }
         return w.Str();

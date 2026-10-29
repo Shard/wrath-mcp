@@ -1,19 +1,9 @@
 /*
  * This file is part of mod-wrathbench, an AzerothCore module.
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: MIT
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
- * more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program. If not, see <http://www.gnu.org/licenses/>.
+ * Copyright (c) 2026 Mark Beukers
+ * Licensed under the MIT License; see LICENSE in the module's root.
  */
 
 #include "WbNav.h"
@@ -22,8 +12,6 @@
 
 #include <algorithm>
 #include <cfloat>
-#include <cmath>
-#include <cstring>
 #include <unordered_set>
 
 namespace WbNav
@@ -63,198 +51,6 @@ namespace WbNav
         if (dist)
             *dist = FLT_MAX;
         return 0;
-    }
-
-    // The core's smooth path, ported because PathGenerator keeps it private:
-    // FindSmoothPath with GetSteerTarget and FixupCorridor (PathGenerator.cpp,
-    // GPL-2.0-or-later like this module), unchanged but for the filter, the
-    // corridor buffer and the point cap (the caller's) — 4y steps along the
-    // surface, each point 0.5y over its polygon, failing when the route needs
-    // the whole cap. A straight-path corner list would not do: a 30y corner
-    // segment across a 55 degree face averages under the drop guard's slope,
-    // and the walk would interpolate through the hill.
-    static bool InRangeYZX(float const* v1, float const* v2, float r, float h)
-    {
-        float const dx = v2[0] - v1[0];
-        float const dy = v2[1] - v1[1]; // elevation
-        float const dz = v2[2] - v1[2];
-        return (dx * dx + dz * dz) < r * r && std::fabs(dy) < h;
-    }
-
-    static uint32_t FixupCorridor(dtPolyRef* path, uint32_t npath, uint32_t maxPath, dtPolyRef const* visited, uint32_t nvisited)
-    {
-        int32_t furthestPath = -1;
-        int32_t furthestVisited = -1;
-        for (int32_t i = int32_t(npath) - 1; i >= 0; --i)
-        {
-            bool found = false;
-            for (int32_t j = int32_t(nvisited) - 1; j >= 0; --j)
-            {
-                if (path[i] == visited[j])
-                {
-                    furthestPath = i;
-                    furthestVisited = j;
-                    found = true;
-                }
-            }
-            if (found)
-                break;
-        }
-        if (furthestPath == -1 || furthestVisited == -1)
-            return npath;
-
-        uint32_t req = nvisited - furthestVisited;
-        uint32_t orig = uint32_t(furthestPath + 1) < npath ? furthestPath + 1 : npath;
-        uint32_t size = npath > orig ? npath - orig : 0;
-        if (req + size > maxPath)
-            size = maxPath - req;
-        if (size)
-            memmove(path + req, path + orig, size * sizeof(dtPolyRef));
-        for (uint32_t i = 0; i < req; ++i)
-            path[i] = visited[(nvisited - 1) - i];
-        return req + size;
-    }
-
-    static bool SteerTarget(dtNavMeshQuery const* query, float const* startPos, float const* endPos, float minTargetDist,
-        dtPolyRef const* path, uint32_t pathSize, float* steerPos, unsigned char& steerPosFlag, dtPolyRef& steerPosRef)
-    {
-        static uint32_t const MAX_STEER_POINTS = 3;
-        float steerPath[MAX_STEER_POINTS * VERTS];
-        unsigned char steerPathFlags[MAX_STEER_POINTS];
-        dtPolyRef steerPathPolys[MAX_STEER_POINTS];
-        int nsteerPath = 0;
-        dtStatus st = query->findStraightPath(startPos, endPos, path, int(pathSize),
-            steerPath, steerPathFlags, steerPathPolys, &nsteerPath, int(MAX_STEER_POINTS));
-        if (!nsteerPath || dtStatusFailed(st))
-            return false;
-        uint32_t ns = 0;
-        while (ns < uint32_t(nsteerPath))
-        {
-            if ((steerPathFlags[ns] & DT_STRAIGHTPATH_OFFMESH_CONNECTION)
-                || !InRangeYZX(&steerPath[ns * VERTS], startPos, minTargetDist, 1000.0f))
-                break;
-            ns++;
-        }
-        if (ns >= uint32_t(nsteerPath))
-            return false;
-        dtVcopy(steerPos, &steerPath[ns * VERTS]);
-        steerPos[1] = startPos[1]; // keep Z value
-        steerPosFlag = steerPathFlags[ns];
-        steerPosRef = steerPathPolys[ns];
-        return true;
-    }
-
-    dtStatus SmoothPath(dtNavMesh const* navMesh, dtNavMeshQuery const* query, dtQueryFilter const& filter,
-        float const* startPos, float const* endPos, dtPolyRef const* polyPath, uint32_t polyPathSize,
-        float* smoothPath, uint32_t* smoothPathSize, uint32_t maxSmoothPathSize)
-    {
-        *smoothPathSize = 0;
-        uint32_t nsmoothPath = 0;
-
-        dtPolyRef polys[PLAN_MAX_POLYS];
-        memcpy(polys, polyPath, sizeof(dtPolyRef) * polyPathSize);
-        uint32_t npolys = polyPathSize;
-
-        float iterPos[VERTS], targetPos[VERTS];
-        if (polyPathSize > 1)
-        {
-            if (dtStatusFailed(query->closestPointOnPolyBoundary(polys[0], startPos, iterPos)))
-                return DT_FAILURE;
-            if (dtStatusFailed(query->closestPointOnPolyBoundary(polys[npolys - 1], endPos, targetPos)))
-                return DT_FAILURE;
-        }
-        else
-        {
-            dtVcopy(iterPos, startPos);
-            dtVcopy(targetPos, endPos);
-        }
-
-        dtVcopy(&smoothPath[nsmoothPath * VERTS], iterPos);
-        nsmoothPath++;
-
-        while (npolys && nsmoothPath < maxSmoothPathSize)
-        {
-            float steerPos[VERTS];
-            unsigned char steerPosFlag;
-            dtPolyRef steerPosRef = 0;
-            if (!SteerTarget(query, iterPos, targetPos, SMOOTH_SLOP, polys, npolys, steerPos, steerPosFlag, steerPosRef))
-                break;
-
-            bool endOfPath = (steerPosFlag & DT_STRAIGHTPATH_END) != 0;
-            bool offMeshConnection = (steerPosFlag & DT_STRAIGHTPATH_OFFMESH_CONNECTION) != 0;
-
-            float delta[VERTS];
-            dtVsub(delta, steerPos, iterPos);
-            float len = dtMathSqrtf(dtVdot(delta, delta));
-            if ((endOfPath || offMeshConnection) && len < SMOOTH_STEP)
-                len = 1.0f;
-            else
-                len = SMOOTH_STEP / len;
-
-            float moveTgt[VERTS];
-            dtVmad(moveTgt, iterPos, delta, len);
-
-            float result[VERTS];
-            static uint32_t const MAX_VISIT_POLY = 16;
-            dtPolyRef visited[MAX_VISIT_POLY];
-            int nvisited = 0;
-            if (dtStatusFailed(query->moveAlongSurface(polys[0], iterPos, moveTgt, &filter, result, visited, &nvisited, int(MAX_VISIT_POLY))))
-                return DT_FAILURE;
-            npolys = FixupCorridor(polys, npolys, PLAN_MAX_POLYS, visited, uint32_t(nvisited));
-
-            query->getPolyHeight(polys[0], result, &result[1]);
-            result[1] += 0.5f;
-            dtVcopy(iterPos, result);
-
-            if (endOfPath && InRangeYZX(iterPos, steerPos, SMOOTH_SLOP, 1.0f))
-            {
-                dtVcopy(iterPos, targetPos);
-                if (nsmoothPath < maxSmoothPathSize)
-                {
-                    dtVcopy(&smoothPath[nsmoothPath * VERTS], iterPos);
-                    nsmoothPath++;
-                }
-                break;
-            }
-            else if (offMeshConnection && InRangeYZX(iterPos, steerPos, SMOOTH_SLOP, 1.0f))
-            {
-                dtPolyRef prevRef = 0;
-                dtPolyRef polyRef = polys[0];
-                uint32_t npos = 0;
-                while (npos < npolys && polyRef != steerPosRef)
-                {
-                    prevRef = polyRef;
-                    polyRef = polys[npos];
-                    npos++;
-                }
-                for (uint32_t i = npos; i < npolys; ++i)
-                    polys[i - npos] = polys[i];
-                npolys -= npos;
-
-                float connectionStartPos[VERTS], connectionEndPos[VERTS];
-                if (dtStatusSucceed(navMesh->getOffMeshConnectionPolyEndPoints(prevRef, polyRef, connectionStartPos, connectionEndPos)))
-                {
-                    if (nsmoothPath < maxSmoothPathSize)
-                    {
-                        dtVcopy(&smoothPath[nsmoothPath * VERTS], connectionStartPos);
-                        nsmoothPath++;
-                    }
-                    dtVcopy(iterPos, connectionEndPos);
-                    if (dtStatusFailed(query->getPolyHeight(polys[0], iterPos, &iterPos[1])))
-                        return DT_FAILURE;
-                    iterPos[1] += 0.5f;
-                }
-            }
-
-            if (nsmoothPath < maxSmoothPathSize)
-            {
-                dtVcopy(&smoothPath[nsmoothPath * VERTS], iterPos);
-                nsmoothPath++;
-            }
-        }
-
-        *smoothPathSize = nsmoothPath;
-        return nsmoothPath < maxSmoothPathSize ? DT_SUCCESS : DT_FAILURE;
     }
 
     dtNavMeshQuery const* PlannerQuery(dtNavMesh const* navMesh)

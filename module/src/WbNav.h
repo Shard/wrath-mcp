@@ -1,19 +1,9 @@
 /*
  * This file is part of mod-wrathbench, an AzerothCore module.
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: MIT
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
- * more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program. If not, see <http://www.gnu.org/licenses/>.
+ * Copyright (c) 2026 Mark Beukers
+ * Licensed under the MIT License; see LICENSE in the module's root.
  */
 
 #ifndef WRATHBENCH_NAV_H
@@ -81,9 +71,15 @@ namespace WbNav
     // then 3y x 50y), with the distance to it.
     dtPolyRef CorePolyAt(dtNavMeshQuery const* query, dtQueryFilter const& filter, float const* point, float* dist);
 
-    // The core's smooth path along a corridor (PathGenerator::FindSmoothPath),
-    // ported because PathGenerator keeps it private; `polyPathSize` at most
-    // PLAN_MAX_POLYS. Fails when the route needs the whole point cap.
+    // The smooth path along a corridor, the walk the core's path builder
+    // makes (PathGenerator::FindSmoothPath, private to it): Recast's
+    // path-follow (WbNavRecast.cpp, zlib, from Recast Navigation's demo)
+    // with the core's step, slop and lift — SMOOTH_STEP steps along the
+    // surface, each point 0.5y over its polygon. A straight-path corner list
+    // would not do: a 30y corner segment across a 55 degree face averages
+    // under the drop guard's slope, and the walk would interpolate through
+    // the hill. `polyPathSize` at most PLAN_MAX_POLYS. Fails when the route
+    // needs the whole point cap.
     dtStatus SmoothPath(dtNavMesh const* navMesh, dtNavMeshQuery const* query, dtQueryFilter const& filter,
         float const* startPos, float const* endPos, dtPolyRef const* polyPath, uint32_t polyPathSize,
         float* smoothPath, uint32_t* smoothPathSize, uint32_t maxSmoothPathSize);

@@ -101,9 +101,11 @@ verified.
 
 ## Licence
 
-Original material is MIT under `LICENSE`, except `module/`, which is
-GPL-2.0-or-later (see `module/LICENSE`). Neither relicenses AzerothCore,
-Blizzard's assets or any dependency; see `THIRD-PARTY-NOTICES.md`.
+Everything here is MIT under `LICENSE`, except
+`module/src/WbNavRecast.cpp`, which is derived from Recast Navigation and keeps
+its zlib licence notice. A worldserver built with the module is a combined work
+under AzerothCore's licence. Nothing here relicenses AzerothCore, Blizzard's
+assets or any dependency; see `THIRD-PARTY-NOTICES.md`.
 
 Nothing Blizzard-derived is in this repository: no client files, no extracted
 maps or DBCs, no game text. The client data a worldserver needs is the user's
