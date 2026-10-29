@@ -17,7 +17,8 @@ Three pieces:
 What an agent may observe and do is `docs/CONTRACTS.md`; with
 `module/PROTOCOL.md` it is the stack's specification. The stack knows nothing
 of episodes, scores or trajectories. A harness plugs those in through the hooks
-`mcp/` exposes. [WrathBench](https://github.com/Shard/WrathBench), an LLM
+`mcp/` exposes; `docs/ARCHITECTURE.md` is how the pieces fit and what those
+hooks are. [WrathBench](https://github.com/Shard/WrathBench), an LLM
 evaluation harness, is one such harness and the stack's first consumer.
 
 Tested against AzerothCore

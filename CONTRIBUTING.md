@@ -51,7 +51,9 @@ change.
 The module compiles only inside an AzerothCore tree and is exercised only by a
 live worldserver, so nothing here can verify it. A `module/` change is verified
 through a WrathBench pin-bump release, which builds the worldserver image with
-the change and runs WrathBench's smoke suite against the live stack. Say in the
+the change and runs WrathBench's smoke suite
+([`infra/smoke/`](https://github.com/Shard/WrathBench/tree/master/infra/smoke))
+against the live stack. Say in the
 pull request what the change should do on the wire, so the smokes that cover it
 can be named. `sdk/examples/live-slice.ts` and `live-move.ts` are the quick
 checks against any worldserver you run yourself.

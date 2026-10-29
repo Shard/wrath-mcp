@@ -4,83 +4,26 @@ The TypeScript library a model's snippets call to drive a character. It wraps
 the module's HTTP/WebSocket protocol (`module/PROTOCOL.md`) in typed helpers,
 turns the module's packet stream into typed events, and folds those events into
 a state cache that says what the character can see right now. The stack's
-sandbox (`mcp/`) hands it to every snippet as the ambient `sdk`, the scripted
-reference run plays through it from inside those snippets, and most of the
-smoke scripts under
-`infra/smoke/` call it directly. Everything it knows comes through the module,
-so it observes only what a real client could observe (`docs/CONTRACTS.md`).
+sandbox (`mcp/`) hands it to every snippet as the ambient `sdk`, and a harness
+or a script can drive it directly. Everything it knows comes through the
+module, so it observes only what a real client could observe
+(`docs/CONTRACTS.md`).
 
 The model does not read this file. It reads `sdk/API.md`, the exhaustive
 per-method reference generated from the source by `sdk/generate-api-docs.ts`.
-This file is for people working on the harness: how the pieces fit, the
-behaviours worth knowing before you compose helpers, and the rules the surface
-is held to.
+This file is for people working on the SDK: the behaviours worth knowing
+before you compose helpers, and the rules the surface is held to. How it fits
+with the module and the MCP server is `docs/ARCHITECTURE.md`; building the
+module, configuring it and running the MCP server are the root `README.md`.
 
-## The stack
-
-The SDK is the middle of three pieces that together give an agent a game
-client's eyes and hands on a stock AzerothCore — packets, not pixels — and
-nothing of the benchmark built on them:
-
-- `module/` (C++, GPL-2.0-or-later): the worldserver module. It takes actions
-  as the client opcodes a client would send and serves the packets a client
-  would receive, over HTTP and a WebSocket. Its wire is `module/PROTOCOL.md`.
-- `sdk/` (this package, `@wrathbench/sdk`): the typed client over that wire,
-  the event stream, the state cache, the helpers and their per-call hints.
-- `mcp/` (`@wrathbench/mcp`): the agent surface over the SDK — a confined,
-  persistent snippet sandbox holding one client, an MCP server, and the core
-  tools (`run_snippet`, `recent_events`, `state_summary`, `write_scratchpad`,
-  `edit_scratchpad`).
-
-What the agent may observe and do is `docs/CONTRACTS.md`; with
-`module/PROTOCOL.md` it is the stack's specification. `runner/` is the
-benchmark that drives the stack; nothing in the stack imports it
-(`bun run boundary`, `docs/ARCHITECTURE.md`, "The stack and the benchmark").
-
-### Quickstart
-
-1. **Add the module to a stock AzerothCore.** Check out AzerothCore at the
-   pinned commit, `3cafaf4a588fd1f287678fdb37438fdedd1ed85c` (`infra/PINS.md`),
-   copy `module/` to `modules/mod-wrathbench`, and build as usual; CMake finds
-   the module itself. `-DWRATHBENCH_BUILD=<your build id>` names the build on
-   `/health`. `infra/docker/server.Dockerfile` is this exact recipe. The
-   worldserver needs the 3.3.5a client data (`dbc`, `maps`, `vmaps`, `mmaps`)
-   for that core, which you supply; none of it is in this repository.
-2. **Configure it.** Copy `module/conf/mod_wrathbench.conf.dist` beside the
-   worldserver's config. `WrathBench.Secret` is required — the port secret,
-   32 characters or more; without it the module does not listen.
-   `WrathBench.Accounts` lists the game accounts sessions may use,
-   `WrathBench.BindAddress` and `WrathBench.Port` (default `0.0.0.0:8086`)
-   where it listens; keep that port on a private network.
-3. **Run the MCP server.** With Bun 1.4 and `bun install` at the repo root:
-
-   ```bash
-   WRATHBENCH_MODULE_URL=http://127.0.0.1:8086 \
-   WRATHBENCH_MODULE_SECRET=<the port secret> \
-     bun mcp/src/main.ts --account <an allowed account>
-   ```
-
-   It speaks MCP over stdio, so an MCP-capable agent launches it as its
-   server command. It leases a session secret for its token with the port
-   secret, hands the sandbox only that, and keeps the scratchpad and the
-   client cache under `--dir` (default `$TMPDIR/wrathbench-mcp/<token>`). The
-   sandbox needs Linux 6.7 or later (Landlock with TCP rules) and refuses to
-   run without it. Event lines and the state summary come back in a plain
-   rendering; a harness supplies its own (`CoreToolRender`).
-4. **Or use the SDK directly**, as the smoke scripts do (below, "At a
-   glance").
-
-### Versioning
+## Versioning
 
 The SDK has its own version, `SDK_VERSION` (`src/version.ts`, the same string
-as `package.json`; `docs/METHODOLOGY.md`, "Fixed harness, frozen per
-version"), and `@wrathbench/mcp` carries the same one. As built, the runner
-depends on the stack at an exact version (`workspace:0.1.0`), so an SDK whose
-version moves fails the install until that dependency moves too, and every
-run records the version it drove as `sdkVersion` in `meta.json`. A change a
-model can see is still a harness change (`docs/METHODOLOGY.md`, "Changing
-this document"). Which changes bump which part of the SDK's version is not
-settled yet.
+as `package.json`), and `@wrathbench/mcp` carries the same one. A harness that
+measures models pins it exactly, because a change a model can see changes what
+it measures; WrathBench's rules for that are its
+[`docs/METHODOLOGY.md`](https://github.com/Shard/WrathBench/blob/master/docs/METHODOLOGY.md).
+Which changes bump which part of the SDK's version is not settled yet.
 
 The module's wire has a version of its own, the integer `protocol` on
 `GET /health` (`module/PROTOCOL.md`, "Versioning"). `connect` checks it before
@@ -94,7 +37,11 @@ binary, not which wire.
 ```ts
 import { connect } from "@wrathbench/sdk";
 
-const client = await connect({ baseUrl: "http://worldserver:8086", token: "run-1" });
+const client = await connect({
+  baseUrl: "http://127.0.0.1:8086",
+  token: crypto.randomUUID().replaceAll("-", ""), // 32 characters or more
+  secret: process.env.WRATHBENCH_MODULE_SECRET, // the port secret
+});
 
 await client.health();
 const session = await client.createSession({ character: "Benchy", race: 1, class: 1 });
@@ -124,11 +71,12 @@ in flight. Subscribing first is what makes the state cache complete.
 bun test sdk                 # the whole suite, from the repo root; no game stack needed
 bunx tsc --noEmit -p sdk     # strict typecheck of src, test and examples
 
-# live checks, need the stack up; not part of bun test. Both read
-# WRATHBENCH_MODULE_SECRET from the environment and send it as the bearer
+# live checks against a worldserver running the module; not part of bun test.
+# Both send WRATHBENCH_MODULE_SECRET, the port secret, as the bearer
 # credential — without it the module answers 401 unauthorized.
-docker compose -f infra/compose.yml exec runner bun sdk/examples/live-slice.ts
-docker compose -f infra/compose.yml exec runner bun sdk/examples/live-move.ts
+export MODULE_HOST=127.0.0.1 MODULE_PORT=8086 WRATHBENCH_MODULE_SECRET=<the port secret>
+bun sdk/examples/live-slice.ts
+bun sdk/examples/live-move.ts
 ```
 
 The tests run against an in-process `Bun.serve` stub (`test/server.ts`) that
@@ -145,10 +93,10 @@ helper-by-helper detail below.
 game's verdict and returns it. `raw()` is not a helper: it queues one
 allowlisted client opcode with a caller-built body (the allowlist is
 `module/PROTOCOL.md`, "raw"). It is how a trajectory shows that a surface is
-needed before one is built, not a second path to any helper
-(`docs/METHODOLOGY.md`, "The model surface"). Helpers stop where they stop
-because that is what the probes and `infra/smoke/one-quest.ts` have actually
-needed; nothing is added in anticipation.
+needed before one is built, not a second path to any helper (WrathBench's
+[`docs/METHODOLOGY.md`](https://github.com/Shard/WrathBench/blob/master/docs/METHODOLOGY.md#the-model-surface),
+"The model surface"). Helpers stop where they stop because that is what
+observed runs have actually needed; nothing is added in anticipation.
 
 **Game outcomes are returned, not thrown.** A helper returns `ok: true` or
 `ok: false` with the `status` intact and a per-status `hint`. "There is no path
@@ -170,8 +118,9 @@ is fair game to optimise; referents are not.
 **A name in view is a valid referent.** Wherever a helper or raw action takes a
 guid, it also takes the name of a unit, item, spell, talent, faction or taxi
 node the model can currently observe (`src/resolve.ts` is the shared
-resolver; `docs/METHODOLOGY.md`, "A name in view is a valid referent, with
-bounded fuzz"). Resolution is deterministic and narrow: normalise case,
+resolver; WrathBench's
+[`docs/METHODOLOGY.md`](https://github.com/Shard/WrathBench/blob/master/docs/METHODOLOGY.md#the-model-surface),
+"A name in view is a valid referent, with bounded fuzz"). Resolution is deterministic and narrow: normalise case,
 whitespace and apostrophes; exact match, else a unique substring, else a unique
 match within a small edit distance. One candidate acts; none refuses and says
 what is in view; two or more refuse and list them. Opcode names and guids
@@ -204,8 +153,8 @@ makes the server swing until it is cancelled, and moving does not cancel it. So
 half-fought mob is how a character dies standing still. `attacking` says which
 happened and `detail` says it in words. If the server cancels our auto-attack
 mid-fight (`SMSG_ATTACKSTOP` with the target still alive), the loop swings
-again. The default `timeout` is 25000 ms, deliberately under the runner's 30 s
-snippet cap; longer fights belong in a background routine. The walk into melee
+again. The default `timeout` is 25000 ms, deliberately under the sandbox's 30 s
+snippet timeout (`mcp/src/main.ts`); longer fights belong in a background routine. The walk into melee
 range draws on the same timeout, so every result also says whether melee range
 was ever reached (`reached`) and how far the target was at the end
 (`distance`), and a `timeout` that never got there opens `detail` with "never
@@ -603,16 +552,17 @@ field:
 - A `create` block flagged `self` whose guid contradicts the seeded identity
   does **not** overwrite `self`. It is recorded on `state.anomalies` and filed
   as an ordinary object in view, because the cache cannot tell which of the
-  two is wrong and picking silently would make it disagree with the trajectory
-  log.
+  two is wrong and picking silently would make it disagree with any record of
+  the stream it was folded from.
 
 ## For maintainers
 
-**The surface is versioned.** The SDK's public shape is part of the harness
-version (`docs/ARCHITECTURE.md`). Adding to it is a minor bump. Changing or
-removing anything exported from `src/index.ts` is a major bump and wants a note
-in `docs/METHODOLOGY.md`. Two consequences: helpers are added because a run
-needed them, never in anticipation; and the cache never exposes a field no
+**The surface is versioned.** `src/index.ts` is the SDK's whole public
+surface, and a harness that pins the SDK treats a change to it as a change to
+what it measures (WrathBench's
+[`docs/METHODOLOGY.md`](https://github.com/Shard/WrathBench/blob/master/docs/METHODOLOGY.md)
+says how). Two consequences: helpers are added because a run needed them,
+never in anticipation; and the cache never exposes a field no
 event carried, because a field that appears and later becomes trustworthy is a
 silent contract change.
 
