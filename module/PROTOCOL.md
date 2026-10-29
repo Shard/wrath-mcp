@@ -965,6 +965,7 @@ pinned AzerothCore commit.
 | `SMSG_NOTIFICATION` | 0x1CB | `{ "text": <string> }` |
 | `SMSG_NAME_QUERY_RESPONSE` | 0x051 | `{ "guid": <guid-string>, "found": <bool>, "name": <string?> }` |
 | `SMSG_MESSAGECHAT` | 0x096 | `{ "type": <u8>, "language": <i32>, "senderGuid": <guid-string>, "senderName": <string?>, "receiverGuid": <guid-string?>, "receiverName": <string?>, "channelName": <string?>, "message": <string>, "chatTag": <u8>, "achievementId": <u32?> }` |
+| `SMSG_CHAT_PLAYER_NOT_FOUND` | 0x2A9 | `{ "name": <string> }` — a whisper found nobody by that name online, or one who does not take whispers (`WorldSession::SendPlayerNotFoundNotice`): the name as it was sent. The client shows it as "no player named … is playing"; the whisper went nowhere |
 
 `SMSG_MESSAGECHAT.data` is decoded per chat `type`, following the layout
 `ChatHandler::BuildChatPacket` writes for each (the core's `Chat.cpp`): the
@@ -1735,6 +1736,7 @@ Quests and gossip (quest/gossip text served as the client would show it):
 | `SMSG_QUESTUPDATE_COMPLETE` | 0x198 | `{ "questId" }` — an exploration or scripted-event objective credited: its only sender is `Player::AreaExploredOrEventHappens`, once per accept, when the server-only `Explored` flag flips, whether or not the rest of the quest is done. NOT sent for kill/item objectives at the pinned commit; read completion from the quest-log `State` complete bit or the final `ADD_KILL` with `current == required` |
 | `SMSG_QUESTUPDATE_FAILED` | 0x196 | `{ "questId" }` |
 | `SMSG_QUESTLOG_FULL` | 0x195 | `{}` — bodiless: the quest log's 25 slots are taken, so an accept (or an auto-accept on a hello or query) added nothing (`Player::SatisfyQuestLog`); the client shows "Quest log is full." The refused quest is not named |
+| `SMSG_QUESTGIVER_QUEST_INVALID` | 0x18F | `{ "reason": <u32> }` — why a quest cannot be taken (`Player::SendCanTakeQuestResponse`, from `CanTakeQuest` on an accept or on a quest-start item's query): the raw `QuestFailedReason` (0 requirements not met, 1 level too low, 6 wrong race, 7 already done, 12 one timed quest at a time, 13/18 already in the log, 21 missing items, 23 not enough money, 26/29 daily limits). The quest is not named; nothing is added to the log |
 | `SMSG_GOSSIP_MESSAGE` | 0x17D | `{ "guid", "menuId", "textId", "options": [{ "optionId", "icon", "text" }], "quests": [{ "questId", "icon", "level", "title" }] }` |
 | `SMSG_GOSSIP_COMPLETE` | 0x17E | `{}` |
 
@@ -1970,7 +1972,10 @@ when "Make this inn your home." is chosen:
 
 The server declines a bind silently (not an innkeeper, out of range, dead,
 inside an instance): no packet follows the confirm, and the SDK reports that
-as the absence of an answer, never as a status.
+as the absence of an answer, never as a status. `SMSG_PLAYERBINDERROR` exists
+in the opcode table but the core never sends it (`STATUS_NEVER`, no builder),
+so nothing stands in for it; likewise `SMSG_RESURRECT_FAILED`, so a
+resurrection the server ignores is told by its absence too.
 
 #### Death
 
@@ -2018,6 +2023,7 @@ Map transfers (navigation):
 | `SMSG_NEW_WORLD` | 0x03E | `{ "map": <u32>, "x", "y", "z", "o" }` — the arrival point (transport-local when aboard one) |
 | `SMSG_TRANSFER_ABORTED` | 0x040 | `{ "map": <u32>, "reason": <u8>, "arg": <u8?> }` — `arg` only for INSUF_EXPAN_LVL / DIFFICULTY / UNIQUE_MESSAGE |
 | `SMSG_CORPSE_NOT_IN_INSTANCE` | 0x506 | `{}` — bodiless: a dead character crossed a dungeon portal's areatrigger and the server refused it because its corpse is not in that dungeon or one inside it (`MapMgr::PlayerCannotEnter`); no transfer follows, and the `move_to` that crossed the trigger ends as it would have anyway |
+| `SMSG_AREA_TRIGGER_MESSAGE` | 0x2B8 | `{ "text": <string> }` — a portal's refusal in words (`WorldSession::SendAreaTriggerMessage`): a dungeon's level gate, a closed instance, a raid entered without a raid group, a battleground portal of the other faction. One event per line of the text (u32 length, then the line; read to the length and cut at the first NUL). No transfer follows, and the `move_to` that crossed the trigger ends as it would have anyway |
 
 `SMSG_NEW_WORLD` is the only map id a client receives after login
 (`SMSG_LOGIN_VERIFY_WORLD` is never re-sent), so it is what self position's

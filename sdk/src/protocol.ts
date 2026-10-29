@@ -500,6 +500,10 @@ export type MotdData = z.infer<typeof motdDataSchema>;
 export const notificationDataSchema = z.looseObject({ text: z.string() });
 export type NotificationData = z.infer<typeof notificationDataSchema>;
 
+/** Chat to a named player found nobody by that name online: the name as it was sent. */
+export const chatPlayerNotFoundDataSchema = z.looseObject({ name: z.string() });
+export type ChatPlayerNotFoundData = z.infer<typeof chatPlayerNotFoundDataSchema>;
+
 export const nameQueryResponseDataSchema = z.looseObject({
   guid: guidSchema,
   found: z.boolean(),
@@ -935,6 +939,14 @@ export const transferAbortedDataSchema = z.looseObject({
 });
 export type TransferAbortedData = z.infer<typeof transferAbortedDataSchema>;
 
+/**
+ * A portal's refusal in words (`WorldSession::SendAreaTriggerMessage`): a
+ * dungeon's level gate, a closed instance, a raid without a raid group. One
+ * event per line of the server's text; no transfer follows.
+ */
+export const areaTriggerMessageDataSchema = z.looseObject({ text: z.string() });
+export type AreaTriggerMessageData = z.infer<typeof areaTriggerMessageDataSchema>;
+
 // ----------------------------------------------- quest / combat extension
 //
 // One schema per row of PROTOCOL.md's quest/combat whitelist, in the same
@@ -1241,6 +1253,13 @@ export const questGiverQuestFailedDataSchema = z.looseObject({
   reason: z.number(),
 });
 export type QuestGiverQuestFailedData = z.infer<typeof questGiverQuestFailedDataSchema>;
+
+/**
+ * Why a quest cannot be taken (`Player::SendCanTakeQuestResponse`): the raw
+ * `QuestFailedReason`. The quest is not named on the wire.
+ */
+export const questGiverQuestInvalidDataSchema = z.looseObject({ reason: z.number() });
+export type QuestGiverQuestInvalidData = z.infer<typeof questGiverQuestInvalidDataSchema>;
 
 /** Kill (or gameobject, `entry | 0x80000000`) credit toward one objective. */
 export const questUpdateAddKillDataSchema = z.looseObject({
@@ -1818,6 +1837,7 @@ export const eventDataSchemas = {
   SMSG_NOTIFICATION: notificationDataSchema,
   SMSG_NAME_QUERY_RESPONSE: nameQueryResponseDataSchema,
   SMSG_MESSAGECHAT: messageChatDataSchema,
+  SMSG_CHAT_PLAYER_NOT_FOUND: chatPlayerNotFoundDataSchema,
   // movement / observation extension
   SMSG_UPDATE_OBJECT: updateObjectDataSchema,
   SMSG_DESTROY_OBJECT: destroyObjectDataSchema,
@@ -1840,6 +1860,7 @@ export const eventDataSchemas = {
   // Bodiless: a dungeon portal refused a ghost whose corpse is not inside
   // that dungeon (MapMgr::PlayerCannotEnter); no transfer starts.
   SMSG_CORPSE_NOT_IN_INSTANCE: emptyDataSchema,
+  SMSG_AREA_TRIGGER_MESSAGE: areaTriggerMessageDataSchema,
   // quest/combat extension — combat
   SMSG_ATTACKSTART: attackStartDataSchema,
   SMSG_ATTACKSTOP: attackStopDataSchema,
@@ -1882,6 +1903,7 @@ export const eventDataSchemas = {
   SMSG_QUESTUPDATE_COMPLETE: questUpdateQuestIdDataSchema,
   SMSG_QUESTUPDATE_FAILED: questUpdateQuestIdDataSchema,
   SMSG_QUESTLOG_FULL: emptyDataSchema,
+  SMSG_QUESTGIVER_QUEST_INVALID: questGiverQuestInvalidDataSchema,
   SMSG_GOSSIP_MESSAGE: gossipMessageDataSchema,
   SMSG_GOSSIP_COMPLETE: emptyDataSchema,
   // loot, vendor, inventory

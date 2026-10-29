@@ -42,6 +42,8 @@ import {
   type ActionResponse,
   type ActivateTaxiReplyData,
   type BindPointUpdateData,
+  type AreaTriggerMessageData,
+  type QuestGiverQuestInvalidData,
   type CharacterDeleteResponse,
   type CorpseQueryData,
   type CreateSessionRequest,
@@ -1688,6 +1690,19 @@ export type TransferResult =
     }
   | {
       readonly ok: false;
+      /**
+       * The portal refused in words (`SMSG_AREA_TRIGGER_MESSAGE`: a dungeon's
+       * level gate, a closed instance, a raid without a raid group); no
+       * transfer started. `text` is the server's first line.
+       */
+      readonly status: "refused";
+      readonly text: string;
+      readonly seq: number;
+      readonly ts: number;
+      readonly hint: string;
+    }
+  | {
+      readonly ok: false;
       readonly status: "waiting";
       /** The destination `SMSG_TRANSFER_PENDING` announced before the deadline ran out. */
       readonly toMap: number;
@@ -2284,6 +2299,18 @@ export type QuestAcceptResult =
       readonly questId: number;
       readonly distance: number;
       readonly hint: string;
+    }
+  | {
+      readonly ok: false;
+      /**
+       * The server will not give this character the quest
+       * (`SMSG_QUESTGIVER_QUEST_INVALID`): `hint` says why.
+       */
+      readonly status: "refused";
+      readonly questId: number;
+      /** Raw `QuestFailedReason`. */
+      readonly reason: number;
+      readonly hint: string;
     };
 
 /**
@@ -2320,6 +2347,19 @@ export type UseItemResult =
       readonly status: "refused";
       /** Raw `InventoryResult` code from `SMSG_INVENTORY_CHANGE_FAILURE`. */
       readonly result: number;
+      readonly questOffer?: undefined;
+      readonly hint: string;
+    }
+  | {
+      readonly ok: false;
+      /**
+       * A quest-start item whose quest the server will not give this
+       * character (`SMSG_QUESTGIVER_QUEST_INVALID`): `hint` says why.
+       */
+      readonly status: "quest_refused";
+      readonly questId: number;
+      /** Raw `QuestFailedReason`. */
+      readonly reason: number;
       readonly questOffer?: undefined;
       readonly hint: string;
     };
@@ -2589,6 +2629,51 @@ const SINGLE_OFFER_OPCODES: ReadonlySet<string> = new Set([
  * window; the bound leaves room for a loaded server.
  */
 const QUEST_LOG_CATCH_UP_MS = 1000;
+
+/**
+ * `QuestFailedReason` (QuestDef.h) as the reason a quest cannot be taken, in
+ * our own words; the client's own line for each is its GlobalStrings text.
+ */
+const QUEST_INVALID_TEXT: Record<number, string> = {
+  0: "you do not meet its requirements (an earlier quest in its chain, your class, a reputation or skill, or a level cap)",
+  1: "your level is too low for it",
+  6: "your race cannot take it",
+  7: "you have already completed it",
+  12: "you can be on only one timed quest at a time",
+  13: "it is already in your quest log",
+  16: "it needs an expansion this account does not have",
+  18: "it is already in your quest log",
+  21: "you do not have the items it requires",
+  23: "you do not have the money it requires",
+  26: "you have done the most daily quests allowed today",
+  27: "this account has reached its play-time limit",
+  29: "you have already completed this daily quest today",
+};
+
+/** The hint for an `SMSG_QUESTGIVER_QUEST_INVALID`: what the server refused and why. */
+function questInvalidHint(questId: number, reason: number): string {
+  const named = QUEST_INVALID_TEXT[reason];
+  return `the server will not give you quest ${questId}: ${named ?? "it gave no reason the SDK names"} (QuestFailedReason ${reason})`;
+}
+
+/**
+ * Waiting on a quest-start item's offer: the details for that quest, or the
+ * refusal, which does not name the quest, so any one after `sinceSeq` is it.
+ */
+function questOfferOrRefusal(e: StreamEvent, questId: number, sinceSeq: number | undefined): boolean {
+  if ((sinceSeq !== undefined && e.seq <= sinceSeq) || isDecodeError(e.data)) return false;
+  if (isEvent(e, "SMSG_QUESTGIVER_QUEST_INVALID")) return true;
+  return isEvent(e, "SMSG_QUESTGIVER_QUEST_DETAILS") && (e.data as QuestGiverQuestDetailsData).questId === questId;
+}
+
+/**
+ * A portal refused in words (`SMSG_AREA_TRIGGER_MESSAGE`): a dungeon's level
+ * gate, a closed instance, a raid without a raid group. The walk that crossed
+ * the trigger still ends where it ended.
+ */
+function areaTriggerRefusalHint(texts: readonly string[]): string {
+  return `the server refused the portal: "${texts.join(" ")}". No transfer follows; you are where the walk ended.`;
+}
 
 /** `acceptQuestFrom`'s hint when the server answers `SMSG_QUESTLOG_FULL`. */
 const QUEST_LOG_FULL_HINT =
@@ -3908,6 +3993,12 @@ export class WrathClient {
     this.events.on("SMSG_CORPSE_NOT_IN_INSTANCE", () => {
       this.tallyActionHint(undefined, "portal", "corpse_not_in_instance", corpseNotInInstanceHint(this.state));
     });
+    // A portal refused in words (a dungeon's level gate, a closed instance):
+    // likewise the only word of it, whichever caller walked there.
+    this.events.on("SMSG_AREA_TRIGGER_MESSAGE", (e) => {
+      if (isDecodeError(e.data)) return;
+      this.tallyActionHint(undefined, "portal", "refused", areaTriggerRefusalHint([(e.data as AreaTriggerMessageData).text]));
+    });
     // A roll frame opening is a client's popup: it reaches the harness block
     // whoever is looking, rebuilt from every open frame, since one tally
     // line holds one hint.
@@ -4231,7 +4322,8 @@ export class WrathClient {
    * `CMSG_MESSAGECHAT` a client sends for those, through `raw`, in the
    * language a client speaks by default: Common for an Alliance race, Orcish
    * for a Horde one. Either way the ack only says it was queued — the chat
-   * echo (or a `SMSG_NOTIFICATION` rejection) is an event, and the server
+   * echo (or a `SMSG_NOTIFICATION` rejection, or `SMSG_CHAT_PLAYER_NOT_FOUND`
+   * for a whisper to nobody online by that name) is an event, and the server
    * drops a party line from someone in no party without a word.
    */
   say(text: string, options: SayOptions = {}): Promise<ActionResponse> {
@@ -5264,19 +5356,18 @@ export class WrathClient {
       if (refusal !== undefined) return withResolved(where, refusal);
     }
     if (startQuest === undefined || item === undefined) return withResolved(where, ack);
-    const offer = await this.waitEvent(
-      (e) =>
-        isEvent(e, "SMSG_QUESTGIVER_QUEST_DETAILS") &&
-        !isDecodeError(e.data) &&
-        (e.data as QuestGiverQuestDetailsData).questId === startQuest &&
-        (sinceSeq === undefined || e.seq > sinceSeq),
-      {
-        timeout: options.timeout ?? 10_000,
-        description:
-          `the quest offer (SMSG_QUESTGIVER_QUEST_DETAILS for quest ${startQuest}) from ${item.name ?? `item ${item.itemId}`} — ` +
-          "the server stays silent when the quest cannot be taken (already in the log or done, level or race gate); check state.quest(id)",
-      },
-    );
+    const offer = await this.waitEvent((e) => questOfferOrRefusal(e, startQuest, sinceSeq), {
+      timeout: options.timeout ?? 10_000,
+      description:
+        `the quest offer (SMSG_QUESTGIVER_QUEST_DETAILS for quest ${startQuest}, or SMSG_QUESTGIVER_QUEST_INVALID) ` +
+        `from ${item.name ?? `item ${item.itemId}`}; check state.quest(id)`,
+    });
+    if (isEvent(offer, "SMSG_QUESTGIVER_QUEST_INVALID")) {
+      const reason = (offer.data as QuestGiverQuestInvalidData).reason;
+      const hint = questInvalidHint(startQuest, reason);
+      this.noteActionHint("useItem", "quest_refused", hint);
+      return withResolved(where, { ok: false, status: "quest_refused", questId: startQuest, reason, hint });
+    }
     const data = offer.data as QuestGiverQuestDetailsData;
     return withResolved(where, { ...ack, questOffer: { questId: data.questId, title: data.title, itemGuid: item.guid } });
   }
@@ -7382,10 +7473,13 @@ export class WrathClient {
     if (status === "arrived") {
       // A portal this walk crossed that refused a ghost: the arrival is the
       // walk's, and the refusal rides its hint (the harness block has it too).
-      const refused = this.events
-        .recent(500)
-        .some((e) => e.seq > sinceSeq && e.seq <= event.seq && e.opcode === "SMSG_CORPSE_NOT_IN_INSTANCE");
-      if (refused) extras.push(corpseNotInInstanceHint(this.state));
+      const crossed = this.events.recent(500).filter((e) => e.seq > sinceSeq && e.seq <= event.seq);
+      if (crossed.some((e) => e.opcode === "SMSG_CORPSE_NOT_IN_INSTANCE")) extras.push(corpseNotInInstanceHint(this.state));
+      // The same for a portal refused in words; its lines arrive one packet each.
+      const lines = crossed
+        .filter((e) => isEvent(e, "SMSG_AREA_TRIGGER_MESSAGE") && !isDecodeError(e.data))
+        .map((e) => (e.data as AreaTriggerMessageData).text);
+      if (lines.length > 0) extras.push(areaTriggerRefusalHint(lines));
       const aboard = data.onTransport !== undefined ? { onTransport: data.onTransport } : {};
       if (data.meshZ === undefined) {
         const hint = withNotes();
@@ -7581,8 +7675,14 @@ export class WrathClient {
     let event: StreamEvent;
     try {
       event = await this.waitEvent(
-        (e) => after(e) && (isEvent(e, "SMSG_NEW_WORLD") || isEvent(e, "SMSG_TRANSFER_ABORTED")),
-        { timeout, epoch, description: "SMSG_NEW_WORLD or SMSG_TRANSFER_ABORTED (map transfer verdict)" },
+        (e) =>
+          after(e) &&
+          (isEvent(e, "SMSG_NEW_WORLD") || isEvent(e, "SMSG_TRANSFER_ABORTED") || isEvent(e, "SMSG_AREA_TRIGGER_MESSAGE")),
+        {
+          timeout,
+          epoch,
+          description: "SMSG_NEW_WORLD, SMSG_TRANSFER_ABORTED or SMSG_AREA_TRIGGER_MESSAGE (map transfer verdict)",
+        },
       );
     } catch (err) {
       if (!(err instanceof EventTimeoutError)) throw err;
@@ -7604,6 +7704,10 @@ export class WrathClient {
           `no map transfer was announced within ${timeout}ms. The character did not enter a portal; ` +
           `check state.self.position and move onto the portal (an areatrigger fires on entry).`,
       };
+    }
+    if (isEvent(event, "SMSG_AREA_TRIGGER_MESSAGE")) {
+      const text = (event.data as AreaTriggerMessageData).text;
+      return { ok: false, status: "refused", text, seq: event.seq, ts: event.ts, hint: areaTriggerRefusalHint([text]) };
     }
     if (isEvent(event, "SMSG_TRANSFER_ABORTED")) {
       const d = event.data as TransferAbortedData;
@@ -8147,7 +8251,13 @@ export class WrathClient {
         // ask it for (CMSG_QUESTGIVER_HELLO on an item guid is dropped), so the
         // offer is the details the server sends for the query — the same
         // packet useItem waits for.
-        const offer = await this.questDetailsFrom(npc, questId, timeout, carried);
+        const answer = await this.questDetailsFrom(npc, questId, timeout, carried);
+        if (answer.offer === undefined) {
+          const hint = questInvalidHint(questId, answer.refused);
+          this.noteActionHint("acceptQuestFrom", "refused", hint);
+          return { ok: false, status: "refused", questId, reason: answer.refused, hint };
+        }
+        const offer = answer.offer;
         wanted = { questId: offer.questId, title: offer.title, icon: 0, level: 0 };
       } else {
         const offered = await this.questOffer(npc, timeout);
@@ -8185,6 +8295,7 @@ export class WrathClient {
       let quest = this.state.quest(questId);
       let refused: InventoryChangeFailureData | undefined;
       let logFull = false;
+      let invalid: QuestGiverQuestInvalidData | undefined;
       if (quest === undefined) {
         await this.waitEvent(
           (e) => {
@@ -8193,6 +8304,10 @@ export class WrathClient {
             if (sinceSeq !== undefined && e.seq <= sinceSeq) return false;
             if (isEvent(e, "SMSG_QUESTLOG_FULL")) {
               logFull = true;
+              return true;
+            }
+            if (isEvent(e, "SMSG_QUESTGIVER_QUEST_INVALID") && !isDecodeError(e.data)) {
+              invalid = e.data as QuestGiverQuestInvalidData;
               return true;
             }
             if (isEvent(e, "SMSG_INVENTORY_CHANGE_FAILURE") && !isDecodeError(e.data)) {
@@ -8206,9 +8321,14 @@ export class WrathClient {
             ...(sinceSeq === undefined ? {} : { sinceSeq: sinceSeq + 1 }),
             description:
               `quest ${questId} to appear in the quest log after accept ` +
-              `(or SMSG_INVENTORY_CHANGE_FAILURE, or SMSG_QUESTLOG_FULL)`,
+              `(or SMSG_INVENTORY_CHANGE_FAILURE, SMSG_QUESTLOG_FULL or SMSG_QUESTGIVER_QUEST_INVALID)`,
           },
         );
+      }
+      if (quest === undefined && invalid !== undefined) {
+        const hint = questInvalidHint(questId, invalid.reason);
+        this.noteActionHint("acceptQuestFrom", "refused", hint);
+        return { ok: false, status: "refused", questId, reason: invalid.reason, hint };
       }
       if (quest === undefined && logFull) {
         this.noteActionHint("acceptQuestFrom", "quest_log_full", QUEST_LOG_FULL_HINT);
@@ -9079,7 +9199,12 @@ export class WrathClient {
    * own tooltip (`startQuest`) is checked first so a wrong quest id is refused
    * here rather than by the server's silence.
    */
-  private async questDetailsFrom(itemGuid: string, questId: number, timeout: number, item: BagSlotItem): Promise<QuestGiverQuestDetailsData> {
+  private async questDetailsFrom(
+    itemGuid: string,
+    questId: number,
+    timeout: number,
+    item: BagSlotItem,
+  ): Promise<{ offer: QuestGiverQuestDetailsData; refused?: undefined } | { offer?: undefined; refused: number }> {
     const starts = questStartedBy(this.state, item);
     if (starts !== undefined && starts !== questId) {
       throw new TypeError(
@@ -9088,20 +9213,14 @@ export class WrathClient {
     }
     const sinceSeq = this.events.recent(1)[0]?.seq;
     await this.questDetails(itemGuid, questId);
-    const offer = await this.waitEvent(
-      (e) =>
-        isEvent(e, "SMSG_QUESTGIVER_QUEST_DETAILS") &&
-        !isDecodeError(e.data) &&
-        (e.data as QuestGiverQuestDetailsData).questId === questId &&
-        (sinceSeq === undefined || e.seq > sinceSeq),
-      {
-        timeout,
-        description:
-          `the quest offer (SMSG_QUESTGIVER_QUEST_DETAILS for quest ${questId}) from ${item.name ?? `item ${item.itemId}`} — ` +
-          "the server stays silent when the item does not start that quest or the quest cannot be taken (already in the log or done, level or race gate)",
-      },
-    );
-    return offer.data as QuestGiverQuestDetailsData;
+    const offer = await this.waitEvent((e) => questOfferOrRefusal(e, questId, sinceSeq), {
+      timeout,
+      description:
+        `the quest offer (SMSG_QUESTGIVER_QUEST_DETAILS for quest ${questId}, or SMSG_QUESTGIVER_QUEST_INVALID) from ` +
+        `${item.name ?? `item ${item.itemId}`} — the server stays silent when the item does not start that quest`,
+    });
+    if (isEvent(offer, "SMSG_QUESTGIVER_QUEST_INVALID")) return { refused: (offer.data as QuestGiverQuestInvalidData).reason };
+    return { offer: offer.data as QuestGiverQuestDetailsData };
   }
 
 

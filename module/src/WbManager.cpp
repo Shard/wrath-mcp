@@ -7405,6 +7405,17 @@ namespace WrathBench
                     w.Add("text", text);
                     break;
                 }
+                // A whisper (or other chat to a named player) found nobody by
+                // that name online (WorldSession::SendPlayerNotFoundNotice):
+                // the name as the sender wrote it, a cstring. The client shows
+                // "No player named '<name>' is currently playing."
+                case SMSG_CHAT_PLAYER_NOT_FOUND:
+                {
+                    name = "SMSG_CHAT_PLAYER_NOT_FOUND";
+                    std::string who; p >> who;
+                    w.Add("name", who);
+                    break;
+                }
                 case SMSG_NAME_QUERY_RESPONSE:
                 {
                     name = "SMSG_NAME_QUERY_RESPONSE";
@@ -9009,6 +9020,17 @@ namespace WrathBench
                 case SMSG_QUESTLOG_FULL:
                     name = "SMSG_QUESTLOG_FULL";
                     break;
+                // Why a quest cannot be taken (Player::SendCanTakeQuestResponse,
+                // from CanTakeQuest's checks on an accept or a query): u32
+                // QuestFailedReason. The client shows it as an error line; the
+                // quest is not named on the wire.
+                case SMSG_QUESTGIVER_QUEST_INVALID:
+                {
+                    name = "SMSG_QUESTGIVER_QUEST_INVALID";
+                    uint32 reason; p >> reason;
+                    w.Add("reason", reason);
+                    break;
+                }
                 // ---------------------------------------------------- gossip
                 case SMSG_GOSSIP_MESSAGE:
                 {
@@ -9667,6 +9689,29 @@ namespace WrathBench
                 case SMSG_CORPSE_NOT_IN_INSTANCE:
                     name = "SMSG_CORPSE_NOT_IN_INSTANCE";
                     break;
+                // A portal's refusal in words (WorldSession::SendAreaTriggerMessage):
+                // a dungeon's level gate, a closed instance, a raid entered
+                // without a raid group, a battleground portal of the other
+                // faction. One packet per line of the text: u32 length (the
+                // NUL included), then the line. The core writes the line from
+                // a string_view, so the bytes run on past `length` into the
+                // lines after it; exactly `length` bytes are read and the text
+                // ends at the first NUL. No transfer follows.
+                case SMSG_AREA_TRIGGER_MESSAGE:
+                {
+                    name = "SMSG_AREA_TRIGGER_MESSAGE";
+                    uint32 len; p >> len;
+                    // A length past the packet's end is a decodeError, never
+                    // an over-read (or an allocation of what it claims).
+                    if (len > p.size() - p.rpos())
+                        throw std::runtime_error("SMSG_AREA_TRIGGER_MESSAGE length past the packet end");
+                    std::string text(len, '\0');
+                    if (len)
+                        p.read(reinterpret_cast<uint8*>(text.data()), len);
+                    text.resize(strnlen(text.c_str(), text.size()));
+                    w.Add("text", text);
+                    break;
+                }
                 // ---------------------------------------- creature movement
                 case SMSG_MONSTER_MOVE:
                 {
