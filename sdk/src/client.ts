@@ -731,6 +731,7 @@ export const KNOWN_ERROR_CODES = [
   "missing_position",
   "missing_face_target",
   "moving",
+  "stunned",
   // guid-taking actions
   "missing_guid",
   "invalid_guid",
@@ -831,6 +832,8 @@ const ERROR_CODE_HINTS: Record<string, string> = {
   moving:
     "a move is running, and a running character faces the way it runs: a turn would steer it off its path, so nothing was sent; " +
     "await sdk.stop() and then face, or walk toward what you want to face",
+  // Only face sends it: a stunned client cannot turn (a rooted one can).
+  stunned: "you are stunned (state.self.stunned) and cannot turn until it wears off; nothing was sent",
   missing_guid:
     "this action needs a guid argument — get one from state.nearbyUnits() or state.closest(...)",
   missing_position: "move_to needs finite x, y and z numbers",
@@ -1295,9 +1298,10 @@ export const MOVE_HINTS: Readonly<Record<string, (point: MovePoint, data: MoveRe
   interrupted: () =>
     `the move stopped early (death, root, stun, or the server rejected the movement). Check state.self, ` +
     `then retry from where you are.`,
-  // A root or a stun (module/PROTOCOL.md, `rooted`): a refusal carries no
-  // route, a walk the root stopped does.
+  // A root (module/PROTOCOL.md, `rooted`): a refusal carries no route, a walk
+  // the root stopped does. A stun is the same under its own name (`stunned`).
   rooted: (_p, d) => (d.pathLength === undefined ? ROOTED_MOVE_HINT : ROOTED_WALK_HINT),
+  stunned: (_p, d) => (d.pathLength === undefined ? STUNNED_MOVE_HINT : STUNNED_WALK_HINT),
   // The client moves another unit (module/PROTOCOL.md, `controlling`): a
   // refusal carries no route, a walk the handover ended does.
   controlling: (_p, d) => (d.pathLength === undefined ? CONTROLLING_MOVE_HINT : CONTROLLING_WALK_HINT),
@@ -1340,16 +1344,28 @@ const DEAD_MOVE_HINT =
   "you are dead and a corpse cannot move; nothing was sent. sdk.repop() releases your spirit, and a ghost can walk.";
 
 /**
- * `rooted`, refused: the module was told the character is rooted (a root, a
- * stun) and sent nothing. Proposed wording, for the operator's approval.
+ * `rooted`, refused: the module was told the character is rooted and sent
+ * nothing. Proposed wording, for the operator's approval.
  */
-const ROOTED_MOVE_HINT = "you are rooted or stunned and cannot move until it wears off; the move was not sent.";
+const ROOTED_MOVE_HINT =
+  "you are rooted and cannot move until it wears off; the move was not sent. You can still turn (face) and cast.";
 
 /**
- * `rooted`, mid-walk: a root or a stun stopped a walk where the character
- * stood. Proposed wording, for the operator's approval.
+ * `rooted`, mid-walk: a root stopped a walk where the character stood.
+ * Proposed wording, for the operator's approval.
  */
-const ROOTED_WALK_HINT = "a root or stun stopped you mid-walk where you stand; you cannot move until it wears off.";
+const ROOTED_WALK_HINT = "a root stopped you mid-walk where you stand; you cannot move until it wears off.";
+
+/**
+ * `stunned`, refused: the unit the client moves is stunned
+ * (`state.self.stunned` for the character), and nothing was sent. Proposed
+ * wording, for the operator's approval.
+ */
+const STUNNED_MOVE_HINT =
+  "you are stunned (state.self.stunned) and can neither move nor turn until it wears off; the move was not sent.";
+
+/** `stunned`, mid-walk: a stun stopped a walk where the character stood. Proposed wording. */
+const STUNNED_WALK_HINT = "a stun stopped you mid-walk where you stand; you cannot move or turn until it wears off.";
 
 /**
  * `controlling`, refused: the server holds a mover for this client (a
@@ -1591,15 +1607,15 @@ const MOVE_LEAVES_NO_STOP: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * A `rooted` verdict that refused the move: the module sent nothing, and the
- * verdict carries no route (`pathLength`), which a walk the root stopped
- * does. Like the planning refusals it moved nothing and is remembered for a
- * repeat (`MOVE_REJECTION_MEMO_MS`: a root outlasts the window), but it sends
- * no stop: the module's root ack already told the server the character
- * stands still, and a rooted client sends nothing.
+ * A `rooted` or `stunned` verdict that refused the move: the module sent
+ * nothing, and the verdict carries no route (`pathLength`), which a walk the
+ * root stopped does. Like the planning refusals it moved nothing and is
+ * remembered for a repeat (`MOVE_REJECTION_MEMO_MS`: a root outlasts the
+ * window), but it sends no stop: the module's root ack already told the
+ * server the character stands still, and a rooted client sends nothing.
  */
 function rootedRefusal(data: MoveResultData): boolean {
-  return data.status === "rooted" && data.pathLength === undefined;
+  return (data.status === "rooted" || data.status === "stunned") && data.pathLength === undefined;
 }
 
 /** A verdict that moved nothing: a refusal at planning, or a root's. */
@@ -4960,7 +4976,9 @@ export class WrathClient {
    * `WrathRequestError` code `moving` while a move is running, nothing sent:
    * the walk runs forward, a client running forward travels where it faces,
    * and a facing held off the walk's course is what no client sends — stop
-   * first, or supersede with `moveTo`.
+   * first, or supersede with `moveTo`. Rejects with code `stunned` while the
+   * character (or the unit it controls) is stunned, nothing sent: a stunned
+   * client cannot turn. A root does not stop a turn.
    *
    * Unlike the calls that take a target, it takes no guid or name: facing a
    * unit is facing its position, `face({ x: unit.x, y: unit.y })`. A string
@@ -10060,11 +10078,12 @@ export class WrathClient {
     try {
       await this.face(point);
     } catch (e) {
-      // Swallow ONLY the load-bearing refusal (409 while a move is active):
-      // anything else — no_session, session_gone, transport loss — must
-      // surface so a dead session fails the fight fast instead of burning
-      // its timeout on invisible re-face ticks.
-      if (e instanceof WrathRequestError && e.code === "moving") return;
+      // Swallow ONLY the load-bearing refusals (409 while a move is active,
+      // or while stunned, which a fight's next tick outlasts): anything
+      // else — no_session, session_gone, transport loss — must surface so a
+      // dead session fails the fight fast instead of burning its timeout on
+      // invisible re-face ticks.
+      if (e instanceof WrathRequestError && (e.code === "moving" || e.code === "stunned")) return;
       throw e;
     }
   }

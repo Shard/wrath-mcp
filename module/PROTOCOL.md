@@ -562,7 +562,10 @@ a stop if the server still holds the character as moving.
 A rooted character cannot move (Roots, below): while the module holds the
 character rooted, a `move_to` is refused before planning with status `rooted`,
 acked with `moveId` alone like any refusal, and nothing is sent, not even the
-redirect's stop; a walk still running then ends `rooted` first.
+redirect's stop; a walk still running then ends `rooted` first. A stun is
+the same refusal under its own status, `stunned` (Roots, below): the unit
+the client moves carries `UNIT_FLAG_STUNNED`, the client-visible bit that
+tells a stun from a root.
 
 While the client moves another unit (a vehicle's driving seat, a possession:
 "Vehicles and possession", below), the walk is that unit's — its guid on
@@ -577,7 +580,7 @@ ends `controlling`.
 Stop moving (sends `MSG_MOVE_STOP` where the character currently is). Always
 acks `200 { "ok": true, "action": "stop" }`; if a move was in
 progress it additionally ends with a `WB_MOVE_RESULT` status `stopped`, or
-`rooted` with no packet when a root has already stopped it. While the client
+`rooted` (or `stunned`) with no packet when a root has already stopped it. While the client
 moves another unit the stop is that unit's ("Vehicles and possession").
 
 Request: `{ "token": "run-abc123", "action": "stop" }`
@@ -593,6 +596,9 @@ or `{ "token": "run-abc123", "action": "face", "x": -8900.0, "y": -130.0 }`
 
 Success `200`: `{ "ok": true, "action": "face", "orientation": 1.57 }`
 Additional errors: `400 {"ok":false,"error":"missing_face_target","action":"face","param":"orientation or x,y"}`,
+`409 {"ok":false,"error":"stunned"}` (the unit the client moves is stunned:
+a stunned client cannot turn, Roots below; nothing sent; a root alone does
+not refuse it),
 `409 {"ok":false,"error":"moving"}` (stop first, or supersede with `move_to`),
 `409 {"ok":false,"error":"controlling"}` (the core holds a mover for this
 client that is not in the character's map, "Vehicles and possession" below;
@@ -1148,8 +1154,15 @@ The module also keeps the rooted state a client keeps: set by
 `SMSG_FORCE_MOVE_ROOT` and `SMSG_SPLINE_MOVE_ROOT` for the character's own
 guid (the multiple-moves sub-packet included), cleared by their unroot twins.
 While it is set the mover stops (`rooted`, above) and `move_to` is refused
-`rooted`. `face` still turns, which is right for a root; a stunned client
-cannot turn, and the module does not yet tell the two apart.
+`rooted`. `face` still turns, which is right for a root. A stun arrives by
+the same root packets, so they cannot tell the two apart; what does is
+`UNIT_FLAG_STUNNED` (0x40000) in the unit's own `UNIT_FIELD_FLAGS`, which the
+server sends the client in the unit's values update (`Unit::SetStunned` sets
+it before it roots and clears it before it unroots; the logout countdown
+sets it too). While the unit the client moves carries it, a `move_to` is
+refused and a walk ends with status `stunned` instead of `rooted`, and
+`face` is refused `409 stunned` with nothing sent: a stunned client neither
+moves nor turns.
 
 Speed changes and the clock. The core changes the speed of a unit its client
 controls by packet too (`Unit::SetSpeed` -> `SendSpeedToController`):
@@ -1722,7 +1735,9 @@ at the top of this document.
   its unit stood. Every other verdict of a walk of another unit carries
   `mover` too, with `pos` that unit's, and `flight: true` when the leg was
   flown.
-- `rooted` — a root or a stun holds the character (Roots, below). A
+- `stunned` — a stun holds the unit the client moves (Roots, below): as
+  `rooted` in every respect, refusal or stopped walk, under its own name.
+- `rooted` — a root holds the character (Roots, below). A
   refusal: the `move_to` arrived while the character was rooted and nothing
   was sent; it carries no `pathLength`. A walk the root stopped: the root ack
   was its stop, at the point the walk had reached, and the verdict carries

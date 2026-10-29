@@ -1882,6 +1882,20 @@ namespace WrathBench
         return mover == player ? s.rooted.load() : s.moverRooted.load();
     }
 
+    // A stun, as against a root: UNIT_FLAG_STUNNED on the unit the client
+    // moves, a bit of its own UNIT_FIELD_FLAGS, which the server sends this
+    // client in the unit's values update (Unit::SetStunned sets it before it
+    // roots, and clears it before it unroots). A stun roots the unit by the
+    // same packets a root does (SetStunned -> SetRooted -> SendMoveRoot), so
+    // the root packets alone cannot tell the two apart; a rooted client still
+    // turns, a stunned one neither moves nor turns. The logout countdown sets
+    // it too (HandleLogoutRequestOpcode), where a client sits and cannot turn
+    // either.
+    static bool StunnedFor(Unit* mover)
+    {
+        return mover->HasUnitFlag(UNIT_FLAG_STUNNED);
+    }
+
     // The transport under a point of the walk, for the character alone: a
     // vehicle or a possessed unit is never walked onto a tram car or a boat.
     static Transport* TransportUnder(BenchSession& s, Unit* mover, float x, float y, float z)
@@ -3714,19 +3728,23 @@ namespace WrathBench
                 w.AddGuid("mover", mover->GetGUID().GetRawValue());
         };
 
-        if (RootedFor(*s, mover, player))
+        bool const stunned = StunnedFor(mover);
+        if (stunned || RootedFor(*s, mover, player))
         {
             // A rooted client cannot move: nothing is sent, not even the stop a
             // redirect sends (the root ack was the stop). A walk the tick has
             // not ended yet ends `rooted` here, and the request is refused with
-            // the same status after its ack, as a refusal at planning is.
+            // the same status after its ack, as a refusal at planning is. A
+            // stun is the same refusal under its own name (StunnedFor), so a
+            // caller can tell a stun from a root it can still turn in.
+            char const* status = stunned ? "stunned" : "rooted";
             if (s->move.active)
-                FinishMove(*s, "rooted");
+                FinishMove(*s, status);
             uint64_t const moveId = ++s->moveIdGen;
             s->move.moveId = moveId;
             ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "move_to").Add("moveId", moveId).Str()});
             Json::Writer w;
-            w.Add("moveId", moveId).Add("status", "rooted");
+            w.Add("moveId", moveId).Add("status", status);
             addMover(w);
             w.Raw("pos", PosJson(mover->GetPositionX(), mover->GetPositionY(), mover->GetPositionZ(), mover->GetOrientation()));
             EmitEvent(*s, "WB_MOVE_RESULT", 0xFF01, w.Str());
@@ -4098,11 +4116,11 @@ namespace WrathBench
             // nothing is sent and it ends `controlling`.
             FinishMove(*s, "controlling");
         }
-        else if (s->move.active && RootedFor(*s, mover, player))
+        else if (s->move.active && (StunnedFor(mover) || RootedFor(*s, mover, player)))
         {
-            // Rooted mid-walk and the tick has not ended it yet: the root ack
-            // already stopped the character where the mover stood.
-            FinishMove(*s, "rooted");
+            // Rooted or stunned mid-walk and the tick has not ended it yet:
+            // the root ack already stopped the character where the mover stood.
+            FinishMove(*s, StunnedFor(mover) ? "stunned" : "rooted");
         }
         else if (s->move.active)
         {
@@ -4130,6 +4148,11 @@ namespace WrathBench
         if (!player)
             return;
 
+        // A stunned client cannot turn (StunnedFor; a rooted one can):
+        // refused, nothing sent. Before the walk's own refusal, since a stun
+        // that has not yet ended a walk is the reason the caller needs.
+        if (Unit* held = ActiveMover(player); held && StunnedFor(held))
+            return ack->set_value({409, Json::Writer().Add("ok", false).Add("error", "stunned").Str()});
         // A walk is forward running, and a client running forward travels
         // where it faces: a facing sent mid-walk would either not match the
         // travel (no client sends that) or bend the walk off its planned path.
@@ -5638,13 +5661,14 @@ namespace WrathBench
             return;
         }
 
-        // Rooted or stunned (OnRootPacket): a client that is told so stops,
-        // and its root ack already carried the stop at the mover's point, so
-        // the move ends here with no further packet. After the death check:
+        // Rooted or stunned (OnRootPacket, StunnedFor): a client that is told
+        // so stops, and its root ack already carried the stop at the mover's
+        // point, so the move ends here with no further packet: `stunned` when
+        // the unit is stunned, `rooted` otherwise. After the death check:
         // dying roots too (Player::KillPlayer), and a death is `interrupted`.
-        if (RootedFor(s, mover, player))
+        if (StunnedFor(mover) || RootedFor(s, mover, player))
         {
-            FinishMove(s, "rooted");
+            FinishMove(s, StunnedFor(mover) ? "stunned" : "rooted");
             return;
         }
 

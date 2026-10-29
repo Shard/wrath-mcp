@@ -1934,14 +1934,15 @@ describe("client: killTarget", () => {
     await stub.stop();
   });
 
-  test("a refused face does not end the fight", async () => {
-    // The module answers `face` with `409 moving` while a move is running. A
-    // real client faces continuously and cannot fail at it, so the loop has to
-    // shrug this off — otherwise every fight dies on a re-face tick.
+  test.each(["moving", "stunned"])("a face refused %s does not end the fight", async (code) => {
+    // The module answers `face` with `409 moving` while a move is running,
+    // and `409 stunned` while a stun holds the character. A real client
+    // faces continuously and cannot fail at it, so the loop has to shrug
+    // these off — otherwise every fight dies on a re-face tick.
     const stub = startStub({
       onConnect: () => combatWorld(),
       failAction: (action) =>
-        action === "face" ? json({ ok: false, error: "moving" }, 409) : undefined,
+        action === "face" ? json({ ok: false, error: code }, 409) : undefined,
     });
     const client = await inWorld(stub);
     const fight = client.killTarget(CREATURE_GUID, {

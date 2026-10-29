@@ -121,6 +121,7 @@ describe("error-code hints", () => {
     ["no_player", /deleteSession/],
     ["unsupported_action", /whitelist/],
     ["moving", /sdk\.stop\(\)/],
+    ["stunned", /stunned.*cannot turn.*nothing was sent/],
     ["missing_guid", /nearbyUnits/],
     ["missing_position", /x, y and z/],
     ["missing_face_target", /orientation.*not a guid or a name.*face\(\{ x: unit\.x, y: unit\.y \}\)/],
