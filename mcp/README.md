@@ -18,7 +18,7 @@ repo root:
 ```bash
 WRATHBENCH_MODULE_URL=http://127.0.0.1:8086 \
 WRATHBENCH_MODULE_SECRET=<the module's port secret> \
-  bun mcp/src/main.ts --account <an allowed account> [--dir <state-dir>] [--token-file <path> | --token <t>]
+  bun mcp/src/main.ts --account <an allowed account> [--dir <state-dir>] [--token-file <path> | --token <t>] [--allow-gm]
 ```
 
 That is an MCP server over stdio serving the core tools: point an MCP-capable
@@ -40,6 +40,37 @@ killed outright leaves the character in the world until a create on its
 account reclaims it (`module/PROTOCOL.md`, "DELETE /session"). The sandbox needs Linux 6.7 or later — Landlock with TCP
 rules — and refuses to start without it; what it confines and what it leaves
 to the deployment's network policy is `docs/ARCHITECTURE.md` ("The sandbox").
+
+## GM accounts
+
+Off by default: the module then refuses a GM account (`gm_account`) and any
+chat the server would run as a command, a `.` or `!` line (`chat_command`),
+whatever the account. Both refusals say how to opt in. To drive a GM account,
+or to let a session run commands, pass `--allow-gm` or set
+`WRATHBENCH_ALLOW_GM=1` (`0`, `false` or unset is off; any other value is
+refused at start) in the server's entry in the client's `mcpServers`:
+
+```json
+{
+  "mcpServers": {
+    "wrath": {
+      "command": "bun",
+      "args": ["/path/to/wrath-mcp/mcp/src/main.ts", "--account", "GMACCOUNT", "--allow-gm"],
+      "env": {
+        "WRATHBENCH_MODULE_URL": "http://127.0.0.1:8086",
+        "WRATHBENCH_MODULE_SECRET": "<the module's port secret>"
+      }
+    }
+  }
+}
+```
+
+or the same entry without `--allow-gm` and with `"WRATHBENCH_ALLOW_GM": "1"`
+in `env`. The opt-in rides the lease this process takes with the port secret
+(`module/PROTOCOL.md`, "POST /lease"), so the session the sandbox creates
+inherits it and nothing a snippet sends can turn it on; stderr says whether
+the module confirmed it. The SDK's equivalent is
+`connect({ ..., allowGm: true })`.
 
 ## Pieces
 

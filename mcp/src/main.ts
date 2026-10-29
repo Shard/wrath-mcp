@@ -6,11 +6,14 @@
  * log, and a plain rendering of events and state where a harness would put
  * its own context rendering (`CoreToolRender`).
  *
- *   bun mcp/src/main.ts [--account <name>] [--dir <state-dir>] [--token-file <path> | --token <session-token>]
+ *   bun mcp/src/main.ts [--account <name>] [--dir <state-dir>] [--token-file <path> | --token <session-token>] [--allow-gm]
  *
  * Environment: `WRATHBENCH_MODULE_URL` (default `http://127.0.0.1:8086`) and
  * `WRATHBENCH_MODULE_SECRET`, the module's port secret, which this process
  * uses to lease a session secret for the token and never hands the sandbox.
+ * `--allow-gm` or `WRATHBENCH_ALLOW_GM=1` is the GM opt-in, off by default:
+ * without it the module refuses a GM account and any chat the server would
+ * run as a command (`allowGmOption`).
  * The scratchpad, the client cache and the token itself (`token`, mode 0600)
  * live in `--dir` (default `$TMPDIR/wrathbench-mcp/<fingerprint>`, mode 0700),
  * so `--dir` alone resumes the session with both. The token is never printed:
@@ -73,6 +76,23 @@ export function withNotices(
   if (notices.length === 0) return result;
   const block = ["--- notices ---", ...notices.map((n) => `${n.kind}: ${n.text}`)].join("\n");
   return { ...result, text: secrets.scrub(`${result.text}\n${block}`) };
+}
+
+/** The environment variable that turns the GM opt-in on, as `--allow-gm` does. */
+export const ALLOW_GM_ENV = "WRATHBENCH_ALLOW_GM";
+
+/**
+ * The GM opt-in, off unless asked for: `--allow-gm` in argv, or
+ * `WRATHBENCH_ALLOW_GM` set to `1` or `true`. Unset, empty, `0` or `false` is
+ * off; any other value is refused rather than read either way, so a typo
+ * cannot pass for a choice.
+ */
+export function allowGmOption(argv: readonly string[], env: Record<string, string | undefined>): boolean {
+  if (argv.includes("--allow-gm")) return true;
+  const v = env[ALLOW_GM_ENV]?.trim().toLowerCase();
+  if (v === undefined || v === "" || v === "0" || v === "false") return false;
+  if (v === "1" || v === "true") return true;
+  throw new Error(`${ALLOW_GM_ENV} must be 1 or true to allow GM use, or 0, false or unset for the default (off)`);
 }
 
 /** The file in the state directory that holds the session token. */
@@ -146,10 +166,19 @@ async function main(): Promise<void> {
   });
   const account = flag("account");
   const moduleUrl = process.env["WRATHBENCH_MODULE_URL"] ?? "http://127.0.0.1:8086";
+  const allowGm = allowGmOption(argv, process.env);
 
   const secrets = new SecretRedactor();
-  const lease = await leaseRunSecret({ moduleUrl, token, ...(account !== undefined ? { account } : {}) }, secrets);
+  // The opt-in rides the lease, which only this process can take: the child's
+  // creates inherit it, and nothing a snippet sends can raise it.
+  const lease = await leaseRunSecret(
+    { moduleUrl, token, ...(account !== undefined ? { account } : {}), ...(allowGm ? { allowGm } : {}) },
+    secrets,
+  );
   if (lease.secret === undefined) console.error(`[wrathbench-mcp] ${lease.note}`);
+  else if (allowGm && !lease.allowGm) {
+    console.error("[wrathbench-mcp] --allow-gm: the module did not confirm the GM opt-in (it predates it), so it serves player use only");
+  } else if (allowGm) console.error("[wrathbench-mcp] GM opt-in on: the module serves a GM account and passes command chat for this session");
 
   const scratchpad = new Scratchpad(join(dir, "scratchpad.md"));
   const clientCache = new ClientCacheStore(join(dir, CLIENT_CACHE_FILE));

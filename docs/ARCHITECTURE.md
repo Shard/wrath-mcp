@@ -102,7 +102,9 @@ A thin bridge. It does two things and should never learn to do a third.
 - Events: taps the outbound packet stream for the session (`SMSG_*`), filters
   it to the observation contract, and publishes it over a WebSocket as JSON.
 - Session management: creates or logs in a character on a player account for a
-  session token, logs out on release.
+  session token, logs out on release. A GM account, and chat the server would
+  run as a command, only with the caller's GM opt-in (`module/PROTOCOL.md`,
+  "POST /session").
 - Audit log: every action dispatched and every observation served, with a
   timestamp and the session's tag (a fingerprint of its token, never the token).
 

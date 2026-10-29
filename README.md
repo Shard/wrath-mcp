@@ -45,7 +45,9 @@ Tested against AzerothCore
    - `WrathBench.Accounts`, the game accounts sessions may use. Each must exist
      in the auth database (`account create <name> <password>` on the
      worldserver console) and be a player account: the module refuses one
-     with a GM security level (`gm_account`).
+     with a GM security level (`gm_account`), and chat the server would run
+     as a command (`chat_command`), unless the caller opts in to GM use
+     (`mcp/README.md`, "GM accounts").
    - `WrathBench.BindAddress` and `WrathBench.Port` (default `127.0.0.1:8086`,
      loopback only). To serve callers on other hosts, set the address and keep
      the port on a private network: it is plain HTTP with bearer secrets.
@@ -109,8 +111,8 @@ verified.
 ## Versions
 
 The stack follows semantic versioning (`CONTRIBUTING.md`, "Versioning"):
-major for a breaking change, minor for a feature or addition, patch for a fix,
-and the same meanings on 0.MINOR.PATCH before 1.0. `CHANGELOG.md` lists what
+major for a breaking change, minor for a feature or addition, patch for a fix.
+Before 1.0 any release may break, and `CHANGELOG.md` says how. It lists what
 each release changed and what an operator must do about it.
 
 ## Licence

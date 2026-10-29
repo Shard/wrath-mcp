@@ -180,6 +180,8 @@ export const leaseResponseSchema = z.looseObject({
   account: z.string(),
   secret: z.string().min(32),
   character: z.string().optional(),
+  /** The GM opt-in this lease carries; absent from a module that predates it. */
+  allowGm: z.boolean().optional(),
 });
 export type LeaseResponse = z.infer<typeof leaseResponseSchema>;
 
@@ -201,6 +203,12 @@ export interface CreateSessionRequest {
   race?: number;
   class?: number;
   gender?: number;
+  /**
+   * The GM opt-in (PROTOCOL.md, "POST /session"): `true` lets a GM account
+   * in and passes chat the server would run as a command. Honoured from an
+   * operator-class caller; a session-class create gets its lease's.
+   */
+  allowGm?: boolean;
 }
 
 /**

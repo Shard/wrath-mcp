@@ -581,6 +581,9 @@ export const KNOWN_ERROR_CODES = [
   "token_in_use",
   "unknown_account",
   "account_not_permitted",
+  // the GM opt-in (PROTOCOL.md, "POST /session", `allowGm`)
+  "gm_account",
+  "chat_command",
   "account_owned_by_other_token",
   "account_in_use",
   "character_not_found",
@@ -710,8 +713,13 @@ const ERROR_CODE_HINTS: Record<string, string> = {
   account_not_permitted:
     "the account name is not on the module's WrathBench.Accounts allowlist for this realm — use a permitted account",
   gm_account:
-    "the account holds a security level above player, and the module serves player accounts only — " +
-    "use an account made with `account create` that no one has raised to GM",
+    "the account holds a security level above player, and without the GM opt-in the module serves player accounts only — " +
+    "use an account made with `account create` that no one has raised to GM, or opt in: the MCP server's --allow-gm " +
+    "(WRATHBENCH_ALLOW_GM=1), or connect({ allowGm: true }) in the SDK",
+  chat_command:
+    "the server would run that text as a command (it starts with '.' or '!'), and this session has no GM opt-in, so nothing was sent — " +
+    "to say it as chat, drop the leading character; commands are allowed only on a session the operator opted in " +
+    "(the MCP server's --allow-gm or WRATHBENCH_ALLOW_GM=1, or connect({ allowGm: true }) in the SDK)",
   account_owned_by_other_token:
     "another live session's token holds a character on this account — wait for that session to end, or use a different account",
   character_not_found: "no character with that name exists on this account — check the name and the account",
@@ -805,6 +813,17 @@ export interface ConnectOptions {
    * default.
    */
   account?: string;
+  /**
+   * The GM opt-in (module/PROTOCOL.md, "POST /session", `allowGm`). Off by
+   * default, and then the module refuses a GM account (`gm_account`) and any
+   * chat the server would run as a command (`chat_command`), whatever the
+   * account. On, both are the account's own business. Bound like `account`:
+   * `createSession`, `deleteCharacter` and `lease` send it, and nothing a
+   * call passes overrides it. A session-class client (one holding a lease
+   * secret) gets the lease's opt-in whatever it sends, so for the snippet
+   * child this is set on the operator's `lease`, never on the child.
+   */
+  allowGm?: boolean;
   /** Defaults to `baseUrl` with an `ws://`/`wss://` scheme. */
   eventsUrl?: string;
   /** Open the event stream during `connect`. Default true; see the note below. */
@@ -3890,6 +3909,7 @@ export class WrathClient {
    * it (docs/CONTRACTS.md, the per-token secret scope; operator, 2026-10-19).
    */
   readonly #boundAccount: string | undefined;
+  readonly #allowGm: boolean;
   readonly #secret: string | undefined;
   readonly #fetchImpl: typeof fetch;
   private readonly requestTimeoutMs: number;
@@ -3945,6 +3965,7 @@ export class WrathClient {
   constructor(options: ConnectOptions) {
     this.token = options.token;
     this.#boundAccount = options.account;
+    this.#allowGm = options.allowGm === true;
     this.#secret = options.secret;
     const sig = options.signal;
     this.defaultSignal = sig === undefined ? undefined : typeof sig === "function" ? sig : () => sig;
@@ -4280,7 +4301,7 @@ export class WrathClient {
    *
    * Seeds the state cache with our own guid and name, which no event carries.
    */
-  async createSession(request: Omit<CreateSessionRequest, "token">): Promise<SessionResponse> {
+  async createSession(request: Omit<CreateSessionRequest, "token" | "allowGm">): Promise<SessionResponse> {
     // Runtime guard: race/class must be numeric ids. A string like "hunter"
     // used to be silently coerced to 0 by the module and the server then
     // created a default Human Warrior — the wrong character with no error
@@ -4309,7 +4330,10 @@ export class WrathClient {
     // closes the RUNNER6→RUNNER cross-account eviction: an omitted-account
     // createSession can no longer default onto a shared account.
     const account = this.#boundAccount ?? request.account;
-    const body: CreateSessionRequest = { token: this.token, ...request, account };
+    // The GM opt-in is the client's, set at connect: a request that carries
+    // one of its own (untyped snippet code can) has it struck, never sent.
+    const { allowGm: _ignored, ...rest } = request as Omit<CreateSessionRequest, "token">;
+    const body: CreateSessionRequest = { token: this.token, ...rest, account, ...this.#gmOptIn() };
     const res = await this.request("POST", "/session", body, sessionResponseSchema);
     this.state.seedSelf({ guid: res.guid, name: res.character });
     return res;
@@ -7093,6 +7117,7 @@ export class WrathClient {
             // refuses an account another live token holds. Unbound, the
             // caller's option (else the module default) stands.
             account: this.#boundAccount ?? options.account,
+            ...this.#gmOptIn(),
           },
           characterDeleteResponseSchema,
         );
@@ -7122,16 +7147,23 @@ export class WrathClient {
    * session-class client for the same token should be constructed with. The
    * runner calls this once per launch and hands `secret` to the snippet
    * child; a snippet has no use for it (its own class is refused with
-   * `403 operator_only`). See module/PROTOCOL.md, "Authentication".
+   * `403 operator_only`). A client connected with `allowGm` leases with
+   * the GM opt-in, which the token's session-class creates then inherit.
+   * See module/PROTOCOL.md, "Authentication".
    */
   lease(account?: string): Promise<LeaseResponse> {
     const bound = this.#boundAccount ?? account;
     return this.request(
       "POST",
       "/lease",
-      bound === undefined ? { token: this.token } : { token: this.token, account: bound },
+      { token: this.token, ...(bound === undefined ? {} : { account: bound }), ...this.#gmOptIn() },
       leaseResponseSchema,
     );
+  }
+
+  /** `{ allowGm: true }` when this client was connected with the GM opt-in, else nothing: off is the field's absence. */
+  #gmOptIn(): { allowGm?: true } {
+    return this.#allowGm ? { allowGm: true } : {};
   }
 
   /** DELETE /lease — operator only. Revokes this token's session secret; a live session is untouched. */
