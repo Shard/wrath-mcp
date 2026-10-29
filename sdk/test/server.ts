@@ -43,6 +43,7 @@ export interface CharacterDeleteBody {
   token?: string;
   character?: string;
   account?: string;
+  allowGm?: boolean;
 }
 
 /** One `POST /session` body, as the SDK sent it. */
@@ -53,6 +54,7 @@ export interface CreateSessionBody {
   race?: number;
   class?: number;
   gender?: number;
+  allowGm?: boolean;
 }
 
 /** One dispatched action body, as the SDK sent it. */
@@ -80,6 +82,8 @@ export interface StubServer {
   authorizations: (string | null)[];
   /** Secrets issued by `POST /lease`, by token. */
   leases: Map<string, string>;
+  /** Every `POST /lease` body, in order. */
+  leaseBodies: Record<string, unknown>[];
   stop(): Promise<void>;
 }
 
@@ -99,6 +103,7 @@ export function startStub(options: StubOptions = {}): StubServer {
   const characterDeletes: CharacterDeleteBody[] = [];
   const authorizations: (string | null)[] = [];
   const leases = new Map<string, string>();
+  const leaseBodies: Record<string, unknown>[] = [];
   let leaseCounter = 0;
 
   const authorized = (req: Request): boolean => {
@@ -118,10 +123,11 @@ export function startStub(options: StubOptions = {}): StubServer {
       if (!authorized(req)) return json({ ok: false, error: "unauthorized" }, 401);
       if (url.pathname === "/lease" && req.method === "POST") {
         return req.json().then((body) => {
-          const b = body as { token?: string; account?: string };
+          const b = body as { token?: string; account?: string; allowGm?: boolean };
+          leaseBodies.push(body as Record<string, unknown>);
           const secret = `leased-${++leaseCounter}-`.padEnd(64, "f");
           leases.set(b.token ?? "", secret);
-          return json({ ok: true, token: b.token ?? "", account: b.account ?? "RUNNER", secret });
+          return json({ ok: true, token: b.token ?? "", account: b.account ?? "RUNNER", secret, allowGm: b.allowGm === true });
         });
       }
       if (url.pathname === "/lease" && req.method === "DELETE") {
@@ -244,6 +250,7 @@ export function startStub(options: StubOptions = {}): StubServer {
     characterDeletes,
     authorizations,
     leases,
+    leaseBodies,
     async stop() {
       await server.stop(true);
     },

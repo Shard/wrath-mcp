@@ -24,9 +24,9 @@ measures models pins it exactly, because a change a model can see changes what
 it measures; WrathBench's rules for that are its
 [`docs/METHODOLOGY.md`](https://github.com/Shard/WrathBench/blob/master/docs/METHODOLOGY.md).
 The version is semantic: major for a breaking change, minor for a feature or
-addition, patch for a fix, with the same meanings on 0.MINOR.PATCH before 1.0
-(`CONTRIBUTING.md`, "Versioning"); `CHANGELOG.md` says what each release
-changed.
+addition, patch for a fix; before 1.0 any release may break
+(`CONTRIBUTING.md`, "Versioning"), and `CHANGELOG.md` says what each release
+changed and how.
 
 The module's wire has a version of its own, the integer `protocol` on
 `GET /health` (`module/PROTOCOL.md`, "Versioning"). `connect` checks it before

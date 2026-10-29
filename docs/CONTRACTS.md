@@ -39,7 +39,7 @@ The action set:
 - Loot: open loot, take item, take money, take all. Chests: the core ignores `CMSG_GAMEOBJ_USE` on a chest and drops `CMSG_LOOT` on a game object guid, so a chest is opened as a client opens one — `CMSG_CAST_SPELL` of the lock's Opening spell (`SPELL_EFFECT_OPEN_LOCK`) at it, then the same store/money/release sequence.
 - Vendor: list, buy, sell, repair.
 - Inventory: equip item, use item, destroy item.
-- Chat: say. Party chat, yell and whisper are the same `CMSG_MESSAGECHAT` sent through the raw passthrough, which the SDK's `say` builds for its `type` option (the channel a party's agents coordinate on); the other chat types stay raw until a trajectory earns them a helper.
+- Chat: say. Party chat, yell and whisper are the same `CMSG_MESSAGECHAT` sent through the raw passthrough, which the SDK's `say` builds for its `type` option (the channel a party's agents coordinate on); the other chat types stay raw until a trajectory earns them a helper. Chat the server would run as a command (the core's own `.`/`!` prefix test) is refused, on every chat path and whatever the account, as a GM account is, unless the session was created with the GM opt-in, which only the holder of the port secret can give (operator decision, Mark, 2026-10-29; module/PROTOCOL.md, "POST /session", `allowGm`). By default the module serves player use only: a GM's command set, or commands granted to a player account in `rbac_account_permissions`, are actions no player's client has, and an agent never reaches them by accident.
 - Death: release spirit, reclaim corpse, spirit healer resurrection (the graveyard fallback when the corpse is unreachable).
 - Stuck: the Help frame's "I'm stuck", which a client sends as `CMSG_CAST_SPELL` of spell 7355 with no target. Every character knows it and may cast it alive or dead; the server's `Spell::EffectStuck` decides the move (a body is released, a ghost goes to the graveyard nearest it, the living go home by Hearthstone or a few yards over). It is a cast by id, so the action set does not grow; the SDK's `unstuck()` sends it only on a second call (operator decision, 2026-10-28).
 - Trainers: list, buy spell.
@@ -112,7 +112,7 @@ The floor that closes that (`module/PROTOCOL.md`
   `node:net`/`Bun.connect` open the module's port, but with no credential to
   read such a connection authenticates nothing.
 - **Token-to-account and token-to-character binding.** A leased token lands on
-  its lease's account whatever the body says, and the first create that
+  its lease's account, with its lease's GM opt-in, whatever the body says, and the first create that
   succeeds under it binds the character; a later same-token create for another
   is refused. A snippet cannot delete any character — its own included — and
   cannot open a session on any account or character but the one it was

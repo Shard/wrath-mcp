@@ -70,12 +70,19 @@ export interface LeaseOptions {
   moduleUrl: string;
   token: string;
   account?: string;
+  /**
+   * The GM opt-in (module/PROTOCOL.md, "POST /lease"). The token's
+   * session-class creates inherit it, so it is set here, by the holder of the
+   * port secret, and never by the child. Absent or false is off.
+   */
+  allowGm?: boolean;
   fetch?: typeof fetch;
   env?: Record<string, string | undefined>;
 }
 
 export type LeaseOutcome =
-  | { secret: string; account: string }
+  /** `allowGm` is the module's word on the opt-in: false from a module that predates it, whatever was asked. */
+  | { secret: string; account: string; allowGm: boolean }
   /** No secret for the child, and why. The launch proceeds bare: a module that needs one refuses the child's first call, which is the honest failure. */
   | { secret: undefined; note: string };
 
@@ -102,7 +109,11 @@ export async function leaseSessionSecret(o: LeaseOptions): Promise<LeaseOutcome>
     res = await f(`${o.moduleUrl}/lease`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
-      body: JSON.stringify(o.account === undefined ? { token: o.token } : { token: o.token, account: o.account }),
+      body: JSON.stringify({
+        token: o.token,
+        ...(o.account === undefined ? {} : { account: o.account }),
+        ...(o.allowGm === true ? { allowGm: true } : {}),
+      }),
       signal: AbortSignal.timeout(5_000),
     });
   } catch (err) {
@@ -110,14 +121,14 @@ export async function leaseSessionSecret(o: LeaseOptions): Promise<LeaseOutcome>
     // in their own words; nothing is gained by failing here first.
     return { secret: undefined, note: `module unreachable for /lease (${err instanceof Error ? err.message : String(err)}) — no session secret leased` };
   }
-  const body = (await res.json().catch(() => null)) as { ok?: boolean; error?: string; secret?: unknown; account?: unknown } | null;
+  const body = (await res.json().catch(() => null)) as { ok?: boolean; error?: string; secret?: unknown; account?: unknown; allowGm?: unknown } | null;
   if (res.status === 404 && body?.error === "not_found") {
     return { secret: undefined, note: "module predates /lease (404 not_found) — no session secret leased; it will not require one" };
   }
   if (!res.ok || body?.ok !== true || typeof body.secret !== "string" || typeof body.account !== "string") {
     throw new Error(`POST /lease for this run's token failed: HTTP ${res.status} ${body?.error ?? ""} — check ${MODULE_SECRET_ENV} matches the worldserver's WrathBench.Secret`);
   }
-  return { secret: body.secret, account: body.account };
+  return { secret: body.secret, account: body.account, allowGm: body.allowGm === true };
 }
 
 /**

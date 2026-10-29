@@ -20,6 +20,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -163,6 +164,13 @@ namespace WrathBench
         // character-select stage, answers with the decoded CMSG_CHAR_ENUM
         // response, never logs in. Episode hygiene for the runner.
         bool listMode{false};
+
+        // The GM opt-in (PROTOCOL.md, "POST /session": `allowGm`). Off, the
+        // module refuses a GM account and any chat the server would run as a
+        // command; on, both are the account's own business. Set before the
+        // session is registered and refreshed only by an idempotent same-token
+        // create, both on the world thread, and read there.
+        bool allowGm{false};
 
         // Login state machine, driven by the outbound packet tap.
         enum Phase { P_AUTH, P_ENUM, P_CREATE, P_ENUM2, P_LOGIN, P_INWORLD, P_DONE, P_DELETE };
@@ -346,6 +354,7 @@ namespace WrathBench
         std::string account;
         std::string character;      // empty until the first successful create
         std::string secret;         // 64 hex chars
+        bool allowGm{false};        // the GM opt-in a session-class create inherits
     };
 
     // Which credential a request presented (PROTOCOL.md, "Authentication").
@@ -398,7 +407,11 @@ namespace WrathBench
 
         // forcedAccount: non-empty for a session-class create — the lease's
         // account, which overrides whatever the body says.
-        HttpReply HttpCreateSession(std::string const& body, std::string const& forcedAccount = "");
+        // A session-class caller's account and GM opt-in are its lease's
+        // (forcedAccount non-empty, forcedAllowGm set); an operator's come
+        // from the body.
+        HttpReply HttpCreateSession(std::string const& body, std::string const& forcedAccount = "",
+            std::optional<bool> forcedAllowGm = std::nullopt);
         HttpReply HttpAction(std::string const& body);
         HttpReply HttpDeleteSession(std::string const& body);
         HttpReply HttpCharacterDelete(std::string const& body);

@@ -12,6 +12,7 @@
 
 #include "AccountMgr.h"
 #include "AchievementMgr.h"
+#include "ChatCommandHelpers.h"
 #include "Config.h"
 #include "CryptoHash.h"
 #include "CryptoRandom.h"
@@ -537,6 +538,7 @@ namespace WrathBench
                 return ErrorReply(404, "not_found");
 
             std::string forcedAccount;
+            std::optional<bool> forcedAllowGm;
             if (cred == Cred::Session)
             {
                 // The token in the body must be the lease's own: a lease
@@ -557,12 +559,16 @@ namespace WrathBench
                         return {409, Json::Writer().Add("ok", false).Add("error", "character_bound")
                             .Add("bound", lease.character).Str()};
                     forcedAccount = lease.account;
+                    // The GM opt-in likewise: the lease's, whatever the body
+                    // says. Only the port secret's holder sets it, so the
+                    // snippet a lease secret is handed to can never raise it.
+                    forcedAllowGm = lease.allowGm;
                 }
             }
 
             if (method == "POST" && target == "/session")
             {
-                HttpReply reply = HttpCreateSession(body, forcedAccount);
+                HttpReply reply = HttpCreateSession(body, forcedAccount, forcedAllowGm);
                 if (cred == Cred::Session && reply.status == 200 && lease.character.empty())
                 {
                     // Bind on success only: a create the core refused (name
@@ -603,6 +609,10 @@ namespace WrathBench
         if (!AccountPermitted(account))
             return ErrorReply(403, "account_not_permitted");
 
+        // The GM opt-in the token's session-class creates inherit. Each
+        // lease says it afresh, so re-leasing without it turns it off.
+        bool const allowGm = req.GetBool("allowGm");
+
         std::array<uint8, 32> const bytes = Acore::Crypto::GetRandomBytes<32>();
         std::string secret = ByteArrayToHexStr(bytes);
         std::string character;
@@ -613,11 +623,21 @@ namespace WrathBench
                 l.character.clear(); // a token re-leased onto another account starts unbound
             l.account = account;
             l.secret = secret;
+            l.allowGm = allowGm;
             character = l.character;
         }
-        LOG_INFO("module", "wrathbench: leased {} to account {}", TokenTag(token), account);
+        // A live session under the token takes the lease's opt-in now, not at
+        // its next create: a re-lease without it must turn it off for the
+        // session already in world, whose create may never come again (a GM
+        // account's is refused before it could refresh anything). World
+        // thread, where the flag is read.
+        PushTask([this, token, allowGm]() {
+            if (auto live = FindByToken(token))
+                live->allowGm = allowGm;
+        });
+        LOG_INFO("module", "wrathbench: leased {} to account {}{}", TokenTag(token), account, allowGm ? " (GM opt-in)" : "");
         Json::Writer w;
-        w.Add("ok", true).Add("token", token).Add("account", account).Add("secret", secret);
+        w.Add("ok", true).Add("token", token).Add("account", account).Add("secret", secret).Add("allowGm", allowGm);
         if (!character.empty())
             w.Add("character", character);
         return {200, w.Str()};
@@ -721,7 +741,8 @@ namespace WrathBench
         return {status, w.Str()};
     }
 
-    HttpReply Manager::HttpCreateSession(std::string const& body, std::string const& forcedAccount)
+    HttpReply Manager::HttpCreateSession(std::string const& body, std::string const& forcedAccount,
+        std::optional<bool> forcedAllowGm)
     {
         Json::Value req = Json::Parse(body);
         std::string token = req.GetString("token");
@@ -760,6 +781,7 @@ namespace WrathBench
         // configured bench accounts, on every surface.
         if (!AccountPermitted(s->account))
             return {403, Json::Writer().Add("ok", false).Add("error", "account_not_permitted").Str()};
+        s->allowGm = forcedAllowGm.value_or(req.GetBool("allowGm"));
         s->charName = req.GetString("character", "");
         // Absent or garbage race/class deliberately parse to 0, which is outside
         // the valid [1,11] range. Whether that matters is only decided at
@@ -800,6 +822,132 @@ namespace WrathBench
         if (v.find_first_not_of("0123456789") != std::string::npos)
             return false;
         try { (void)std::stoull(v); return true; } catch (...) { return false; }
+    }
+
+    // How a caller opts in to GM use, said by both refusals that need it.
+    static char const* const kGmOptInHint =
+        "the module serves player use only unless the session is created with allowGm "
+        "(the MCP server's --allow-gm or WRATHBENCH_ALLOW_GM=1; the SDK's connect({ allowGm: true }); "
+        "on a leased token, the lease's allowGm)";
+
+    // Whether the stock chat handler would take this text as a command:
+    // ChatHandler::ParseCommands's prefix test, exactly (AzerothCore 3cafaf4a,
+    // src/server/game/Chat/Chat.cpp:250-271). A '.' or '!', then neither the
+    // same character again nor the command delimiter. What follows is the
+    // command lookup, which for an unknown command lets a player's line through
+    // as chat; the module refuses at the prefix and runs no lookup.
+    static bool ChatTextRunsCommand(std::string_view text)
+    {
+        if (text.empty())
+            return false;
+        if ((text[0] != '!') && (text[0] != '.'))
+            return false;
+        if (text.length() < 2)
+            return false;
+        if (text[1] == text[0])
+            return false;
+        if (text[1] == Acore::Impl::ChatCommands::COMMAND_DELIMITER)
+            return false;
+        return true;
+    }
+
+    // The addon channel's command form: AddonChannelCommandHandler::ParseCommands
+    // (Chat.cpp:991-1030) runs a command for "AzerothCore\t", an 'h' or 'i', a
+    // four-character counter and at least one character of command. Its 'p'
+    // (ping) runs none. The text is a C string there, so "str[k] is not NUL"
+    // for k up to 17 is a length of 18 or more.
+    static bool AddonTextRunsCommand(std::string_view text)
+    {
+        if (text.size() < 18 || std::memcmp(text.data(), "AzerothCore\t", 12) != 0)
+            return false;
+        return text[12] == 'h' || text[12] == 'i';
+    }
+
+    // Whether WorldSession::HandleMessagechatOpcode would hand this
+    // CMSG_MESSAGECHAT body to a command parser (ChatHandler.cpp:61-308 at the
+    // pinned core, the parse calls at 302 and 307): read as the handler reads
+    // it, with the same ByteBuffer calls, and through the same checks that
+    // stand before its two parse calls. A body the handler cannot read throws
+    // there as here, and runs nothing. The checks that depend on the
+    // character or the server's config (language known, muted, addon channel
+    // enabled) are not repeated: failing them stops the line before any
+    // command, so refusing such a line anyway costs nothing.
+    static bool ChatPacketRunsCommand(WorldPacket const& packet)
+    {
+        try
+        {
+            WorldPacket in(packet);
+            in.rpos(0);
+            uint32 type = 0, lang = 0;
+            in >> type >> lang;
+            if (type >= MAX_CHAT_MSG_TYPE)
+                return false;
+            std::string to, channel, msg;
+            switch (type)
+            {
+                case CHAT_MSG_SAY:
+                case CHAT_MSG_EMOTE:
+                case CHAT_MSG_YELL:
+                case CHAT_MSG_PARTY:
+                case CHAT_MSG_PARTY_LEADER:
+                case CHAT_MSG_GUILD:
+                case CHAT_MSG_OFFICER:
+                case CHAT_MSG_RAID:
+                case CHAT_MSG_RAID_LEADER:
+                case CHAT_MSG_RAID_WARNING:
+                case CHAT_MSG_BATTLEGROUND:
+                case CHAT_MSG_BATTLEGROUND_LEADER:
+                    msg = in.ReadCString(lang != LANG_ADDON);
+                    break;
+                case CHAT_MSG_WHISPER:
+                    in >> to;
+                    msg = in.ReadCString(lang != LANG_ADDON);
+                    break;
+                case CHAT_MSG_CHANNEL:
+                    in >> channel;
+                    msg = in.ReadCString(lang != LANG_ADDON);
+                    break;
+                default:
+                    // AFK and DND skip the parse (ignoreChecks); every other
+                    // type reads no text, and empty text is never parsed.
+                    return false;
+            }
+            if (msg.length() > 255 || (lang != LANG_ADDON && msg.find("|0") != std::string::npos))
+                return false;
+            if (msg.empty())
+                return false;
+            // The handler passes msg.c_str(): the text up to its first NUL.
+            std::string_view const text(msg.c_str());
+            if (lang == LANG_ADDON)
+            {
+                // LANG_ADDON is read only for these types; the rest are dropped.
+                switch (type)
+                {
+                    case CHAT_MSG_PARTY:
+                    case CHAT_MSG_RAID:
+                    case CHAT_MSG_GUILD:
+                    case CHAT_MSG_BATTLEGROUND:
+                    case CHAT_MSG_WHISPER:
+                        return AddonTextRunsCommand(text);
+                    default:
+                        return false;
+                }
+            }
+            return ChatTextRunsCommand(text);
+        }
+        catch (ByteBufferException const&)
+        {
+            return false;
+        }
+    }
+
+    // The refusal for chat that would run a command, without the opt-in.
+    static std::string ChatCommandRefusal(std::string const& action)
+    {
+        return Json::Writer().Add("ok", false).Add("error", "chat_command").Add("action", action)
+            .Add("hint", std::string("the server would run this text as a command (it starts with '.' or '!'); ")
+                + kGmOptInHint)
+            .Str();
     }
 
     // The raw-action allowlist (PROTOCOL.md "raw"). Every entry is a
@@ -1158,6 +1306,7 @@ namespace WrathBench
         s->token = token;
         s->account = account;
         s->charName = req.GetString("character");
+        s->allowGm = req.GetBool("allowGm");
         s->deleteMode = true;
 
         auto ack = std::make_shared<std::promise<HttpReply>>();
@@ -1187,6 +1336,7 @@ namespace WrathBench
         s->account = req.GetString("account", DefaultAccount());
         if (!AccountPermitted(s->account))
             return {403, Json::Writer().Add("ok", false).Add("error", "account_not_permitted").Str()};
+        s->allowGm = req.GetBool("allowGm");
         s->listMode = true;
 
         auto ack = std::make_shared<std::promise<HttpReply>>();
@@ -1215,20 +1365,28 @@ namespace WrathBench
             return fail("unknown_account");
         s->accountId = accountId;
 
-        // Player accounts only (PROTOCOL.md, "POST /session"). A session runs
-        // at its account's security level, and the stock chat handler runs a
-        // GM's dot commands, so a GM account would give `say` the server's
-        // command set: actions no client of a player could send. Decided first,
-        // before any teardown or reclaim, so a refused create disturbs nothing.
-        // The highest level the account holds on any realm decides, read from
-        // account_access directly: AccountMgr::GetSecurity(id) takes whichever
-        // row comes first.
-        uint32 security = SEC_PLAYER;
-        if (QueryResult access = LoginDatabase.Query("SELECT MAX(gmlevel) AS gmlevel FROM account_access WHERE id = {}", accountId))
-            if (!access->Fetch()[0].IsNull())
-                security = access->Fetch()[0].Get<uint8>();
-        if (security > SEC_PLAYER)
-            return fail("gm_account", 403);
+        // Player accounts only, unless the caller opted in (PROTOCOL.md,
+        // "POST /session", `allowGm`). A session runs at its account's security
+        // level, and the stock chat handler runs a GM's dot commands, so a GM
+        // account would give `say` the server's command set: actions no client
+        // of a player could send. Decided first, before any teardown or
+        // reclaim, so a refused create disturbs nothing. The highest level the
+        // account holds on any realm decides, read from account_access
+        // directly: AccountMgr::GetSecurity(id) takes whichever row comes first.
+        if (!s->allowGm)
+        {
+            uint32 security = SEC_PLAYER;
+            if (QueryResult access = LoginDatabase.Query("SELECT MAX(gmlevel) AS gmlevel FROM account_access WHERE id = {}", accountId))
+                if (!access->Fetch()[0].IsNull())
+                    security = access->Fetch()[0].Get<uint8>();
+            if (security > SEC_PLAYER)
+            {
+                if (!s->ackFired.exchange(true))
+                    ack->set_value({403, Json::Writer().Add("ok", false).Add("error", "gm_account")
+                        .Add("hint", kGmOptInHint).Str()});
+                return;
+            }
+        }
 
         // --- Same-token create (idempotent liftoff / self-reclaim) ---------
         // A repeated createSession under the same token must never dead-end. If
@@ -1262,6 +1420,10 @@ namespace WrathBench
                 {
                     // account/charName/targetGuidRaw are create-time-stable and
                     // published before P_INWORLD, so reading them here is safe.
+                    // The opt-in is this create's: a resumed caller that no
+                    // longer asks for it turns it off (it passed the GM-account
+                    // check above on its own terms). World thread, as its reads.
+                    existing->allowGm = s->allowGm;
                     if (!s->ackFired.exchange(true))
                         ack->set_value({200, Json::Writer().Add("ok", true)
                             .Add("account", existing->account).Add("character", existing->charName)
@@ -1473,6 +1635,11 @@ namespace WrathBench
         *p << uint32(CHAT_MSG_SAY);
         *p << uint32(lang);
         *p << text;
+        if (!s->allowGm && ChatPacketRunsCommand(*p))
+        {
+            delete p;
+            return reply(403, ChatCommandRefusal("say"));
+        }
         s->ws->QueuePacket(p);
 
         Audit(*s, "action", Json::Writer().Add("op", "say").Add("text", text).Str());
@@ -4052,6 +4219,15 @@ namespace WrathBench
             p = new WorldPacket(op, payload.size() / 2);
             for (size_t i = 0; i + 1 < payload.size(); i += 2)
                 *p << uint8(std::stoul(payload.substr(i, 2), nullptr, 16));
+            // Party, yell and whisper ride CMSG_MESSAGECHAT here, and the
+            // stock handler runs commands from any of them: the same test as
+            // `say`, on the bytes the handler will read.
+            if (op == CMSG_MESSAGECHAT && !s->allowGm && ChatPacketRunsCommand(*p))
+            {
+                delete p;
+                ack->set_value({403, ChatCommandRefusal(action)});
+                return;
+            }
             auditW.Add("opcode", opcode).Add("payload", payload);
         }
         else

@@ -80,9 +80,10 @@ version covers the module built from the same commit:
 - **Patch** for a fix: behaviour brought back to what the documentation
   already says.
 
-Before 1.0 the same meanings apply to `0.MINOR.PATCH`. Every release has a
-`CHANGELOG.md` entry, and what an operator must change on their side is
-listed there under its own heading.
+Before 1.0 none of that is promised: any release may break, whatever number
+moves, and the changelog says how. Every release has a `CHANGELOG.md` entry,
+and what an operator must change on their side is listed there under its own
+heading.
 
 The module's wire has its own integer, `protocol` on `GET /health`, which
 moves only for a change an existing SDK would misread (`module/PROTOCOL.md`,

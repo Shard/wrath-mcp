@@ -2,7 +2,8 @@
 
 What each release of the stack changed: the module, `@wrathbench/sdk` and
 `@wrathbench/mcp`, which release together at one version. Versions follow
-semantic versioning (`CONTRIBUTING.md`, "Versioning"). The module's wire
+semantic versioning (`CONTRIBUTING.md`, "Versioning"); before 1.0 any release
+may break, and its entry says how. The module's wire
 version, `protocol` on `GET /health`, is separate and named where it moves.
 
 ## Unreleased
@@ -16,9 +17,27 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   only has the module built in opens no control port. A deployment that
   relied on the shipped conf's `1` sets it, in its conf or as
   `AC_WRATH_BENCH_ENABLE=1` in the worldserver's environment.
+- **Command chat is refused by default.** Without the GM opt-in (below), `say`
+  and `raw` `CMSG_MESSAGECHAT` answer `403 chat_command`, with a hint and
+  nothing sent, for text the server would run as a command: the core's own
+  `.`/`!` prefix test, and the addon channel's command form, whatever the
+  account. That closes the gap 0.2.0 left, a player account granted commands
+  in `rbac_account_permissions`. A deployment whose sessions send commands on
+  purpose opts in; one that never does changes nothing.
 
 ### Added
 
+- **The GM opt-in, off by default.** The MCP server's `--allow-gm` or
+  `WRATHBENCH_ALLOW_GM=1` (`mcp/README.md`, "GM accounts"), and the SDK's
+  `connect({ allowGm: true })`, let a GM account in and pass command chat
+  through. On the wire it is `allowGm` on `POST /session`, `POST /characters`,
+  `POST /character-delete` and `POST /lease`; a leased token's creates take
+  the lease's, so only the port secret's holder can opt in, never a snippet.
+  `POST /lease` echoes `allowGm`. There is no server conf for it. The
+  SDK's opt-in is the client's: `createSession` sends it, and strikes an
+  `allowGm` a call passes.
+- `gm_account` and `chat_command` in `KNOWN_ERROR_CODES`, each with a hint
+  that says how to opt in; the module's replies carry the same as `hint`.
 - The server's refusals a client shows, as events: `SMSG_AREA_TRIGGER_MESSAGE`
   (a portal refused in words: a dungeon's level gate, a closed instance, a raid
   without a raid group), `SMSG_QUESTGIVER_QUEST_INVALID` (why a quest cannot be
@@ -36,6 +55,11 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Changed
 
+- Versioning: before 1.0 any release may break, and the changelog says how
+  (`CONTRIBUTING.md`, "Versioning").
+- `LeaseOutcome` from `leaseSessionSecret`/`leaseRunSecret` carries
+  `allowGm`, the module's word on the opt-in (false from a module that
+  predates it).
 - `acceptQuestFrom` settles on `SMSG_QUESTGIVER_QUEST_INVALID` with
   `status: "refused"`, the reason and a hint, where it waited out its timeout;
   `useItem` on a quest-start item likewise answers `status: "quest_refused"`.
@@ -49,7 +73,8 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 - `module/PROTOCOL.md` said swap and split are off the raw allowlist; they are
   on it.
 - `sdk/API.md`: `raw`'s row said no SDK method sends the talent opcodes, though
-  `learnTalent` sends `CMSG_LEARN_TALENT`; `state.self.corpse` is documented.
+  `learnTalent` sends `CMSG_LEARN_TALENT`; `state.self.corpse` is documented;
+  `acceptQuestFrom` lists its statuses and `useItem` names `quest_refused`.
 
 ## 0.2.0
 

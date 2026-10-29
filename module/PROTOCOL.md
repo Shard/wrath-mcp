@@ -64,12 +64,16 @@ Two credential classes:
 
 The lease is what binds a token to an account and a character:
 
-- `POST /lease { token, account }` (operator) records `token → account` and
-  returns the secret. Re-leasing a token rotates its secret (a resumed run
-  re-leases the token it stored) and keeps its character binding unless the
-  account changed.
+- `POST /lease { token, account, allowGm? }` (operator) records `token →
+  account`, and the GM opt-in ("POST /session" below) when `allowGm` is
+  `true`, and returns the secret. Re-leasing a token rotates its secret (a
+  resumed run re-leases the token it stored) and keeps its character binding
+  unless the account changed; the opt-in is each lease's own, so a re-lease
+  without it turns it off, for a session already in world too.
 - A session-class `POST /session` lands on the lease's account whatever the body
-  says (`403 account_not_leased` if the body names another). The first create
+  says (`403 account_not_leased` if the body names another), and takes the
+  lease's GM opt-in whatever its body's `allowGm` says: only the port
+  secret's holder can opt in, never the snippet a lease secret is handed to. The first create
   that succeeds binds the token to that character; a later same-token create
   naming a different one is `409 character_bound` with `bound: <name>`. A create
   the core refused (name taken, bad race/class) binds nothing.
@@ -222,9 +226,28 @@ Request:
   "character": "Benchy",     // required, character name
   "race": 1,                  // required when the character must be created; in [1,11]
   "class": 1,                 // required when the character must be created; in [1,11]
-  "gender": 0                 // optional, default 0 (Male)
+  "gender": 0,                // optional, default 0 (Male)
+  "allowGm": true             // optional, default false: the GM opt-in, below
 }
 ```
+
+`allowGm` is the GM opt-in, off unless the body carries JSON `true`.
+Off, the module serves player use only: it refuses an account with a GM
+security level (`gm_account`, below) and any chat the server would run as a
+command (`chat_command`, "say" below), whatever the account. A session runs
+at its account's security level and the stock chat handler runs commands,
+so without both refusals a GM account, or a player account granted commands
+in `rbac_account_permissions`, would make `say` a door to the server's
+command set, which no player's client has. On, both are the account's own
+business and the module passes them through. It exists so an operator who
+means to drive a GM account can, and so an agent never does by accident.
+A session-class create takes its lease's opt-in, whatever its body says
+("Authentication"); an operator-class create takes the body's. A session in
+world takes a new lease's opt-in for its token at once, so a resumed caller
+that re-leases without it turns it off whether or not it creates again; a
+same-token create that finds its session in world sets it to the create's. The
+module has no conf for it: the opt-in comes only from the holder of the port
+secret, who already decides which accounts the module serves.
 
 `race`/`class` semantics: when the named character already
 exists on the account, `race` and `class` are ignored entirely — the existing
@@ -284,15 +307,14 @@ Errors:
 - `403 {"ok":false,"error":"account_not_permitted"}` — `account` is not on the
   `WrathBench.Accounts` allowlist.
 - `400 {"ok":false,"error":"unknown_account"}`
-- `403 {"ok":false,"error":"gm_account"}` — the account holds a security level
-  above player (`account_access.gmlevel` greater than 0 on any realm). The
-  module serves player accounts only: a session runs at its account's level,
-  and the stock chat handler runs a GM's dot commands, so a GM account would
-  make `say` a door to the server's command set, which no player's client has.
-  Checked first, before any reclaim, so a refused create disturbs no other
-  session. `POST /characters` and `POST /character-delete` refuse the same
-  accounts the same way. Give the module dedicated accounts made with
-  `account create`, which are players unless someone raises them.
+- `403 {"ok":false,"error":"gm_account","hint":...}` — the account holds a
+  security level above player (`account_access.gmlevel` greater than 0 on any
+  realm) and the create has no GM opt-in (`allowGm` above); the hint says how
+  to opt in. Checked first, before any reclaim, so a refused create disturbs
+  no other session. `POST /characters` and `POST /character-delete` refuse the
+  same accounts the same way, and take `allowGm` the same way. For player use,
+  give the module dedicated accounts made with `account create`, which are
+  players unless someone raises them.
 - `400 {"ok":false,"error":"socket_setup_failed"}`
 - `502 {"ok":false,"error":"char_create_failed_code_<N>"}` — game-level
   char-create rejection (N is the `SMSG_CHAR_CREATE` result code); also surfaced as
@@ -371,6 +393,22 @@ Success `200`:
 The say language is chosen server-side from the character's team (Common for
 Alliance, Orcish for Horde); the caller does not supply it. A client-visible
 rejection (e.g. muted) comes back as a `SMSG_NOTIFICATION` event, not an HTTP error.
+
+Without the GM opt-in ("POST /session", `allowGm`), text the server would
+run as a command is refused and nothing is sent:
+`403 {"ok":false,"error":"chat_command","action":"say","hint":...}`, the hint
+saying how to opt in. The test is the core's own, read off the packet the
+module built, exactly as `WorldSession::HandleMessagechatOpcode` reads it:
+`ChatHandler::ParseCommands`'s prefix (a `.` or `!`, then neither the same
+character again nor a space; `src/server/game/Chat/Chat.cpp`, lines 250-271
+at the pinned core) and, for `LANG_ADDON` lines, the addon channel's command
+form (`AzerothCore\t`, then `h` or `i`, a four-character counter and a
+command; `AddonChannelCommandHandler::ParseCommands`, lines 991-1030; the two
+parse calls are `src/server/game/Handlers/ChatHandler.cpp` lines 302 and
+307). The module stops at the prefix and runs no command lookup, so a line like `.hi`,
+which the core would say as chat for a player when no command matches, is
+refused too: say it without the leading character. `raw` `CMSG_MESSAGECHAT`
+(party, yell, whisper, any chat type) is held to the same test.
 
 #### move_to
 
@@ -648,7 +686,9 @@ core logs it and, as for any client, may kick the session). Success `200`:
 
 Errors (all `400`): `missing_opcode`, `opcode_not_allowed` (echoes `opcode`
 and a hint), `invalid_payload` (not whole hex bytes), `payload_too_large`
-(echoes `received` and `maximum`).
+(echoes `received` and `maximum`). And `403 chat_command`: a `CMSG_MESSAGECHAT`
+whose text the server would run as a command, on a session without the GM
+opt-in ("say" above has the test).
 
 Allowlist — every entry is an opcode a stock client sends during ordinary play
 whose handler does nothing a non-GM client could not do:
@@ -744,11 +784,14 @@ exactly the evidence the hatch exists to produce.
 
 ### POST /lease
 
-Operator only. `{ "token": <str>, "account"?: <str> }` →
-`200 { "ok": true, "token", "account", "secret", "character"? }`. Binds the
-token to the account (default `WrathBench.Account`) and issues — or, for a
-token already leased, rotates — its session secret; `character` is present when
-an earlier create under this token already bound one. Errors: `400
+Operator only. `{ "token": <str>, "account"?: <str>, "allowGm"?: <bool> }` →
+`200 { "ok": true, "token", "account", "secret", "allowGm", "character"? }`.
+Binds the token to the account (default `WrathBench.Account`) and issues — or,
+for a token already leased, rotates — its session secret; `allowGm` is the GM
+opt-in its session-class creates inherit ("POST /session"), echoed so the
+caller knows the module took it (a module that predates it echoes nothing);
+`character` is present when an earlier create under this token already bound
+one. Errors: `400
 missing_token`, `400 weak_token`, `403 account_not_permitted`, `403
 operator_only`. See "Authentication".
 
@@ -760,7 +803,7 @@ Revokes the token's lease secret; a live session under the token is untouched.
 ### POST /characters
 
 Operator only (`403 operator_only` for a session-class caller).
-`{ "token": <str>, "account"?: <str> }` → `200 { "ok": true, "enum": { "count": <number>, "characters": [ { "guid", "name", "race", "class", "gender", "level" }, ... ] } }`.
+`{ "token": <str>, "account"?: <str>, "allowGm"?: <bool> }` → `200 { "ok": true, "enum": { "count": <number>, "characters": [ { "guid", "name", "race", "class", "gender", "level" }, ... ] } }`.
 A parked utility session (never enters world) answers with the decoded `SMSG_CHAR_ENUM` for the account — the same data a client's character-select screen shows. Exists for a harness's housekeeping between sessions (list-then-delete leftover characters); errors mirror `/character-delete` (`missing_token`, `token_in_use`, `account_not_permitted`, `unknown_account`, `gm_account`, `account_in_use` when a live session holds the account, `504 timeout`).
 
 ### POST /character-delete
@@ -783,6 +826,7 @@ Request:
 ```json
 { "token": "del-abc123", "account": "RUNNER", "character": "Benchy" }
 ```
+(`allowGm: true` may be added, as on `POST /session`, to serve a GM account.)
 (`token` is a fresh throwaway token for this operation's audit log/event
 stream; `account` optional as in `POST /session`, but must be on the module's
 configured account allowlist (`WrathBench.Accounts`, defaulting to the single
