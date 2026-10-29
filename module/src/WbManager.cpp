@@ -984,6 +984,9 @@ namespace WrathBench
         { "CMSG_BUYBACK_ITEM", CMSG_BUYBACK_ITEM },
         // spell/aura control
         { "CMSG_CANCEL_AURA", CMSG_CANCEL_AURA },
+        // the client's Dismount (empty body; MiscHandler.cpp
+        // HandleCancelMountAuraOpcode); the SDK's dismount sends it
+        { "CMSG_CANCEL_MOUNT_AURA", CMSG_CANCEL_MOUNT_AURA },
         { "CMSG_CANCEL_AUTO_REPEAT_SPELL", CMSG_CANCEL_AUTO_REPEAT_SPELL },
         { "CMSG_CANCEL_CHANNELLING", CMSG_CANCEL_CHANNELLING },
         { "CMSG_SET_SHEATHED", CMSG_SET_SHEATHED },
@@ -4092,6 +4095,7 @@ namespace WrathBench
                         break;
                     }
             uint32 startQuest = proto ? proto->StartQuest : 0;
+            bool opensForLoot = false;
             if (spellId)
             {
                 // The same client cast counter as cast_spell's: the core hands
@@ -4122,10 +4126,24 @@ namespace WrathBench
                 p = new WorldPacket(CMSG_QUESTGIVER_QUERY_QUEST, 13);
                 *p << uint64(item->GetGUID().GetRawValue()) << uint32(startQuest) << uint8(0);
             }
+            else if (proto && proto->HasFlag(ITEM_FLAG_HAS_LOOT))
+            {
+                // A clam, a satchel, a lockbox: the template's
+                // ITEM_FLAG_HAS_LOOT is what makes a client's right-click open
+                // it for loot rather than use it. u8 bag, u8 slot, exactly what
+                // SpellHandler.cpp HandleOpenItemOpcode reads; the window
+                // arrives as SMSG_LOOT_RESPONSE under the item's guid, and a
+                // refusal (locked, dead) as SMSG_INVENTORY_CHANGE_FAILURE.
+                p = new WorldPacket(CMSG_OPEN_ITEM, 2);
+                *p << uint8(bag) << uint8(slot);
+                opensForLoot = true;
+            }
             else
                 return err(400, "item_not_usable");
             auditW.Add("bag", (uint32)bag).Add("slot", (uint32)slot).Add("spellId", spellId)
                 .AddGuid("itemGuid", item->GetGUID().GetRawValue()).Add("startQuest", startQuest);
+            if (opensForLoot)
+                auditW.Add("open", true);
             if (spellId && glyphSlot)
                 auditW.Add("glyphSlot", (uint32)glyphSlot);
         }

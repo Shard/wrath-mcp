@@ -58,8 +58,22 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   own readings; undefined until a block carried the field), and
   `state.self` carries `inCombat` and `stunned`. Stand state, shapeshift form,
   glyphs, own stats and rested XP need fields the module does not forward yet.
+- Dismount: `state.self.mounted` (`UNIT_FLAG_MOUNT` on self, no wire change)
+  and the SDK's `dismount()`, which sends the client's Dismount,
+  `CMSG_CANCEL_MOUNT_AURA` (new on the raw allowlist), and answers
+  `dismounted` once the flag clears; `not_mounted` and `in_flight` are
+  answered from the state cache with nothing sent.
+- Items that open for loot: `use_item` on an item with `ITEM_FLAG_HAS_LOOT`
+  and no on-use spell or quest (a clam, a satchel, a lockbox) sends
+  `CMSG_OPEN_ITEM`, where it answered `item_not_usable`. The SDK's `useItem`
+  empties the window under the item's guid as `lootCorpse` empties a corpse's
+  and answers `looted`, `none_stored` or `empty` with what reached the bag, or
+  `refused` with the `InventoryResult` (a locked lockbox).
 
 ### Changed
+
+- The `opcode_not_allowed` hint and `activateTaxi`'s already-mounted refusal
+  point at `dismount()` rather than a raw `CMSG_CANCEL_AURA`.
 
 - Versioning: before 1.0 any release may break, and the changelog says how
   (`CONTRIBUTING.md`, "Versioning").
