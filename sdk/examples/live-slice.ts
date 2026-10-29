@@ -1,18 +1,20 @@
 /**
- * The Stage-2 vertical slice, driven entirely through the SDK.
+ * A vertical slice of the stack, driven entirely through the SDK.
  *
- * This is the same ground infra/smoke/module-slice.ts covers, but where the
- * probe pokes the wire by hand, this asserts the SDK's own surface: `connect`
- * opens the event stream, `createSession` seeds the state cache,
- * `waitForChat` reads the echo back off the stream, and the cache — which was
- * never told anything except events plus the session seed — agrees.
+ * Where a wire-level probe pokes the module by hand, this asserts the SDK's
+ * own surface: `connect` opens the event stream, `createSession` seeds the
+ * state cache, `waitForChat` reads the echo back off the stream, and the cache
+ * — which was never told anything except events plus the session seed —
+ * agrees.
  *
- * Not part of `bun test`: it needs a booted worldserver. Run it from inside the
- * compose network:
+ * Not part of `bun test`: it needs a booted worldserver running the module.
+ * Point it at the module's port and pass the port secret:
  *
- *   docker compose -f infra/compose.yml exec runner bun sdk/examples/live-slice.ts
+ *   MODULE_HOST=127.0.0.1 MODULE_PORT=8086 \
+ *   WRATHBENCH_MODULE_SECRET=<the port secret> bun sdk/examples/live-slice.ts
  *
- * Override the target with MODULE_HOST / MODULE_PORT (default worldserver:8086).
+ * MODULE_HOST / MODULE_PORT default to worldserver:8086, a container
+ * network's service name for the worldserver.
  */
 
 import { randomBytes } from "node:crypto";
@@ -33,7 +35,7 @@ const CHARACTER = process.env.SLICE_CHARACTER ?? "Benchslice";
 /**
  * The operator credential (`module/PROTOCOL.md`, "Authentication"): the port
  * secret, which every route requires. Read from the environment the way the
- * runner reads it. Left unset it is sent as nothing, which a module that
+ * MCP server reads it. Left unset it is sent as nothing, which a module that
  * predates authentication accepts and any current one answers `401
  * unauthorized`.
  */

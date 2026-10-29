@@ -11,12 +11,14 @@
  * construction, whereas an arbitrary 30y bearing lands in a wall or a lake and
  * comes back `target_off_mesh` / `path_incomplete`.
  *
- * Not part of `bun test`: it needs a booted worldserver. Run it from inside the
- * compose network:
+ * Not part of `bun test`: it needs a booted worldserver running the module.
+ * Point it at the module's port and pass the port secret:
  *
- *   docker compose -f infra/compose.yml exec runner bun sdk/examples/live-move.ts
+ *   MODULE_HOST=127.0.0.1 MODULE_PORT=8086 \
+ *   WRATHBENCH_MODULE_SECRET=<the port secret> bun sdk/examples/live-move.ts
  *
- * Override the target with MODULE_HOST / MODULE_PORT (default worldserver:8086).
+ * MODULE_HOST / MODULE_PORT default to worldserver:8086, a container
+ * network's service name for the worldserver.
  */
 
 import { randomBytes } from "node:crypto";
@@ -32,7 +34,7 @@ const CHARACTER = process.env.MOVE_CHARACTER ?? "Benchmove";
 /**
  * The operator credential (`module/PROTOCOL.md`, "Authentication"): the port
  * secret, which every route requires. Read from the environment the way the
- * runner reads it. Left unset it is sent as nothing, which a module that
+ * MCP server reads it. Left unset it is sent as nothing, which a module that
  * predates authentication accepts and any current one answers `401
  * unauthorized`.
  */

@@ -21,9 +21,10 @@ WrathBench.Enable = 1
 #
 #    WrathBench.BindAddress
 #        Description: Address the module's HTTP/WebSocket server binds to.
-#                     The compose network is private and nothing is published to
-#                     the host, so 0.0.0.0 is reachable only from inside the
-#                     `wrathbench` network (see infra/compose.yml).
+#                     Keep the port on a private network: 0.0.0.0 is safe only
+#                     where nothing publishes it beyond the hosts that should
+#                     reach it (in a container, an unpublished port on a
+#                     private network).
 #        Default:     "0.0.0.0"
 #
 
@@ -51,7 +52,8 @@ WrathBench.Threads = 2
 #    WrathBench.Account
 #        Description: Default auth account a session attaches to when the
 #                     /session request omits "account". Must already exist in the
-#                     auth DB (infra/bootstrap creates RUNNER).
+#                     auth DB (`account create <name> <password>` on the
+#                     worldserver console).
 #        Default:     "RUNNER"
 #
 
@@ -65,8 +67,8 @@ WrathBench.Account = "RUNNER"
 #                     /character-delete) refuses accounts not on this list with
 #                     403 account_not_permitted.
 #                     A deployment that runs several accounts sets its own list
-#                     here; the fleet's lives in the deployment, not in this
-#                     file, so what ships is the single-account default.
+#                     in its own config, so what ships is the single-account
+#                     default.
 #        Default:     the WrathBench.Account value (single-account behaviour)
 #
 
@@ -78,11 +80,11 @@ WrathBench.Accounts = "RUNNER"
 #                     HTTP request and /events upgrade must carry
 #                     `Authorization: Bearer <credential>`; this value is the
 #                     operator credential that may use every route, and the one
-#                     the runner presents to lease per-run session secrets. At
+#                     the sandbox host presents to lease per-session secrets. At
 #                     least 32 characters; with it unset or shorter the module
 #                     does not listen at all. Never put a real value in this
-#                     file: infra/compose.yml passes it as AC_WRATH_BENCH_SECRET
-#                     from WRATHBENCH_MODULE_SECRET in the operator's .env.
+#                     file: pass it as AC_WRATH_BENCH_SECRET in the
+#                     worldserver's environment.
 #        Default:     "" (control surface disabled)
 #
 
@@ -93,6 +95,8 @@ WrathBench.Secret = ""
 #        Description: Directory for per-session audit logs (JSONL, one file per
 #                     session token). Every action dispatched and event served is
 #                     logged here with a timestamp and session id (docs/CONTRACTS.md).
+#                     The default is the AzerothCore Docker image's log path;
+#                     elsewhere, point it at a writable directory.
 #        Default:     "/azerothcore/env/dist/logs/wrathbench"
 #
 

@@ -1,9 +1,9 @@
 # Included inline by AzerothCore's modules/CMakeLists.txt (auto-discovered as
 # modules/<name>/<name>.cmake). Stamps the build identity served on /health.
 #
-# WRATHBENCH_BUILD is the wrathbench repo's `git describe --tags --always
-# --dirty`, passed in by infra/docker/server.Dockerfile from the docker
-# build-arg of the same name (see infra/compose.yml x-ac-build). It is scoped to
+# WRATHBENCH_BUILD is whatever the builder passes as -DWRATHBENCH_BUILD=<id>
+# (WrathBench's worldserver image passes its repository's `git describe --tags
+# --always --dirty`). It is scoped to
 # WbManager.cpp alone so a new describe string recompiles one translation unit,
 # not the whole module, and leaves the rest of the ccache intact. Unset or
 # empty: the module reports "unknown".
