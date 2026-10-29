@@ -74,9 +74,7 @@ and `@wrathbench/mcp` release together at one version (`SDK_VERSION`,
 version covers the module built from the same commit:
 
 - **Major** for a breaking change: something that worked stops working, or
-  works differently, without the user changing anything on their side. That
-  includes the module's configuration defaults, its error answers and the
-  layout of its audit log, not only the TypeScript surface.
+  works differently, without the user changing anything on their side.
 - **Minor** for a feature or an addition: a new method, helper, action, event
   or option that leaves everything existing as it was.
 - **Patch** for a fix: behaviour brought back to what the documentation
