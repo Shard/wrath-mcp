@@ -1401,6 +1401,12 @@ one of:
   `fields` is always present but may be `{}` when the mask carried no
   whitelisted field. `objectType` is `"unknown"` for a type id outside the
   known enum (forward compatibility, not an expected case).
+  A create block carries every field the core has non-zero for this receiver
+  (`Object::BuildValuesUpdate` with `UPDATETYPE_CREATE_OBJECT` sets a mask bit
+  only for a non-zero field, or one flagged to be sent regardless), and a
+  client starts every field at 0: a named field absent from `fields` is 0 on
+  the client, not unobserved. A values block is the opposite, a delta, where
+  absent means unchanged. The SDK reads both that way (`StateCache`).
 - Field delta: `{ "update": "values", "guid": <guid-string>, "fields": { ... } }`
 - Left update range: `{ "update": "outOfRange", "guids": [ <guid-string>, ... ] }`
 - Near objects: `{ "update": "near", "guids": [ <guid-string>, ... ] }` — same

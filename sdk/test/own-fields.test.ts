@@ -37,7 +37,7 @@ describe("stand state and shapeshift form", () => {
     expect(row.sitting).toBe(false);
     expect(row.shapeshiftForm).toBeUndefined();
     row = replay([createMob(1, {})]).units().find((u) => u.guid === MOB)!;
-    expect(row.sitting).toBeUndefined();
+    expect(row.sitting).toBe(false);
   });
 
   test("on self: stand state by id and name, sitting, and the form with 'none'", () => {
@@ -48,6 +48,80 @@ describe("stand state and shapeshift form", () => {
     const later = replay([selfValues(1, { standState: 2 }), selfValues(2, { health: 10, shapeshiftForm: 17 })]);
     expect(later.self.sitting?.value).toBe(true);
     expect(later.self.shapeshiftForm?.value).toEqual({ id: 17, name: "battleStance" });
+  });
+});
+
+const OTHER = "9002";
+const IN_COMBAT = 0x0008_0000;
+const selfCreate = (seq: number, fields: Record<string, number>) =>
+  update(seq, { update: "create", guid: SELF_GUID, objectType: "player", self: true, fields: { health: 50, maxHealth: 50, level: 1, ...fields } });
+const mobValues = (seq: number, fields: Record<string, number>) => update(seq, { update: "values", guid: MOB, fields });
+const mobRow = (cache: StateCache) => cache.units().find((u) => u.guid === MOB)!;
+
+describe("a create block states what it leaves out as zero", () => {
+  test("a unit with no flag words has none set, stands and is in no form", () => {
+    const row = mobRow(replay([createMob(1, {})]));
+    expect(row).toMatchObject({
+      inCombat: false, stunned: false, skinnable: false, lootable: false, tapped: false, tappedByYou: false, sitting: false, roles: [],
+    });
+    expect(row.shapeshiftForm).toBeUndefined();
+  });
+
+  test("a unit known from a values block alone stays unobserved", () => {
+    const row = mobRow(replay([mobValues(1, { health: 40 })]));
+    expect(row).toMatchObject({ inCombat: undefined, lootable: undefined, sitting: undefined });
+  });
+
+  test("a values block that omits the field leaves it unchanged; a later create resets it", () => {
+    const set = replay([createMob(1, { unitFlags: IN_COMBAT, dynamicFlags: 0x1, standState: 1 }), mobValues(2, { health: 40 })]);
+    expect(mobRow(set)).toMatchObject({ inCombat: true, lootable: true, sitting: true });
+    const reset = replay([createMob(1, { unitFlags: IN_COMBAT, standState: 1 }), mobValues(2, { health: 40 }), createMob(3, {})]);
+    expect(mobRow(reset)).toMatchObject({ inCombat: false, sitting: false });
+  });
+
+  test("a fresh character reads standing, in no form, no rested XP, no flags", () => {
+    const cache = replay([selfCreate(1, {})]);
+    expect(cache.self.standState?.value).toEqual({ id: 0, name: "stand" });
+    expect(cache.self.sitting?.value).toBe(false);
+    expect(cache.self.shapeshiftForm?.value).toEqual({ id: 0, name: "none" });
+    expect(cache.self.restedXp?.value).toBe(0);
+    expect(cache.self.resting?.value).toBe(false);
+    expect(cache.self.ghost?.value).toBe(false);
+    expect(cache.self.inCombat?.value).toBe(false);
+    expect(cache.self.stunned?.value).toBe(false);
+    expect(cache.self.mounted?.value).toBe(false);
+    expect(cache.self.taxiFlight?.value).toBe(false);
+  });
+
+  test("on self a values block without the fields changes nothing, and a later create resets them", () => {
+    const fields = { standState: 1, shapeshiftForm: 5, restedXp: 300, playerFlags: 0x20, unitFlags: IN_COMBAT };
+    const held = replay([selfCreate(1, fields), selfValues(2, { health: 40 })]);
+    expect(held.self.sitting?.value).toBe(true);
+    expect(held.self.shapeshiftForm?.value.id).toBe(5);
+    expect(held.self.restedXp?.value).toBe(300);
+    expect(held.self.resting?.value).toBe(true);
+    expect(held.self.inCombat?.value).toBe(true);
+    const reset = replay([selfCreate(1, fields), selfValues(2, { health: 40 }), selfCreate(3, {})]);
+    expect(reset.self.sitting?.value).toBe(false);
+    expect(reset.self.shapeshiftForm?.value.id).toBe(0);
+    expect(reset.self.restedXp?.value).toBe(0);
+    expect(reset.self.resting?.value).toBe(false);
+    expect(reset.self.inCombat?.value).toBe(false);
+  });
+
+  test("another player's create invents no PRIVATE field", () => {
+    const cache = replay([
+      update(1, { update: "create", guid: OTHER, objectType: "player", pos: { x: 1, y: 2, z: 3, o: 0 }, fields: { health: 50, maxHealth: 50, level: 3 } }),
+    ]);
+    const other = cache.nearby.get(OTHER)!;
+    expect(other.fields.get("unitFlags")?.value).toBe(0);
+    expect(other.fields.has("restedXp")).toBe(false);
+    expect(other.fields.has("playerFlags")).toBe(false);
+  });
+
+  test("an item or a game object create is left as the module sent it", () => {
+    const cache = replay([update(1, { update: "create", guid: "9100", objectType: "gameObject", fields: { entry: 5 } })]);
+    expect([...cache.nearby.get("9100")!.fields.keys()]).toEqual(["entry"]);
   });
 });
 

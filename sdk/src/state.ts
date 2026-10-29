@@ -656,9 +656,9 @@ export interface SelfState extends UnitFieldsState {
    * `PLAYER_FLAGS_RESTING` on our own `playerFlags`: true while the character
    * is in a rest area — an inn or a city — which is what the client's own
    * resting icon says. Read the same way `taxiFlight` reads `unitFlags`: only
-   * from a block that actually carried `playerFlags`, so an update that omits
+   * from a block that carried `playerFlags`, so a values update that omits
    * the field leaves the last observation standing rather than erasing it.
-   * `undefined` until a block has carried `playerFlags` at all.
+   * A create block that omits it states 0, so a fresh character reads false.
    */
   resting: Observed<boolean> | undefined;
   /**
@@ -678,15 +678,14 @@ export interface SelfState extends UnitFieldsState {
    * `PLAYER_FLAGS_GHOST` on our own `playerFlags`: true while the released
    * spirit walks as a ghost, from the release until the resurrect. A ghost's
    * health reads 1, not 0, so this is the reading that says dead once the
-   * spirit is released. Guarded like `resting`; `undefined` until a block has
-   * carried `playerFlags` at all.
+   * spirit is released. Guarded like `resting`.
    */
   ghost: Observed<boolean> | undefined;
   /**
    * `UNIT_FLAG_IN_COMBAT` and `UNIT_FLAG_STUNNED` on our own `unitFlags`: the
    * client's combat indicator and its stunned state. Guarded like `resting`:
-   * read only from a block that carried `unitFlags`, so an update without it
-   * leaves the last observation standing; `undefined` until one has.
+   * a values update without `unitFlags` leaves the last observation standing,
+   * a create block without it states 0.
    */
   inCombat: Observed<boolean> | undefined;
   stunned: Observed<boolean> | undefined;
@@ -753,8 +752,8 @@ export interface SelfState extends UnitFieldsState {
    * Stand state, byte 0 of our own `UNIT_FIELD_BYTES_1`: `id` the
    * `UnitStandStateType` and `name` its reading ("stand", "sit", "sitChair",
    * "sleep", "dead", "kneel", …), and `sitting` whether the client draws the
-   * character seated (sit or any chair). Guarded like `resting`; `undefined`
-   * until a block carried the field.
+   * character seated (sit or any chair). Guarded like `resting`: a create
+   * block without the field states "stand".
    */
   standState: Observed<{ readonly id: number; readonly name: string | undefined }> | undefined;
   sitting: Observed<boolean> | undefined;
@@ -762,7 +761,7 @@ export interface SelfState extends UnitFieldsState {
    * Shapeshift form, byte 3 of our own `UNIT_FIELD_BYTES_2`: `id` the
    * `ShapeshiftForm` (0 none; the numbering a spellbook row's `stances` and
    * `form` use) and `name` ("none", "cat", "bear", "battleStance",
-   * "stealth", …). Guarded the same way.
+   * "stealth", …). Guarded the same way: a create block without it states none.
    */
   shapeshiftForm: Observed<{ readonly id: number; readonly name: string | undefined }> | undefined;
   /**
@@ -770,7 +769,10 @@ export interface SelfState extends UnitFieldsState {
    * undefined until a block carried its field. `undefined` until any has.
    */
   stats: Observed<CharacterStats> | undefined;
-  /** Rested XP (`PLAYER_REST_STATE_EXPERIENCE`): the bonus pool the XP bar shades. */
+  /**
+   * Rested XP (`PLAYER_REST_STATE_EXPERIENCE`): the bonus pool the XP bar
+   * shades. A create block without the field states 0.
+   */
   restedXp: Observed<number> | undefined;
   /**
    * Which unit this client moves, from `SMSG_CLIENT_CONTROL_UPDATE`
@@ -1740,8 +1742,9 @@ export interface UnitView {
    * Units and players, from `UNIT_FIELD_FLAGS`: the client's own readings of
    * the unit's state. `inCombat` is `UNIT_FLAG_IN_COMBAT`, `stunned`
    * `UNIT_FLAG_STUNNED`, `skinnable` `UNIT_FLAG_SKINNABLE` (a corpse that
-   * can be skinned). Each is undefined until a block carried the field, and
-   * for game objects and corpses.
+   * can be skinned). A create block without the field states 0, so each is
+   * false; undefined only for a unit known from a values block alone, and for
+   * game objects and corpses.
    */
   readonly inCombat: boolean | undefined;
   readonly stunned: boolean | undefined;
@@ -1753,8 +1756,9 @@ export interface UnitView {
    * is `UNIT_DYNFLAG_TAPPED`, the unit has a loot recipient (someone has
    * tagged it); `tappedByYou` is `UNIT_DYNFLAG_TAPPED_BY_PLAYER`, that
    * recipient is you or your group. Tapped by someone else is `tapped` with
-   * `tappedByYou` false. Each is undefined until a block carried the
-   * field, and for game objects and corpses.
+   * `tappedByYou` false. A create block without the field states 0,
+   * so each is false; undefined only for a unit known from a values block
+   * alone, and for game objects and corpses.
    */
   readonly lootable: boolean | undefined;
   readonly tapped: boolean | undefined;
@@ -1763,8 +1767,8 @@ export interface UnitView {
    * Units and players: whether the client draws them seated (stand state, byte
    * 0 of `UNIT_FIELD_BYTES_1`, sit or any chair), and the shapeshift form's
    * name (byte 3 of `UNIT_FIELD_BYTES_2`: "cat", "bear", "ghostWolf", …).
-   * `sitting` is undefined until a block carried its field; `shapeshiftForm`
-   * is undefined also when the unit is in no form.
+   * `sitting` is undefined only for a unit known from a values block alone;
+   * `shapeshiftForm` is undefined also when the unit is in no form.
    */
   readonly sitting: boolean | undefined;
   readonly shapeshiftForm: string | undefined;
@@ -5070,7 +5074,7 @@ export class StateCache {
         this.self.fields.clear();
         for (const [key, v] of kept) this.self.fields.set(key, v);
       }
-      this.mergeFields(this.self, block.fields, seq, ts);
+      this.mergeFields(this.self, createdFields(block, true), seq, ts);
       return;
     }
 
@@ -5087,7 +5091,7 @@ export class StateCache {
           ts,
         };
       }
-      this.mergeFields(obj, createdFields(block), seq, ts);
+      this.mergeFields(obj, createdFields(block, false), seq, ts);
       this.joinName(obj);
     });
   }
@@ -5760,18 +5764,35 @@ function supersededCorpses(objects: Iterable<NearbyObject>): Set<GuidKey> {
 }
 
 /**
- * A create block's fields as the client reads them. The core's create mask
- * carries only the non-zero fields (`Object::BuildValuesUpdate`) and a client
- * starts every field at zero, so a unit's create that states its `maxHealth`
- * and no `health` is a unit at 0 health: a creature that came into view
- * already dead. Stated, so an object re-entering view dead does not keep the
- * health it left with.
+ * The fields a create block states as zero by leaving them out. The core's
+ * create mask carries a field only when it is non-zero
+ * (`Object::BuildValuesUpdate` with `UPDATETYPE_CREATE_OBJECT` tests
+ * `m_uint32Values[index]`) and a client starts every field at zero, so the
+ * readings off these are known on a create block and unknown on a values
+ * block. Only fields the module names and forwards when non-zero are listed;
+ * `standState` and `shapeshiftForm` unpack `UNIT_FIELD_BYTES_1` / `_2`, so
+ * they are absent only when every byte of the word is zero.
  */
-function createdFields(block: CreateBlock): UpdateFields | undefined {
+const CREATE_ZERO_UNIT_FIELDS = ["unitFlags", "dynamicFlags", "npcFlags", "standState", "shapeshiftForm"] as const;
+/** Our own `playerFlags` and rested XP. Rested XP is PRIVATE, so nobody else's create states it. */
+const CREATE_ZERO_SELF_FIELDS = ["playerFlags", "restedXp"] as const;
+
+/**
+ * A create block's fields as the client reads them: what the block leaves out
+ * is zero, not unobserved. A unit's create that states its `maxHealth` and no
+ * `health` is a unit at 0 health, a creature that came into view already dead
+ * (stated, so an object re-entering view dead does not keep the health it
+ * left with); a unit with no `unitFlags` has none set, and a fresh character
+ * with no `standState` stands.
+ */
+function createdFields(block: CreateBlock, isSelf: boolean): UpdateFields | undefined {
   const fields = block.fields;
   if (block.objectType !== "unit" && block.objectType !== "player") return fields;
-  if (fields === undefined || !("maxHealth" in fields) || "health" in fields) return fields;
-  return { ...fields, health: 0 };
+  const out: UpdateFields = { ...fields };
+  if ("maxHealth" in out && !("health" in out)) out.health = 0;
+  for (const key of CREATE_ZERO_UNIT_FIELDS) if (!(key in out)) out[key] = 0;
+  if (isSelf) for (const key of CREATE_ZERO_SELF_FIELDS) if (!(key in out)) out[key] = 0;
+  return out;
 }
 
 /**

@@ -392,6 +392,18 @@ interface CastAim {
   resolved?: ResolvedRef;
 }
 
+/**
+ * A `targetPoint` that names no point, answered as a value with nothing sent:
+ * the SDK declining to act, as `moveTo` answers a target it cannot place.
+ */
+export interface CastPointRefusal {
+  readonly ok: false;
+  readonly status: "unknown_target";
+  readonly hint: string;
+  readonly action?: undefined;
+  readonly questOffer?: undefined;
+}
+
 /** The wire fields a resolved aim adds to `cast_spell` / `use_item`: none when it has neither target. */
 function aimFields(aim: CastAim): { itemTargetGuid?: string; destX?: number; destY?: number; destZ?: number } {
   return {
@@ -450,20 +462,34 @@ function resolveItemTarget(state: StateCache, ref: ItemTargetRef, arg: string): 
  * Resolve a cast's ground target to a point: `{ x, y, z }` as given, or a
  * unit (its guid or name) at its position now, as `state.units()` reports
  * it. No axis is made up: a point without z is refused, since the ground
- * height at an arbitrary x, y is nothing a client observes.
+ * height at an arbitrary x, y is nothing a client observes. A referent that
+ * yields no point (no z, a name matching none or two, a unit out of view)
+ * comes back as `{ unknown }`, as `resolveMoveTarget` does; a malformed point
+ * still throws, as `moveTo` does.
  */
-function resolveCastPoint(state: StateCache, ref: GuidOrUnit | { x: number; y: number; z: number }, arg: string): MovePoint {
+function resolveCastPoint(
+  state: StateCache,
+  ref: GuidOrUnit | { x: number; y: number; z: number },
+  arg: string,
+): MovePoint | { unknown: string } {
   let target: unknown = ref;
-  if (typeof target === "string" && !GUID_TEXT.test(target.trim())) target = resolveNamedTarget(state, target, arg).guid;
+  if (typeof target === "string" && !GUID_TEXT.test(target.trim())) {
+    try {
+      target = resolveNamedTarget(state, target, arg).guid;
+    } catch (e) {
+      return { unknown: e instanceof Error ? e.message : String(e) };
+    }
+  }
   const guid = moveTargetGuid(target);
   if (guid === undefined) {
     if (target !== null && typeof target === "object") {
       const { x, y, z } = target as Record<string, unknown>;
       if (typeof x === "number" && typeof y === "number" && z === undefined) {
-        throw new TypeError(
-          `${arg} needs z as well as x and y; nothing was sent. The ground height at a point is not something ` +
+        return {
+          unknown:
+            `${arg} needs z as well as x and y; nothing was sent. The ground height at a point is not something ` +
             `the client observes: take the z of a unit there, or your own (state.self.position)`,
-        );
+        };
       }
     }
     assertMovePoint(target, arg);
@@ -473,10 +499,11 @@ function resolveCastPoint(state: StateCache, ref: GuidOrUnit | { x: number; y: n
   const seen = state.nearby.get(key);
   const at = seen === undefined ? undefined : pointOf(seen)?.value;
   if (at === undefined) {
-    throw new TypeError(
-      `${arg}: guid ${key} is ${seen === undefined ? "not in view" : "in view but has no observed position yet"}, ` +
+    return {
+      unknown:
+        `${arg}: guid ${key} is ${seen === undefined ? "not in view" : "in view but has no observed position yet"}, ` +
         `so there is no point to cast at; nothing was sent. Pass a unit in view or a point { x, y, z }`,
-    );
+    };
   }
   return { x: at.x, y: at.y, z: at.z };
 }
@@ -2420,7 +2447,9 @@ export interface CastTargetOptions {
    * name) standing for where it is now.
    * `castSpell(10, undefined, { targetPoint: { x: -8913.2, y: -136.5, z: 81.9 } })`.
    * All three axes are needed: nothing a client observes gives the ground
-   * height at an arbitrary x, y.
+   * height at an arbitrary x, y; without z, or for a unit out of view, the
+   * call answers `{ ok: false, status: "unknown_target", hint }` and sends
+   * nothing.
    */
   targetPoint?: GuidOrUnit | { readonly x: number; readonly y: number; readonly z: number };
 }
@@ -2552,6 +2581,8 @@ export type UseItemResult =
       readonly questOffer?: undefined;
       readonly hint: string;
     }
+  /** A `targetPoint` that names no point (no z, a unit out of view): nothing was sent. */
+  | CastPointRefusal
   | {
       readonly ok: false;
       /**
@@ -4991,20 +5022,28 @@ export class WrathClient {
    * harness hint (`castSpell <reason>`, naming the spell and the target), so
    * it reaches the model whether a snippet or a background routine cast it.
    * `options` aims it at an item or a point on the ground instead
-   * (`CastTargetOptions`).
+   * (`CastTargetOptions`). A `targetPoint` that names no point (no z, a unit
+   * out of view) is answered `{ ok: false, status: "unknown_target", hint }`
+   * with nothing sent.
    */
-  castSpell(spellId: number, targetGuid?: GuidOrUnit, options: CastTargetOptions = {}): Promise<WithResolved<ActionResponse>> {
+  castSpell(
+    spellId: number,
+    targetGuid?: GuidOrUnit,
+    options: CastTargetOptions = {},
+  ): Promise<WithResolved<ActionResponse | CastPointRefusal>> {
     const aim = this.castAim(options, "castSpell");
+    if ("refusal" in aim) return Promise.resolve(aim.refusal);
     const run = (guid: string | undefined) => this.trackedCast(spellId, guid, aim).then((out) => withResolved(aim, out));
     if (targetGuid === undefined) return run(undefined);
     return this.byName(targetGuid, "castSpell(spellId, targetGuid)", run);
   }
 
   /**
-   * A cast's item and ground targets, resolved where the caller stands: a
-   * referent that names nothing throws before anything is sent.
+   * A cast's item and ground targets, resolved where the caller stands: an
+   * item that names nothing throws before anything is sent, and a point that
+   * names none comes back as the refusal to answer with (tallied as a hint).
    */
-  private castAim(options: CastTargetOptions, method: string): CastAim {
+  private castAim(options: CastTargetOptions, method: string): CastAim | { readonly refusal: CastPointRefusal } {
     const aim: CastAim = {};
     if (options.targetItem !== undefined) {
       const item = resolveItemTarget(this.state, options.targetItem, `${method}(..., { targetItem })`);
@@ -5012,7 +5051,12 @@ export class WrathClient {
       if (item.resolved !== undefined) aim.resolved = item.resolved;
     }
     if (options.targetPoint !== undefined) {
-      aim.targetPoint = resolveCastPoint(this.state, options.targetPoint, `${method}(..., { targetPoint })`);
+      const point = resolveCastPoint(this.state, options.targetPoint, `${method}(..., { targetPoint })`);
+      if ("unknown" in point) {
+        this.noteActionHint(method, "unknown_target", point.unknown);
+        return { refusal: { ok: false, status: "unknown_target", hint: point.unknown } };
+      }
+      aim.targetPoint = point;
     }
     return aim;
   }
@@ -5707,6 +5751,8 @@ export class WrathClient {
    *
    * `options.targetItem` and `options.targetPoint` aim the item's spell at
    * another item or a point on the ground (`CastTargetOptions`).
+   * A `targetPoint` that names no point (no z, a unit out of view) is
+   * `{ ok: false, status: "unknown_target", hint }`, with nothing sent.
    */
   async useItem(bagOrName: number | string, slot?: number | GuidOrUnit, targetGuid?: GuidOrUnit, options: UseItemOptions = {}): Promise<WithResolved<UseItemResult>> {
     // `useItem("Healing Potion", guid)`: with a name, the second argument
@@ -5722,6 +5768,7 @@ export class WrathClient {
     const found = resolveItemSlot(this.state.bag().items, bagOrName, slot as number | undefined, "useItem(bagOrName, slot?)", "state.bag()");
     if ("refusal" in found) throw new TypeError(found.refusal);
     const aim = this.castAim(options, "useItem");
+    if ("refusal" in aim) return aim.refusal;
     // The used item's own fuzzy match is the one reported; a target item's
     // only when the used item matched exactly.
     const where = found.resolved === undefined && aim.resolved !== undefined ? { ...found, resolved: aim.resolved } : found;
