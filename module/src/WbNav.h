@@ -81,9 +81,15 @@ namespace WbNav
     // then 3y x 50y), with the distance to it.
     dtPolyRef CorePolyAt(dtNavMeshQuery const* query, dtQueryFilter const& filter, float const* point, float* dist);
 
-    // The core's smooth path along a corridor (PathGenerator::FindSmoothPath),
-    // ported because PathGenerator keeps it private; `polyPathSize` at most
-    // PLAN_MAX_POLYS. Fails when the route needs the whole point cap.
+    // The smooth path along a corridor, the walk the core's path builder
+    // makes (PathGenerator::FindSmoothPath, private to it): Recast's
+    // path-follow (WbNavRecast.cpp, zlib, from Recast Navigation's demo)
+    // with the core's step, slop and lift — SMOOTH_STEP steps along the
+    // surface, each point 0.5y over its polygon. A straight-path corner list
+    // would not do: a 30y corner segment across a 55 degree face averages
+    // under the drop guard's slope, and the walk would interpolate through
+    // the hill. `polyPathSize` at most PLAN_MAX_POLYS. Fails when the route
+    // needs the whole point cap.
     dtStatus SmoothPath(dtNavMesh const* navMesh, dtNavMeshQuery const* query, dtQueryFilter const& filter,
         float const* startPos, float const* endPos, dtPolyRef const* polyPath, uint32_t polyPathSize,
         float* smoothPath, uint32_t* smoothPathSize, uint32_t maxSmoothPathSize);
