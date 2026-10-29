@@ -2379,6 +2379,7 @@ describe("state cache: spellbook, cooldowns and talents", () => {
       activeSpec: 1,
       specCount: 2,
       talents: [{ talentId: 7, rank: 2 }],
+      glyphs: [],
       seq: 61,
       ts: 1_700_000_000_061,
     });

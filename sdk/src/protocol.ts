@@ -1721,7 +1721,21 @@ export const talentsInfoDataSchema = z.looseObject({
   unspentPoints: z.number().optional(),
   specCount: z.number().optional(),
   activeSpec: z.number().optional(),
-  specs: z.array(z.looseObject({ talents: z.array(talentRowSchema) })).optional(),
+  specs: z
+    .array(
+      z.looseObject({
+        talents: z.array(talentRowSchema),
+        /**
+         * The spec's glyph slots, slot = index: a `GlyphProperties.dbc` id (0
+         * for an empty slot) with the glyph's spell and name from the
+         * client's own data; absent from a module older than the field.
+         */
+        glyphs: z
+          .array(z.looseObject({ slot: z.number(), glyphId: z.number(), spellId: z.number().optional(), name: z.string().optional() }))
+          .optional(),
+      }),
+    )
+    .optional(),
 });
 export type TalentsInfoData = z.infer<typeof talentsInfoDataSchema>;
 
@@ -1857,6 +1871,14 @@ export const playerBoundDataSchema = z.looseObject({
   areaName: z.string(),
 });
 export type PlayerBoundData = z.infer<typeof playerBoundDataSchema>;
+
+/** `SMSG_EXPLORATION_EXPERIENCE`: "Discovered <area>", with the XP it gave (0 at the level cap or for an area worth none). */
+export const explorationExperienceDataSchema = z.looseObject({
+  areaId: z.number(),
+  areaName: z.string(),
+  xp: z.number(),
+});
+export type ExplorationExperienceData = z.infer<typeof explorationExperienceDataSchema>;
 
 /**
  * One faction row as the module serves it: the wire's reputation
@@ -2086,6 +2108,7 @@ export const eventDataSchemas = {
   SMSG_LOG_XPGAIN: logXpGainDataSchema,
   SMSG_PARTYKILLLOG: partyKillLogDataSchema,
   SMSG_LEVELUP_INFO: levelUpInfoDataSchema,
+  SMSG_EXPLORATION_EXPERIENCE: explorationExperienceDataSchema,
   SMSG_ITEM_PUSH_RESULT: itemPushResultDataSchema,
   // quests and gossip
   SMSG_QUESTGIVER_STATUS: questGiverStatusDataSchema,

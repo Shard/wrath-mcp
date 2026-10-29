@@ -198,6 +198,26 @@ const MIRROR_TIMER_TYPES = ["fatigue", "breath", "fire"] as const;
 /** `ItemClass` (AzerothCore `ItemTemplate.h`): the two classes `SMSG_SET_PROFICIENCY` names. */
 const ITEM_CLASS_WEAPON = 2;
 const ITEM_CLASS_ARMOR = 4;
+/** `UnitStandStateType` (AzerothCore `UnitDefines.h`) by value, and the ones a client reads as sitting. */
+const STAND_STATE_NAMES = [
+  "stand", "sit", "sitChair", "sleep", "sitLowChair", "sitMediumChair", "sitHighChair", "dead", "kneel", "submerged",
+] as const;
+const SITTING_STAND_STATES: ReadonlySet<number> = new Set([1, 2, 4, 5, 6]);
+
+/** The update-field keys the character sheet is built from. */
+const SHEET_FIELD = /^(stat\d|resistance\d|(ranged)?[aA]ttackPower(Mods|Multiplier)?|(ranged)?[cC]ritPct|spellCritPct\d|blockPct|dodgePct|parryPct)$/;
+
+/** `ShapeshiftForm` (AzerothCore `UnitDefines.h`) by value; 0 is no form. The numbering spellbook rows' `stances` and `form` use. */
+const SHAPESHIFT_FORM_NAMES: Readonly<Record<number, string>> = {
+  0: "none", 1: "cat", 2: "tree", 3: "travel", 4: "aqua", 5: "bear", 6: "ambient", 7: "ghoul", 8: "direBear",
+  9: "stevesGhoul", 10: "tharonjaSkeleton", 11: "testOfStrength", 12: "blbPlayer", 13: "shadowDance",
+  14: "creatureBear", 15: "creatureCat", 16: "ghostWolf", 17: "battleStance", 18: "defensiveStance",
+  19: "berserkerStance", 20: "test", 21: "zombie", 22: "metamorphosis", 25: "undead", 26: "masterAngler",
+  27: "flightEpic", 28: "shadow", 29: "flight", 30: "stealth", 31: "moonkin", 32: "spiritOfRedemption",
+};
+
+/** The spell schools after physical, as `resistance1`..`6` and `spellCritPct1`..`6` index them (`SpellSchools`). */
+const MAGIC_SCHOOLS = ["holy", "fire", "nature", "frost", "shadow", "arcane"] as const;
 
 /**
  * `PLAYER_FLAGS_RESTING` on 3.3.5a (AzerothCore `Player.h`, `PlayerFlags`) —
@@ -728,6 +748,29 @@ export interface SelfState extends UnitFieldsState {
    */
   proficiency: Observed<{ readonly weaponMask: number | undefined; readonly armorMask: number | undefined }> | undefined;
   /**
+   * Stand state, byte 0 of our own `UNIT_FIELD_BYTES_1`: `id` the
+   * `UnitStandStateType` and `name` its reading ("stand", "sit", "sitChair",
+   * "sleep", "dead", "kneel", …), and `sitting` whether the client draws the
+   * character seated (sit or any chair). Guarded like `resting`; `undefined`
+   * until a block carried the field.
+   */
+  standState: Observed<{ readonly id: number; readonly name: string | undefined }> | undefined;
+  sitting: Observed<boolean> | undefined;
+  /**
+   * Shapeshift form, byte 3 of our own `UNIT_FIELD_BYTES_2`: `id` the
+   * `ShapeshiftForm` (0 none; the numbering a spellbook row's `stances` and
+   * `form` use) and `name` ("none", "cat", "bear", "battleStance",
+   * "stealth", …). Guarded the same way.
+   */
+  shapeshiftForm: Observed<{ readonly id: number; readonly name: string | undefined }> | undefined;
+  /**
+   * The character sheet, from our own PRIVATE update fields; each number is
+   * undefined until a block carried its field. `undefined` until any has.
+   */
+  stats: Observed<CharacterStats> | undefined;
+  /** Rested XP (`PLAYER_REST_STATE_EXPERIENCE`): the bonus pool the XP bar shades. */
+  restedXp: Observed<number> | undefined;
+  /**
    * The last `SMSG_ACTIVATETAXIREPLY` (the answer to a raw `CMSG_ACTIVATETAXI`).
    * Kept because it is the only thing that says a flight was *accepted*; the
    * ride itself shows on `taxiFlight`.
@@ -776,6 +819,29 @@ export interface MirrorTimer {
   readonly paused: boolean;
   readonly seq: number;
   readonly ts: number;
+}
+
+/**
+ * The character sheet (`SelfState.stats`). Primary stats and armour are the
+ * totals with buffs; `attackPower` is (base + mods) × (1 + multiplier), the
+ * server's own total, floored. Percentages are as the sheet shows them.
+ */
+export interface CharacterStats {
+  readonly strength: number | undefined;
+  readonly agility: number | undefined;
+  readonly stamina: number | undefined;
+  readonly intellect: number | undefined;
+  readonly spirit: number | undefined;
+  readonly armor: number | undefined;
+  readonly resistances: { readonly [school in (typeof MAGIC_SCHOOLS)[number]]: number | undefined };
+  readonly attackPower: number | undefined;
+  readonly rangedAttackPower: number | undefined;
+  readonly critPct: number | undefined;
+  readonly rangedCritPct: number | undefined;
+  readonly spellCritPct: { readonly [school in (typeof MAGIC_SCHOOLS)[number]]: number | undefined };
+  readonly blockPct: number | undefined;
+  readonly dodgePct: number | undefined;
+  readonly parryPct: number | undefined;
 }
 
 /**
@@ -1294,6 +1360,14 @@ export interface SpellCooldown {
   readonly ts: number;
 }
 
+/** One glyph slot (`TalentState.glyphs`). */
+export interface GlyphSlot {
+  readonly slot: number;
+  readonly glyphId: number;
+  readonly spellId: number | undefined;
+  readonly name: string | undefined;
+}
+
 export interface TalentEntry {
   readonly talentId: number;
   /** 0-based, as on the wire: 0 means one point spent. */
@@ -1307,6 +1381,13 @@ export interface TalentState {
   readonly specCount: number;
   /** Talents of the active spec. */
   readonly talents: readonly TalentEntry[];
+  /**
+   * The active spec's glyph slots, slot = index (what `useItem`'s
+   * `glyphSlot` names): `glyphId` is the `GlyphProperties.dbc` id, 0 for an
+   * empty slot, with the glyph's spell and name. Empty from a module older
+   * than the field.
+   */
+  readonly glyphs: readonly GlyphSlot[];
   readonly seq: number;
   readonly ts: number;
 }
@@ -1657,6 +1738,15 @@ export interface UnitView {
   readonly lootable: boolean | undefined;
   readonly tapped: boolean | undefined;
   readonly tappedByYou: boolean | undefined;
+  /**
+   * Units and players: whether the client draws them seated (stand state, byte
+   * 0 of `UNIT_FIELD_BYTES_1`, sit or any chair), and the shapeshift form's
+   * name (byte 3 of `UNIT_FIELD_BYTES_2`: "cat", "bear", "ghostWolf", …).
+   * `sitting` is undefined until a block carried its field; `shapeshiftForm`
+   * is undefined also when the unit is in no form.
+   */
+  readonly sitting: boolean | undefined;
+  readonly shapeshiftForm: string | undefined;
 }
 
 /** How a unit regards this character (`UnitView.reaction`). */
@@ -2070,6 +2160,11 @@ export class StateCache {
     totems: [],
     mirrorTimers: [],
     proficiency: undefined,
+    standState: undefined,
+    sitting: undefined,
+    shapeshiftForm: undefined,
+    stats: undefined,
+    restedXp: undefined,
     taxiReply: undefined,
     bindPoint: undefined,
     health: undefined,
@@ -3962,6 +4057,7 @@ export class StateCache {
           activeSpec,
           specCount: d.specCount ?? 0,
           talents: (spec?.talents ?? []).map((t) => ({ talentId: t.talentId, rank: t.rank })),
+          glyphs: (spec?.glyphs ?? []).map((g) => ({ slot: g.slot, glyphId: g.glyphId, spellId: g.spellId, name: g.name })),
           seq: event.seq,
           ts: event.ts,
         };
@@ -5268,6 +5364,15 @@ export class StateCache {
       if (fields.channelSpell === 0) this.self.channeling = undefined;
       // A Death Knight has runes from the start, in the base layout.
       if (fields.class === CLASS_DEATH_KNIGHT && this.self.runes === undefined) this.publishRunes(seq, ts);
+      if (typeof fields.standState === "number") {
+        this.self.standState = { value: { id: fields.standState, name: STAND_STATE_NAMES[fields.standState] }, seq, ts };
+        this.self.sitting = { value: SITTING_STAND_STATES.has(fields.standState), seq, ts };
+      }
+      if (typeof fields.shapeshiftForm === "number") {
+        this.self.shapeshiftForm = { value: { id: fields.shapeshiftForm, name: SHAPESHIFT_FORM_NAMES[fields.shapeshiftForm] }, seq, ts };
+      }
+      if (typeof fields.restedXp === "number") this.self.restedXp = { value: fields.restedXp, seq, ts };
+      if (Object.keys(fields).some((k) => SHEET_FIELD.test(k))) this.self.stats = { value: this.characterStats(), seq, ts };
       const healthAfter = target.fields.get("health")?.value;
       const pos = this.self.position?.value;
       // The died transition: own health reaching 0 from a living value. Until
@@ -5291,6 +5396,37 @@ export class StateCache {
       })),
       seq,
       ts,
+    };
+  }
+
+  /** The character sheet from our own fields as they now stand. */
+  private characterStats(): CharacterStats {
+    const f = (key: string): number | undefined => this.self.fields.get(key)?.value;
+    const total = (base: string): number | undefined => {
+      const b = f(base);
+      if (b === undefined) return undefined;
+      return Math.floor(Math.max(0, b + (f(`${base}Mods`) ?? 0)) * (1 + (f(`${base}Multiplier`) ?? 0)));
+    };
+    const bySchool = (prefix: string) =>
+      Object.fromEntries(MAGIC_SCHOOLS.map((school, i) => [school, f(`${prefix}${i + 1}`)])) as {
+        [school in (typeof MAGIC_SCHOOLS)[number]]: number | undefined;
+      };
+    return {
+      strength: f("stat0"),
+      agility: f("stat1"),
+      stamina: f("stat2"),
+      intellect: f("stat3"),
+      spirit: f("stat4"),
+      armor: f("resistance0"),
+      resistances: bySchool("resistance"),
+      attackPower: total("attackPower"),
+      rangedAttackPower: total("rangedAttackPower"),
+      critPct: f("critPct"),
+      rangedCritPct: f("rangedCritPct"),
+      spellCritPct: bySchool("spellCritPct"),
+      blockPct: f("blockPct"),
+      dodgePct: f("dodgePct"),
+      parryPct: f("parryPct"),
     };
   }
 
@@ -5480,6 +5616,7 @@ function toUnitView(
     docked: obj.transport?.value.docked,
     reaction: type === "unit" || type === "player" ? reactionOf(obj) : undefined,
     ...unitStateOf(type, obj.fields.get("unitFlags")?.value, obj.fields.get("dynamicFlags")?.value),
+    ...postureOf(type, obj.fields.get("standState")?.value, obj.fields.get("shapeshiftForm")?.value),
   };
 }
 
@@ -5503,6 +5640,19 @@ function unitStateOf(
     lootable: d === undefined ? undefined : (d & UNIT_DYNFLAG_LOOTABLE) !== 0,
     tapped: d === undefined ? undefined : (d & UNIT_DYNFLAG_TAPPED) !== 0,
     tappedByYou: d === undefined ? undefined : (d & UNIT_DYNFLAG_TAPPED_BY_PLAYER) !== 0,
+  };
+}
+
+/** Sitting and the shapeshift form for `toUnitView`, units and players only. */
+function postureOf(
+  type: string | undefined,
+  standState: number | undefined,
+  form: number | undefined,
+): Pick<UnitView, "sitting" | "shapeshiftForm"> {
+  const living = type === "unit" || type === "player";
+  return {
+    sitting: !living || standState === undefined ? undefined : SITTING_STAND_STATES.has(standState),
+    shapeshiftForm: !living || form === undefined || form === 0 ? undefined : SHAPESHIFT_FORM_NAMES[form],
   };
 }
 

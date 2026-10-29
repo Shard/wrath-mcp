@@ -1296,7 +1296,11 @@ not need it, docs/CONTRACTS.md):
   `maxPower1`..`maxPower7`, `level`, `faction`, `unitFlags` (with
   `taxiFlight`, the `UNIT_FLAG_TAXI_FLIGHT` bit named), `displayId`,
   `dynamicFlags`, `npcFlags`, `targetGuid`, `race`, `class`, `gender`,
-  `powerType` (the last four unpacked from UNIT_FIELD_BYTES_0), and
+  `powerType` (the last four unpacked from UNIT_FIELD_BYTES_0),
+  `standState` (byte 0 of UNIT_FIELD_BYTES_1, `UnitStandStateType`: 0
+  stand, 1 sit, 2-6 chairs, 3 sleep, 7 dead, 8 kneel, 9 submerged),
+  `shapeshiftForm` (byte 3 of UNIT_FIELD_BYTES_2, `ShapeshiftForm`, 0 none;
+  the rest of both words is dropped), and
   `summonedByGuid`, `createdByGuid`, `charmedByGuid` (the
   PUBLIC owner fields as guid strings — a pet's master; `"0"` when unset) and
   `petNumber` (UNIT_FIELD_PETNUMBER; on first sight of a unit with a non-zero
@@ -1802,6 +1806,7 @@ Progress:
 | `SMSG_LOG_XPGAIN` | 0x1D0 | `{ "victimGuid" ("0" for non-kill), "amount", "fromKill": <bool> }` |
 | `SMSG_PARTYKILLLOG` | 0x1F5 | `{ "killerGuid", "victimGuid" }` — `Unit::Kill`: the player who landed the killing blow on a kill that rewards a player, broadcast to the killer's party (its subgroup in a raid), or sent to the killer alone when it has no group. `killerGuid` may be another member; nothing else about the kill is carried |
 | `SMSG_LEVELUP_INFO` | 0x1D4 | `{ "level", "healthGained" }` |
+| `SMSG_EXPLORATION_EXPERIENCE` | 0x1F8 | `{ "areaId", "areaName", "xp" }` — "Discovered <area>" (`Player::SendExplorationExperience`): the XP it gave, 0 at the level cap or for an area worth none; `areaName` is the client's `AreaTable.dbc` text, `""` when it has no row |
 | `SMSG_ITEM_PUSH_RESULT` | 0x166 | `{ "playerGuid", "itemId", "count", "totalCount", "bagSlot", "itemSlot", "looted": <bool>, "created": <bool> }` |
 
 Quests and gossip (quest/gossip text served as the client would show it):
@@ -1879,7 +1884,7 @@ core's `SPELL_ATTR2_ALLOW_WHILE_NOT_SHAPESHIFTED`):
 | `SMSG_SPELL_COOLDOWN` | 0x134 | `{ "guid", "flags": <u8>, "cooldowns": [{ "spellId", "cooldownMs" }] }` — cooldowns that just started for `guid` (self or pet); `flags & 1` = the GCD was triggered too; a 0 ms entry is a GCD-only marker |
 | `SMSG_COOLDOWN_EVENT` | 0x135 | `{ "spellId", "guid" }` — "start the timer you already know for this spell": the duration is Spell.dbc knowledge the module does not serve |
 | `SMSG_CLEAR_COOLDOWN` | 0x1DE | `{ "spellId", "guid" }` |
-| `SMSG_TALENTS_INFO` | 0x4C0 | `{ "pet": false, "unspentPoints", "specCount", "activeSpec", "specs": [{ "talents": [{ "talentId", "rank" }] }] }` — `rank` is 0-based; glyph slots are consumed and not served. The pet form is `{ "pet": true }` only (the pet bar itself is `SMSG_PET_SPELLS`; pet talents have not been asked for). Sent on login, level-up, after every `CMSG_LEARN_TALENT`, on spec change, and after a successful talent reset |
+| `SMSG_TALENTS_INFO` | 0x4C0 | `{ "pet": false, "unspentPoints", "specCount", "activeSpec", "specs": [{ "talents": [{ "talentId", "rank" }], "glyphs": [{ "slot", "glyphId", "spellId"?, "name"? }] }] }` — `rank` is 0-based; `glyphs` are the spec's six glyph slots, slot = index, `glyphId` the `GlyphProperties.dbc` id (0 empty) with the glyph's spell and its `Spell.dbc` name beside it. The pet form is `{ "pet": true }` only (the pet bar itself is `SMSG_PET_SPELLS`; pet talents have not been asked for). Sent on login, level-up, after every `CMSG_LEARN_TALENT`, on spec change, and after a successful talent reset |
 | `MSG_TALENT_WIPE_CONFIRM` | 0x2AA | `{ "guid", "cost": <u32 copper>, "nothingToReset": <bool> }` — the trainer's "unlearn all talents?" dialog (`Player::SendTalentWipeConfirm`) after its unlearn gossip option; a client answers yes by echoing the opcode with the guid (raw). `nothingToReset` is the guid-0/cost-0 form `HandleTalentWipeConfirmOpcode` sends back when there are no talents to reset or the money is short; a successful reset has no packet of its own — `SMSG_TALENTS_INFO` follows with every rank gone |
 | `WB_TALENT_TREE` | 0xFF08 | `{ "class": <u8>, "unspentPoints": <u32>, "tabs": [{ "tabId", "name"?, "page", "talents": [{ "talentId", "name"?, "row", "col", "maxRank", "ranks": [<spellId> × maxRank], "dependsOn"?, "dependsOnRank"? }] }] }` — the answer to the `talent_tree` action: every TalentTab.dbc tab whose class mask holds the character's class, in page order, and every Talent.dbc row in it sorted by row then column. `name` on a tab is the client's TalentTab.dbc text (the module reads the file: `dbc/TalentTab.dbc`, 24 fields, record size 96, refused otherwise), on a talent the first rank spell's Spell.dbc name; `dependsOnRank` is 0-based. What the talent frame draws, nothing more — no icons, no tooltips, and no server-side state (the ranks learned are `SMSG_TALENTS_INFO`'s, joined by the SDK) |
 
@@ -2140,7 +2145,19 @@ Served in `SMSG_UPDATE_OBJECT` `fields` alongside the existing set:
   ranged weapon fires, 0 for none; raw `CMSG_SET_AMMO` sets it),
   `selfResSpell` (`PLAYER_SELF_RES_SPELL`, the spell a dead character may
   resurrect itself with — a Soulstone, Reincarnation — which raw
-  `CMSG_SELF_RES` casts; 0 for none); the skill pane as raw fields
+  `CMSG_SELF_RES` casts; 0 for none); the character sheet: `stat0`-`stat4` (strength, agility,
+  stamina, intellect, spirit: `UNIT_FIELD_STAT0`, the totals with buffs),
+  `resistance0`-`resistance6` (`UNIT_FIELD_RESISTANCES`: armour, then holy,
+  fire, nature, frost, shadow, arcane), `attackPower`, `attackPowerMods`
+  (signed), `attackPowerMultiplier` (float) and the same three `ranged…`
+  (`UNIT_FIELD_(RANGED_)ATTACK_POWER[_MODS|_MULTIPLIER]`; the server's total
+  is (base + mods) × (1 + multiplier)) — these are PRIVATE/OWNER, so a pet's
+  reach its owner too — and the floats `blockPct`, `dodgePct`, `parryPct`,
+  `critPct`, `rangedCritPct` and `spellCritPct0`-`6` (per school, 0
+  physical .. 6 arcane); `restedXp` (`PLAYER_REST_STATE_EXPERIENCE`, the rested
+  bonus pool; the explored-areas mask, `PLAYER_EXPLORED_ZONES_1`, is not
+  served until it has a compact, named shape: 128 raw words would ride every
+  self update); the skill pane as raw fields
   `skill<slot><Off>` with slot 0-127 (`PLAYER_SKILL_INFO_1_1`, three packed
   u32s per line) and Off one of `Id`/`Step` (low/high u16 of the first),
   `Value`/`Max` (the second), `TempBonus`/`PermBonus` (the third, as signed
