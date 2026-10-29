@@ -158,6 +158,19 @@ const CORPSE_FLAG_BONES = 0x01;
 const UNIT_FLAG_TAXI_FLIGHT = 0x0010_0000;
 
 /**
+ * The `unitFlags` bits (AzerothCore `UnitDefines.h`, `UnitFlags`) and the
+ * `dynamicFlags` bits (`SharedDefines.h`, `UnitDynFlags`) a client names:
+ * stunned, in combat, skinnable; lootable, tapped, tapped by you. Decoded from
+ * the two integers the module already serves; nothing new is observed.
+ */
+const UNIT_FLAG_STUNNED = 0x0004_0000;
+const UNIT_FLAG_IN_COMBAT = 0x0008_0000;
+const UNIT_FLAG_SKINNABLE = 0x0400_0000;
+const UNIT_DYNFLAG_LOOTABLE = 0x0001;
+const UNIT_DYNFLAG_TAPPED = 0x0004;
+const UNIT_DYNFLAG_TAPPED_BY_PLAYER = 0x0008;
+
+/**
  * `PLAYER_FLAGS_RESTING` on 3.3.5a (AzerothCore `Player.h`, `PlayerFlags`) —
  * the bit the server sets while the character stands in a rest area, and the
  * one a client reads to draw the resting icon on the XP bar. Decoded here,
@@ -616,6 +629,14 @@ export interface SelfState extends UnitFieldsState {
    * carried `playerFlags` at all.
    */
   ghost: Observed<boolean> | undefined;
+  /**
+   * `UNIT_FLAG_IN_COMBAT` and `UNIT_FLAG_STUNNED` on our own `unitFlags`: the
+   * client's combat indicator and its stunned state. Guarded like `resting`:
+   * read only from a block that carried `unitFlags`, so an update without it
+   * leaves the last observation standing; `undefined` until one has.
+   */
+  inCombat: Observed<boolean> | undefined;
+  stunned: Observed<boolean> | undefined;
   /**
    * The last `SMSG_ACTIVATETAXIREPLY` (the answer to a raw `CMSG_ACTIVATETAXI`).
    * Kept because it is the only thing that says a flight was *accepted*; the
@@ -1486,6 +1507,33 @@ export interface UnitView {
    * tapped).
    */
   readonly reaction: UnitReaction | undefined;
+  /** `UNIT_FIELD_FLAGS` raw, the number the named flags below are read from; undefined until a block carried it. */
+  readonly unitFlags: number | undefined;
+  /** `UNIT_DYNAMIC_FLAGS` raw, as the server sent it to this client; undefined until a block carried it. */
+  readonly dynamicFlags: number | undefined;
+  /**
+   * Units and players, from `unitFlags`: the client's own readings of the
+   * unit's state. `inCombat` is `UNIT_FLAG_IN_COMBAT`, `stunned`
+   * `UNIT_FLAG_STUNNED`, `skinnable` `UNIT_FLAG_SKINNABLE` (a corpse that
+   * can be skinned). Each is undefined until a block carried `unitFlags`, and
+   * for game objects and corpses.
+   */
+  readonly inCombat: boolean | undefined;
+  readonly stunned: boolean | undefined;
+  readonly skinnable: boolean | undefined;
+  /**
+   * Units and players, from `dynamicFlags`, which the server rewrites for each
+   * receiver (`Unit::BuildValuesUpdate`): `lootable` is `UNIT_DYNFLAG_LOOTABLE`,
+   * already cleared for a character not allowed to loot the corpse; `tapped`
+   * is `UNIT_DYNFLAG_TAPPED`, the unit has a loot recipient (someone has
+   * tagged it); `tappedByYou` is `UNIT_DYNFLAG_TAPPED_BY_PLAYER`, that
+   * recipient is you or your group. Tapped by someone else is `tapped` with
+   * `tappedByYou` false. Each is undefined until a block carried
+   * `dynamicFlags`, and for game objects and corpses.
+   */
+  readonly lootable: boolean | undefined;
+  readonly tapped: boolean | undefined;
+  readonly tappedByYou: boolean | undefined;
 }
 
 /** How a unit regards this character (`UnitView.reaction`). */
@@ -1890,6 +1938,8 @@ export class StateCache {
     resting: undefined,
     casting: undefined,
     ghost: undefined,
+    inCombat: undefined,
+    stunned: undefined,
     taxiReply: undefined,
     bindPoint: undefined,
     health: undefined,
@@ -4929,6 +4979,12 @@ export class StateCache {
         this.self.resting = { value: (fields.playerFlags & PLAYER_FLAGS_RESTING) !== 0, seq, ts };
         this.self.ghost = { value: (fields.playerFlags & PLAYER_FLAGS_GHOST) !== 0, seq, ts };
       }
+      // `inCombat` and `stunned` are the same shape off `unitFlags`, in their
+      // own guard: a delta without the field says nothing about either.
+      if (typeof fields.unitFlags === "number") {
+        this.self.inCombat = { value: (fields.unitFlags & UNIT_FLAG_IN_COMBAT) !== 0, seq, ts };
+        this.self.stunned = { value: (fields.unitFlags & UNIT_FLAG_STUNNED) !== 0, seq, ts };
+      }
       const healthAfter = target.fields.get("health")?.value;
       const pos = this.self.position?.value;
       // The died transition: own health reaching 0 from a living value. Until
@@ -5125,6 +5181,32 @@ function toUnitView(
     goType: goTypeOf(obj),
     docked: obj.transport?.value.docked,
     reaction: type === "unit" || type === "player" ? reactionOf(obj) : undefined,
+    ...unitStateOf(type, obj.fields.get("unitFlags")?.value, obj.fields.get("dynamicFlags")?.value),
+  };
+}
+
+/**
+ * The raw flag words and the named readings off them for `toUnitView`: only a
+ * unit or player has them, and each group is undefined until a block carried
+ * its field, the way `taxiFlight` is read.
+ */
+function unitStateOf(
+  type: string | undefined,
+  unitFlags: number | undefined,
+  dynamicFlags: number | undefined,
+): Pick<UnitView, "unitFlags" | "dynamicFlags" | "inCombat" | "stunned" | "skinnable" | "lootable" | "tapped" | "tappedByYou"> {
+  const living = type === "unit" || type === "player";
+  const u = living ? unitFlags : undefined;
+  const d = living ? dynamicFlags : undefined;
+  return {
+    unitFlags: u,
+    dynamicFlags: d,
+    inCombat: u === undefined ? undefined : (u & UNIT_FLAG_IN_COMBAT) !== 0,
+    stunned: u === undefined ? undefined : (u & UNIT_FLAG_STUNNED) !== 0,
+    skinnable: u === undefined ? undefined : (u & UNIT_FLAG_SKINNABLE) !== 0,
+    lootable: d === undefined ? undefined : (d & UNIT_DYNFLAG_LOOTABLE) !== 0,
+    tapped: d === undefined ? undefined : (d & UNIT_DYNFLAG_TAPPED) !== 0,
+    tappedByYou: d === undefined ? undefined : (d & UNIT_DYNFLAG_TAPPED_BY_PLAYER) !== 0,
   };
 }
 
