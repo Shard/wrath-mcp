@@ -982,6 +982,9 @@ namespace WrathBench
         { "CMSG_READ_ITEM", CMSG_READ_ITEM },
         { "CMSG_OPEN_ITEM", CMSG_OPEN_ITEM },
         { "CMSG_BUYBACK_ITEM", CMSG_BUYBACK_ITEM },
+        // the ammo slot: a hunter's arrows or bullets by item id (body u32
+        // item id, 0 clears); CMSG_AUTOEQUIP_ITEM cannot equip ammo
+        { "CMSG_SET_AMMO", CMSG_SET_AMMO },
         // spell/aura control
         { "CMSG_CANCEL_AURA", CMSG_CANCEL_AURA },
         // the client's Dismount (empty body; MiscHandler.cpp
@@ -992,6 +995,14 @@ namespace WrathBench
         { "CMSG_SET_SHEATHED", CMSG_SET_SHEATHED },
         { "CMSG_STANDSTATECHANGE", CMSG_STANDSTATECHANGE },
         { "CMSG_RESURRECT_RESPONSE", CMSG_RESURRECT_RESPONSE },
+        // the dead character's own resurrection (Soulstone, Reincarnation):
+        // empty body; the handler casts PLAYER_SELF_RES_SPELL, served on self
+        { "CMSG_SELF_RES", CMSG_SELF_RES },
+        // dismiss the summoned companion (body u64 critter guid)
+        { "CMSG_DISMISS_CRITTER", CMSG_DISMISS_CRITTER },
+        // the right-click on a totem icon (body u8 slot, as SMSG_TOTEM_CREATED
+        // names it: 0 fire, 1 earth, 2 water, 3 air)
+        { "CMSG_TOTEM_DESTROYED", CMSG_TOTEM_DESTROYED },
         // flight paths
         { "CMSG_TAXINODE_STATUS_QUERY", CMSG_TAXINODE_STATUS_QUERY },
         { "CMSG_TAXIQUERYAVAILABLENODES", CMSG_TAXIQUERYAVAILABLENODES },
@@ -6764,6 +6775,19 @@ namespace WrathBench
 
             // The pet bar, if a pet is out (a no-op otherwise).
             player->PetSpellInitialize();
+
+            // Class resources no update field holds: the combo points and
+            // their target (Unit::SendComboPoints, the core's own sender), and
+            // a Death Knight's converted runes, which the login's aura
+            // applications announced one SMSG_CONVERT_RUNE each
+            // (Player::ConvertRune to the rune's current type changes
+            // nothing and sends exactly that packet; the guard is
+            // Player::InitRunes's own, the runes exist only then).
+            player->SendComboPoints();
+            if (player->IsClass(CLASS_DEATH_KNIGHT, CLASS_CONTEXT_ABILITY))
+                for (uint8 i = 0; i < MAX_RUNES; ++i)
+                    if (player->GetCurrentRune(i) != player->GetBaseRune(i))
+                        player->ConvertRune(i, player->GetCurrentRune(i));
         }
         catch (std::exception const& e)
         {
@@ -6919,7 +6943,7 @@ namespace WrathBench
     };
     struct PendingGuids
     {
-        GuidHalves target, summonedBy, createdBy, charmedBy, corpseOwner;
+        GuidHalves target, summonedBy, createdBy, charmedBy, corpseOwner, channelObject;
     };
 
     // An item's random property (ITEM_FIELD_RANDOM_PROPERTIES_ID, PUBLIC):
@@ -7034,6 +7058,12 @@ namespace WrathBench
             if (index == UNIT_FIELD_CREATEDBY + 1)  { g.createdBy.hi = v; g.createdBy.hasHi = true; return true; }
             if (index == UNIT_FIELD_CHARMEDBY)      { g.charmedBy.lo = v; g.charmedBy.hasLo = true; return true; }
             if (index == UNIT_FIELD_CHARMEDBY + 1)  { g.charmedBy.hi = v; g.charmedBy.hasHi = true; return true; }
+            // A channel in progress (PUBLIC, Spell::SendChannelStart sets
+            // both and SendChannelUpdate(0) clears them): what the unit
+            // channels at, and the spell; 0 when not channelling.
+            if (index == UNIT_FIELD_CHANNEL_OBJECT)     { g.channelObject.lo = v; g.channelObject.hasLo = true; return true; }
+            if (index == UNIT_FIELD_CHANNEL_OBJECT + 1) { g.channelObject.hi = v; g.channelObject.hasHi = true; return true; }
+            if (index == UNIT_CHANNEL_SPELL)            { f.Add("channelSpell", v); return true; }
             // The pet number a client keys its CMSG_PET_NAME_QUERY on
             // (UNIT_FIELD_PETNUMBER, PUBLIC; 0 on anything that is not a pet).
             if (index == UNIT_FIELD_PETNUMBER)
@@ -7082,6 +7112,13 @@ namespace WrathBench
                 // the number on the talent frame; SMSG_TALENTS_INFO carries the
                 // same figure.
                 if (index == PLAYER_CHARACTER_POINTS1) { f.Add("talentPoints", v); return true; }
+                // The ammo a ranged weapon fires (PLAYER_AMMO_ID, PRIVATE):
+                // an item id, 0 when none is set; CMSG_SET_AMMO changes it.
+                if (index == PLAYER_AMMO_ID) { f.Add("ammoId", v); return true; }
+                // The spell a dead character may resurrect itself with
+                // (PLAYER_SELF_RES_SPELL, PRIVATE: a Soulstone, Reincarnation),
+                // what CMSG_SELF_RES casts; 0 when there is none.
+                if (index == PLAYER_SELF_RES_SPELL) { f.Add("selfResSpell", v); return true; }
                 // Skills: 128 lines x 3 packed u32s, PRIVATE
                 // to self. Served raw per field the way the quest log is, plus
                 // the client's SkillLine.dbc name beside each id so the SDK
@@ -7261,6 +7298,7 @@ namespace WrathBench
         AddPendingGuid(f, "createdByGuid", g.createdBy);
         AddPendingGuid(f, "charmedByGuid", g.charmedBy);
         AddPendingGuid(f, "corpseOwnerGuid", g.corpseOwner);
+        AddPendingGuid(f, "channelObjectGuid", g.channelObject);
         if (corpseOwnerOut && (g.corpseOwner.hasLo || g.corpseOwner.hasHi))
             *corpseOwnerOut = uint64_t(g.corpseOwner.lo) | (uint64_t(g.corpseOwner.hi) << 32);
         return f.Str();
@@ -7945,6 +7983,47 @@ namespace WrathBench
                     misses += "]";
                     w.AddGuid("casterGuid", (uint64_t)caster).Add("spellId", spellId);
                     w.Raw("hitGuids", hits).Raw("misses", misses);
+                    // A Death Knight's rune list (CAST_FLAG_RUNE_LIST 0x00200000,
+                    // Spell::SendSpellGo), the only packet that tells a client
+                    // which runes a cast spent: past the cast targets
+                    // (SpellCastTargets::Write) and the power left
+                    // (CAST_FLAG_POWER_LEFT_SELF 0x800), u8 ready-rune mask
+                    // before the cast, u8 after, then for each rune spent (set
+                    // before, clear after) u8 cooldown passed, 0-255 of its
+                    // base. The core writes the list for a player caster only,
+                    // so only a player's is read, and in a try of its own so a
+                    // surprise here costs the runes and nothing else.
+                    if ((castFlags & 0x00200000) && ObjectGuid(caster).IsPlayer())
+                    {
+                        try
+                        {
+                            uint32 tmask; p >> tmask;
+                            uint64 skip = 0;
+                            // unit | corpse_ally | gameobject | corpse_enemy | minipet
+                            if (tmask & (0x0002 | 0x0200 | 0x0800 | 0x8000 | 0x00010000)) p.readPackGUID(skip);
+                            if (tmask & (0x0010 | 0x1000)) p.readPackGUID(skip);   // item | trade item
+                            if (tmask & 0x0020) { p.readPackGUID(skip); float a, b, c; p >> a >> b >> c; } // source
+                            if (tmask & 0x0040) { p.readPackGUID(skip); float a, b, c; p >> a >> b >> c; } // dest
+                            if (tmask & 0x2000) { std::string str; p >> str; }    // string
+                            if (castFlags & 0x00000800) { uint32 powerLeft; p >> powerLeft; }
+                            uint8 before, after; p >> before >> after;
+                            std::string spent = "[";
+                            bool firstRune = true;
+                            for (uint8 i = 0; i < 6; ++i)
+                            {
+                                uint8 bit = uint8(1u << i);
+                                if (!(before & bit) || (after & bit))
+                                    continue;
+                                uint8 passed; p >> passed;
+                                if (!firstRune) spent += ',';
+                                spent += Json::Writer().Add("index", (uint32)i).Add("passed", (uint32)passed).Str();
+                                firstRune = false;
+                            }
+                            spent += "]";
+                            w.Add("runesBefore", (uint32)before).Add("runesAfter", (uint32)after).Raw("runesSpent", spent);
+                        }
+                        catch (std::exception const&) { }
+                    }
                     break;
                 }
                 case SMSG_CAST_FAILED:
@@ -8081,6 +8160,95 @@ namespace WrathBench
                     }
                     auras += "]";
                     w.AddGuid("targetGuid", (uint64_t)target).Raw("auras", auras);
+                    break;
+                }
+                // ------------------------------------------- class resources
+                // The combo points a rogue or a feral druid holds, and on
+                // whom (Unit::SendComboPoints, to the player alone): target
+                // packGUID (empty when there is none), u8 points. Sent on
+                // every change, a spend and a target change included.
+                case SMSG_UPDATE_COMBO_POINTS:
+                {
+                    name = "SMSG_UPDATE_COMBO_POINTS";
+                    uint64 target = 0; p.readPackGUID(target);
+                    uint8 points; p >> points;
+                    w.AddGuid("targetGuid", (uint64_t)target).Add("points", (uint32)points);
+                    break;
+                }
+                // A Death Knight rune changing type (Player::ConvertRune): u8
+                // rune index 0-5, u8 RuneType (0 blood, 1 unholy, 2 frost, 3
+                // death). Readiness rides SMSG_SPELL_GO's rune list (below);
+                // SMSG_RESYNC_RUNES and SMSG_ADD_RUNE_POWER have no caller
+                // at the pinned commit (the one ResyncRunes call in
+                // SpellEffects.cpp is commented out), so they are left to
+                // the drop census until one does.
+                case SMSG_CONVERT_RUNE:
+                {
+                    name = "SMSG_CONVERT_RUNE";
+                    uint8 index, runeType; p >> index >> runeType;
+                    w.Add("index", (uint32)index).Add("runeType", (uint32)runeType);
+                    break;
+                }
+                // A channel opening, and its pushback or end
+                // (Spell::SendChannelStart / SendChannelUpdate, to every
+                // client in range): caster packGUID, then u32 spell and u32
+                // duration in ms for the start, u32 time left in ms for the
+                // update, 0 being the end (interrupted or run out). The
+                // channel follows the spell's own SMSG_SPELL_GO.
+                case MSG_CHANNEL_START:
+                {
+                    name = "MSG_CHANNEL_START";
+                    uint64 caster = 0; p.readPackGUID(caster);
+                    uint32 spellId, durationMs; p >> spellId >> durationMs;
+                    w.AddGuid("casterGuid", (uint64_t)caster).Add("spellId", spellId);
+                    AddSpellFields(w, spellId);
+                    w.Add("durationMs", durationMs);
+                    break;
+                }
+                case MSG_CHANNEL_UPDATE:
+                {
+                    name = "MSG_CHANNEL_UPDATE";
+                    uint64 caster = 0; p.readPackGUID(caster);
+                    uint32 timeMs; p >> timeMs;
+                    w.AddGuid("casterGuid", (uint64_t)caster).Add("timeMs", timeMs);
+                    break;
+                }
+                // A totem in one of the four totem slots (Totem::InitStats,
+                // to its owner alone): u8 slot (0 fire, 1 earth, 2 water,
+                // 3 air: the number CMSG_TOTEM_DESTROYED takes), u64 totem
+                // guid, u32 duration in ms, u32 spell that summoned it.
+                case SMSG_TOTEM_CREATED:
+                {
+                    name = "SMSG_TOTEM_CREATED";
+                    uint8 slot; uint64 totem; uint32 durationMs, spellId;
+                    p >> slot >> totem >> durationMs >> spellId;
+                    w.Add("slot", (uint32)slot).AddGuid("guid", (uint64_t)totem)
+                     .Add("durationMs", durationMs).Add("spellId", spellId);
+                    AddSpellFields(w, spellId);
+                    break;
+                }
+                // The breath, fatigue and fire bars (Player::SendMirrorTimer,
+                // StopMirrorTimer; MiscPackets.cpp), to the player alone and
+                // only on a change: entering or leaving the water, death.
+                // Start: u32 type (0 fatigue, 1 breath, 2 fire), u32 value
+                // and u32 max in ms, i32 scale (ms gained per ms: -1
+                // draining, 10 refilling), u8 paused, u32 spell. Stop: u32
+                // type. SMSG_PAUSE_MIRROR_TIMER has no caller at the pinned
+                // commit and is left to the drop census until one does.
+                case SMSG_START_MIRROR_TIMER:
+                {
+                    name = "SMSG_START_MIRROR_TIMER";
+                    uint32 type, value, maxValue; int32 scale; uint8 paused; uint32 spellId;
+                    p >> type >> value >> maxValue >> scale >> paused >> spellId;
+                    w.Add("type", type).Add("value", value).Add("max", maxValue).Add("scale", scale)
+                     .Add("paused", paused != 0).Add("spellId", spellId);
+                    break;
+                }
+                case SMSG_STOP_MIRROR_TIMER:
+                {
+                    name = "SMSG_STOP_MIRROR_TIMER";
+                    uint32 type; p >> type;
+                    w.Add("type", type);
                     break;
                 }
                 // ------------------------------------------- spellbook/talents

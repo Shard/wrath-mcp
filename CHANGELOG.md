@@ -74,6 +74,18 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   map and quest tracker draw for each quest in the log. The SDK's
   `questAreas()` asks for them and keeps them in `state.questPois`;
   `docs/CONTRACTS.md` records them as served.
+- Class resources and the bars a client draws, as events and on
+  `state.self`: combo points (`SMSG_UPDATE_COMBO_POINTS`, `comboPoints`); a
+  Death Knight's runes (`SMSG_CONVERT_RUNE` and the rune list on
+  `SMSG_SPELL_GO`, `runes`); our own channel (`MSG_CHANNEL_START` /
+  `MSG_CHANNEL_UPDATE`, and `channelSpell` / `channelObjectGuid` on units,
+  `channeling`); totems (`SMSG_TOTEM_CREATED`, `totems`); the breath, fatigue
+  and fire bars (`SMSG_START_MIRROR_TIMER` / `SMSG_STOP_MIRROR_TIMER`,
+  `mirrorTimers`). The reattach replay re-sends the combo points and any
+  converted runes.
+- Raw allowlist: `CMSG_SET_AMMO` (with `ammoId`, `PLAYER_AMMO_ID`, on self),
+  `CMSG_SELF_RES` (with `selfResSpell`, `PLAYER_SELF_RES_SPELL`, on self),
+  `CMSG_DISMISS_CRITTER` and `CMSG_TOTEM_DESTROYED`.
 
 ### Changed
 

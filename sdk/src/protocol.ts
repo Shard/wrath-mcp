@@ -1002,6 +1002,15 @@ export const spellGoDataSchema = z.looseObject({
   spellId: z.number(),
   hitGuids: z.array(guidSchema),
   misses: z.array(z.looseObject({ guid: guidSchema, reason: z.number() })),
+  /**
+   * A Death Knight's rune list, on a player's cast that spent or activated
+   * runes: the ready-rune bit masks before and after the cast (bit n is rune
+   * n, 0-1 blood, 2-3 unholy, 4-5 frost by slot), and each rune spent with
+   * how much of its cooldown had passed, 0-255 of the whole. Absent otherwise.
+   */
+  runesBefore: z.number().optional(),
+  runesAfter: z.number().optional(),
+  runesSpent: z.array(z.looseObject({ index: z.number(), passed: z.number() })).optional(),
 });
 export type SpellGoData = z.infer<typeof spellGoDataSchema>;
 
@@ -1109,6 +1118,71 @@ export const auraUpdateDataSchema = z.looseObject({
   auras: z.array(auraSchema),
 });
 export type AuraUpdateData = z.infer<typeof auraUpdateDataSchema>;
+
+/** `SMSG_UPDATE_COMBO_POINTS`: the combo points held and on whom (`"0"` when on no one), sent on every change. */
+export const updateComboPointsDataSchema = z.looseObject({
+  targetGuid: guidSchema,
+  points: z.number(),
+});
+export type UpdateComboPointsData = z.infer<typeof updateComboPointsDataSchema>;
+
+/** `SMSG_CONVERT_RUNE`: Death Knight rune `index` (0-5) became `runeType` (0 blood, 1 unholy, 2 frost, 3 death). */
+export const convertRuneDataSchema = z.looseObject({
+  index: z.number(),
+  runeType: z.number(),
+});
+export type ConvertRuneData = z.infer<typeof convertRuneDataSchema>;
+
+/** `MSG_CHANNEL_START`: a unit in range began channelling `spellId` for `durationMs`. */
+export const channelStartDataSchema = z.looseObject({
+  casterGuid: guidSchema,
+  spellId: z.number(),
+  rank: z.number().optional(),
+  name: z.string().optional(),
+  durationMs: z.number(),
+});
+export type ChannelStartData = z.infer<typeof channelStartDataSchema>;
+
+/** `MSG_CHANNEL_UPDATE`: the channel's time left after a pushback; 0 is its end. */
+export const channelUpdateDataSchema = z.looseObject({
+  casterGuid: guidSchema,
+  timeMs: z.number(),
+});
+export type ChannelUpdateData = z.infer<typeof channelUpdateDataSchema>;
+
+/**
+ * `SMSG_TOTEM_CREATED`: one of our totems in `slot` (0 fire, 1 earth, 2 water,
+ * 3 air — the slot `CMSG_TOTEM_DESTROYED` takes), its guid, how long it lasts
+ * and the spell that summoned it.
+ */
+export const totemCreatedDataSchema = z.looseObject({
+  slot: z.number(),
+  guid: guidSchema,
+  durationMs: z.number(),
+  spellId: z.number(),
+  rank: z.number().optional(),
+  name: z.string().optional(),
+});
+export type TotemCreatedData = z.infer<typeof totemCreatedDataSchema>;
+
+/**
+ * `SMSG_START_MIRROR_TIMER`: a breath, fatigue or fire bar (`type` 1, 0, 2)
+ * at `value` of `max` ms, moving by `scale` ms per ms (-1 draining, 10
+ * refilling). Sent only on a change, never per tick.
+ */
+export const startMirrorTimerDataSchema = z.looseObject({
+  type: z.number(),
+  value: z.number(),
+  max: z.number(),
+  scale: z.number(),
+  paused: z.boolean(),
+  spellId: z.number(),
+});
+export type StartMirrorTimerData = z.infer<typeof startMirrorTimerDataSchema>;
+
+/** `SMSG_STOP_MIRROR_TIMER`: the bar of this `type` is gone (refilled, or the character died). */
+export const stopMirrorTimerDataSchema = z.looseObject({ type: z.number() });
+export type StopMirrorTimerData = z.infer<typeof stopMirrorTimerDataSchema>;
 
 export const logXpGainDataSchema = z.looseObject({
   victimGuid: guidSchema,
@@ -1922,6 +1996,14 @@ export const eventDataSchemas = {
   SMSG_SPELLENERGIZELOG: spellEnergizeLogDataSchema,
   SMSG_AURA_UPDATE: auraUpdateDataSchema,
   SMSG_AURA_UPDATE_ALL: auraUpdateDataSchema,
+  // class resources, channels, totems, mirror timers
+  SMSG_UPDATE_COMBO_POINTS: updateComboPointsDataSchema,
+  SMSG_CONVERT_RUNE: convertRuneDataSchema,
+  MSG_CHANNEL_START: channelStartDataSchema,
+  MSG_CHANNEL_UPDATE: channelUpdateDataSchema,
+  SMSG_TOTEM_CREATED: totemCreatedDataSchema,
+  SMSG_START_MIRROR_TIMER: startMirrorTimerDataSchema,
+  SMSG_STOP_MIRROR_TIMER: stopMirrorTimerDataSchema,
   // progress
   SMSG_LOG_XPGAIN: logXpGainDataSchema,
   SMSG_PARTYKILLLOG: partyKillLogDataSchema,
