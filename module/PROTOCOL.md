@@ -1927,7 +1927,7 @@ coordinates ride any of these.
 
 The auction house stays outside both lists: `CMSG_AUCTION_*` is not
 allowlisted and no auction reply is tapped (deferred, with the dungeon finder,
-guilds, battlegrounds, glyphs, dual spec and equipment sets, until
+guilds, battlegrounds, dual spec and equipment sets, until
 single-player play is validated; docs/CONTRACTS.md).
 
 Achievements and flight paths ([Shard/WrathBench#8](https://github.com/Shard/WrathBench/issues/8) first half):
