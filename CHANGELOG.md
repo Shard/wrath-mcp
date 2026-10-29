@@ -73,7 +73,8 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 - `module/PROTOCOL.md` said swap and split are off the raw allowlist; they are
   on it.
 - `sdk/API.md`: `raw`'s row said no SDK method sends the talent opcodes, though
-  `learnTalent` sends `CMSG_LEARN_TALENT`; `state.self.corpse` is documented.
+  `learnTalent` sends `CMSG_LEARN_TALENT`; `state.self.corpse` is documented;
+  `acceptQuestFrom` lists its statuses and `useItem` names `quest_refused`.
 
 ## 0.2.0
 
