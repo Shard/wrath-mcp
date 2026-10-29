@@ -105,6 +105,7 @@ describe("event frames", () => {
       "SMSG_NOTIFICATION",
       "SMSG_NAME_QUERY_RESPONSE",
       "SMSG_MESSAGECHAT",
+      "SMSG_CHAT_PLAYER_NOT_FOUND",
       "SMSG_UPDATE_OBJECT",
       "SMSG_DESTROY_OBJECT",
       "SMSG_CREATURE_QUERY_RESPONSE",
@@ -124,6 +125,7 @@ describe("event frames", () => {
       "SMSG_NEW_WORLD",
       "SMSG_TRANSFER_ABORTED",
       "SMSG_CORPSE_NOT_IN_INSTANCE",
+      "SMSG_AREA_TRIGGER_MESSAGE",
       // quest/combat extension, in PROTOCOL.md's table order
       "SMSG_ATTACKSTART",
       "SMSG_ATTACKSTOP",
@@ -158,6 +160,7 @@ describe("event frames", () => {
       "SMSG_QUESTUPDATE_COMPLETE",
       "SMSG_QUESTUPDATE_FAILED",
       "SMSG_QUESTLOG_FULL",
+      "SMSG_QUESTGIVER_QUEST_INVALID",
       "SMSG_GOSSIP_MESSAGE",
       "SMSG_GOSSIP_COMPLETE",
       "SMSG_LOOT_RESPONSE",

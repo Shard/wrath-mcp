@@ -601,7 +601,7 @@ them: `{ "ok": true, "action": "<name>" }`.
 | `sell_item` | `guid`, `itemGuid`, `count?` | `CMSG_SELL_ITEM` | `count` 0/omitted = whole stack |
 | `repair_all` | `guid` | `CMSG_REPAIR_ITEM` | item guid 0 = repair everything |
 | `equip_item` | `bag`, `slot` | `CMSG_AUTOEQUIP_ITEM` | `bag` 255 = backpack/equipment container, `slot` 23-38 = backpack slots |
-| `use_item` | `bag`, `slot`, `targetGuid?` | `CMSG_USE_ITEM`, or `CMSG_QUESTGIVER_QUERY_QUEST` | module fills item guid + on-use spell id from the item (client-cache knowledge) and the cast count from the counter `cast_spell` uses. An item with no on-use spell but a `startquest` is right-clicked the way a client does it: `CMSG_QUESTGIVER_QUERY_QUEST` with the item guid as the questgiver and the template's quest id (`HandleUseItemOpcode` drops spell id 0 as unknown, so `CMSG_USE_ITEM` is never the packet for it); the server answers `SMSG_QUESTGIVER_QUEST_DETAILS`, and `quest_accept` with the same item guid takes it. `400 no_item_at_slot`; `400 item_not_usable` only when the item has neither an on-use spell nor a quest to start. The audit row carries `spellId`, `itemGuid`, `startQuest` |
+| `use_item` | `bag`, `slot`, `targetGuid?`, `glyphSlot?` | `CMSG_USE_ITEM`, or `CMSG_QUESTGIVER_QUERY_QUEST` | module fills item guid + on-use spell id from the item (client-cache knowledge) and the cast count from the counter `cast_spell` uses. `glyphSlot` (0-5, default 0) is the glyph slot a client's glyph frame sends with a glyph, the u32 after the item guid; the server judges the slot's level lock and glyph type (`SMSG_CAST_FAILED`), and anything past the six slots is `400 invalid_glyph_slot` before dispatch. An item with no on-use spell but a `startquest` is right-clicked the way a client does it: `CMSG_QUESTGIVER_QUERY_QUEST` with the item guid as the questgiver and the template's quest id (`HandleUseItemOpcode` drops spell id 0 as unknown, so `CMSG_USE_ITEM` is never the packet for it); the server answers `SMSG_QUESTGIVER_QUEST_DETAILS`, and `quest_accept` with the same item guid takes it. `400 no_item_at_slot`; `400 item_not_usable` only when the item has neither an on-use spell nor a quest to start. The audit row carries `spellId`, `itemGuid`, `startQuest`, and `glyphSlot` when it is not 0 |
 | `destroy_item` | `bag`, `slot`, `count?` | `CMSG_DESTROYITEM` | `count` 0/omitted = whole stack |
 | `trainer_list` | `guid` | `CMSG_TRAINER_LIST` | `SMSG_TRAINER_LIST` follows — or nothing at all when the NPC is out of interaction range, is not a trainer, or trains another class (the handler returns silently) |
 | `trainer_buy_spell` | `guid`, `spellId` | `CMSG_TRAINER_BUY_SPELL` | costs the character's own money server-side; answered by `SMSG_TRAINER_BUY_SUCCEEDED` or `SMSG_TRAINER_BUY_FAILED` |
@@ -965,6 +965,7 @@ pinned AzerothCore commit.
 | `SMSG_NOTIFICATION` | 0x1CB | `{ "text": <string> }` |
 | `SMSG_NAME_QUERY_RESPONSE` | 0x051 | `{ "guid": <guid-string>, "found": <bool>, "name": <string?> }` |
 | `SMSG_MESSAGECHAT` | 0x096 | `{ "type": <u8>, "language": <i32>, "senderGuid": <guid-string>, "senderName": <string?>, "receiverGuid": <guid-string?>, "receiverName": <string?>, "channelName": <string?>, "message": <string>, "chatTag": <u8>, "achievementId": <u32?> }` |
+| `SMSG_CHAT_PLAYER_NOT_FOUND` | 0x2A9 | `{ "name": <string> }` — a whisper found nobody by that name online, or one who does not take whispers (`WorldSession::SendPlayerNotFoundNotice`): the name as it was sent. The client shows it as "no player named … is playing"; the whisper went nowhere |
 
 `SMSG_MESSAGECHAT.data` is decoded per chat `type`, following the layout
 `ChatHandler::BuildChatPacket` writes for each (the core's `Chat.cpp`): the
@@ -1245,6 +1246,23 @@ not need it, docs/CONTRACTS.md):
   `petNumber` (UNIT_FIELD_PETNUMBER; on first sight of a unit with a non-zero
   one the module issues the `CMSG_PET_NAME_QUERY` a client does, once per
   number per session)
+- units and players, beside `faction` (the `UNIT_FIELD_FACTIONTEMPLATE`
+  id): that template's FactionTemplate.dbc row, which a client reads to
+  colour the unit hostile, neutral or friendly — `factionRow` (the template
+  id the row describes; absent when the client data has no such row),
+  `factionRowFaction` (its Faction.dbc faction), `factionRowFlags`,
+  `factionRowGroup` / `factionRowFriendGroup` / `factionRowEnemyGroup` (the
+  faction-group masks: its own, those it befriends, those it fights),
+  `factionRowEnemy0`..`3` and `factionRowFriend0`..`3` (explicit enemy and
+  friend factions), and `factionRowRepIndex` (the faction's Faction.dbc
+  `reputationListID`, -1 when it keeps no reputation). For a faction that
+  keeps one, also `factionRowBaseRace0`..`3`, `factionRowBaseClass0`..`3`
+  and `factionRowBaseRep0`..`3`, its Faction.dbc base reputation table (the
+  standing of a faction the login reputation list leaves out). Client-cache
+  knowledge served beside the id the way skill names are; every key is
+  re-served whenever `faction` is, so a changed template overwrites the row.
+  The SDK does the client's arithmetic (`UnitView.reaction`) with the
+  character's own row and reputation pane
 - players additionally: `playerFlags` (served as the raw integer; the module
   names no bit off it. The SDK decodes `PLAYER_FLAGS_GHOST` and
   `PLAYER_FLAGS_RESTING` SDK-side — a naming of already-served
@@ -1735,6 +1753,7 @@ Quests and gossip (quest/gossip text served as the client would show it):
 | `SMSG_QUESTUPDATE_COMPLETE` | 0x198 | `{ "questId" }` — an exploration or scripted-event objective credited: its only sender is `Player::AreaExploredOrEventHappens`, once per accept, when the server-only `Explored` flag flips, whether or not the rest of the quest is done. NOT sent for kill/item objectives at the pinned commit; read completion from the quest-log `State` complete bit or the final `ADD_KILL` with `current == required` |
 | `SMSG_QUESTUPDATE_FAILED` | 0x196 | `{ "questId" }` |
 | `SMSG_QUESTLOG_FULL` | 0x195 | `{}` — bodiless: the quest log's 25 slots are taken, so an accept (or an auto-accept on a hello or query) added nothing (`Player::SatisfyQuestLog`); the client shows "Quest log is full." The refused quest is not named |
+| `SMSG_QUESTGIVER_QUEST_INVALID` | 0x18F | `{ "reason": <u32> }` — why a quest cannot be taken (`Player::SendCanTakeQuestResponse`, from `CanTakeQuest` on an accept or on a quest-start item's query): the raw `QuestFailedReason` (0 requirements not met, 1 level too low, 6 wrong race, 7 already done, 12 one timed quest at a time, 13/18 already in the log, 21 missing items, 23 not enough money, 26/29 daily limits). The quest is not named; nothing is added to the log |
 | `SMSG_GOSSIP_MESSAGE` | 0x17D | `{ "guid", "menuId", "textId", "options": [{ "optionId", "icon", "text" }], "quests": [{ "questId", "icon", "level", "title" }] }` |
 | `SMSG_GOSSIP_COMPLETE` | 0x17E | `{}` |
 
@@ -1908,7 +1927,7 @@ coordinates ride any of these.
 
 The auction house stays outside both lists: `CMSG_AUCTION_*` is not
 allowlisted and no auction reply is tapped (deferred, with the dungeon finder,
-guilds, battlegrounds, glyphs, dual spec and equipment sets, until
+guilds, battlegrounds, dual spec and equipment sets, until
 single-player play is validated; docs/CONTRACTS.md).
 
 Achievements and flight paths ([Shard/WrathBench#8](https://github.com/Shard/WrathBench/issues/8) first half):
@@ -1970,7 +1989,10 @@ when "Make this inn your home." is chosen:
 
 The server declines a bind silently (not an innkeeper, out of range, dead,
 inside an instance): no packet follows the confirm, and the SDK reports that
-as the absence of an answer, never as a status.
+as the absence of an answer, never as a status. `SMSG_PLAYERBINDERROR` exists
+in the opcode table but the core never sends it (`STATUS_NEVER`, no builder),
+so nothing stands in for it; likewise `SMSG_RESURRECT_FAILED`, so a
+resurrection the server ignores is told by its absence too.
 
 #### Death
 
@@ -2018,6 +2040,7 @@ Map transfers (navigation):
 | `SMSG_NEW_WORLD` | 0x03E | `{ "map": <u32>, "x", "y", "z", "o" }` — the arrival point (transport-local when aboard one) |
 | `SMSG_TRANSFER_ABORTED` | 0x040 | `{ "map": <u32>, "reason": <u8>, "arg": <u8?> }` — `arg` only for INSUF_EXPAN_LVL / DIFFICULTY / UNIQUE_MESSAGE |
 | `SMSG_CORPSE_NOT_IN_INSTANCE` | 0x506 | `{}` — bodiless: a dead character crossed a dungeon portal's areatrigger and the server refused it because its corpse is not in that dungeon or one inside it (`MapMgr::PlayerCannotEnter`); no transfer follows, and the `move_to` that crossed the trigger ends as it would have anyway |
+| `SMSG_AREA_TRIGGER_MESSAGE` | 0x2B8 | `{ "text": <string> }` — a portal's refusal in words (`WorldSession::SendAreaTriggerMessage`): a dungeon's level gate, a closed instance, a raid entered without a raid group, a battleground portal of the other faction. One event per line of the text (u32 length, then the line; read to the length, cut at the first NUL, a line's own trailing newline dropped). No transfer follows, and the `move_to` that crossed the trigger ends as it would have anyway |
 
 `SMSG_NEW_WORLD` is the only map id a client receives after login
 (`SMSG_LOGIN_VERIFY_WORLD` is never re-sent), so it is what self position's
@@ -2044,11 +2067,19 @@ Served in `SMSG_UPDATE_OBJECT` `fields` alongside the existing set:
   3.3.5 layout: two u32s of packed u16 objective counters); inventory as
   `invSlot<n>Lo`/`invSlot<n>Hi` u32 guid halves, n 0-22 = equipment + bag
   slots, 23-38 = backpack slots, 39-66 = bank slots, 67-73 = bank bag slots,
-  86-117 = keyring slots, 118-149 = currency token slots (the core's
-  numbering, `PLAYER_FIELD_INV_SLOT_HEAD` through
-  `PLAYER_FIELD_CURRENCYTOKEN_SLOT_1`). The vendor buyback slots between the
-  bank bags and the keyring (74-85) are not served. The SDK reassembles guids
+  74-85 = vendor buyback slots, 86-117 = keyring slots, 118-149 = currency
+  token slots (the core's numbering, `PLAYER_FIELD_INV_SLOT_HEAD` through
+  `PLAYER_FIELD_CURRENCYTOKEN_SLOT_1`, contiguous). The SDK reassembles guids
   and joins them to item create blocks; its `inventory` view stops at 73.
+  The buyback slots are the vendor window's buyback tab: an item sold is
+  moved into one (`Player::AddItemToBuyBackSlot`), keeping the item object the
+  client already holds (a part-stack sale creates a new one), and the slot
+  number is what `CMSG_BUYBACK_ITEM` (raw: `u64 vendor guid, u32 slot`) names.
+  Beside them `buybackPrice<n>`, n 0-11, the copper each costs to buy back
+  (`PLAYER_FIELD_BUYBACK_PRICE_1`, slot 74 + n). The reattach replay does
+  not re-create a buyback item's object (the core's own create builder skips
+  those slots), so after a reattach a slot filled earlier reads with a guid
+  and no entry.
 - items and containers: `stackCount`, `durability`, `maxDurability`,
   `itemFlags`, `ownerLo`/`ownerHi`, `containedLo`/`containedHi`; the random
   property and the enchantment slots, PUBLIC fields every client in range
@@ -2089,8 +2120,10 @@ Served in `SMSG_UPDATE_OBJECT` `fields` alongside the existing set:
   compressed out, and the SDK joins halves into guids and addresses the
   slot as `(bag = the bag's equipment slot 19-22, slot = n)`, which is what
   `CMSG_USE_ITEM` / `CMSG_DESTROYITEM` / `CMSG_AUTOEQUIP_ITEM` resolve
-  through `Player::GetItemByPos`. Nothing new on the action side: swap and
-  split stay off the allowlist.
+  through `Player::GetItemByPos`. Nothing new on the action side: moving,
+  swapping and splitting items is the raw allowlist's (`CMSG_SWAP_ITEM`,
+  `CMSG_SPLIT_ITEM` and the rest of its inventory line), addressed by the
+  same `(bag, slot)` pairs.
 
 ## Audit log
 

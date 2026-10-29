@@ -917,6 +917,23 @@ export interface WornBag {
   readonly name: string | undefined;
 }
 
+/**
+ * One occupied slot of the vendor window's buyback tab: an item this character
+ * sold, which `CMSG_BUYBACK_ITEM` (raw: `[{ guid: vendor }, { u32: slot }]`,
+ * at a vendor) buys back for `price`. `slot` is the core's 74-85, the number
+ * that packet names. The same three-way join as `bag()`: after a reattach a
+ * slot filled earlier has a guid and no `itemId` (the replay does not
+ * re-create the item), as a client that dialled in again would hold it.
+ */
+export interface BuybackItem extends ItemInstance {
+  readonly slot: number;
+  readonly guid: GuidKey;
+  readonly itemId: number | undefined;
+  readonly count: number | undefined;
+  /** Copper to buy it back (`PLAYER_FIELD_BUYBACK_PRICE_1`); `undefined` until observed. */
+  readonly price: number | undefined;
+}
+
 /** The whole carried inventory — backpack plus worn bags — as `bag()` reports it. */
 export interface BagContents {
   readonly items: readonly BagSlotItem[];
@@ -1455,6 +1472,157 @@ export interface UnitView {
    * the car is out of the map's visibility range of the character.
    */
   readonly docked: boolean | undefined;
+  /**
+   * Units and players: how this unit regards you, as a client colours its
+   * name — `hostile` (red), `neutral` (yellow) or `friendly` (green). The
+   * client's own reading (`unitReaction`): the unit's FactionTemplate.dbc row,
+   * which the module serves beside its `faction`, against yours, and, for a
+   * faction that keeps a reputation, your standing with it (capped at
+   * neutral while at war). Your own pets and summons, and party members and
+   * theirs, are friendly. Undefined for game objects, and until both rows
+   * (and, for a reputation faction, the reputation pane) have arrived.
+   * Not modelled: a duel opponent, free-for-all PvP areas and the
+   * quest-scripted forced reactions (`SMSG_SET_FORCED_REACTIONS` is not
+   * tapped).
+   */
+  readonly reaction: UnitReaction | undefined;
+}
+
+/** How a unit regards this character (`UnitView.reaction`). */
+export type UnitReaction = "hostile" | "neutral" | "friendly";
+
+/**
+ * One FactionTemplate.dbc row, as the module serves it beside a unit's
+ * `faction` (`factionRow*` update fields): the Faction.dbc faction it belongs
+ * to, its flags, its own faction-group mask and the groups it befriends and
+ * fights, its explicit enemy and friend factions, and the faction's
+ * reputation index (-1 when it keeps none).
+ */
+export interface FactionTemplateRow {
+  readonly faction: number;
+  readonly flags: number;
+  readonly group: number;
+  readonly friendGroup: number;
+  readonly enemyGroup: number;
+  readonly enemies: readonly number[];
+  readonly friends: readonly number[];
+  readonly repIndex: number;
+  /**
+   * For a faction that keeps a reputation: its Faction.dbc base table, four
+   * `{ raceMask, classMask, value }` entries, which give the standing of a
+   * faction the reputation pane does not list. Empty otherwise.
+   */
+  readonly base: readonly { readonly raceMask: number; readonly classMask: number; readonly value: number }[];
+}
+
+/** `FACTION_TEMPLATE_FLAG_ATTACK_PVP_ACTIVE_PLAYERS`: contested guards, hostile to a PvP-flagged character. */
+const FACTION_TEMPLATE_ATTACK_PVP_ACTIVE = 0x1000;
+/** `FACTION_TEMPLATE_FLAG_HATES_ALL_EXCEPT_FRIENDS`. */
+const FACTION_TEMPLATE_HATES_ALL_EXCEPT_FRIENDS = 0x2000;
+/** `PLAYER_FLAGS_CONTESTED_PVP`: this character fought in PvP lately; contested guards attack it. */
+const PLAYER_FLAGS_CONTESTED_PVP = 0x0000_0100;
+/** `UNIT_FLAG_PLAYER_CONTROLLED`: a player, or a unit a player controls. */
+const UNIT_FLAG_PLAYER_CONTROLLED = 0x0000_0008;
+/** The ranks in order, Hated 0 .. Exalted 7, as the core numbers `ReputationRank`. */
+const REPUTATION_RANK_ORDER: readonly ReputationRank[] = [
+  "Hated", "Hostile", "Unfriendly", "Neutral", "Friendly", "Honored", "Revered", "Exalted",
+];
+
+/** A unit's served FactionTemplate row, when it is the row of the template it carries now. */
+function factionTemplateRowOf(fields: ReadonlyMap<string, Observed<number>>): FactionTemplateRow | undefined {
+  const id = fields.get("faction")?.value;
+  if (id === undefined || fields.get("factionRow")?.value !== id) return undefined;
+  const n = (key: string): number => fields.get(key)?.value ?? 0;
+  return {
+    faction: n("factionRowFaction"),
+    flags: n("factionRowFlags"),
+    group: n("factionRowGroup"),
+    friendGroup: n("factionRowFriendGroup"),
+    enemyGroup: n("factionRowEnemyGroup"),
+    enemies: [0, 1, 2, 3].map((i) => n(`factionRowEnemy${i}`)),
+    friends: [0, 1, 2, 3].map((i) => n(`factionRowFriend${i}`)),
+    repIndex: fields.get("factionRowRepIndex")?.value ?? -1,
+    base: fields.has("factionRowBaseRep0")
+      ? [0, 1, 2, 3].map((i) => ({
+          raceMask: n(`factionRowBaseRace${i}`),
+          classMask: n(`factionRowBaseClass${i}`),
+          value: n(`factionRowBaseRep${i}`),
+        }))
+      : [],
+  };
+}
+
+/**
+ * A faction's base reputation for a race and class, read off its Faction.dbc
+ * table the way the client (and the core's `ReputationMgr::GetBaseReputation`)
+ * does: the first entry whose race mask takes the race (or that names only
+ * classes) and whose class mask takes the class (or is empty); 0 when none.
+ */
+export function baseReputation(row: FactionTemplateRow, race: number, cls: number): number {
+  const raceMask = race > 0 ? 2 ** (race - 1) : 0;
+  const classMask = cls > 0 ? 2 ** (cls - 1) : 0;
+  for (const b of row.base) {
+    const raceOk = (b.raceMask & raceMask) !== 0 || (b.raceMask === 0 && b.classMask !== 0);
+    const classOk = (b.classMask & classMask) !== 0 || b.classMask === 0;
+    if (raceOk && classOk) return b.value;
+  }
+  return 0;
+}
+
+/** `FactionTemplateEntry::IsFriendlyTo`: the explicit lists first, then the group masks both ways. */
+function templateFriendlyTo(a: FactionTemplateRow, b: FactionTemplateRow): boolean {
+  if (a.faction === b.faction) return true;
+  if (b.faction !== 0) {
+    if (a.enemies.includes(b.faction)) return false;
+    if (a.friends.includes(b.faction)) return true;
+  }
+  return (a.friendGroup & b.group) !== 0 || (a.group & b.friendGroup) !== 0;
+}
+
+/** `FactionTemplateEntry::IsHostileTo`: the explicit lists first, then the enemy-group mask. */
+function templateHostileTo(a: FactionTemplateRow, b: FactionTemplateRow): boolean {
+  if (b.faction !== 0) {
+    if (a.enemies.includes(b.faction)) return true;
+    if (a.friends.includes(b.faction)) return false;
+  }
+  return (a.enemyGroup & b.group) !== 0;
+}
+
+/**
+ * How a unit with template row `unit` regards a character with template row
+ * `self` — the reading a 3.3.5a client makes from its FactionTemplate.dbc and
+ * its own reputation, the same arithmetic as the core's
+ * `Unit::GetFactionReactionTo`. A faction that keeps a reputation answers by
+ * the character's standing with it (`standing`, capped at neutral while at
+ * war; the pane's row for it, or, for a faction the pane does not list, the
+ * row's base reputation for the character's race and class, never at war —
+ * `undefined` when neither is known, which leaves the reaction unknown); any
+ * other by the template relations. Ranks bin as the core's
+ * `IsHostileTo`/`IsFriendlyTo` do: Hostile and below hostile, Friendly and
+ * above friendly, Unfriendly and Neutral neutral.
+ */
+export function unitReaction(
+  unit: FactionTemplateRow,
+  self: FactionTemplateRow,
+  options: {
+    readonly contestedPvp: boolean;
+    readonly standing: (unit: FactionTemplateRow) => { readonly rank: ReputationRank; readonly atWar: boolean } | undefined;
+  },
+): UnitReaction | undefined {
+  if ((unit.flags & FACTION_TEMPLATE_ATTACK_PVP_ACTIVE) !== 0 && options.contestedPvp) return "hostile";
+  if (unit.repIndex >= 0) {
+    const st = options.standing(unit);
+    if (st === undefined) return undefined;
+    let rank = REPUTATION_RANK_ORDER.indexOf(st.rank);
+    if (st.atWar) rank = Math.min(rank, REPUTATION_RANK_ORDER.indexOf("Neutral"));
+    if (rank <= REPUTATION_RANK_ORDER.indexOf("Hostile")) return "hostile";
+    if (rank >= REPUTATION_RANK_ORDER.indexOf("Friendly")) return "friendly";
+    return "neutral";
+  }
+  if (templateHostileTo(unit, self)) return "hostile";
+  if (templateFriendlyTo(unit, self) || templateFriendlyTo(self, unit)) return "friendly";
+  if ((unit.flags & FACTION_TEMPLATE_HATES_ALL_EXCEPT_FRIENDS) !== 0) return "hostile";
+  return "neutral";
 }
 
 /**
@@ -1695,6 +1863,7 @@ export interface StateSnapshot {
   readonly group: GroupState | undefined;
   readonly mailbox: MailboxState | undefined;
   readonly bank: BankContents;
+  readonly buyback: readonly BuybackItem[];
   readonly trade: TradeState | undefined;
   readonly lastSeq: number;
   readonly eventCount: number;
@@ -2738,6 +2907,35 @@ export class StateCache {
     return { guid: this.bankGuid?.value, items, bags, freeSlots: totalSlots - items.length, totalSlots };
   }
 
+  // -------------------------------------------------------------- buyback
+
+  /**
+   * The vendor buyback tab: what this character sold and can buy back, in
+   * slot order (74-85, the slot `CMSG_BUYBACK_ITEM` names), each with the
+   * price the tab shows. Empty until a sale; the server keeps twelve, the
+   * oldest giving way to the next sale.
+   */
+  buyback(): BuybackItem[] {
+    const out: BuybackItem[] = [];
+    for (let slot = BUYBACK_FIRST_SLOT; slot <= BUYBACK_LAST_SLOT; slot++) {
+      const lo = this.self.fields.get(`invSlot${slot}Lo`);
+      const hi = this.self.fields.get(`invSlot${slot}Hi`);
+      if (!lo && !hi) continue;
+      const guid = formatGuid((BigInt(hi?.value ?? 0) << 32n) | BigInt((lo?.value ?? 0) >>> 0));
+      if (guid === "0") continue;
+      const item = this.nearby.get(guid);
+      out.push({
+        slot,
+        guid,
+        itemId: item?.entry?.value,
+        ...this.itemInstance(item),
+        count: item?.fields.get("stackCount")?.value,
+        price: this.self.fields.get(`buybackPrice${slot - BUYBACK_FIRST_SLOT}`)?.value,
+      });
+    }
+    return out;
+  }
+
   // ---------------------------------------------------------------- trade
 
   /** The trade window, or `undefined` until any trade packet. */
@@ -3064,6 +3262,7 @@ export class StateCache {
       group: this.group(),
       mailbox: this.mailbox(),
       bank: this.bank(),
+      buyback: this.buyback(),
       trade: this.tradeState,
       lastSeq: this.lastSeq,
       eventCount: this.eventCount,
@@ -4159,9 +4358,10 @@ export class StateCache {
     const now = Date.now();
     const out: UnitView[] = [];
     const superseded = supersededCorpses(this.nearby.values());
+    const reactionOf = this.reactionReader();
     for (const obj of this.nearby.values()) {
       if (superseded.has(obj.guid)) continue;
-      const view = toUnitView(obj, from, this.creatures, now);
+      const view = toUnitView(obj, from, this.creatures, now, reactionOf);
       if (view === undefined) continue;
 
       if (!passesUnitFilter(view, obj, f)) continue;
@@ -4190,6 +4390,41 @@ export class StateCache {
       if (b.distance === undefined) return -1;
       return a.distance - b.distance;
     });
+  }
+
+  /**
+   * The reaction reader one scan of the view shares: our own template row,
+   * PvP flag, reputation pane and party read once, then each unit's row
+   * against them (`unitReaction`). Our own pets and summons, and a party
+   * member's (or the member), are friendly whatever their rows say: the
+   * core's `GetReactionTo` answers those before it reads a template.
+   */
+  private reactionReader(): (obj: NearbyObject) => UnitReaction | undefined {
+    const self = factionTemplateRowOf(this.self.fields);
+    const me = this.self.guid;
+    const contestedPvp = ((this.self.fields.get("playerFlags")?.value ?? 0) & PLAYER_FLAGS_CONTESTED_PVP) !== 0;
+    const party = new Set(this.groupState?.members.map((m) => m.guid) ?? []);
+    const byFaction = new Map<number, ReputationEntry>();
+    for (const row of this.reputationMap.values()) if (row.factionId !== undefined) byFaction.set(row.factionId, row);
+    const race = this.self.fields.get("race")?.value;
+    const cls = this.self.fields.get("class")?.value;
+    const standing = (unit: FactionTemplateRow) => {
+      const row = byFaction.get(unit.faction);
+      if (row !== undefined) return row;
+      // The login list leaves out a faction with no flags and no standing:
+      // its reputation is the Faction.dbc base for this race and class.
+      if (unit.base.length === 0 || race === undefined || cls === undefined) return undefined;
+      return { rank: reputationRank(baseReputation(unit, race, cls)), atWar: false };
+    };
+    return (obj) => {
+      const owner = obj.ownerGuid?.value;
+      if (me !== undefined && owner === me) return "friendly";
+      const playerControlled = ((obj.fields.get("unitFlags")?.value ?? 0) & UNIT_FLAG_PLAYER_CONTROLLED) !== 0;
+      if (playerControlled && (party.has(obj.guid) || (owner !== undefined && party.has(owner)))) return "friendly";
+      const unit = factionTemplateRowOf(obj.fields);
+      if (unit === undefined || self === undefined) return undefined;
+      return unitReaction(unit, self, { contestedPvp, standing });
+    };
   }
 
   /** Units in view whose observed template entry is `entry`. */
@@ -4245,6 +4480,7 @@ export class StateCache {
 
     let best: UnitView | undefined;
     let bestD2 = Infinity;
+    const reactionOf = this.reactionReader();
     // One clock for the ordering and the rows, so they cannot disagree.
     const now = Date.now();
     const superseded = supersededCorpses(this.nearby.values());
@@ -4255,7 +4491,7 @@ export class StateCache {
       if (predicate && !predicate(obj)) continue;
       // The answer is a `units()` row, so what `units()` leaves out — items
       // and containers, our own inventory — is never an answer here either.
-      const view = toUnitView(obj, from, this.creatures, now);
+      const view = toUnitView(obj, from, this.creatures, now, reactionOf);
       if (view === undefined) continue;
       if (criteria && !passesUnitFilter(view, obj, criteria)) continue;
       const d2 = (p.x - from.x) ** 2 + (p.y - from.y) ** 2 + (p.z - from.z) ** 2;
@@ -4854,6 +5090,7 @@ function toUnitView(
   from: UnitPosition | undefined,
   creatures: ReadonlyMap<number, Observed<CreatureInfo>>,
   now: number,
+  reactionOf: (obj: NearbyObject) => UnitReaction | undefined,
 ): UnitView | undefined {
   const type = obj.objectType?.value;
   if (type === "item" || type === "container") return undefined;
@@ -4887,6 +5124,7 @@ function toUnitView(
     roles: npcRolesOf(obj.fields.get("npcFlags")?.value),
     goType: goTypeOf(obj),
     docked: obj.transport?.value.docked,
+    reaction: type === "unit" || type === "player" ? reactionOf(obj) : undefined,
   };
 }
 
@@ -5334,11 +5572,14 @@ const QUEST_ID_FIELD = /^quest\d+Id$/;
 /** Equipment + bags are 0-22, backpack 23-38 (PROTOCOL.md). */
 /**
  * The last `invSlot<n>` this view reads: the bank bags. Older modules stop at
- * 38; newer ones also serve the keyring (86-117) and currency tokens
- * (118-149), which no view lists; only a collect objective's count reads them
- * (`carriedItems`).
+ * 38; newer ones also serve the vendor buyback slots (74-85, `buyback()`), the
+ * keyring (86-117) and currency tokens (118-149), which no view lists; only a
+ * collect objective's count reads the last two (`carriedItems`).
  */
 const INVENTORY_LAST_SLOT = 73;
+/** The vendor buyback slots' `invSlot<n>` (`BUYBACK_SLOT_START`, `BUYBACK_SLOT_END - 1`). */
+const BUYBACK_FIRST_SLOT = 74;
+const BUYBACK_LAST_SLOT = 85;
 /** The keyring's first and the currency tokens' last `invSlot<n>` (`KEYRING_SLOT_START`, `CURRENCYTOKEN_SLOT_END - 1`). */
 const KEYRING_FIRST_SLOT = 86;
 const CURRENCY_LAST_SLOT = 149;

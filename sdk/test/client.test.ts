@@ -2670,6 +2670,26 @@ describe("client: quests", () => {
     await stub.stop();
   });
 
+  test("an accept the server refuses is refused with the reason at once, not a timeout", async () => {
+    // Player::CanTakeQuest(quest, true) on the accept: SMSG_QUESTGIVER_QUEST_INVALID
+    // with a QuestFailedReason (1: level too low), and nothing is added.
+    const stub = startStub({ onConnect: () => questWorld() });
+    const client = await inWorld(stub);
+    const started = Date.now();
+    const pending = client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 5000 });
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify(questGiverList([QUEST_ID], 86)));
+    await untilAction(stub, "quest_accept");
+    stub.push(JSON.stringify({ seq: 87, opcode: "SMSG_QUESTGIVER_QUEST_INVALID", opcodeId: 0x18f, ts: 1_700_000_000_870, data: { reason: 1 } }));
+    const result = await pending;
+    expect(Date.now() - started).toBeLessThan(2000);
+    const hint = `the server will not give you quest ${QUEST_ID}: your level is too low for it (QuestFailedReason 1)`;
+    expect(result).toMatchObject({ ok: false, status: "refused", questId: QUEST_ID, reason: 1, hint });
+    expect(client.drainActionHints()[0]).toMatchObject({ action: "acceptQuestFrom", status: "refused", hint });
+    client.close();
+    await stub.stop();
+  });
+
   test("a full-log refusal from before the accept is not read as its answer", async () => {
     // An auto-accept hello on a full log sends its own SMSG_QUESTLOG_FULL
     // before the accept; only one after the accept answers it.
@@ -5717,6 +5737,29 @@ describe("client: quest-start items and the questgiver marker pre-check (2026-08
     const result = await accept;
     expect(result).toMatchObject({ ok: true, status: "accepted", questId: START_QUEST, title: "The Tome of Divinity" });
     expect(stub.actions.map((x) => x.action)).not.toContain("quest_list");
+    client.close();
+    await stub.stop();
+  });
+
+  test("a quest-start item whose quest the server refuses settles useItem and acceptQuestFrom with the reason", async () => {
+    // HandleQuestgiverQueryQuestOpcode: CanTakeQuest(quest, true) answers the
+    // query with SMSG_QUESTGIVER_QUEST_INVALID (7: already completed).
+    const stub = startStub({ onConnect: () => tome() });
+    const client = await inWorld(stub);
+    await client.events.waitForOpcode("SMSG_ITEM_QUERY_SINGLE_RESPONSE", { timeout: 2000 });
+    const started = Date.now();
+    const used = client.useItem("Tome of Divinity", undefined, undefined, { timeout: 5000 });
+    await untilAction(stub, "use_item");
+    stub.push(frame(90, "SMSG_QUESTGIVER_QUEST_INVALID", { reason: 7 }));
+    const hint = `the server will not give you quest ${START_QUEST}: you have already completed it (QuestFailedReason 7)`;
+    expect(await used).toMatchObject({ ok: false, status: "quest_refused", questId: START_QUEST, reason: 7, hint });
+
+    const accept = client.acceptQuestFrom(ITEM_GUID, START_QUEST, { timeout: 5000 });
+    await untilAction(stub, "quest_details");
+    stub.push(frame(91, "SMSG_QUESTGIVER_QUEST_INVALID", { reason: 7 }));
+    expect(await accept).toMatchObject({ ok: false, status: "refused", questId: START_QUEST, reason: 7, hint });
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(stub.actions.map((x) => x.action)).not.toContain("quest_accept");
     client.close();
     await stub.stop();
   });

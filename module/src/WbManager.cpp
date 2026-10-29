@@ -3901,6 +3901,14 @@ namespace WrathBench
             uint8 bag = static_cast<uint8>(req.GetInt("bag"));
             uint8 slot = static_cast<uint8>(req.GetInt("slot"));
             uint64_t target = ParseGuid(req, "targetGuid");
+            // The glyph slot a client's glyph frame sends with a glyph (the
+            // u32 after the item guid; 0 for every other item). The server
+            // drops anything past its six slots (MAX_GLYPH_SLOT_INDEX) as a
+            // missing item, so that is refused here, before dispatch; the
+            // slot's level lock and glyph type stay the server's to judge.
+            int64_t glyphSlot = req.GetInt("glyphSlot", 0);
+            if (glyphSlot < 0 || glyphSlot >= MAX_GLYPH_SLOT_INDEX)
+                return err(400, "invalid_glyph_slot");
             // The client fills the item guid and on-use spell id from its own
             // inventory + item cache; the module reads the same client-visible
             // state from the live item.
@@ -3924,7 +3932,7 @@ namespace WrathBench
                 // in-progress check skips a 0 the same way.
                 p = new WorldPacket(CMSG_USE_ITEM, 1 + 1 + 1 + 4 + 8 + 4 + 1 + 4 + 9);
                 *p << uint8(bag) << uint8(slot) << uint8(s->NextCastCount()) << uint32(spellId);
-                *p << uint64(item->GetGUID().GetRawValue()) << uint32(0) << uint8(0);
+                *p << uint64(item->GetGUID().GetRawValue()) << uint32(glyphSlot) << uint8(0);
                 if (target)
                 {
                     *p << uint32(0x0002);                        // TARGET_FLAG_UNIT
@@ -3951,6 +3959,8 @@ namespace WrathBench
                 return err(400, "item_not_usable");
             auditW.Add("bag", (uint32)bag).Add("slot", (uint32)slot).Add("spellId", spellId)
                 .AddGuid("itemGuid", item->GetGUID().GetRawValue()).Add("startQuest", startQuest);
+            if (spellId && glyphSlot)
+                auditW.Add("glyphSlot", (uint32)glyphSlot);
         }
         else if (action == "destroy_item")
         {
@@ -6763,6 +6773,40 @@ namespace WrathBench
             f.Add(key + "Text", e->description[0]);
     }
 
+    // A unit's faction template (UNIT_FIELD_FACTIONTEMPLATE, PUBLIC) is a
+    // FactionTemplate.dbc row the client reads to colour the unit hostile,
+    // neutral or friendly: its Faction.dbc faction, flags, the faction-group
+    // masks (its own, those it befriends, those it fights), the explicit
+    // enemy and friend factions, and whether that faction keeps a reputation
+    // (Faction.dbc reputationListID, -1 when not) with, for one that does,
+    // the faction's race/class base reputation table (the client's own
+    // Faction.dbc base for a faction the reputation list does not carry).
+    // Served beside the id the
+    // way a skill's name rides beside its id; the SDK does the client's
+    // arithmetic with the character's own reputation. `factionRow` names the
+    // template the row describes, so a template with no row never leaves an
+    // earlier template's row standing for it. Every field is served, zeros
+    // included, so a changed template overwrites every earlier one.
+    static void AppendFactionTemplate(Json::Writer& f, uint32 id)
+    {
+        FactionTemplateEntry const* t = sFactionTemplateStore.LookupEntry(id);
+        if (!t)
+            return;
+        FactionEntry const* fe = sFactionStore.LookupEntry(t->faction);
+        f.Add("factionRow", id).Add("factionRowFaction", t->faction).Add("factionRowFlags", t->factionFlags)
+         .Add("factionRowGroup", t->ourMask).Add("factionRowFriendGroup", t->friendlyMask)
+         .Add("factionRowEnemyGroup", t->hostileMask)
+         .Add("factionRowRepIndex", fe ? fe->reputationListID : -1);
+        for (uint32 i = 0; i < MAX_FACTION_RELATIONS; ++i)
+            f.Add("factionRowEnemy" + std::to_string(i), t->enemyFaction[i])
+             .Add("factionRowFriend" + std::to_string(i), t->friendFaction[i]);
+        if (fe && fe->CanHaveReputation())
+            for (uint32 i = 0; i < 4; ++i)
+                f.Add("factionRowBaseRace" + std::to_string(i), fe->BaseRepRaceMask[i])
+                 .Add("factionRowBaseClass" + std::to_string(i), fe->BaseRepClassMask[i])
+                 .Add("factionRowBaseRep" + std::to_string(i), fe->BaseRepValue[i]);
+    }
+
     static bool AppendNamedField(Json::Writer& f, uint8 typeId, uint32 index, uint32 v,
         PendingGuids& g, uint32* entryOut, uint32* petNumberOut)
     {
@@ -6809,7 +6853,7 @@ namespace WrathBench
                 case UNIT_FIELD_HEALTH:          f.Add("health", v); return true;
                 case UNIT_FIELD_MAXHEALTH:       f.Add("maxHealth", v); return true;
                 case UNIT_FIELD_LEVEL:           f.Add("level", v); return true;
-                case UNIT_FIELD_FACTIONTEMPLATE: f.Add("faction", v); return true;
+                case UNIT_FIELD_FACTIONTEMPLATE: f.Add("faction", v); AppendFactionTemplate(f, v); return true;
                 case UNIT_FIELD_FLAGS:
                     // taxiFlight names UNIT_FLAG_TAXI_FLIGHT (0x00100000) off
                     // the same field: the client's own "on a flight path"
@@ -6878,20 +6922,26 @@ namespace WrathBench
                     f.Add("quest" + std::to_string(rel / 5) + offName[rel % 5], v);
                     return true;
                 }
-                // Equipment/bag/backpack/bank/keyring/currency item guids as
-                // lo/hi u32 halves keyed by inventory slot (0-22 equipment+bags,
-                // 23-38 backpack, 39-66 bank, 67-73 bank bags, 86-117 keyring,
-                // 118-149 currency tokens — the core's slot numbering, the
-                // fields are contiguous). The vendor buyback slots between them
-                // (74-85) are not served. Halves stay u32 JSON numbers; the
-                // SDK joins them into guids. Bank slots since; keyring and
-                // currency since, which the server counts toward a quest's
-                // items (`Player::GetItemCount`).
-                if ((index >= PLAYER_FIELD_INV_SLOT_HEAD && index < PLAYER_FIELD_BANKBAG_SLOT_1 + 14) ||
-                    (index >= PLAYER_FIELD_KEYRING_SLOT_1 && index < PLAYER_FIELD_CURRENCYTOKEN_SLOT_1 + 64))
+                // Equipment/bag/backpack/bank/buyback/keyring/currency item
+                // guids as lo/hi u32 halves keyed by inventory slot (0-22
+                // equipment+bags, 23-38 backpack, 39-66 bank, 67-73 bank bags,
+                // 74-85 vendor buyback, 86-117 keyring, 118-149 currency
+                // tokens — the core's slot numbering, the fields are
+                // contiguous). Halves stay u32 JSON numbers; the SDK joins
+                // them into guids. The buyback slots are the vendor's buyback
+                // tab, and the slot number is what CMSG_BUYBACK_ITEM names.
+                if (index >= PLAYER_FIELD_INV_SLOT_HEAD && index < PLAYER_FIELD_CURRENCYTOKEN_SLOT_1 + 64)
                 {
                     uint32 rel = index - PLAYER_FIELD_INV_SLOT_HEAD;
                     f.Add("invSlot" + std::to_string(rel / 2) + (rel % 2 ? "Hi" : "Lo"), v);
+                    return true;
+                }
+                // What buying each buyback slot back costs, in copper
+                // (PLAYER_FIELD_BUYBACK_PRICE_1, PRIVATE): the price the
+                // buyback tab shows beside the item. n 0-11 is slot 74 + n.
+                if (index >= PLAYER_FIELD_BUYBACK_PRICE_1 && index < PLAYER_FIELD_BUYBACK_PRICE_1 + 12)
+                {
+                    f.Add("buybackPrice" + std::to_string(index - PLAYER_FIELD_BUYBACK_PRICE_1), v);
                     return true;
                 }
             }
@@ -7387,6 +7437,17 @@ namespace WrathBench
                     name = "SMSG_NOTIFICATION";
                     std::string text; p >> text;
                     w.Add("text", text);
+                    break;
+                }
+                // A whisper (or other chat to a named player) found nobody by
+                // that name online (WorldSession::SendPlayerNotFoundNotice):
+                // the name as the sender wrote it, a cstring. The client shows
+                // "No player named '<name>' is currently playing."
+                case SMSG_CHAT_PLAYER_NOT_FOUND:
+                {
+                    name = "SMSG_CHAT_PLAYER_NOT_FOUND";
+                    std::string who; p >> who;
+                    w.Add("name", who);
                     break;
                 }
                 case SMSG_NAME_QUERY_RESPONSE:
@@ -8993,6 +9054,17 @@ namespace WrathBench
                 case SMSG_QUESTLOG_FULL:
                     name = "SMSG_QUESTLOG_FULL";
                     break;
+                // Why a quest cannot be taken (Player::SendCanTakeQuestResponse,
+                // from CanTakeQuest's checks on an accept or a query): u32
+                // QuestFailedReason. The client shows it as an error line; the
+                // quest is not named on the wire.
+                case SMSG_QUESTGIVER_QUEST_INVALID:
+                {
+                    name = "SMSG_QUESTGIVER_QUEST_INVALID";
+                    uint32 reason; p >> reason;
+                    w.Add("reason", reason);
+                    break;
+                }
                 // ---------------------------------------------------- gossip
                 case SMSG_GOSSIP_MESSAGE:
                 {
@@ -9651,6 +9723,32 @@ namespace WrathBench
                 case SMSG_CORPSE_NOT_IN_INSTANCE:
                     name = "SMSG_CORPSE_NOT_IN_INSTANCE";
                     break;
+                // A portal's refusal in words (WorldSession::SendAreaTriggerMessage):
+                // a dungeon's level gate, a closed instance, a raid entered
+                // without a raid group, a battleground portal of the other
+                // faction. One packet per line of the text: u32 length (the
+                // NUL included), then the line. The core writes the line from
+                // a string_view, so the bytes run on past `length` into the
+                // lines after it; exactly `length` bytes are read, and the
+                // last of them is the NUL or, for every line but the last, the
+                // newline that ended it, which is dropped. No transfer follows.
+                case SMSG_AREA_TRIGGER_MESSAGE:
+                {
+                    name = "SMSG_AREA_TRIGGER_MESSAGE";
+                    uint32 len; p >> len;
+                    // A length past the packet's end is a decodeError, never
+                    // an over-read (or an allocation of what it claims).
+                    if (len > p.size() - p.rpos())
+                        throw std::runtime_error("SMSG_AREA_TRIGGER_MESSAGE length past the packet end");
+                    std::string text(len, '\0');
+                    if (len)
+                        p.read(reinterpret_cast<uint8*>(text.data()), len);
+                    text.resize(strnlen(text.c_str(), text.size()));
+                    if (!text.empty() && text.back() == '\n')
+                        text.pop_back();
+                    w.Add("text", text);
+                    break;
+                }
                 // ---------------------------------------- creature movement
                 case SMSG_MONSTER_MOVE:
                 {

@@ -188,6 +188,35 @@ describe("a portal that refuses a ghost (SMSG_CORPSE_NOT_IN_INSTANCE)", () => {
   });
 });
 
+describe("a portal refused in words (SMSG_AREA_TRIGGER_MESSAGE)", () => {
+  const gate = "The gate of Nowhere Keep turns you away.";
+  const hint = `the server refused the portal: "${gate}". No transfer follows; you are where the walk ended.`;
+
+  test("rides the arrival's hint and reaches the harness block", async () => {
+    const stub = startStub({ onConnect: () => world() });
+    const client = await inWorld(stub);
+    const pending = client.moveTo({ x: -1230, y: 990, z: 42 });
+    await untilAction(stub, "move_to");
+    push(stub, frame(90, "WB_AREATRIGGER", { triggerId: 9001, moveId: 1, pos: { x: -1231, y: 989, z: 42, o: 0 } }));
+    push(stub, frame(91, "SMSG_AREA_TRIGGER_MESSAGE", { text: gate }));
+    push(stub, result(92, 1, "arrived"));
+    expect(await pending).toMatchObject({ ok: true, status: "arrived", hint });
+    expect(client.drainActionHints()).toEqual([expect.objectContaining({ action: "portal", status: "refused", hint })]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("settles waitForTransfer as refused, with the server's text", async () => {
+    const stub = startStub({ onConnect: () => world() });
+    const client = await inWorld(stub);
+    const pending = client.waitForTransfer({ timeout: 5000 });
+    push(stub, frame(91, "SMSG_AREA_TRIGGER_MESSAGE", { text: gate }));
+    expect(await pending).toMatchObject({ ok: false, status: "refused", text: gate, seq: 91, hint });
+    client.close();
+    await stub.stop();
+  });
+});
+
 describe("moveToAsync: a ghost's climb is not told fall damage is free", () => {
   test("a dz > 0 drop keeps the climb recipe alone", async () => {
     const stub = startStub({ onConnect: () => world([ghostFlags(20)]) });

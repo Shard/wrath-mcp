@@ -35,6 +35,9 @@ Tested against AzerothCore
    without it the module reports `unknown`.
 4. Copy `module/conf/mod_wrathbench.conf.dist` beside the worldserver's config
    and set it:
+   - `WrathBench.Enable = 1` (or `AC_WRATH_BENCH_ENABLE=1`). The module is off
+     unless this is set, in the shipped conf and in the code alike, so a
+     worldserver that only has it built in opens no control port.
    - `WrathBench.Secret`, the port secret, 32 characters or more. It is
      required; without it the module does not listen. Keep it out of the file
      itself and pass it as `AC_WRATH_BENCH_SECRET` in the worldserver's
