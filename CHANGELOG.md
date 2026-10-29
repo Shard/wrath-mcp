@@ -53,9 +53,9 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 - `use_item` takes `glyphSlot` (0-5), the slot a client's glyph frame sends
   with a glyph; `useItem(..., { glyphSlot })` in the SDK.
 - Unit state flags named, from the `unitFlags` and `dynamicFlags` the module
-  already serves (no wire change): `units()` rows carry both raw beside
-  `inCombat`, `stunned`, `skinnable`, `lootable`, `tapped` and `tappedByYou`
-  (the client's own readings; undefined until a block carried the field), and
+  already serves (no wire change): `units()` rows carry `inCombat`,
+  `stunned`, `skinnable`, `lootable`, `tapped` and `tappedByYou` (the client's
+  own readings; undefined until a block carried the field), and
   `state.self` carries `inCombat` and `stunned`. Stand state, shapeshift form,
   glyphs, own stats and rested XP need fields the module does not forward yet.
 

@@ -1,8 +1,7 @@
 /**
  * The unit state flags named off the `unitFlags` and `dynamicFlags` the module
  * serves: `UnitView.inCombat` / `stunned` / `skinnable` / `lootable` / `tapped`
- * / `tappedByYou` with the raw words beside them, and `state.self.inCombat` /
- * `stunned`. Bit values are AzerothCore's (`UnitDefines.h`, `SharedDefines.h`);
+ * / `tappedByYou` and `state.self.inCombat` / `stunned`. Bit values are AzerothCore's (`UnitDefines.h`, `SharedDefines.h`);
  * the frames are hand-written from module/PROTOCOL.md.
  */
 import { describe, expect, test } from "bun:test";
@@ -41,18 +40,17 @@ const replay = (frames: readonly unknown[]) => StateCache.replay(toEvents(frames
 const mob = (cache: StateCache) => cache.units().find((u) => u.guid === MOB)!;
 
 describe("UnitView: unit state flags", () => {
-  test("a block with neither field leaves every flag and both raw words undefined", () => {
+  test("a block with neither field leaves every flag undefined", () => {
     const row = mob(replay([create(1, MOB, "unit", {})]));
-    for (const key of ["unitFlags", "dynamicFlags", "inCombat", "stunned", "skinnable", "lootable", "tapped", "tappedByYou"] as const) {
+    for (const key of ["inCombat", "stunned", "skinnable", "lootable", "tapped", "tappedByYou"] as const) {
       expect(row[key]).toBeUndefined();
     }
   });
 
-  test("unitFlags names in combat, stunned and skinnable, and serves the raw word", () => {
+  test("unitFlags names in combat, stunned and skinnable", () => {
     const row = mob(replay([create(1, MOB, "unit", { unitFlags: IN_COMBAT | SKINNABLE })]));
-    expect(row).toMatchObject({ unitFlags: IN_COMBAT | SKINNABLE, inCombat: true, stunned: false, skinnable: true });
+    expect(row).toMatchObject({ inCombat: true, stunned: false, skinnable: true });
     // dynamicFlags never carried: its readings stay unobserved, not false.
-    expect(row.dynamicFlags).toBeUndefined();
     expect(row.lootable).toBeUndefined();
     expect(row.tapped).toBeUndefined();
     expect(row.tappedByYou).toBeUndefined();
@@ -62,7 +60,7 @@ describe("UnitView: unit state flags", () => {
     const stunned = replay([create(1, MOB, "unit", { unitFlags: STUNNED }), values(2, MOB, { health: 40 })]);
     expect(mob(stunned)).toMatchObject({ stunned: true, inCombat: false, health: 40 });
     const cleared = replay([create(1, MOB, "unit", { unitFlags: STUNNED }), values(2, MOB, { unitFlags: IN_COMBAT })]);
-    expect(mob(cleared)).toMatchObject({ unitFlags: IN_COMBAT, stunned: false, inCombat: true });
+    expect(mob(cleared)).toMatchObject({ stunned: false, inCombat: true });
   });
 
   test("an unrelated bit (taxi flight) names none of them", () => {
@@ -75,9 +73,9 @@ describe("UnitView: unit state flags", () => {
 
   test("dynamicFlags names lootable, and the corpse stops being lootable when the bit drops", () => {
     const lootable = replay([create(1, MOB, "unit", { health: 0, dynamicFlags: LOOTABLE })]);
-    expect(mob(lootable)).toMatchObject({ dynamicFlags: LOOTABLE, lootable: true, tapped: false, tappedByYou: false });
+    expect(mob(lootable)).toMatchObject({ lootable: true, tapped: false, tappedByYou: false });
     const looted = replay([create(1, MOB, "unit", { health: 0, dynamicFlags: LOOTABLE }), values(2, MOB, { dynamicFlags: 0 })]);
-    expect(mob(looted)).toMatchObject({ dynamicFlags: 0, lootable: false });
+    expect(mob(looted)).toMatchObject({ lootable: false });
   });
 
   test("tapped by you is both bits, tapped by someone else is the first alone, untapped is neither", () => {
@@ -96,7 +94,7 @@ describe("UnitView: unit state flags", () => {
 
   test("a game object has the flags undefined, whatever its fields carry", () => {
     const row = mob(replay([create(1, MOB, "gameObject", { unitFlags: IN_COMBAT, dynamicFlags: LOOTABLE })]));
-    for (const key of ["unitFlags", "dynamicFlags", "inCombat", "stunned", "skinnable", "lootable", "tapped", "tappedByYou"] as const) {
+    for (const key of ["inCombat", "stunned", "skinnable", "lootable", "tapped", "tappedByYou"] as const) {
       expect(row[key]).toBeUndefined();
     }
   });

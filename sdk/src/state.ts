@@ -1507,29 +1507,25 @@ export interface UnitView {
    * tapped).
    */
   readonly reaction: UnitReaction | undefined;
-  /** `UNIT_FIELD_FLAGS` raw, the number the named flags below are read from; undefined until a block carried it. */
-  readonly unitFlags: number | undefined;
-  /** `UNIT_DYNAMIC_FLAGS` raw, as the server sent it to this client; undefined until a block carried it. */
-  readonly dynamicFlags: number | undefined;
   /**
-   * Units and players, from `unitFlags`: the client's own readings of the
-   * unit's state. `inCombat` is `UNIT_FLAG_IN_COMBAT`, `stunned`
+   * Units and players, from `UNIT_FIELD_FLAGS`: the client's own readings of
+   * the unit's state. `inCombat` is `UNIT_FLAG_IN_COMBAT`, `stunned`
    * `UNIT_FLAG_STUNNED`, `skinnable` `UNIT_FLAG_SKINNABLE` (a corpse that
-   * can be skinned). Each is undefined until a block carried `unitFlags`, and
+   * can be skinned). Each is undefined until a block carried the field, and
    * for game objects and corpses.
    */
   readonly inCombat: boolean | undefined;
   readonly stunned: boolean | undefined;
   readonly skinnable: boolean | undefined;
   /**
-   * Units and players, from `dynamicFlags`, which the server rewrites for each
+   * Units and players, from `UNIT_DYNAMIC_FLAGS`, which the server rewrites for each
    * receiver (`Unit::BuildValuesUpdate`): `lootable` is `UNIT_DYNFLAG_LOOTABLE`,
    * already cleared for a character not allowed to loot the corpse; `tapped`
    * is `UNIT_DYNFLAG_TAPPED`, the unit has a loot recipient (someone has
    * tagged it); `tappedByYou` is `UNIT_DYNFLAG_TAPPED_BY_PLAYER`, that
    * recipient is you or your group. Tapped by someone else is `tapped` with
-   * `tappedByYou` false. Each is undefined until a block carried
-   * `dynamicFlags`, and for game objects and corpses.
+   * `tappedByYou` false. Each is undefined until a block carried the
+   * field, and for game objects and corpses.
    */
   readonly lootable: boolean | undefined;
   readonly tapped: boolean | undefined;
@@ -5186,21 +5182,19 @@ function toUnitView(
 }
 
 /**
- * The raw flag words and the named readings off them for `toUnitView`: only a
- * unit or player has them, and each group is undefined until a block carried
- * its field, the way `taxiFlight` is read.
+ * The named readings off the flag words for `toUnitView`: only a unit or
+ * player has them, and each group is undefined until a block carried its
+ * field, the way `taxiFlight` is read.
  */
 function unitStateOf(
   type: string | undefined,
   unitFlags: number | undefined,
   dynamicFlags: number | undefined,
-): Pick<UnitView, "unitFlags" | "dynamicFlags" | "inCombat" | "stunned" | "skinnable" | "lootable" | "tapped" | "tappedByYou"> {
+): Pick<UnitView, "inCombat" | "stunned" | "skinnable" | "lootable" | "tapped" | "tappedByYou"> {
   const living = type === "unit" || type === "player";
   const u = living ? unitFlags : undefined;
   const d = living ? dynamicFlags : undefined;
   return {
-    unitFlags: u,
-    dynamicFlags: d,
     inCombat: u === undefined ? undefined : (u & UNIT_FLAG_IN_COMBAT) !== 0,
     stunned: u === undefined ? undefined : (u & UNIT_FLAG_STUNNED) !== 0,
     skinnable: u === undefined ? undefined : (u & UNIT_FLAG_SKINNABLE) !== 0,
