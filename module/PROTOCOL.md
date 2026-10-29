@@ -88,10 +88,14 @@ on `POST /lease` as "this module has no leasing" and runs
 without a session secret, where `403 operator_only` would mean the route is
 there and the credential is wrong.
 
-The module never logs a secret; `POST /lease` is the only response that carries
-one. Secrets are compared in constant time. With `WrathBench.Secret` unset or
-shorter than 32 characters the module does not listen at all (logged at ERROR),
-so a mis-deployed worldserver is unreachable rather than open.
+The module never logs a secret, and the worldserver log never carries a token:
+it names a session by `tok:` and the first 8 hex characters of the token's
+SHA-256, enough to correlate one session's lines and no more. (The per-session
+audit log is keyed by token; "Audit log" below.) `POST /lease` is the only
+response that carries a secret. Secrets are compared in constant time. With
+`WrathBench.Secret` unset or shorter than 32 characters the module does not
+listen at all (logged at ERROR), so a mis-deployed worldserver is unreachable
+rather than open.
 
 ## Versioning
 

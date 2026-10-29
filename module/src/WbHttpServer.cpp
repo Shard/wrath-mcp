@@ -99,7 +99,7 @@ namespace WrathBench
         {
             if (ec)
             {
-                LOG_DEBUG("module", "wrathbench: ws accept failed for token '{}': {}", _token, ec.message());
+                LOG_DEBUG("module", "wrathbench: ws accept failed for {}: {}", TokenTag(_token), ec.message());
                 return;
             }
             _opened = true;
