@@ -4349,23 +4349,12 @@ namespace WrathBench
         }
         w.Add("standing", standing);
         // The client adds its own Faction.dbc base for the character's race
-        // and class (ReputationMgr::GetBaseReputation is the same arithmetic
-        // over the same masks); `reputation` is what the pane shows and what
-        // the Neutral/Friendly/... rank is read off.
+        // and class, the base the server reads off the same masks
+        // (ReputationMgr::GetBaseReputation); `reputation` is what the pane
+        // shows and what the Neutral/Friendly/... rank is read off.
         if (fe && player)
         {
-            uint32 raceMask = player->getRaceMask();
-            uint32 classMask = player->getClassMask();
-            int32 base = 0;
-            for (int i = 0; i < 4; ++i)
-            {
-                if ((fe->BaseRepRaceMask[i] & raceMask || (fe->BaseRepRaceMask[i] == 0 && fe->BaseRepClassMask[i] != 0))
-                    && (fe->BaseRepClassMask[i] & classMask || fe->BaseRepClassMask[i] == 0))
-                {
-                    base = fe->BaseRepValue[i];
-                    break;
-                }
-            }
+            int32 base = player->GetReputationMgr().GetBaseReputation(fe);
             w.Add("base", base).Add("reputation", base + standing);
         }
         return w.Str();
