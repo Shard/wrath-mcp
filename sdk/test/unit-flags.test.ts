@@ -40,20 +40,20 @@ const replay = (frames: readonly unknown[]) => StateCache.replay(toEvents(frames
 const mob = (cache: StateCache) => cache.units().find((u) => u.guid === MOB)!;
 
 describe("UnitView: unit state flags", () => {
-  test("a block with neither field leaves every flag undefined", () => {
-    const row = mob(replay([create(1, MOB, "unit", {})]));
+  test("a create block with neither field states every flag false; a values block alone leaves them undefined", () => {
+    const created = mob(replay([create(1, MOB, "unit", {})]));
+    const seen = mob(replay([values(1, MOB, { health: 40 })]));
     for (const key of ["inCombat", "stunned", "skinnable", "lootable", "tapped", "tappedByYou"] as const) {
-      expect(row[key]).toBeUndefined();
+      expect(created[key]).toBe(false);
+      expect(seen[key]).toBeUndefined();
     }
   });
 
   test("unitFlags names in combat, stunned and skinnable", () => {
     const row = mob(replay([create(1, MOB, "unit", { unitFlags: IN_COMBAT | SKINNABLE })]));
     expect(row).toMatchObject({ inCombat: true, stunned: false, skinnable: true });
-    // dynamicFlags never carried: its readings stay unobserved, not false.
-    expect(row.lootable).toBeUndefined();
-    expect(row.tapped).toBeUndefined();
-    expect(row.tappedByYou).toBeUndefined();
+    // dynamicFlags absent from a create block is 0: nothing lootable or tapped.
+    expect(row).toMatchObject({ lootable: false, tapped: false, tappedByYou: false });
   });
 
   test("a raised flag clears on the next delta that carries the field, and survives one that does not", () => {

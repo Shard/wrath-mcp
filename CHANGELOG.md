@@ -188,6 +188,21 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 - `sdk/API.md`: `raw`'s row said no SDK method sends the talent opcodes, though
   `learnTalent` sends `CMSG_LEARN_TALENT`; `state.self.corpse` is documented;
   `acceptQuestFrom` lists its statuses and `useItem` names `quest_refused`.
+- A create block's absent fields read as zero. The core sends only the
+  non-zero fields in a create (`Object::BuildValuesUpdate`), and a client
+  starts every field at 0, so the cache now states `unitFlags`,
+  `dynamicFlags`, `standState` and `shapeshiftForm` (and, for the
+  character itself, `playerFlags` and `restedXp`) as 0 when a create block
+  leaves them out. A fresh character reads `state.self.standState` stand,
+  `sitting` false, `shapeshiftForm` none, `restedXp` 0, and a creature with no
+  flags reads `inCombat`, `stunned`, `skinnable`, `sitting` false, where they
+  were undefined until the first change. A values block that omits a field
+  still means unchanged.
+- `castSpell` and `useItem` with a `targetPoint` that names no point (no z, a
+  unit or name that is not in view) answer `{ ok: false, status:
+  "unknown_target", hint }` with nothing sent, as `moveTo` answers a target it
+  cannot place; they threw. A malformed point and an unresolvable `targetItem`
+  still throw.
 
 ## 0.2.0
 

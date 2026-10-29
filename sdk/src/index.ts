@@ -56,6 +56,7 @@ export type {
   QuestOptions,
   UseItemOptions,
   CastTargetOptions,
+  CastPointRefusal,
   ItemTargetRef,
   QuestOfferRow,
   QuestRewardChoice,

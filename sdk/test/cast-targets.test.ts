@@ -183,12 +183,34 @@ describe("targetPoint", () => {
     await stub.stop();
   });
 
-  test("no z, or a unit out of view, throws before anything is sent", async () => {
+  test("no z, or a unit out of view, is answered unknown_target and nothing is sent", async () => {
     const stub = startStub({ onConnect: () => world() });
     const client = await inWorld(stub);
-    expect(() => client.castSpell(MEND, undefined, { targetPoint: { x: 1, y: 2 } as never })).toThrow(/needs z as well as x and y; nothing was sent/);
-    expect(() => client.castSpell(MEND, undefined, { targetPoint: "99999" })).toThrow(/guid 99999 is not in view/);
-    await expect(client.useItem("Gritstone Charm", undefined, undefined, { targetPoint: { x: 1, y: 2 } as never })).rejects.toThrow(/needs z/);
+    const noZ = await client.castSpell(MEND, undefined, { targetPoint: { x: 1, y: 2 } as never });
+    expect(noZ).toMatchObject({ ok: false, status: "unknown_target" });
+    expect((noZ as { hint: string }).hint).toMatch(/needs z as well as x and y; nothing was sent/);
+    const away = await client.castSpell(MEND, undefined, { targetPoint: "99999" });
+    expect(away).toMatchObject({ ok: false, status: "unknown_target" });
+    expect((away as { hint: string }).hint).toMatch(/guid 99999 is not in view/);
+    const nameless = await client.castSpell(MEND, undefined, { targetPoint: "Nobody Here" });
+    expect(nameless).toMatchObject({ ok: false, status: "unknown_target" });
+    expect((nameless as { hint: string }).hint).toMatch(/neither a decimal guid nor the name of anything in view/);
+    const item = await client.useItem("Gritstone Charm", undefined, undefined, { targetPoint: { x: 1, y: 2 } as never });
+    expect(item).toMatchObject({ ok: false, status: "unknown_target" });
+    expect((item as { hint: string }).hint).toMatch(/needs z/);
+    expect(stub.actions).toEqual([]);
+    expect(client.drainActionHints().map((h) => [h.action, h.status])).toEqual([
+      ["castSpell", "unknown_target"],
+      ["useItem", "unknown_target"],
+    ]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a malformed point still throws, as moveTo's does", async () => {
+    const stub = startStub({ onConnect: () => world() });
+    const client = await inWorld(stub);
+    expect(() => client.castSpell(MEND, undefined, { targetPoint: { x: 1, y: 2, z: Number.NaN } })).toThrow();
     expect(stub.actions).toEqual([]);
     client.close();
     await stub.stop();
