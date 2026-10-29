@@ -160,12 +160,15 @@ const UNIT_FLAG_TAXI_FLIGHT = 0x0010_0000;
 /**
  * The `unitFlags` bits (AzerothCore `UnitDefines.h`, `UnitFlags`) and the
  * `dynamicFlags` bits (`SharedDefines.h`, `UnitDynFlags`) a client names:
- * stunned, in combat, skinnable; lootable, tapped, tapped by you. Decoded from
- * the two integers the module already serves; nothing new is observed.
+ * stunned, in combat, skinnable, mounted; lootable, tapped, tapped by you.
+ * Decoded from the two integers the module already serves; nothing new is
+ * observed. `UNIT_FLAG_MOUNT` is the bit the server's own `IsMounted()` reads,
+ * set by `Unit::Mount` and cleared by `Unit::Dismount`.
  */
 const UNIT_FLAG_STUNNED = 0x0004_0000;
 const UNIT_FLAG_IN_COMBAT = 0x0008_0000;
 const UNIT_FLAG_SKINNABLE = 0x0400_0000;
+const UNIT_FLAG_MOUNT = 0x0800_0000;
 const UNIT_DYNFLAG_LOOTABLE = 0x0001;
 const UNIT_DYNFLAG_TAPPED = 0x0004;
 const UNIT_DYNFLAG_TAPPED_BY_PLAYER = 0x0008;
@@ -637,6 +640,12 @@ export interface SelfState extends UnitFieldsState {
    */
   inCombat: Observed<boolean> | undefined;
   stunned: Observed<boolean> | undefined;
+  /**
+   * `UNIT_FLAG_MOUNT` on our own `unitFlags`: true while the character rides
+   * a mount. A flight path mounts the rider too, so it is true for the ride
+   * (`taxiFlight`), which cannot be dismounted. Guarded the same way.
+   */
+  mounted: Observed<boolean> | undefined;
   /**
    * The last `SMSG_ACTIVATETAXIREPLY` (the answer to a raw `CMSG_ACTIVATETAXI`).
    * Kept because it is the only thing that says a flight was *accepted*; the
@@ -1936,6 +1945,7 @@ export class StateCache {
     ghost: undefined,
     inCombat: undefined,
     stunned: undefined,
+    mounted: undefined,
     taxiReply: undefined,
     bindPoint: undefined,
     health: undefined,
@@ -4975,11 +4985,13 @@ export class StateCache {
         this.self.resting = { value: (fields.playerFlags & PLAYER_FLAGS_RESTING) !== 0, seq, ts };
         this.self.ghost = { value: (fields.playerFlags & PLAYER_FLAGS_GHOST) !== 0, seq, ts };
       }
-      // `inCombat` and `stunned` are the same shape off `unitFlags`, in their
-      // own guard: a delta without the field says nothing about either.
+      // `inCombat`, `stunned` and `mounted` are the same shape off
+      // `unitFlags`, in their own guard: a delta without the field says
+      // nothing about any of them.
       if (typeof fields.unitFlags === "number") {
         this.self.inCombat = { value: (fields.unitFlags & UNIT_FLAG_IN_COMBAT) !== 0, seq, ts };
         this.self.stunned = { value: (fields.unitFlags & UNIT_FLAG_STUNNED) !== 0, seq, ts };
+        this.self.mounted = { value: (fields.unitFlags & UNIT_FLAG_MOUNT) !== 0, seq, ts };
       }
       const healthAfter = target.fields.get("health")?.value;
       const pos = this.self.position?.value;

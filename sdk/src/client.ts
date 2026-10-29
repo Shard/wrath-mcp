@@ -749,12 +749,12 @@ const ERROR_CODE_HINTS: Record<string, string> = {
     "this session already played a character (see `bound`) and cannot create another — call createSession " +
     "with that name, or deleteSession and continue with it",
   item_not_usable:
-    "the module refused use_item for that bag/slot — the item there has no on-use spell and no quest to start, " +
+    "the module refused use_item for that bag/slot — the item there has no on-use spell, no quest to start and does not open for loot, " +
     "or the slot is empty or shifted (slots move after looting/selling); check state.bag()",
   opcode_not_allowed:
     "sdk.raw() sends only the CMSG_* opcodes on the module's raw allowlist, and this one is not on it — " +
     "where an sdk method sends that opcode (castSpell, questAccept, ...) call the method, otherwise it cannot be sent; " +
-    "an aura you can cancel, a mount among them, goes with sdk.raw(\"CMSG_CANCEL_AURA\", [{ u32: spellId }])",
+    "a mount comes off with dismount(); any other aura you can cancel goes with sdk.raw(\"CMSG_CANCEL_AURA\", [{ u32: spellId }])",
   invalid_payload:
     "the raw payload did not reach the module as whole hex bytes — pass a field list like " +
     "[{ u32: id }, { guid: unit.guid }] and let the SDK pack it",
@@ -2381,7 +2381,15 @@ export type UseItemResult =
       readonly reason: number;
       readonly questOffer?: undefined;
       readonly hint: string;
-    };
+    }
+  /**
+   * An item that opens for loot (a clam, a satchel, a lockbox): what its
+   * window gave up, read exactly as `lootCorpse` reads a corpse's.
+   */
+  | (Extract<LootResult, { status: "looted" | "none_stored" | "empty" }> & {
+      readonly questOffer?: undefined;
+      readonly hint?: string;
+    });
 
 /** `ITEM_SPELLTRIGGER_ON_USE`: the template spell a client's right-click casts. */
 const ITEM_SPELLTRIGGER_ON_USE = 0;
@@ -2840,7 +2848,7 @@ const TAXI_REPLY_HINTS: Record<number, string> = {
   5: "no flight master is in interaction range (ERR_TAXINOVENDORNEARBY); moveTo the NPC and retry",
   6: "this character has not visited that node (ERR_TAXINOTVISITED) — a flight master only sells routes between nodes you have discovered on foot; the destination must be in state.lastTaxiNodes(guid).known",
   7: "you are busy (ERR_TAXIPLAYERBUSY): in combat, casting, or trading; wait and retry",
-  8: "you are already mounted (ERR_TAXIPLAYERALREADYMOUNTED); dismount first — sdk.raw(\"CMSG_CANCEL_AURA\", [{ u32: mountSpellId }]) cancels the mount's aura",
+  8: "you are already mounted (ERR_TAXIPLAYERALREADYMOUNTED); dismount() first",
   9: "you are shapeshifted (ERR_TAXIPLAYERSHAPESHIFTED); cancel the form first",
   10: "you are moving (ERR_TAXIPLAYERMOVING); stop(), stand still a moment, retry",
   11: "the destination is the node you are standing at (ERR_TAXISAMENODE); pick another",
@@ -3415,6 +3423,26 @@ export type ActivateTaxiResult =
       readonly to: TaxiNodeRef;
       readonly hint: string;
     };
+
+export interface DismountOptions {
+  /** How long to wait for the mount to come off, in ms. Default 3000. */
+  timeout?: number;
+}
+
+/**
+ * The outcome of `dismount`, as a value. `dismounted` is `state.self.mounted`
+ * observed false after the send. The refusals are read off the state cache
+ * before anything is sent, because the server answers both with only a
+ * system line.
+ *
+ * - `not_mounted`: `state.self.mounted` already says false; nothing was sent.
+ * - `in_flight`: on a flight path (`state.self.taxiFlight`); the server keeps
+ *   the rider mounted until the landing, so nothing was sent.
+ * - `unconfirmed`: sent, and no update clearing the mount arrived in time.
+ */
+export type DismountResult =
+  | { readonly ok: true; readonly status: "dismounted" }
+  | { readonly ok: false; readonly status: "not_mounted" | "in_flight" | "unconfirmed"; readonly hint: string };
 
 export interface BindOptions {
   /** How long to wait for each of the three server answers (menu, confirm, bind point), in ms. Default 10000. */
@@ -5332,6 +5360,12 @@ export class WrathClient {
    * it is `acceptQuestFrom(questOffer.itemGuid, questOffer.questId)` — the
    * item guid stands where an NPC guid would (2026-08-30, the Tome of
    * Divinity defect).
+   *
+   * An item that opens for loot (a clam, a satchel, a lockbox) is opened the
+   * way a client's right-click does it, `CMSG_OPEN_ITEM`, and its window is
+   * emptied as `lootCorpse` empties a corpse's: the answer is `looted`,
+   * `none_stored` or `empty` with what reached the bag, or `refused` with the
+   * `InventoryResult` (a locked lockbox).
    */
   async useItem(bagOrName: number | string, slot?: number | GuidOrUnit, targetGuid?: GuidOrUnit, options: UseItemOptions = {}): Promise<WithResolved<UseItemResult>> {
     // `useItem("Healing Potion", guid)`: with a name, the second argument
@@ -5350,50 +5384,109 @@ export class WrathClient {
     slot = where.slot;
     const item = this.state.bag().items.find((i) => i.bag === bag && i.slot === slot);
     const startQuest = questStartedBy(this.state, item);
-    const sinceSeq = this.events.recent(1)[0]?.seq;
-    let ack: ActionResponse;
-    try {
-      ack = await this.action({
-        action: "use_item",
-        bag,
-        slot,
-        targetGuid: targetGuid === undefined ? undefined : this.targetGuid(targetGuid, "useItem(..., targetGuid)"),
-        ...(glyphSlot === undefined ? {} : { glyphSlot }),
-      });
-    } catch (err) {
-      // A bare item_not_usable cannot be told apart from "the slot shifted
-      // under me" (roster-sonnet-20260822); say what the local cache thinks is
-      // at that address so the model does not have to guess.
-      if (err instanceof WrathRequestError && err.code === "item_not_usable") {
-        const label = item === undefined ? "" : `${item.name ?? `item ${item.itemId ?? "?"}`}${item.count !== undefined ? ` x${item.count}` : ""}`;
-        err.message += item === undefined
-          ? ` — local state sees nothing at bag ${bag} slot ${slot}; slots shift after looting/selling, re-read state.bag()`
-          : startQuest !== undefined
-            ? ` — local state sees ${label} at bag ${bag} slot ${slot}, and its tooltip says it starts quest ${startQuest}: this module build predates quest-start items and must be rebuilt; until then the quest cannot be started from the item`
-            : ` — local state sees ${label} at bag ${bag} slot ${slot}: that item has no on-use spell and no quest to start (per its tooltip, state.items)`;
-      }
-      throw err;
-    }
     const spellId = onUseSpellOf(this.state, item);
-    if (spellId !== undefined && item !== undefined) {
-      const refusal = await this.useItemVerdict(item, spellId, sinceSeq);
-      if (refusal !== undefined) return withResolved(where, refusal);
+    // The module accepts an item with neither an on-use spell nor a quest to
+    // start only when it opens for loot, so an ack for one whose tooltip (its
+    // spell list included) is cached is an open, and the window it brings is
+    // emptied like a corpse's.
+    const opens = item !== undefined && spellId === undefined && startQuest === undefined && item.itemId !== undefined &&
+      this.state.items.get(item.itemId)?.value?.spells !== undefined;
+    const sinceSeq = this.events.recent(1)[0]?.seq;
+    // Collected from before the dispatch, as lootCorpse does, so no push slips
+    // in ahead of the listener.
+    const stored: StoredLootItem[] = [];
+    const offPush = opens
+      ? this.events.on("SMSG_ITEM_PUSH_RESULT", (e: StreamEvent) => {
+          if (isDecodeError(e.data) || (sinceSeq !== undefined && e.seq <= sinceSeq)) return;
+          const d = e.data as ItemPushResultData;
+          if (d.looted) stored.push({ itemId: d.itemId, count: d.count });
+        })
+      : undefined;
+    try {
+      let ack: ActionResponse;
+      try {
+        ack = await this.action({
+          action: "use_item",
+          bag,
+          slot,
+          targetGuid: targetGuid === undefined ? undefined : this.targetGuid(targetGuid, "useItem(..., targetGuid)"),
+          ...(glyphSlot === undefined ? {} : { glyphSlot }),
+        });
+      } catch (err) {
+        // A bare item_not_usable cannot be told apart from "the slot shifted
+        // under me" (roster-sonnet-20260822); say what the local cache thinks is
+        // at that address so the model does not have to guess.
+        if (err instanceof WrathRequestError && err.code === "item_not_usable") {
+          const label = item === undefined ? "" : `${item.name ?? `item ${item.itemId ?? "?"}`}${item.count !== undefined ? ` x${item.count}` : ""}`;
+          err.message += item === undefined
+            ? ` — local state sees nothing at bag ${bag} slot ${slot}; slots shift after looting/selling, re-read state.bag()`
+            : startQuest !== undefined
+              ? ` — local state sees ${label} at bag ${bag} slot ${slot}, and its tooltip says it starts quest ${startQuest}: this module build predates quest-start items and must be rebuilt; until then the quest cannot be started from the item`
+              : ` — local state sees ${label} at bag ${bag} slot ${slot}: that item has no on-use spell and no quest to start (per its tooltip, state.items), and does not open for loot`;
+        }
+        throw err;
+      }
+      if (spellId !== undefined && item !== undefined) {
+        const refusal = await this.useItemVerdict(item, spellId, sinceSeq);
+        if (refusal !== undefined) return withResolved(where, refusal);
+      }
+      if (opens) return withResolved(where, await this.openedItemLoot(item, sinceSeq, stored, options.timeout ?? 10_000));
+      if (startQuest === undefined || item === undefined) return withResolved(where, ack);
+      const offer = await this.waitEvent((e) => questOfferOrRefusal(e, startQuest, sinceSeq), {
+        timeout: options.timeout ?? 10_000,
+        description:
+          `the quest offer (SMSG_QUESTGIVER_QUEST_DETAILS for quest ${startQuest}, or SMSG_QUESTGIVER_QUEST_INVALID) ` +
+          `from ${item.name ?? `item ${item.itemId}`}; check state.quest(id)`,
+      });
+      if (isEvent(offer, "SMSG_QUESTGIVER_QUEST_INVALID")) {
+        const reason = (offer.data as QuestGiverQuestInvalidData).reason;
+        const hint = questInvalidHint(startQuest, reason);
+        this.noteActionHint("useItem", "quest_refused", hint);
+        return withResolved(where, { ok: false, status: "quest_refused", questId: startQuest, reason, hint });
+      }
+      const data = offer.data as QuestGiverQuestDetailsData;
+      return withResolved(where, { ...ack, questOffer: { questId: data.questId, title: data.title, itemGuid: item.guid } });
+    } finally {
+      offPush?.();
     }
-    if (startQuest === undefined || item === undefined) return withResolved(where, ack);
-    const offer = await this.waitEvent((e) => questOfferOrRefusal(e, startQuest, sinceSeq), {
-      timeout: options.timeout ?? 10_000,
-      description:
-        `the quest offer (SMSG_QUESTGIVER_QUEST_DETAILS for quest ${startQuest}, or SMSG_QUESTGIVER_QUEST_INVALID) ` +
-        `from ${item.name ?? `item ${item.itemId}`}; check state.quest(id)`,
-    });
-    if (isEvent(offer, "SMSG_QUESTGIVER_QUEST_INVALID")) {
-      const reason = (offer.data as QuestGiverQuestInvalidData).reason;
-      const hint = questInvalidHint(startQuest, reason);
-      this.noteActionHint("useItem", "quest_refused", hint);
-      return withResolved(where, { ok: false, status: "quest_refused", questId: startQuest, reason, hint });
+  }
+
+  /**
+   * The loot of an item `useItem` opened (`CMSG_OPEN_ITEM`): its window
+   * (`SMSG_LOOT_RESPONSE` under the item's own guid) emptied the client's way,
+   * as a chest's is, and the bag pushes counted. A window that closes at once
+   * is `empty`; a refusal — locked, or dead — is `SMSG_INVENTORY_CHANGE_FAILURE`
+   * for the item and comes back as `refused`. Silence throws `EventTimeoutError`.
+   */
+  private async openedItemLoot(
+    item: BagSlotItem,
+    sinceSeq: number | undefined,
+    stored: StoredLootItem[],
+    timeout: number,
+  ): Promise<UseItemResult> {
+    const ours = (guid: string) => guidKey(guid) === item.guid;
+    const first = await this.waitEvent(
+      (e) =>
+        (sinceSeq === undefined || e.seq > sinceSeq) &&
+        !isDecodeError(e.data) &&
+        ((isEvent(e, "SMSG_LOOT_RESPONSE") && !isLootError(e.data as LootResponseData) && ours((e.data as LootWindowData).guid)) ||
+          (isEvent(e, "SMSG_LOOT_RELEASE_RESPONSE") && ours((e.data as { guid: string }).guid)) ||
+          (isEvent(e, "SMSG_INVENTORY_CHANGE_FAILURE") && isOwnInventoryFailure(e.data as InventoryChangeFailureData, item.guid))),
+      {
+        timeout,
+        description:
+          `the loot window of ${item.name ?? `item ${item.itemId}`} (SMSG_LOOT_RESPONSE, SMSG_LOOT_RELEASE_RESPONSE ` +
+          `or SMSG_INVENTORY_CHANGE_FAILURE)`,
+      },
+    );
+    if (isEvent(first, "SMSG_INVENTORY_CHANGE_FAILURE")) {
+      const code = (first.data as InventoryChangeFailureData).result;
+      const hint = `${JSON.stringify(item.name ?? `item ${item.itemId ?? "?"}`)} was not opened: ${inventoryResultText(code) ?? `inventory error ${code}`}`;
+      this.noteActionHint("useItem", "refused", hint);
+      return { ok: false, status: "refused", result: code, hint };
     }
-    const data = offer.data as QuestGiverQuestDetailsData;
-    return withResolved(where, { ...ack, questOffer: { questId: data.questId, title: data.title, itemGuid: item.guid } });
+    if (isEvent(first, "SMSG_LOOT_RELEASE_RESPONSE")) return { ok: false, status: "empty", gold: 0, items: [] };
+    return this.emptyLootWindow(first, first.data as LootWindowData, stored, timeout, item.guid);
   }
 
   /**
@@ -8205,53 +8298,72 @@ export class WrathClient {
             hint: LOOT_REFUSED_HINTS[error],
           };
         }
-        const window: LootWindowData = response;
-        // What the replay will try to store: slots free to loot (0, ALLOW_LOOT)
-        // or owned outright (4, OWNER — every slot of a solo loot). Group-only
-        // slot types are shown but never auto-stored.
-        const expected = window.items.filter(isStorableSlot).length;
-        if (chest) {
-          // The module's auto-loot replay rides on `loot_all`, which a chest
-          // never goes through; send the client's sequence from here.
-          for (const item of window.items.filter(isStorableSlot)) await this.lootItem(item.slot);
-          if (window.gold > 0) await this.lootMoney();
-          await this.lootRelease(id);
-        }
-        const release = await this.waitEvent((e) => isEvent(e, "SMSG_LOOT_RELEASE_RESPONSE"), {
-          timeout,
-          sinceSeq: first.seq + 1,
-          includeBuffered: true,
-          description: "the loot window closing (SMSG_LOOT_RELEASE_RESPONSE)",
-        });
-        // The pushes usually precede the release, but the ordering is not
-        // contractual; give stragglers a short grace rather than under-reporting.
-        const deadline = Date.now() + Math.min(timeout, LOOT_PUSH_GRACE_MS);
-        let graceSince = release.seq + 1;
-        while (stored.length < expected && Date.now() < deadline) {
-          try {
-            const push = await this.waitEvent(
-              (e) => isEvent(e, "SMSG_ITEM_PUSH_RESULT") && !isDecodeError(e.data),
-              { timeout: Math.max(1, deadline - Date.now()), sinceSeq: graceSince },
-            );
-            graceSince = push.seq + 1; // the on() listener above already recorded it
-          } catch {
-            break; // grace expired: report what was confirmed, nothing more
-          }
-        }
-        // A slot up for a group roll is shown and never stored: the roll is
-        // the way to it, so the answer says one is open and how to vote.
-        const rolling = window.items.filter((i) => i.slotType === LOOT_SLOT_ROLL_ONGOING);
-        const now = this.state.lastTs;
-        const frames = this.state.pendingRolls(now).filter((r) => rolling.some((i) => i.slot === r.slot && i.itemId === r.itemId));
-        const roll = frames.length > 0 ? { hint: openRollsHint(frames, now) } : {};
-        if (expected > 0 && stored.length === 0) {
-          return { ok: false, status: "none_stored", gold: window.gold, items: [], window: window.items, ...roll };
-        }
-        return { ok: true, status: "looted", gold: window.gold, items: stored, window: window.items, ...roll };
+        // The module's auto-loot replay rides on `loot_all`, which a chest
+        // never goes through; the client's sequence is sent from here.
+        return await this.emptyLootWindow(first, response, stored, timeout, chest ? id : undefined);
       } finally {
         offPush();
       }
     });
+  }
+
+  /**
+   * The tail of a loot once its window is open: wait for the release, count
+   * the bag pushes `stored` collects (its listener registered before the
+   * window was asked for), and answer `looted` or `none_stored`. With
+   * `releaseGuid` the client's auto-loot sequence is sent from here —
+   * `CMSG_AUTOSTORE_LOOT_ITEM` per storable slot, `CMSG_LOOT_MONEY` if there
+   * is gold, `CMSG_LOOT_RELEASE` — for a window `loot_all` did not open (a
+   * chest, an item opened by `useItem`); without it the module's replay is
+   * already doing it.
+   */
+  private async emptyLootWindow(
+    first: StreamEvent,
+    window: LootWindowData,
+    stored: StoredLootItem[],
+    timeout: number,
+    releaseGuid: string | undefined,
+  ): Promise<Extract<LootResult, { status: "looted" | "none_stored" }>> {
+    // What the replay will try to store: slots free to loot (0, ALLOW_LOOT)
+    // or owned outright (4, OWNER — every slot of a solo loot). Group-only
+    // slot types are shown but never auto-stored.
+    const expected = window.items.filter(isStorableSlot).length;
+    if (releaseGuid !== undefined) {
+      for (const item of window.items.filter(isStorableSlot)) await this.lootItem(item.slot);
+      if (window.gold > 0) await this.lootMoney();
+      await this.lootRelease(releaseGuid);
+    }
+    const release = await this.waitEvent((e) => isEvent(e, "SMSG_LOOT_RELEASE_RESPONSE"), {
+      timeout,
+      sinceSeq: first.seq + 1,
+      includeBuffered: true,
+      description: "the loot window closing (SMSG_LOOT_RELEASE_RESPONSE)",
+    });
+    // The pushes usually precede the release, but the ordering is not
+    // contractual; give stragglers a short grace rather than under-reporting.
+    const deadline = Date.now() + Math.min(timeout, LOOT_PUSH_GRACE_MS);
+    let graceSince = release.seq + 1;
+    while (stored.length < expected && Date.now() < deadline) {
+      try {
+        const push = await this.waitEvent(
+          (e) => isEvent(e, "SMSG_ITEM_PUSH_RESULT") && !isDecodeError(e.data),
+          { timeout: Math.max(1, deadline - Date.now()), sinceSeq: graceSince },
+        );
+        graceSince = push.seq + 1; // the caller's on() listener already recorded it
+      } catch {
+        break; // grace expired: report what was confirmed, nothing more
+      }
+    }
+    // A slot up for a group roll is shown and never stored: the roll is
+    // the way to it, so the answer says one is open and how to vote.
+    const rolling = window.items.filter((i) => i.slotType === LOOT_SLOT_ROLL_ONGOING);
+    const now = this.state.lastTs;
+    const frames = this.state.pendingRolls(now).filter((r) => rolling.some((i) => i.slot === r.slot && i.itemId === r.itemId));
+    const roll = frames.length > 0 ? { hint: openRollsHint(frames, now) } : {};
+    if (expected > 0 && stored.length === 0) {
+      return { ok: false, status: "none_stored", gold: window.gold, items: [], window: window.items, ...roll };
+    }
+    return { ok: true, status: "looted", gold: window.gold, items: stored, window: window.items, ...roll };
   }
 
   /**
@@ -8663,6 +8775,48 @@ export class WrathClient {
       this.noteActionHint("activateTaxi", "refused", hint);
       return { ok: false, status: "refused", reply, from: window.current, via, to, hint };
     });
+  }
+
+  /**
+   * Get off the mount, as the client's Dismount does: `CMSG_CANCEL_MOUNT_AURA`
+   * (no body; `HandleCancelMountAuraOpcode` dismounts and removes every
+   * mount aura), then wait for `state.self.mounted` to read false. Refused
+   * from the state cache, nothing sent, when the character is not mounted or
+   * is on a flight path (see `DismountResult`).
+   */
+  async dismount(options: DismountOptions = {}): Promise<DismountResult> {
+    if (this.state.self.taxiFlight?.value === true) {
+      const hint = "on a flight path: the rider stays mounted until the landing (state.self.taxiFlight turns false)";
+      this.noteActionHint("dismount", "in_flight", hint);
+      return { ok: false, status: "in_flight", hint };
+    }
+    if (this.state.self.mounted?.value === false) {
+      const hint = "not mounted (state.self.mounted is false); nothing was sent";
+      this.noteActionHint("dismount", "not_mounted", hint);
+      return { ok: false, status: "not_mounted", hint };
+    }
+    const sinceSeq = this.events.recent(1)[0]?.seq;
+    await this.raw("CMSG_CANCEL_MOUNT_AURA");
+    const off = (): boolean => {
+      const m = this.state.self.mounted;
+      return m !== undefined && m.value === false && (sinceSeq === undefined || m.seq > sinceSeq);
+    };
+    if (!off()) {
+      try {
+        await this.waitEvent(() => off(), {
+          timeout: options.timeout ?? 3000,
+          description: "the mount coming off (UNIT_FLAG_MOUNT cleared on our own unitFlags)",
+        });
+      } catch (e) {
+        if (!(e instanceof EventTimeoutError)) throw e;
+      }
+    }
+    if (off()) return { ok: true, status: "dismounted" };
+    const hint =
+      "no update clearing the mount arrived after CMSG_CANCEL_MOUNT_AURA; read state.self.mounted before trying " +
+      "again (the server answers a character that is not mounted with only a system line)";
+    this.noteActionHint("dismount", "unconfirmed", hint);
+    return { ok: false, status: "unconfirmed", hint };
   }
 
   /**

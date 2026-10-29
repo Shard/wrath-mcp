@@ -28,6 +28,8 @@ export type {
   BuySpellResult,
   ConnectOptions,
   DeleteCharacterOptions,
+  DismountOptions,
+  DismountResult,
   EquipItemResult,
   EquipOptions,
   ErrorCode,
