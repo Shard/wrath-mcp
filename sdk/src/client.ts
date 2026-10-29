@@ -1054,6 +1054,14 @@ export type MoveResult =
       readonly ok: true;
       readonly status: "arrived";
       readonly moveId: number;
+      /**
+       * The unit this move drove when it was not the character — the vehicle
+       * or possessed unit the client moves (`state.self.control`); `position`
+       * is then that unit's. Absent on the character's own walk.
+       */
+      readonly mover?: string;
+      /** The leg was flown (a flying mover's straight line), not walked over the mesh. */
+      readonly flight?: boolean;
       readonly position: UnitPosition;
       readonly seq: number;
       readonly ts: number;
@@ -1085,6 +1093,8 @@ export type MoveResult =
       readonly ok: true;
       readonly status: "transferred";
       readonly moveId: number;
+      readonly mover?: string;
+      readonly flight?: boolean;
       /** Where the character was on the old map when the portal took it. */
       readonly position: UnitPosition;
       readonly seq: number;
@@ -1107,6 +1117,8 @@ export type MoveResult =
       readonly ok: true;
       readonly status: "teleported";
       readonly moveId: number;
+      readonly mover?: string;
+      readonly flight?: boolean;
       /** Where the character was when the teleport took it. */
       readonly position: UnitPosition;
       readonly seq: number;
@@ -1141,6 +1153,8 @@ export type MoveResult =
       readonly dz?: undefined;
       readonly surfaceZ?: undefined;
       readonly nearest?: undefined;
+      readonly mover?: undefined;
+      readonly flight?: undefined;
       /** Why the target resolved to nothing, and what to pass instead. */
       readonly hint: string;
     }
@@ -1148,6 +1162,10 @@ export type MoveResult =
       readonly ok: false;
       readonly status: Exclude<KnownMoveStatus, "arrived" | "transferred" | "teleported"> | (string & {});
       readonly moveId: number;
+      /** The unit this move drove, or was asked to drive, when it was not the character; `position` is then that unit's. */
+      readonly mover?: string;
+      /** The leg was flown: a flying mover's straight line, judged against the client's own geometry. */
+      readonly flight?: boolean;
       readonly position: UnitPosition;
       readonly seq: number;
       readonly ts: number;
@@ -1228,10 +1246,14 @@ export const MOVE_HINTS: Readonly<Record<string, (point: MovePoint, data: MoveRe
     `cast, ignores pathing, and returns you to your bound inn; retry it if the cast fails with ` +
     `SPELL_FAILED_MOVING.`,
   path_incomplete: (p, d) =>
-    `the walkable mesh has no continuous route to (${fmtXY(p)})` +
-    (d.reachedPos ? `; it ends at (${fmtXY(d.reachedPos)}, z ${d.reachedPos.z.toFixed(1)})${heightGap(d.reachedPos.z - p.z)}` : "") +
-    `. The module already tried one subdivision. Route around (a road, a ramp, a door) or approach from ` +
-    `another side.`,
+    d.flight === true
+      ? `the straight flight line to (${fmtXY(p)}, z ${p.z.toFixed(1)}) runs into terrain or a building` +
+        (d.reachedPos ? `; it is clear as far as (${fmtXY(d.reachedPos)}, z ${d.reachedPos.z.toFixed(1)})` : "") +
+        `. Fly higher (a point well above the ground between) or around it, in a leg or two.`
+      : `the walkable mesh has no continuous route to (${fmtXY(p)})` +
+        (d.reachedPos ? `; it ends at (${fmtXY(d.reachedPos)}, z ${d.reachedPos.z.toFixed(1)})${heightGap(d.reachedPos.z - p.z)}` : "") +
+        `. The module already tried one subdivision. Route around (a road, a ramp, a door) or approach from ` +
+        `another side.`,
   drop: (p, d) => {
     const edge = d.reachedPos ?? d.pos;
     if (d.dz !== undefined && d.dz > 0) return climbHint(d.dz, edge);
@@ -1303,21 +1325,25 @@ const ROOTED_MOVE_HINT = "you are rooted or stunned and cannot move until it wea
 const ROOTED_WALK_HINT = "a root or stun stopped you mid-walk where you stand; you cannot move until it wears off.";
 
 /**
- * `controlling`, refused: the client moves another unit (a vehicle's driving
- * seat, a possession), which the walker does not drive yet, and sent nothing.
+ * `controlling`, refused: the server holds a mover for this client (a
+ * vehicle, a possessed unit: `state.self.control.mover`) that the walker
+ * cannot reach — not in view on this map — so nothing was sent.
  */
 const CONTROLLING_MOVE_HINT =
-  "you are controlling another unit (state.self.control.mover: a vehicle's driving seat or a possessed unit) and " +
-  "moveTo does not drive it yet; the move was not sent. Its spells are on state.pet() (petCast); leaveVehicle() " +
-  "returns control from a vehicle, and a possession ends with its own spell or on its own.";
+  "the unit you control (state.self.control.mover) is not on your map or not in view, so there is nothing to " +
+  "drive; the move was not sent. Wait for control to return (a possession ends on its own or with its recall " +
+  "spell on state.pet(); leaveVehicle() leaves a vehicle), then move again.";
 
-/** `controlling`, mid-walk: control passed to another unit and the walk ended where the character stood. */
+/** `controlling`, mid-walk: control changed hands and the walk ended where its unit stood. */
 const CONTROLLING_WALK_HINT =
-  "control passed to another unit mid-walk (state.self.control.mover) and the walk ended where you stand; " +
-  "moveTo does not drive that unit yet.";
+  "control changed hands mid-walk (state.self.control.mover) and the walk ended where its unit stood; " +
+  "read state.self.control and move again from here.";
 
 /** `UNIT_NPC_FLAG_SPELLCLICK` (AzerothCore `UnitDefines.h`): the unit takes `CMSG_SPELLCLICK`; cleared while its seats are full. */
 const UNIT_NPC_FLAG_SPELLCLICK = 0x0100_0000;
+
+/** `TARGET_FLAG_DEST_LOCATION` (`SpellDefines.h`): the SpellCastTargets mask bit for a ground point. */
+const TARGET_FLAG_DEST_LOCATION = 0x40;
 
 /** `interrupted` when the verdict found the character dead. */
 const MOVE_DIED_HINT =
@@ -6800,12 +6826,15 @@ export class WrathClient {
   }
 
   /**
-   * Have the pet cast one of its own spells, by name (`state.pet().spells`,
-   * case-insensitive exact, else a unique substring) or by id, at a unit or at
-   * nothing. The pet frame's button: `CMSG_PET_ACTION` with the spell.
+   * Have the pet — or the vehicle or possessed unit the character controls,
+   * whose bar `state.pet()` then is — cast one of its own spells, by name
+   * (`state.pet().spells`, case-insensitive exact, else a unique substring)
+   * or by id, at a unit, at a ground point (a cannon's shot) or at nothing.
+   * The pet frame's button, `CMSG_PET_ACTION` with the spell, for a unit or
+   * no target; `CMSG_PET_CAST_SPELL` with the point for a ground target.
    * Ack-only; a refusal arrives as `SMSG_PET_CAST_FAILED`.
    */
-  async petCast(spell: string | number, target?: GuidOrUnit): Promise<WithResolved<PetActionResult>> {
+  async petCast(spell: string | number, target?: GuidOrUnit | MovePoint): Promise<WithResolved<PetActionResult>> {
     const pet = this.petGuidOrRefuse("petCast");
     if ("refusal" in pet) return pet.refusal;
     const book = this.state.pet()?.spells ?? [];
@@ -6833,6 +6862,28 @@ export class WrathClient {
         `castable rows in state.pet().spells are the ones with passive: false`);
     }
     if (target === undefined) return this.petAction(pet.guid, known.spellId, 0x81, "0");
+    if (typeof target === "object" && !("guid" in target)) {
+      // A ground target (a cannon's shot, a vehicle's area spell): the bar's
+      // button cannot carry a point, so the cast is `CMSG_PET_CAST_SPELL`, the
+      // opcode a client sends from a controlled unit's bar with a cursor
+      // target — u64 caster, u8 cast count, u32 spell, u8 cast flags, then
+      // SpellCastTargets as `CMSG_CAST_SPELL` carries them
+      // (`SpellCastTargets::Read`): TARGET_FLAG_DEST_LOCATION, a packed
+      // transport guid of 0 and the point. The handler takes it for a pet or a
+      // charmed/possessed unit alike (`HandlePetCastSpellOpcode`).
+      const ack = await this.raw("CMSG_PET_CAST_SPELL", [
+        { guid: pet.guid },
+        { u8: 1 },
+        { u32: known.spellId },
+        { u8: 0 },
+        { u32: TARGET_FLAG_DEST_LOCATION },
+        { packedGuid: "0" },
+        { f32: target.x },
+        { f32: target.y },
+        { f32: target.z },
+      ]);
+      return { ok: true, status: "sent", ack };
+    }
     return this.byName(target, "petCast(spell, target)", (guid) => this.petAction(pet.guid, known.spellId, 0x81, guid));
   }
 
@@ -7920,6 +7971,8 @@ export class WrathClient {
       seq: event.seq,
       ts: event.ts,
       ...(data.pathLength !== undefined ? { pathLength: data.pathLength } : {}),
+      ...(data.mover !== undefined ? { mover: data.mover } : {}),
+      ...(data.flight === true ? { flight: true } : {}),
     } as const;
     if (status === "arrived") {
       // A portal this walk crossed that refused a ghost: the arrival is the

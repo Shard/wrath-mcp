@@ -31,6 +31,7 @@
 #include "Opcodes.h"
 #include "Map.h"
 #include "MapCollisionData.h"
+#include "ModelIgnoreFlags.h"
 #include "DetourCommon.h"
 #include "PathGenerator.h"
 #include "MovementTypedefs.h"
@@ -1780,13 +1781,42 @@ namespace WrathBench
     // echoed counter, then this same MovementInfo: one writer, so an ack can
     // never disagree with the walk about the transport block, the swimming
     // flag, the state flags or the clock.
-    static void AppendMovementInfo(WorldPacket& p, BenchSession& s, Player* player, uint32 moveFlags,
+    //
+    // Whether `unit` is the session's own character, as against a unit it
+    // moves: by identity, never by type (a possessed player is another
+    // player's character).
+    static bool IsOwnCharacter(BenchSession& s, Unit* unit)
+    {
+        return s.ws && unit == static_cast<Unit*>(s.ws->GetPlayer());
+    }
+
+    static void AppendMovementInfo(WorldPacket& p, BenchSession& s, Unit* mover, uint32 moveFlags,
         float x, float y, float z, float o, Transport* transport)
     {
-        moveFlags |= s.stateMoveFlags.load() & ~uint32(MOVEMENTFLAG_CAN_FLY);
+        // The character's told flags, or the controlled unit's (a vehicle, a
+        // possessed unit: BenchSession::moverMoveFlags, its own flags at the
+        // handover and the packets for its guid since). The can-fly gap is the
+        // character's alone: a flying mover flies, and its packets say so
+        // (FLYING | CAN_FLY, which ReadMovementInfo keeps once the mover has
+        // its fly aura and strips until then).
+        bool const own = IsOwnCharacter(s, mover);
+        if (own)
+            moveFlags |= s.stateMoveFlags.load() & ~uint32(MOVEMENTFLAG_CAN_FLY);
+        else
+            moveFlags |= s.moverMoveFlags.load();
         if (transport)
             moveFlags |= MOVEMENTFLAG_ONTRANSPORT;
-        bool const swimming = !transport && (s.move.active ? s.move.swimming : player->IsInWater());
+        // The walk's swim and flight state only when the walk drives this unit
+        // (an ack for the character while a vehicle is walked reads the
+        // character's). FLYING is the walk's own, as a client's physics set it
+        // on an airborne can-fly unit: no packet tells the client (the core
+        // adds it to a possessed flyer in place, Unit::SetCharmedBy).
+        bool const walkIsThis = s.move.active
+            && (s.move.moverGuid ? mover->GetGUID().GetRawValue() == s.move.moverGuid : own);
+        if (walkIsThis && s.move.flying)
+            moveFlags |= MOVEMENTFLAG_FLYING;
+        bool const flying = (moveFlags & MOVEMENTFLAG_FLYING) != 0;
+        bool const swimming = !transport && !flying && (walkIsThis ? s.move.swimming : mover->IsInWater());
         if (swimming)
             moveFlags = (moveFlags | MOVEMENTFLAG_SWIMMING) & ~uint32(MOVEMENTFLAG_WATERWALKING);
         p << uint32(moveFlags);
@@ -1802,19 +1832,61 @@ namespace WrathBench
             p << uint32(transport->GetPathProgress());
             p << int8(-1);          // seat: none (not a vehicle)
         }
-        if (swimming)
-            p << float(0.0f);       // pitch: level, swimming along the surface
+        if (swimming || flying)
+            p << float(0.0f);       // pitch: level, swimming along the surface or flying straight
         p << uint32(0);             // fallTime
     }
 
-    static void SendMovePacket(BenchSession& s, Player* player, uint16 opcode, uint32 moveFlags,
+    static void SendMovePacket(BenchSession& s, Unit* mover, uint16 opcode, uint32 moveFlags,
         float x, float y, float z, float o, Transport* transport = nullptr)
     {
         WorldPacket* p = new WorldPacket(opcode, 8 + 4 + 2 + 4 + 16 + 8 + 16 + 4 + 1 + 4 + 4);
-        *p << player->GetPackGUID();
-        AppendMovementInfo(*p, s, player, moveFlags, x, y, z, o, transport);
+        *p << mover->GetPackGUID();
+        AppendMovementInfo(*p, s, mover, moveFlags, x, y, z, o, transport);
         s.ws->QueuePacket(p);
         s.move.sentO = o;
+    }
+
+    // The unit this "client" moves, as the server has it (Player::m_mover):
+    // the character, or the vehicle or possessed unit a control handover put
+    // in its place (OnClientControlUpdate). Every movement packet carries its
+    // guid or the server drops it (HandleMovementOpcodes), so the walk is the
+    // mover's: its position, speed, map and water, its guid on the packets.
+    // Null when the core holds a mover that is not in the character's map,
+    // which no packet could drive.
+    static Unit* ActiveMover(Player* player)
+    {
+        Unit* mover = static_cast<Unit*>(player->m_mover);
+        if (!mover)
+            return player;
+        if (mover != player && (!mover->IsInWorld() || mover->GetMap() != player->GetMap()))
+            return nullptr;
+        return mover;
+    }
+
+    // Whether the walk in flight drives `unit` (MoveState::moverGuid: 0 is
+    // the character), for the acks and packets that must restate the walk's
+    // point only for the unit being walked.
+    static bool WalkDrives(BenchSession const& s, Unit* unit, Player* player)
+    {
+        MoveState const& m = s.move;
+        if (!m.active)
+            return false;
+        return m.moverGuid ? unit->GetGUID().GetRawValue() == m.moverGuid : unit == player;
+    }
+
+    // The rooted state this "client" holds for `mover`: the character's own
+    // (BenchSession::rooted) or the controlled unit's (moverRooted).
+    static bool RootedFor(BenchSession& s, Unit* mover, Player* player)
+    {
+        return mover == player ? s.rooted.load() : s.moverRooted.load();
+    }
+
+    // The transport under a point of the walk, for the character alone: a
+    // vehicle or a possessed unit is never walked onto a tram car or a boat.
+    static Transport* TransportUnder(BenchSession& s, Unit* mover, float x, float y, float z)
+    {
+        return IsOwnCharacter(s, mover) ? FindTransportAt(mover->GetMap(), x, y, z) : nullptr;
     }
 
     // The MovementInfo of a unit as it stands, for the packets a client sends
@@ -1851,6 +1923,22 @@ namespace WrathBench
         if (flags & (MOVEMENTFLAG_SWIMMING | MOVEMENTFLAG_FLYING))
             p << float(unit->m_movementInfo.pitch);
         p << uint32(0);             // fallTime
+    }
+
+    // The MovementInfo of an ack for `unit`: the walk's or the server's pose
+    // (AppendMovementInfo) — unless the unit sits on a vehicle seat, when it
+    // is the seat's: the unit's own block with ONTRANSPORT, the vehicle's
+    // guid, the seat offset and the seat (AppendUnitMovementInfo). The
+    // handlers apply an ack's MovementInfo whole (HandleMoverRelocation), so
+    // an ack during the boarding spline that omitted the seat would take the
+    // passenger off it in the server's record.
+    static void AppendAckMovementInfo(WorldPacket& p, BenchSession& s, Unit* unit, uint32 moveFlags,
+        float x, float y, float z, float o, Transport* transport)
+    {
+        if (unit->GetVehicle())
+            AppendUnitMovementInfo(p, s, unit);
+        else
+            AppendMovementInfo(p, s, unit, moveFlags, x, y, z, o, transport);
     }
 
     // Swimming, as the server judges it and a client does it. Every number
@@ -1894,15 +1982,15 @@ namespace WrathBench
     // swimming, the body held under the surface as above (never below the
     // bed). Shallower: wading, the body on the bed, at run speed, as a client
     // walks through shallows. World thread.
-    static WaterPose WaterPoseAt(Player* player, float x, float y, float meshZ)
+    static WaterPose WaterPoseAt(Unit* mover, float x, float y, float meshZ)
     {
         WaterPose pose;
         pose.z = meshZ;
-        Map* map = player->GetMap();
+        Map* map = mover->GetMap();
         if (!map)
             return pose;
-        float const height = player->GetCollisionHeight();
-        LiquidData const liquid = map->GetLiquidData(player->GetPhaseMask(), x, y, meshZ, height, {});
+        float const height = mover->GetCollisionHeight();
+        LiquidData const liquid = map->GetLiquidData(mover->GetPhaseMask(), x, y, meshZ, height, {});
         if (liquid.Status == LIQUID_MAP_NO_WATER || liquid.Level <= INVALID_HEIGHT || liquid.DepthLevel <= INVALID_HEIGHT
             || liquid.Level <= liquid.DepthLevel)
             return pose;
@@ -1937,10 +2025,10 @@ namespace WrathBench
     // is about 4 s rather than the 20 s a run down its length took, during
     // which the server held the character at the lip.
     static bool IsDropSegment(WbVec const& a, WbVec const& b, float* dzOut);
-    static uint64_t FallMs(Player* player, WbVec const& a, WbVec const& b)
+    static uint64_t FallMs(Unit* mover, WbVec const& a, WbVec const& b)
     {
-        float const fall = Movement::computeFallTime(a.z - b.z, player->HasFeatherFallAura());
-        float const run = player->GetSpeed(MOVE_RUN);
+        float const fall = Movement::computeFallTime(a.z - b.z, mover->HasFeatherFallAura());
+        float const run = mover->GetSpeed(MOVE_RUN);
         float const across = std::sqrt((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y));
         float const ride = run > 0.01f ? across / run : 0.0f;
         return uint64_t(std::llround(double(std::max(fall, ride)) * 1000.0));
@@ -1962,11 +2050,11 @@ namespace WrathBench
     // that changes mid-walk is not. `dry` skips the water test for a route the
     // walker never swims (a transport leg: PlaceMover gives a deck no water).
     // Segment lengths are 3D, as `pathLength`. World thread.
-    static WalkEta WalkEtaMs(Player* player, std::vector<WbVec> const& points, bool dry)
+    static WalkEta WalkEtaMs(Unit* mover, std::vector<WbVec> const& points, bool dry)
     {
         WalkEta eta;
-        float const run = player->GetSpeed(MOVE_RUN);
-        float const swim = player->GetSpeed(MOVE_SWIM);
+        float const run = mover->GetSpeed(MOVE_RUN);
+        float const swim = mover->GetSpeed(MOVE_SWIM);
         if (!(run > 0.01f) || !(swim > 0.01f))
             return eta;
         double seconds = 0.0;
@@ -1983,7 +2071,7 @@ namespace WrathBench
             float dz = 0.0f;
             if (IsDropSegment(a, b, &dz) && dz < 0.0f)
             {
-                seconds += double(FallMs(player, a, b)) / 1000.0;
+                seconds += double(FallMs(mover, a, b)) / 1000.0;
                 continue;
             }
             if (dry)
@@ -1996,12 +2084,90 @@ namespace WrathBench
             for (uint32 k = 0; k < n; ++k)
             {
                 float const t = (float(k) + 0.5f) / float(n);
-                bool const swimming = WaterPoseAt(player, a.x + sx * t, a.y + sy * t, a.z + sz * t).swimming;
+                bool const swimming = WaterPoseAt(mover, a.x + sx * t, a.y + sy * t, a.z + sz * t).swimming;
                 ++eta.samples;
                 seconds += step / (swimming ? swim : run);
                 if (swimming)
                     eta.swimYards += step;
             }
+        }
+        eta.ms = uint64_t(std::llround(seconds * 1000.0));
+        return eta;
+    }
+
+    // A flying mover's route: the straight line a client flies it along, from
+    // where it is to the point asked for, at the z asked for. Nothing here
+    // reads the mesh. The line is judged against the geometry a client has:
+    // the map's line of sight over models and game objects
+    // (Map::isInLineOfSight, as the core judges a spell's; it does not see
+    // terrain), and the terrain's own height under each sample of the line
+    // (Map::GetGridHeight, the ground at x,y whatever z is asked from — a
+    // sample inside a hill is below it; GetHeight would search down from the
+    // sample and find nothing), so a line into a hillside or through a wall is refused as
+    // `path_incomplete` at the last clear sample — the agent flies higher or
+    // around. The line's own length is the route (`pathLength`), its time the
+    // mover's flight speed over it (FlightEtaMs). One LoS query per sample on
+    // a refused line, one for the whole line otherwise.
+    static constexpr float FLIGHT_SAMPLE_YARDS = 4.0f;
+
+    struct FlightPlan
+    {
+        char const* status{nullptr};
+        bool hasReached{false};
+        WbVec reached{};
+    };
+
+    static FlightPlan PlanFlight(Unit* mover, float x, float y, float z, std::vector<WbVec>& points)
+    {
+        FlightPlan plan;
+        Map* map = mover->GetMap();
+        WbVec const from{mover->GetPositionX(), mover->GetPositionY(), mover->GetPositionZ()};
+        WbVec const to{x, y, z};
+        points.clear();
+        points.push_back(from);
+        float const sx = to.x - from.x, sy = to.y - from.y, sz = to.z - from.z;
+        float const len = std::sqrt(sx * sx + sy * sy + sz * sz);
+        uint32 const n = std::max<uint32>(1, uint32(std::ceil(len / FLIGHT_SAMPLE_YARDS)));
+        WbVec clear = from;
+        for (uint32 k = 1; k <= n; ++k)
+        {
+            float const t = float(k) / float(n);
+            WbVec const at{from.x + sx * t, from.y + sy * t, from.z + sz * t};
+            float const terrain = map->GetGridHeight(at.x, at.y);
+            bool const underGround = terrain > INVALID_HEIGHT && terrain > at.z + 0.5f;
+            bool const seen = !underGround && map->isInLineOfSight(clear.x, clear.y, clear.z, at.x, at.y, at.z,
+                mover->GetPhaseMask(), LINEOFSIGHT_ALL_CHECKS, VMAP::ModelIgnoreFlags::Nothing);
+            if (!seen)
+            {
+                plan.status = "path_incomplete";
+                plan.hasReached = true;
+                plan.reached = clear;
+                points.push_back(clear);
+                return plan;
+            }
+            clear = at;
+        }
+        points.push_back(to);
+        return plan;
+    }
+
+    // How long the mover flies `points` at its flight speed (the server's
+    // MOVE_FLIGHT, every flight-speed aura in it), or its run speed when it
+    // has none; 0 when neither can be read. Reported, as WalkEtaMs is.
+    static WalkEta FlightEtaMs(Unit* mover, std::vector<WbVec> const& points)
+    {
+        WalkEta eta;
+        float speed = mover->GetSpeed(MOVE_FLIGHT);
+        if (!(speed > 0.01f))
+            speed = mover->GetSpeed(MOVE_RUN);
+        if (!(speed > 0.01f))
+            return eta;
+        double seconds = 0.0;
+        for (size_t i = 1; i < points.size(); ++i)
+        {
+            WbVec const& a = points[i - 1];
+            WbVec const& b = points[i];
+            seconds += std::sqrt(std::pow(b.x - a.x, 2.0f) + std::pow(b.y - a.y, 2.0f) + std::pow(b.z - a.z, 2.0f)) / speed;
         }
         eta.ms = uint64_t(std::llround(seconds * 1000.0));
         return eta;
@@ -2030,9 +2196,9 @@ namespace WrathBench
     // polygons in the box, so in a dense interior the point found is a
     // walkable one near the request rather than provably the nearest. False
     // when no polygon lies in the box. Detour's axis order is (y, z, x).
-    static bool NearestMeshPoint(Player* player, float x, float y, float z, float radius, WbVec& out)
+    static bool NearestMeshPoint(Unit* mover, float x, float y, float z, float radius, WbVec& out)
     {
-        dtNavMeshQuery const* query = player->GetMap()->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
+        dtNavMeshQuery const* query = mover->GetMap()->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
         if (!query)
             return false;
         dtQueryFilter filter;
@@ -2057,9 +2223,9 @@ namespace WrathBench
     // nearest point is then on the boundary, up to 3y away, and its height
     // is not the ground at (x, y) — lifting to it would hang the character in
     // the air beside a cliff edge.
-    static bool MeshHeightAt(Player* player, float x, float y, float z, float* out)
+    static bool MeshHeightAt(Unit* mover, float x, float y, float z, float* out)
     {
-        dtNavMeshQuery const* query = player->GetMap()->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
+        dtNavMeshQuery const* query = mover->GetMap()->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
         if (!query)
             return false;
         dtQueryFilter filter;
@@ -2124,16 +2290,16 @@ namespace WrathBench
     // bed is still refused.
     static constexpr float FOOT_UNDER_SURFACE = 1.0f;
     static constexpr float EDGE_LOOK_OFFSET = 1.0f;
-    static bool FootUnderSurface(Player* player, WbVec const& edge, WbVec const& foot, float* surfaceZ)
+    static bool FootUnderSurface(Unit* mover, WbVec const& edge, WbVec const& foot, float* surfaceZ)
     {
-        Map* map = player->GetMap();
+        Map* map = mover->GetMap();
         float top = edge.z + EDGE_LOOK_OFFSET;
         float search = std::max(DEFAULT_HEIGHT_SEARCH, top - foot.z + FOOT_UNDER_SURFACE);
-        float s = map->GetHeight(player->GetPhaseMask(), foot.x, foot.y, top, true, search);
+        float s = map->GetHeight(mover->GetPhaseMask(), foot.x, foot.y, top, true, search);
         if (s <= INVALID_HEIGHT || foot.z >= s - FOOT_UNDER_SURFACE)
             return false;
-        LiquidData const liquid = map->GetLiquidData(player->GetPhaseMask(), foot.x, foot.y, foot.z,
-            player->GetCollisionHeight(), {});
+        LiquidData const liquid = map->GetLiquidData(mover->GetPhaseMask(), foot.x, foot.y, foot.z,
+            mover->GetCollisionHeight(), {});
         if (liquid.Status != LIQUID_MAP_NO_WATER && liquid.Level > INVALID_HEIGHT && liquid.DepthLevel > INVALID_HEIGHT
             && liquid.Level > liquid.DepthLevel && foot.z <= liquid.Level + SWIM_SURFACE_TOLERANCE)
             return false;
@@ -2187,9 +2353,9 @@ namespace WrathBench
     // caller can estimate the fall the way Player::HandleFall will charge it.
     // An aura on self is what the client's own buff frame shows; the number
     // is the client's Spell.dbc reading of it. Omitted when zero.
-    static void AddSafeFall(Json::Writer& w, Player* player)
+    static void AddSafeFall(Json::Writer& w, Unit* mover)
     {
-        int32 safeFall = player->GetTotalAuraModifier(SPELL_AURA_SAFE_FALL);
+        int32 safeFall = mover->GetTotalAuraModifier(SPELL_AURA_SAFE_FALL);
         if (safeFall > 0)
             w.Add("safeFall", (uint32)safeFall);
     }
@@ -2279,7 +2445,7 @@ namespace WrathBench
     // (WorldObject::UpdateAllowedPositionZ). False, with `why`, when the
     // corridor does not reach the end polygon or the route would not fit
     // REPLAN_MAX_POINTS; nothing is walked then.
-    static bool PlanAround(Player* player, dtNavMesh const* navMesh, dtNavMeshQuery const* query, ExcludePolysFilter const& filter,
+    static bool PlanAround(Unit* mover, dtNavMesh const* navMesh, dtNavMeshQuery const* query, ExcludePolysFilter const& filter,
         dtPolyRef startRef, dtPolyRef endRef, float const* start, float const* end, std::vector<WbVec>& out, char const** why,
         int* polysOut = nullptr)
     {
@@ -2290,7 +2456,7 @@ namespace WrathBench
         for (size_t i = 0; i + 2 < pts.size(); i += 3)
         {
             WbVec v{ pts[i + 2], pts[i], pts[i + 1] };
-            player->UpdateAllowedPositionZ(v.x, v.y, v.z);
+            mover->UpdateAllowedPositionZ(v.x, v.y, v.z);
             out.push_back(v);
         }
         return true;
@@ -2298,16 +2464,16 @@ namespace WrathBench
 
     // The polygon a move from where the character stands paths from: the one
     // under it, else the start snap's (ResolvePathAt). Zero when neither is.
-    static dtPolyRef MoverStartPoly(Player* player, dtNavMeshQuery const* query)
+    static dtPolyRef MoverStartPoly(Unit* mover, dtNavMeshQuery const* query)
     {
         ExcludePolysFilter const base;
         float dist = 0.0f;
-        float here[3] = { player->GetPositionY(), player->GetPositionZ(), player->GetPositionX() };
+        float here[3] = { mover->GetPositionY(), mover->GetPositionZ(), mover->GetPositionX() };
         dtPolyRef ref = CorePolyAt(query, base, here, &dist);
         if (ref && dist <= REPLAN_FAR_FROM_POLY)
             return ref;
         WbVec near;
-        if (!NearestMeshPoint(player, here[2], here[0], here[1], START_SNAP_RADIUS, near))
+        if (!NearestMeshPoint(mover, here[2], here[0], here[1], START_SNAP_RADIUS, near))
             return 0;
         float snapped[3] = { near.y, near.z, near.x };
         return CorePolyAt(query, base, snapped, nullptr);
@@ -2318,9 +2484,9 @@ namespace WrathBench
     // nearest polygon of a closed island the start is not on is no answer,
     // since no route gets there (by the Deadmines entrance the nearest
     // polygon to a guessed point was a 7-polygon island under the hill).
-    static bool NearestReachablePoint(Player* player, float x, float y, float z, float radius, WbVec& out)
+    static bool NearestReachablePoint(Unit* mover, float x, float y, float z, float radius, WbVec& out)
     {
-        auto& mmap = player->GetMap()->GetMapCollisionData().GetMMapData();
+        auto& mmap = mover->GetMap()->GetMapCollisionData().GetMMapData();
         dtNavMesh const* navMesh = mmap.GetNavMesh();
         dtNavMeshQuery const* query = mmap.GetNavMeshQuery();
         if (!navMesh || !query)
@@ -2329,7 +2495,7 @@ namespace WrathBench
         float extents[3] = { radius, 50.0f, radius };
         float closest[3] = { 0.0f, 0.0f, 0.0f };
         dtPolyRef ref = 0;
-        if (!WbNav::NearestReachable(navMesh, query, MoverStartPoly(player, query), point, extents, &ref, closest))
+        if (!WbNav::NearestReachable(navMesh, query, MoverStartPoly(mover, query), point, extents, &ref, closest))
             return false;
         out = { closest[2], closest[0], closest[1] };
         return true;
@@ -2350,9 +2516,9 @@ namespace WrathBench
     // how many levels there are, with the level in `only` when there is one.
     static constexpr float MESH_COLUMN_HALF = 50.0f;
     static constexpr float MESH_LEVEL_MERGE = 2.0f;
-    static size_t MeshLevelsAt(Player* player, float x, float y, float z, float* only)
+    static size_t MeshLevelsAt(Unit* mover, float x, float y, float z, float* only)
     {
-        auto& mmap = player->GetMap()->GetMapCollisionData().GetMMapData();
+        auto& mmap = mover->GetMap()->GetMapCollisionData().GetMMapData();
         dtNavMesh const* navMesh = mmap.GetNavMesh();
         dtNavMeshQuery const* query = mmap.GetNavMeshQuery();
         if (!navMesh || !query)
@@ -2364,7 +2530,7 @@ namespace WrathBench
         int n = 0;
         if (dtStatusFailed(query->queryPolygons(center, half, &base, polys, &n, 64)))
             return 0;
-        dtPolyRef const startRef = MoverStartPoly(player, query);
+        dtPolyRef const startRef = MoverStartPoly(mover, query);
         std::vector<float> levels;
         for (int i = 0; i < n; ++i)
         {
@@ -2395,12 +2561,12 @@ namespace WrathBench
     // to a one-point smooth path only for a one-polygon corridor, so it
     // answers NOPATH and the planner no_route (WbNav::PlanCorridor). Only ever
     // asked after both have failed; a route that exists is always theirs.
-    static bool WithinSlop(Player* player, WbVec const& a, float x, float y, float z)
+    static bool WithinSlop(Unit* mover, WbVec const& a, float x, float y, float z)
     {
         float const dx = a.x - x, dy = a.y - y;
         if (dx * dx + dy * dy > WbNav::SMOOTH_SLOP * WbNav::SMOOTH_SLOP || std::fabs(a.z - z) > MESH_LEVEL_MERGE)
             return false;
-        auto& mmap = player->GetMap()->GetMapCollisionData().GetMMapData();
+        auto& mmap = mover->GetMap()->GetMapCollisionData().GetMMapData();
         dtNavMesh const* navMesh = mmap.GetNavMesh();
         dtNavMeshQuery const* query = mmap.GetNavMeshQuery();
         if (!navMesh || !query)
@@ -2440,11 +2606,11 @@ namespace WrathBench
     // missing tile inside NORMAL|NOT_USING_PATH; the endpoint check is 2D so
     // that a stale z in the request is the mesh's problem (meshZ), not the
     // agent's.
-    Manager::PathResolve Manager::ResolvePathAt(Player* player, float x, float y, float z, float reqZ, bool force)
+    Manager::PathResolve Manager::ResolvePathAt(Unit* mover, float x, float y, float z, float reqZ, bool force)
     {
         PathResolve r;
-        dtNavMesh const* navMesh = player->GetMap()->GetMapCollisionData().GetMMapData().GetNavMesh();
-        if (!HaveNavTile(navMesh, player->GetPositionX(), player->GetPositionY(), player->GetPositionZ())
+        dtNavMesh const* navMesh = mover->GetMap()->GetMapCollisionData().GetMMapData().GetNavMesh();
+        if (!HaveNavTile(navMesh, mover->GetPositionX(), mover->GetPositionY(), mover->GetPositionZ())
             || !HaveNavTile(navMesh, x, y, z))
         {
             r.status = "no_mesh";
@@ -2458,14 +2624,14 @@ namespace WrathBench
         // mesh-bound; only the pathfinder is). A path from the character to
         // itself is NORMAL exactly when the start is on the mesh; the core
         // does not otherwise say which end of a failed path was off it.
-        float sx = player->GetPositionX(), sy = player->GetPositionY(), sz = player->GetPositionZ();
+        float sx = mover->GetPositionX(), sy = mover->GetPositionY(), sz = mover->GetPositionZ();
         {
-            PathGenerator probe(player);
+            PathGenerator probe(mover);
             probe.CalculatePath(sx, sy, sz, false);
             if (probe.GetPathType() & (PATHFIND_NOT_USING_PATH | PATHFIND_FARFROMPOLY_START))
             {
                 WbVec near;
-                if (!NearestMeshPoint(player, sx, sy, sz, START_SNAP_RADIUS, near))
+                if (!NearestMeshPoint(mover, sx, sy, sz, START_SNAP_RADIUS, near))
                 {
                     r.status = "start_off_mesh";
                     return r;
@@ -2487,7 +2653,7 @@ namespace WrathBench
         // NearestReachable). Past it the request stays as asked and ends
         // path_incomplete like any route the mesh does not have: an island is
         // walkable ground, only not from here.
-        dtNavMeshQuery const* query = player->GetMap()->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
+        dtNavMeshQuery const* query = mover->GetMap()->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
         ExcludePolysFilter const base;
         float startPt[3] = { sy, sz, sx };
         dtPolyRef startRef = query ? CorePolyAt(query, base, startPt, nullptr) : 0;
@@ -2541,7 +2707,7 @@ namespace WrathBench
             }
         }
 
-        PathGenerator gen(player);
+        PathGenerator gen(mover);
         bool built = gen.CalculatePath(sx, sy, sz, x, y, z, false);
         PathType type = gen.GetPathType();
         Movement::PointsArray const& pts = gen.GetPath();
@@ -2587,17 +2753,17 @@ namespace WrathBench
             // path's slop on a neighbouring polygon, which neither the core nor
             // the planner joins): the walk is the step to it, settled like any
             // route. Audited as move_end_slop.
-            if (WithinSlop(player, { sx, sy, sz }, x, y, z))
+            if (WithinSlop(mover, { sx, sy, sz }, x, y, z))
             {
                 r.status = nullptr;
                 r.hasReached = false;
                 r.slopEnd = true;
                 r.points = { { sx, sy, sz }, { x, y, sz } };
-                SettleRoute(player, r, z, reqZ, force);
+                SettleRoute(mover, r, z, reqZ, force);
                 return r;
             }
             if (!partial.empty())
-                TryEdgeDrop(player, partial, x, y, z, reqZ, force, r);
+                TryEdgeDrop(mover, partial, x, y, z, reqZ, force, r);
             bool routeLedge = false; // the route itself steps down a ledge on its way to its end
             for (size_t i = 0; i + 1 < partial.size() && !routeLedge; ++i)
                 routeLedge = IsDropSegment(partial[i], partial[i + 1], nullptr);
@@ -2605,7 +2771,7 @@ namespace WrathBench
             {
                 PathResolve::EdgeDrop const first = r.edgeDrop;
                 r.edgeDrop = PathResolve::EdgeDrop{};
-                TryEdgeDrop(player, std::vector<WbVec>{ partial.front() }, x, y, z, reqZ, force, r);
+                TryEdgeDrop(mover, std::vector<WbVec>{ partial.front() }, x, y, z, reqZ, force, r);
                 if (!r.edgeDrop.tried)
                     r.edgeDrop = first; // the request is not below the start: the first answer stands
                 else
@@ -2664,7 +2830,7 @@ namespace WrathBench
             if (nonTrivial)
             {
                 G3D::Vector3 const& mid = pts[got - 1];
-                PathGenerator leg2(player);
+                PathGenerator leg2(mover);
                 bool built2 = leg2.CalculatePath(mid.x, mid.y, mid.z, x, y, z, false);
                 if (built2 && IsCompletePath(leg2.GetPathType(), leg2.GetPath()) && endpointOk(leg2))
                 {
@@ -2685,7 +2851,7 @@ namespace WrathBench
             else
             {
                 r.hasReached = true;
-                r.reachedX = player->GetPositionX(); r.reachedY = player->GetPositionY(); r.reachedZ = player->GetPositionZ();
+                r.reachedX = mover->GetPositionX(); r.reachedY = mover->GetPositionY(); r.reachedZ = mover->GetPositionZ();
                 partial.push_back({sx, sy, sz});
             }
             // Neither the core's path nor the subdivision reached the end:
@@ -2705,7 +2871,7 @@ namespace WrathBench
                 int polys = 0;
                 std::vector<WbVec> planned;
                 if (!plan || !startRef || !endRef
-                    || !PlanAround(player, navMesh, plan, base, startRef, endRef, startPt, endPt, planned, &why, &polys))
+                    || !PlanAround(mover, navMesh, plan, base, startRef, endRef, startPt, endPt, planned, &why, &polys))
                     return incomplete();
                 WbVec const& last = planned.back();
                 float ex = last.x - x, ey = last.y - y;
@@ -2724,13 +2890,13 @@ namespace WrathBench
             return r;
         }
         std::vector<size_t> refusing;
-        SettleRoute(player, r, z, reqZ, force, &refusing);
+        SettleRoute(mover, r, z, reqZ, force, &refusing);
         if (r.status && std::strcmp(r.status, "drop") == 0)
-            ReplanSteep(player, sx, sy, sz, x, y, z, reqZ, force, refusing, r);
+            ReplanSteep(mover, sx, sy, sz, x, y, z, reqZ, force, refusing, r);
         return r;
     }
 
-    void Manager::SettleRoute(Player* player, PathResolve& r, float z, float reqZ, bool force, std::vector<size_t>* refusing)
+    void Manager::SettleRoute(Unit* mover, PathResolve& r, float z, float reqZ, bool force, std::vector<size_t>* refusing)
     {
         // The endpoint: the core's normalization keeps a requested z that
         // sits under the terrain (see END_SINK_MAX). The polygon the path
@@ -2739,7 +2905,7 @@ namespace WrathBench
         {
             WbVec& end = r.points.back();
             float polyZ = 0.0f;
-            if (MeshHeightAt(player, end.x, end.y, z, &polyZ) && end.z < polyZ - END_SINK_MAX)
+            if (MeshHeightAt(mover, end.x, end.y, z, &polyZ) && end.z < polyZ - END_SINK_MAX)
             {
                 r.hasEndLift = true;
                 r.endLiftFrom = end.z;
@@ -2753,7 +2919,7 @@ namespace WrathBench
         if (r.hasStartLevel && !r.points.empty())
             r.points.front() = { r.levelFromX, r.levelFromY, r.levelFromZ };
         if (r.hasSnap)
-            r.points.insert(r.points.begin(), { player->GetPositionX(), player->GetPositionY(), player->GetPositionZ() });
+            r.points.insert(r.points.begin(), { mover->GetPositionX(), mover->GetPositionY(), mover->GetPositionZ() });
         // Per-segment drop guard over the whole polyline (the main path and,
         // when spliced, the leg2 continuation): the walk is not dispatched.
         // `points` is kept so the move_path audit shows the route that fell.
@@ -2773,7 +2939,7 @@ namespace WrathBench
             if (!IsDropSegment(r.points[i], r.points[i + 1], &dz))
                 continue;
             float surfaceZ = 0.0f;
-            bool buried = dz < 0.0f && FootUnderSurface(player, r.points[i], r.points[i + 1], &surfaceZ);
+            bool buried = dz < 0.0f && FootUnderSurface(mover, r.points[i], r.points[i + 1], &surfaceZ);
             if (!force || dz > 0.0f || buried)
             {
                 if (refusing)
@@ -2810,7 +2976,7 @@ namespace WrathBench
     // guard passes is walked like any other and a route it refuses is never
     // walked. The start and end polygons are never barred: the first is
     // where the character stands, the second is where it asked to go.
-    void Manager::ReplanSteep(Player* player, float sx, float sy, float sz, float x, float y, float z, float reqZ,
+    void Manager::ReplanSteep(Unit* mover, float sx, float sy, float sz, float x, float y, float z, float reqZ,
         bool force, std::vector<size_t> const& refusing, PathResolve& r)
     {
         PathResolve::Replan rp;
@@ -2824,7 +2990,7 @@ namespace WrathBench
             r.replan = rp;
         };
 
-        auto& mmap = player->GetMap()->GetMapCollisionData().GetMMapData();
+        auto& mmap = mover->GetMap()->GetMapCollisionData().GetMMapData();
         dtNavMesh const* navMesh = mmap.GetNavMesh();
         dtNavMeshQuery const* query = mmap.GetNavMeshQuery();
         if (!navMesh || !query)
@@ -2877,7 +3043,7 @@ namespace WrathBench
             cand.levelZ = r.levelZ;
             cand.levelIslandPolys = r.levelIslandPolys;
             char const* why = "";
-            if (!PlanAround(player, navMesh, plan, filter, startRef, endRef, start, end, cand.points, &why))
+            if (!PlanAround(mover, navMesh, plan, filter, startRef, endRef, start, end, cand.points, &why))
                 return finish("failed", why);
             // The core's endpoint check (ResolvePathAt's endpointOk): the
             // route ends within 4y of the request in 2D.
@@ -2887,7 +3053,7 @@ namespace WrathBench
                 return finish("failed", "end_short");
 
             std::vector<size_t> again;
-            SettleRoute(player, cand, z, reqZ, force, &again);
+            SettleRoute(mover, cand, z, reqZ, force, &again);
             rp.points = uint32(cand.points.size());
             if (!cand.status)
             {
@@ -2932,23 +3098,23 @@ namespace WrathBench
     // surface within `search`. `climb` when the terrain itself rises over
     // `top` there: GetHeight does not see terrain over the point it looks
     // from, and would answer with what lies under it.
-    static float SurfaceUnder(Player* player, float x, float y, float top, float search, bool* climb)
+    static float SurfaceUnder(Unit* mover, float x, float y, float top, float search, bool* climb)
     {
-        Map* map = player->GetMap();
+        Map* map = mover->GetMap();
         *climb = map->GetGridHeight(x, y) > top;
         if (*climb)
             return INVALID_HEIGHT;
-        float const g = map->GetHeight(player->GetPhaseMask(), x, y, top, true, search);
+        float const g = map->GetHeight(mover->GetPhaseMask(), x, y, top, true, search);
         if (g <= INVALID_HEIGHT)
             return INVALID_HEIGHT;
-        LiquidData const liquid = map->GetLiquidData(player->GetPhaseMask(), x, y, g, player->GetCollisionHeight(), {});
+        LiquidData const liquid = map->GetLiquidData(mover->GetPhaseMask(), x, y, g, mover->GetCollisionHeight(), {});
         if (liquid.Status != LIQUID_MAP_NO_WATER && liquid.Level > INVALID_HEIGHT && liquid.DepthLevel > INVALID_HEIGHT
             && liquid.Level > g && liquid.Level <= top)
             return liquid.Level;
         return g;
     }
 
-    void Manager::TryEdgeDrop(Player* player, std::vector<WbVec> const& partial, float x, float y, float z, float reqZ,
+    void Manager::TryEdgeDrop(Unit* mover, std::vector<WbVec> const& partial, float x, float y, float z, float reqZ,
         bool force, PathResolve& r)
     {
         WbVec const from = partial.back();
@@ -2969,9 +3135,9 @@ namespace WrathBench
         if (dist < 0.01f)
             return refuse("no_direction");
         float const ux = dx / dist, uy = dy / dist;
-        Map* map = player->GetMap();
-        uint32 const phase = player->GetPhaseMask();
-        float const body = player->GetCollisionHeight();
+        Map* map = mover->GetMap();
+        uint32 const phase = mover->GetPhaseMask();
+        float const body = mover->GetCollisionHeight();
         // The body's line between two points: a wall, a model or a
         // game-object in the way (Map::isInLineOfSight; terrain is not in
         // it, and is the samples' own ground reads).
@@ -3022,7 +3188,7 @@ namespace WrathBench
             bool climb = false;
             // The look reaches the request's own height and the default
             // search past it, so a fall toward the request finds its floor.
-            float const s = SurfaceUnder(player, next.x, next.y, top, std::max(DEFAULT_HEIGHT_SEARCH, top - z + DEFAULT_HEIGHT_SEARCH), &climb);
+            float const s = SurfaceUnder(mover, next.x, next.y, top, std::max(DEFAULT_HEIGHT_SEARCH, top - z + DEFAULT_HEIGHT_SEARCH), &climb);
             if (climb)
                 return refuse("climb");
             if (s <= INVALID_HEIGHT)
@@ -3067,10 +3233,10 @@ namespace WrathBench
         // ground before it. Bounded in practice by the fall itself: the arc
         // ends at its contact, the face at its first walkable pair, so flat
         // ground ends the run at the next sample; never past the request.
-        float const run = player->GetSpeed(MOVE_RUN);
+        float const run = mover->GetSpeed(MOVE_RUN);
         if (!(run > 0.01f))
             return refuse("no_speed");
-        bool const slowFall = player->HasFeatherFallAura();
+        bool const slowFall = mover->HasFeatherFallAura();
         float const fallSearch = std::max(DEFAULT_HEIGHT_SEARCH, edge.z + EDGE_LOOK_OFFSET - z + DEFAULT_HEIGHT_SEARCH);
         auto bodyAt = [&](float t, float speed) { // the arc's height at `t` yards along the line
             return edge.z - Movement::computeFallElevation((t - travelled) / speed, slowFall);
@@ -3100,7 +3266,7 @@ namespace WrathBench
                     break;
                 }
                 bool climb = false;
-                float const s = SurfaceUnder(player, here.x, here.y, body + EDGE_LOOK_OFFSET, fallSearch, &climb);
+                float const s = SurfaceUnder(mover, here.x, here.y, body + EDGE_LOOK_OFFSET, fallSearch, &climb);
                 if (s <= INVALID_HEIGHT && !climb)
                     return refuse("no_surface");
                 if (climb || s >= body)
@@ -3154,7 +3320,7 @@ namespace WrathBench
                 if (!lookClear(landing, next, top))
                     break;
                 bool climb = false;
-                float const s = SurfaceUnder(player, next.x, next.y, top, fallSearch, &climb);
+                float const s = SurfaceUnder(mover, next.x, next.y, top, fallSearch, &climb);
                 if (climb || s <= INVALID_HEIGHT)
                     break;
                 next.z = s;
@@ -3204,7 +3370,7 @@ namespace WrathBench
         WbVec start = landing;
         std::vector<WbVec> snapWalk; // the ground between the landing and the mesh it walks onto
         {
-            PathGenerator probe(player);
+            PathGenerator probe(mover);
             probe.CalculatePath(landing.x, landing.y, landing.z, landing.x, landing.y, landing.z, false);
             float landPt[3] = { landing.y, landing.z, landing.x };
             dtPolyRef const landRef = query ? CorePolyAt(query, base, landPt, nullptr) : 0;
@@ -3242,7 +3408,7 @@ namespace WrathBench
                     if (!lookClear(p, n, top))
                         return refuse("snap_climb");
                     bool climb = false;
-                    float const s = SurfaceUnder(player, n.x, n.y, top, DEFAULT_HEIGHT_SEARCH, &climb);
+                    float const s = SurfaceUnder(mover, n.x, n.y, top, DEFAULT_HEIGHT_SEARCH, &climb);
                     if (climb)
                         return refuse("snap_climb");
                     if (s <= INVALID_HEIGHT)
@@ -3264,7 +3430,7 @@ namespace WrathBench
         };
         std::vector<WbVec> below;
         {
-            PathGenerator gen(player);
+            PathGenerator gen(mover);
             if (gen.CalculatePath(start.x, start.y, start.z, x, y, z, false)
                 && IsCompletePath(gen.GetPathType(), gen.GetPath()))
             {
@@ -3282,7 +3448,7 @@ namespace WrathBench
             char const* why = "";
             std::vector<WbVec> planned;
             if (plan && startRef && endRef
-                && PlanAround(player, navMesh, plan, base, startRef, endRef, startPt, endPt, planned, &why)
+                && PlanAround(mover, navMesh, plan, base, startRef, endRef, startPt, endPt, planned, &why)
                 && nearEnd(planned.back()))
                 below = std::move(planned);
         }
@@ -3290,7 +3456,7 @@ namespace WrathBench
         // (WithinSlop): the route ends there, with no leg below. At Skettis
         // the fall came down 0.8y straight under the request, on the polygon
         // beside its own, and was refused no_route_from_landing.
-        if (below.empty() && WithinSlop(player, start, x, y, z))
+        if (below.empty() && WithinSlop(mover, start, x, y, z))
         {
             below.push_back(start);
             ed.endAtLanding = true;
@@ -3321,7 +3487,7 @@ namespace WrathBench
         if (ed.landingSnap)
             cand.points.push_back(below.front());
         cand.points.insert(cand.points.end(), below.begin() + 1, below.end());
-        SettleRoute(player, cand, z, reqZ, force);
+        SettleRoute(mover, cand, z, reqZ, force);
 
         // One fall per move: the edge is the route's only ledge. A ledge of
         // the mesh's own before it, or one below, would be walked by the same
@@ -3356,11 +3522,11 @@ namespace WrathBench
     // between. A target the mesh rejects at every one of those heights is
     // still `target_off_mesh`; `meshZ` is always relative to the z the agent
     // asked for.
-    Manager::PathResolve Manager::ResolvePath(Player* player, float x, float y, float z, bool unitTarget, bool* usedGroundZ, float* groundZOut, bool force, bool* usedMeshZ)
+    Manager::PathResolve Manager::ResolvePath(Unit* mover, float x, float y, float z, bool unitTarget, bool* usedGroundZ, float* groundZOut, bool force, bool* usedMeshZ)
     {
         if (usedGroundZ) *usedGroundZ = false;
         if (usedMeshZ) *usedMeshZ = false;
-        float groundZ = player->GetMap()->GetHeight(player->GetPhaseMask(), x, y, z, true);
+        float groundZ = mover->GetMap()->GetHeight(mover->GetPhaseMask(), x, y, z, true);
         bool haveGround = groundZ > INVALID_HEIGHT && std::fabs(groundZ - z) > 0.5f;
         if (groundZOut) *groundZOut = haveGround ? groundZ : z;
 
@@ -3373,7 +3539,7 @@ namespace WrathBench
             {
                 r.nearestSearched = true;
                 WbVec near;
-                if (NearestReachablePoint(player, x, y, haveGround ? groundZ : z, TARGET_NEAREST_RADIUS, near))
+                if (NearestReachablePoint(mover, x, y, haveGround ? groundZ : z, TARGET_NEAREST_RADIUS, near))
                 {
                     r.hasNearest = true;
                     r.nearestX = near.x; r.nearestY = near.y; r.nearestZ = near.z;
@@ -3399,10 +3565,10 @@ namespace WrathBench
             if (!isTargetOffMesh(r) || restsOnGround)
                 return withNearest(r);
             float level = 0.0f;
-            if (MeshLevelsAt(player, x, y, z, &level) != 1 || level <= z + 0.5f
+            if (MeshLevelsAt(mover, x, y, z, &level) != 1 || level <= z + 0.5f
                 || (haveGround && std::fabs(level - groundZ) <= 0.5f))
                 return withNearest(r);
-            PathResolve r3 = ResolvePathAt(player, x, y, level, z, force);
+            PathResolve r3 = ResolvePathAt(mover, x, y, level, z, force);
             if (isTargetOffMesh(r3))
                 return withNearest(r);
             if (usedMeshZ) *usedMeshZ = true;
@@ -3412,18 +3578,18 @@ namespace WrathBench
 
         if (unitTarget && haveGround)
         {
-            PathResolve r = ResolvePathAt(player, x, y, groundZ, z, force);
+            PathResolve r = ResolvePathAt(mover, x, y, groundZ, z, force);
             if (!isTargetOffMesh(r))
             {
                 if (usedGroundZ) *usedGroundZ = true;
                 return r;
             }
-            return meshLevel(ResolvePathAt(player, x, y, z, z, force));
+            return meshLevel(ResolvePathAt(mover, x, y, z, z, force));
         }
-        PathResolve r = ResolvePathAt(player, x, y, z, z, force);
+        PathResolve r = ResolvePathAt(mover, x, y, z, z, force);
         if (isTargetOffMesh(r) && haveGround)
         {
-            PathResolve r2 = ResolvePathAt(player, x, y, groundZ, z, force);
+            PathResolve r2 = ResolvePathAt(mover, x, y, groundZ, z, force);
             if (!isTargetOffMesh(r2))
             {
                 if (usedGroundZ) *usedGroundZ = true;
@@ -3453,17 +3619,32 @@ namespace WrathBench
         m.pathLength = 0.0f;
         m.etaMs = 0;
         // Server-confirmed position, when the session is still live: this is the
-        // ground truth that the synthesized movement was actually applied.
+        // ground truth that the synthesized movement was actually applied. Of
+        // the unit the walk drove (`mover` names it when it is not the
+        // character; `flight` when the leg was flown).
         Player* player = (s.ws && sWorldSessionMgr->FindSession(s.accountId) == s.ws) ? s.ws->GetPlayer() : nullptr;
-        if (player)
+        Unit* unit = !player ? nullptr : (m.moverGuid ? ObjectAccessor::GetUnit(*player, ObjectGuid(m.moverGuid)) : static_cast<Unit*>(player));
+        if (m.moverGuid)
+            w.AddGuid("mover", m.moverGuid);
+        if (m.flying)
+            w.Add("flight", true);
+        m.moverGuid = 0;
+        m.flying = false;
+        // `pos` always: a driven unit gone from the map by the verdict (a
+        // possession recalled, a ride's end despawning the mount, the session
+        // gone) leaves the walker's own last point, the client's last word on
+        // where it was.
+        if (unit)
         {
-            w.Raw("pos", PosJson(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation()));
+            w.Raw("pos", PosJson(unit->GetPositionX(), unit->GetPositionY(), unit->GetPositionZ(), unit->GetOrientation()));
             // Aboard a transport at the end of the move: the server is carrying
             // the character (it accepted ONTRANSPORT packets), so say which.
-            if (Transport* t = player->GetTransport())
+            if (Transport* t = unit->GetTransport())
                 w.Raw("onTransport", Json::Writer().AddGuid("guid", (uint64_t)t->GetGUID().GetRawValue())
                     .Add("entry", t->GetEntry()).Str());
         }
+        else
+            w.Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO));
         // The z the mesh resolved the request to, when it differed from the
         // request by more than 1y: the honest signal that the agent's z was off
         // and the module walked to the ground instead.
@@ -3504,15 +3685,17 @@ namespace WrathBench
             Audit(*s, "action", a.Str());
         }
 
-        if (static_cast<Unit*>(player->m_mover) != player)
+        // The unit the client moves (ActiveMover): the character, or the
+        // vehicle or possessed unit a control handover put in its place. The
+        // walk is the mover's from here on: its guid on every packet, its
+        // position, speed, map and water; a flying mover's leg is flown
+        // (PlanFlight, below). A mover the core holds out of this map can be
+        // driven by no packet: refused `controlling` before planning, acked
+        // with moveId alone as `rooted` is, and a walk still running ends the
+        // same way. A verdict for a walk of another unit names it (`mover`).
+        Unit* mover = ActiveMover(player);
+        if (!mover)
         {
-            // The client moves another unit (a vehicle's driving seat, a
-            // possession: OnClientControlUpdate), and the server drops every
-            // movement packet that carries the character's own guid
-            // (HandleMovementOpcodes reads Player::m_mover). The walker does
-            // not drive that unit yet, so the request is refused before
-            // planning, acked with moveId alone as `rooted` is, and a walk
-            // still running ends the same way; `mover` names the unit.
             if (s->move.active)
                 FinishMove(*s, "controlling");
             uint64_t const moveId = ++s->moveIdGen;
@@ -3520,13 +3703,18 @@ namespace WrathBench
             ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "move_to").Add("moveId", moveId).Str()});
             Json::Writer w;
             w.Add("moveId", moveId).Add("status", "controlling");
-            w.AddGuid("mover", static_cast<Unit*>(player->m_mover)->GetGUID().GetRawValue());
+            if (Unit* held = static_cast<Unit*>(player->m_mover))
+                w.AddGuid("mover", held->GetGUID().GetRawValue());
             w.Raw("pos", PosJson(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation()));
             EmitEvent(*s, "WB_MOVE_RESULT", 0xFF01, w.Str());
             return;
         }
+        auto addMover = [&](Json::Writer& w) {
+            if (mover != player)
+                w.AddGuid("mover", mover->GetGUID().GetRawValue());
+        };
 
-        if (s->rooted.load())
+        if (RootedFor(*s, mover, player))
         {
             // A rooted client cannot move: nothing is sent, not even the stop a
             // redirect sends (the root ack was the stop). A walk the tick has
@@ -3539,12 +3727,20 @@ namespace WrathBench
             ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "move_to").Add("moveId", moveId).Str()});
             Json::Writer w;
             w.Add("moveId", moveId).Add("status", "rooted");
-            w.Raw("pos", PosJson(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation()));
+            addMover(w);
+            w.Raw("pos", PosJson(mover->GetPositionX(), mover->GetPositionY(), mover->GetPositionZ(), mover->GetOrientation()));
             EmitEvent(*s, "WB_MOVE_RESULT", 0xFF01, w.Str());
             return;
         }
 
-        if (s->move.active)
+        if (s->move.active && !WalkDrives(*s, mover, player))
+        {
+            // The walk still running drove another unit (control changed hands
+            // since; the tick has not seen it yet): the server drops that
+            // unit's packets now, so nothing is sent and it ends `controlling`.
+            FinishMove(*s, "controlling");
+        }
+        else if (s->move.active)
         {
             // A client whose run is redirected stops first: without this the
             // server's last movement word stays MOVEMENTFLAG_FORWARD when the
@@ -3552,8 +3748,8 @@ namespace WrathBench
             // later cast fails SPELL_FAILED_MOVING (~10 minutes of
             // Hearthstone casts in nav-probe c3).
             MoveState& old = s->move;
-            SendMovePacket(*s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, old.curX, old.curY, old.curZ, old.curO,
-                FindTransportAt(player->GetMap(), old.curX, old.curY, old.curZ));
+            SendMovePacket(*s, mover, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, old.curX, old.curY, old.curZ, old.curO,
+                TransportUnder(*s, mover, old.curX, old.curY, old.curZ));
             FinishMove(*s, "superseded");
         }
 
@@ -3589,18 +3785,28 @@ namespace WrathBench
             // Nothing moved; if the server still has the character flagged as
             // moving (a superseded run it has not yet seen stop), end it the
             // way a client's run ends. A no-op for a character already still.
-            if (player->isMoving())
-                SendMovePacket(*s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE,
-                    player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation(),
-                    player->GetTransport());
+            if (mover->isMoving())
+                SendMovePacket(*s, mover, MSG_MOVE_STOP, MOVEMENTFLAG_NONE,
+                    mover->GetPositionX(), mover->GetPositionY(), mover->GetPositionZ(), mover->GetOrientation(),
+                    mover->GetTransport());
             Json::Writer w;
             w.Add("moveId", moveId).Add("status", status);
-            w.Raw("pos", PosJson(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation()));
+            addMover(w);
+            w.Raw("pos", PosJson(mover->GetPositionX(), mover->GetPositionY(), mover->GetPositionZ(), mover->GetOrientation()));
             EmitEvent(*s, "WB_MOVE_RESULT", 0xFF01, w.Str());
         };
 
-        if (player->GetExactDist2d(x, y) > 250.0f)
+        if (mover->GetExactDist2d(x, y) > 250.0f)
             return failEvent("too_far");
+
+        // A flying mover (the Eye of Acherus, a flying vehicle) is not walked
+        // over the mesh: a client flies it in a straight line, and so does the
+        // module (PlanFlight). Known the way a client knows it: from the
+        // flight flags the unit's own create block carried at the handover and
+        // the packets for its guid since (BenchSession::moverMoveFlags), never
+        // from the creature's template.
+        bool const flying = mover != player
+            && (s->moverMoveFlags.load() & (MOVEMENTFLAG_CAN_FLY | MOVEMENTFLAG_DISABLE_GRAVITY)) != 0;
 
         // Resolve the request against the server's mmaps (the one sanctioned
         // navmesh use, docs/CONTRACTS.md "Pathing") into either a walkable
@@ -3616,12 +3822,25 @@ namespace WrathBench
         PathResolve r;
         bool transportLeg = false; // the straight leg onto or off a transport: WalkEtaMs runs it dry
         {
-            Map* map = player->GetMap();
-            Transport* startT = player->GetTransport();
+            Map* map = mover->GetMap();
+            Transport* startT = mover->GetTransport();
             if (!startT)
-                startT = FindTransportAt(map, player->GetPositionX(), player->GetPositionY(), player->GetPositionZ());
+                startT = FindTransportAt(map, mover->GetPositionX(), mover->GetPositionY(), mover->GetPositionZ());
             Transport* targetT = FindTransportAt(map, x, y, z);
-            if ((startT || targetT) && player->GetExactDist2d(x, y) <= 30.0f)
+            if (flying)
+            {
+                FlightPlan const fp = PlanFlight(mover, x, y, z, r.points);
+                r.status = fp.status;
+                if (fp.hasReached)
+                {
+                    r.hasReached = true;
+                    r.reachedX = fp.reached.x; r.reachedY = fp.reached.y; r.reachedZ = fp.reached.z;
+                }
+                Audit(*s, "action", Json::Writer().Add("op", "move_flight_leg").Add("moveId", moveId)
+                    .Add("status", r.status ? r.status : "ok")
+                    .Add("flightSpeed", (double)mover->GetSpeed(MOVE_FLIGHT)).Str());
+            }
+            else if (mover == player && (startT || targetT) && mover->GetExactDist2d(x, y) <= 30.0f)
             {
                 transportLeg = true;
                 bool leaving = startT != nullptr && !targetT;
@@ -3637,7 +3856,7 @@ namespace WrathBench
                 // reported as `meshZ`, like a mesh-corrected arrival.
                 if (leaving)
                 {
-                    float groundZ = map->GetHeight(player->GetPhaseMask(), x, y, z, true);
+                    float groundZ = map->GetHeight(mover->GetPhaseMask(), x, y, z, true);
                     if (groundZ > INVALID_HEIGHT && std::fabs(groundZ - z) > 1.0f)
                     {
                         endZ = groundZ;
@@ -3645,7 +3864,7 @@ namespace WrathBench
                         r.meshZ = groundZ;
                     }
                 }
-                r.points.push_back({player->GetPositionX(), player->GetPositionY(), player->GetPositionZ()});
+                r.points.push_back({mover->GetPositionX(), mover->GetPositionY(), mover->GetPositionZ()});
                 r.points.push_back({x, y, endZ});
                 Json::Writer a;
                 a.Add("op", "move_transport_leg").Add("moveId", moveId)
@@ -3657,7 +3876,7 @@ namespace WrathBench
             else
             {
                 bool usedGroundZ = false, usedMeshZ = false; float groundZ = z;
-                r = ResolvePath(player, x, y, z, !guid.empty(), &usedGroundZ, &groundZ, force, &usedMeshZ);
+                r = ResolvePath(mover, x, y, z, !guid.empty(), &usedGroundZ, &groundZ, force, &usedMeshZ);
                 if (usedGroundZ)
                     Audit(*s, "action", Json::Writer().Add("op", "move_ground_z").Add("moveId", moveId)
                         .Add("unitTarget", !guid.empty()).Add("z", (double)z).Add("groundZ", (double)groundZ).Str());
@@ -3686,9 +3905,9 @@ namespace WrathBench
                         .Add("polys", r.longPolys).Add("pointCount", (uint64_t)r.points.size()).Str());
                 if (r.hasSnap)
                     Audit(*s, "action", Json::Writer().Add("op", "move_start_snap").Add("moveId", moveId)
-                        .Raw("from", PosJson(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation()))
+                        .Raw("from", PosJson(mover->GetPositionX(), mover->GetPositionY(), mover->GetPositionZ(), mover->GetOrientation()))
                         .Raw("to", Json::Writer().Add("x", (double)r.snapX).Add("y", (double)r.snapY).Add("z", (double)r.snapZ).Str())
-                        .Add("distance", (double)std::sqrt(std::pow(r.snapX - player->GetPositionX(), 2.0f) + std::pow(r.snapY - player->GetPositionY(), 2.0f) + std::pow(r.snapZ - player->GetPositionZ(), 2.0f)))
+                        .Add("distance", (double)std::sqrt(std::pow(r.snapX - mover->GetPositionX(), 2.0f) + std::pow(r.snapY - mover->GetPositionY(), 2.0f) + std::pow(r.snapZ - mover->GetPositionZ(), 2.0f)))
                         .Str());
                 if (r.hasStartLevel)
                     Audit(*s, "action", Json::Writer().Add("op", "move_start_level").Add("moveId", moveId)
@@ -3750,13 +3969,16 @@ namespace WrathBench
             .Raw("points", PathPointsJson(r.points)).Str());
         if (r.status != nullptr)
         {
-            if (player->isMoving()) // see failEvent
-                SendMovePacket(*s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE,
-                    player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation(),
-                    player->GetTransport());
+            if (mover->isMoving()) // see failEvent
+                SendMovePacket(*s, mover, MSG_MOVE_STOP, MOVEMENTFLAG_NONE,
+                    mover->GetPositionX(), mover->GetPositionY(), mover->GetPositionZ(), mover->GetOrientation(),
+                    mover->GetTransport());
             Json::Writer w;
             w.Add("moveId", moveId).Add("status", r.status);
-            w.Raw("pos", PosJson(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation()));
+            addMover(w);
+            if (flying)
+                w.Add("flight", true);
+            w.Raw("pos", PosJson(mover->GetPositionX(), mover->GetPositionY(), mover->GetPositionZ(), mover->GetOrientation()));
             if (r.hasReached)
                 w.Raw("reachedPos", Json::Writer().Add("x", (double)r.reachedX).Add("y", (double)r.reachedY).Add("z", (double)r.reachedZ).Str());
             if (r.hasDrop)
@@ -3765,7 +3987,7 @@ namespace WrathBench
                 w.Raw("target", Json::Writer().Add("x", (double)x).Add("y", (double)y).Add("z", (double)z).Str());
                 if (r.hasSurfaceZ)
                     w.Add("surfaceZ", (double)r.surfaceZ);
-                AddSafeFall(w, player);
+                AddSafeFall(w, mover);
             }
             if (r.nearestSearched)
             {
@@ -3805,14 +4027,14 @@ namespace WrathBench
         // liquid query per ETA_SAMPLE_YARDS of route, on this thread.
         {
             auto const t0 = std::chrono::steady_clock::now();
-            WalkEta const eta = WalkEtaMs(player, m.points, transportLeg);
+            WalkEta const eta = flying ? FlightEtaMs(mover, m.points) : WalkEtaMs(mover, m.points, transportLeg);
             int64_t const costUs = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - t0).count();
             m.etaMs = eta.ms;
             Audit(*s, "action", Json::Writer().Add("op", "move_eta").Add("moveId", moveId)
                 .Add("etaMs", eta.ms).Add("pathLength", (double)m.pathLength)
                 .Add("swimYards", (double)eta.swimYards).Add("samples", eta.samples).Add("costUs", costUs)
-                .Add("runSpeed", (double)player->GetSpeed(MOVE_RUN)).Add("swimSpeed", (double)player->GetSpeed(MOVE_SWIM))
+                .Add("runSpeed", (double)mover->GetSpeed(MOVE_RUN)).Add("swimSpeed", (double)mover->GetSpeed(MOVE_SWIM))
                 .Str());
         }
         // Before the walker starts: nothing below can end the move first, but
@@ -3827,18 +4049,25 @@ namespace WrathBench
         m.destX = m.points.back().x; m.destY = m.points.back().y; m.destZ = m.points.back().z;
         m.curO = Position::NormalizeOrientation(std::atan2(m.points[1].y - m.points[0].y, m.points[1].x - m.points[0].x));
         m.stopping = false;
+        m.moverGuid = mover == player ? 0 : mover->GetGUID().GetRawValue();
+        m.flying = flying;
         m.active = true;
         // Where the body starts, from the server's record of the last swim
         // flag sent: a character idling in water starts swimming, and one the
         // world moved in or out of water since (a teleport, a knockback)
-        // sends the transition first, as a client's physics would.
-        m.swimming = player->IsInWater();
-        PlaceMover(*s, player, m.curX, m.curY, m.curZ, MOVEMENTFLAG_NONE, now);
+        // sends the transition first, as a client's physics would. A flight
+        // has no water.
+        m.swimming = !flying && mover->IsInWater();
+        PlaceMover(*s, mover, m.curX, m.curY, m.curZ, MOVEMENTFLAG_NONE, now);
 
-        SendMovePacket(*s, player, MSG_MOVE_START_FORWARD, MOVEMENTFLAG_FORWARD, m.curX, m.curY, m.curZ, m.curO,
-            FindTransportAt(player->GetMap(), m.curX, m.curY, m.curZ));
-        Audit(*s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_START_FORWARD")
-            .Add("moveId", moveId).Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO)).Str());
+        SendMovePacket(*s, mover, MSG_MOVE_START_FORWARD, MOVEMENTFLAG_FORWARD, m.curX, m.curY, m.curZ, m.curO,
+            TransportUnder(*s, mover, m.curX, m.curY, m.curZ));
+        Json::Writer startW;
+        startW.Add("op", "move_pkt").Add("opcode", "MSG_MOVE_START_FORWARD").Add("moveId", moveId);
+        addMover(startW);
+        if (flying)
+            startW.Add("flight", true);
+        Audit(*s, "action", startW.Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO)).Str());
     }
 
     void Manager::DoStop(std::string token, std::shared_ptr<std::promise<HttpReply>> ack)
@@ -3850,7 +4079,26 @@ namespace WrathBench
 
         Audit(*s, "action", Json::Writer().Add("op", "stop").Str());
 
-        if (s->move.active && s->rooted.load())
+        // The unit the client moves (ActiveMover): the stop carries its
+        // guid, as any movement packet must. A mover the core holds out of
+        // this map takes no packet, so none is sent.
+        Unit* mover = ActiveMover(player);
+        if (!mover)
+        {
+            if (s->move.active)
+                FinishMove(*s, "controlling");
+            ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "stop").Str()});
+            return;
+        }
+
+        if (s->move.active && !WalkDrives(*s, mover, player))
+        {
+            // The walk drove another unit and control has changed hands since
+            // (the tick has not seen it yet): its packets are dropped now, so
+            // nothing is sent and it ends `controlling`.
+            FinishMove(*s, "controlling");
+        }
+        else if (s->move.active && RootedFor(*s, mover, player))
         {
             // Rooted mid-walk and the tick has not ended it yet: the root ack
             // already stopped the character where the mover stood.
@@ -3861,19 +4109,16 @@ namespace WrathBench
             MoveState& m = s->move;
             // Stop where the "client" is (the interpolated position); the server
             // accepts it the same way it accepts any client stop mid-run.
-            SendMovePacket(*s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, m.curX, m.curY, m.curZ, m.curO,
-                FindTransportAt(player->GetMap(), m.curX, m.curY, m.curZ));
+            SendMovePacket(*s, mover, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, m.curX, m.curY, m.curZ, m.curO,
+                TransportUnder(*s, mover, m.curX, m.curY, m.curZ));
             FinishMove(*s, "stopped");
         }
-        else if (static_cast<Unit*>(player->m_mover) == player)
+        else
         {
-            SendMovePacket(*s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE,
-                player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation(),
-                player->GetTransport());
+            SendMovePacket(*s, mover, MSG_MOVE_STOP, MOVEMENTFLAG_NONE,
+                mover->GetPositionX(), mover->GetPositionY(), mover->GetPositionZ(), mover->GetOrientation(),
+                mover->GetTransport());
         }
-        // Else the client moves another unit (OnClientControlUpdate): a stop
-        // under the character's own guid would be dropped by the server, and
-        // the walker does not drive that unit yet, so nothing is sent.
         ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "stop").Str()});
     }
 
@@ -3891,19 +4136,20 @@ namespace WrathBench
         // Refused, nothing sent (PROTOCOL.md "face").
         if (s->move.active)
             return ack->set_value({409, Json::Writer().Add("ok", false).Add("error", "moving").Str()});
-        // The character's own facing while the client moves another unit
-        // (OnClientControlUpdate) would be dropped by the server
-        // (HandleMovementOpcodes), and the walker does not turn that unit yet.
-        // Refused, nothing sent.
-        if (static_cast<Unit*>(player->m_mover) != player)
+        // The unit the client moves turns (ActiveMover): a vehicle's driving
+        // seat turns the vehicle, a possession the possessed unit. A mover
+        // the core holds out of this map takes no packet: refused, nothing
+        // sent.
+        Unit* mover = ActiveMover(player);
+        if (!mover)
             return ack->set_value({409, Json::Writer().Add("ok", false).Add("error", "controlling").Str()});
 
         float target = hasO ? Position::NormalizeOrientation(o)
-                            : (hasXY ? player->GetAngle(x, y) : player->GetOrientation());
+                            : (hasXY ? mover->GetAngle(x, y) : mover->GetOrientation());
 
         Audit(*s, "action", Json::Writer().Add("op", "face").Add("orientation", (double)target).Str());
-        SendMovePacket(*s, player, MSG_MOVE_SET_FACING, MOVEMENTFLAG_NONE,
-            player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), target);
+        SendMovePacket(*s, mover, MSG_MOVE_SET_FACING, MOVEMENTFLAG_NONE,
+            mover->GetPositionX(), mover->GetPositionY(), mover->GetPositionZ(), target);
         ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "face")
             .Add("orientation", (double)target).Str()});
     }
@@ -5095,7 +5341,7 @@ namespace WrathBench
         return p.IsWithinBox(center, t.boxLength / 2.0f, t.boxWidth / 2.0f, t.boxHeight / 2.0f);
     }
 
-    void Manager::CheckAreaTriggers(BenchSession& s, Player* player, float x, float y, float z, int64_t nowMs)
+    void Manager::CheckAreaTriggers(BenchSession& s, Player* player, Unit* mover, float x, float y, float z, int64_t nowMs)
     {
         if (!_areaTriggersLoaded)
             return;
@@ -5143,8 +5389,8 @@ namespace WrathBench
         if (s.move.active)
         {
             MoveState& m = s.move;
-            SendMovePacket(s, player, MSG_MOVE_HEARTBEAT, MOVEMENTFLAG_FORWARD, x, y, z, m.curO,
-                FindTransportAt(player->GetMap(), x, y, z));
+            SendMovePacket(s, mover, MSG_MOVE_HEARTBEAT, MOVEMENTFLAG_FORWARD, x, y, z, m.curO,
+                TransportUnder(s, mover, x, y, z));
             m.lastPacketMs = nowMs;
             Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_HEARTBEAT")
                 .Add("moveId", m.moveId).Add("cause", "areatrigger").Raw("pos", PosJson(x, y, z, m.curO)).Str());
@@ -5236,7 +5482,7 @@ namespace WrathBench
                     EmitEvent(*s, "WB_SELF_MOVE", 0xFF09, w.Str());
                 }
             }
-            CheckAreaTriggers(*s, player, x, y, z, nowMs);
+            CheckAreaTriggers(*s, player, player, x, y, z, nowMs);
         }
     }
 
@@ -5252,25 +5498,25 @@ namespace WrathBench
     // carries no mounted-speed bonus (Unit::UpdateSpeed). Not on a transport
     // (no water on a deck), and nothing while a forced ledge is being fallen:
     // no packet goes out mid-fall, and the landing decides.
-    void Manager::PlaceMover(BenchSession& s, Player* player, float x, float y, float meshZ, uint32 moveFlags, int64_t nowMs)
+    void Manager::PlaceMover(BenchSession& s, Unit* mover, float x, float y, float meshZ, uint32 moveFlags, int64_t nowMs)
     {
         MoveState& m = s.move;
         m.curX = x; m.curY = y; m.curZ = meshZ;
-        if (m.inFall)
-            return;
-        Transport* transport = FindTransportAt(player->GetMap(), x, y, meshZ);
-        WaterPose const pose = transport ? WaterPose{false, meshZ} : WaterPoseAt(player, x, y, meshZ);
+        if (m.inFall || m.flying)
+            return; // a flight has no water: the body is where the line puts it
+        Transport* transport = TransportUnder(s, mover, x, y, meshZ);
+        WaterPose const pose = transport ? WaterPose{false, meshZ} : WaterPoseAt(mover, x, y, meshZ);
         m.curZ = pose.z;
         if (pose.swimming == m.swimming)
             return;
         m.swimming = pose.swimming;
         char const* opcode = pose.swimming ? "MSG_MOVE_START_SWIM" : "MSG_MOVE_STOP_SWIM";
-        SendMovePacket(s, player, pose.swimming ? MSG_MOVE_START_SWIM : MSG_MOVE_STOP_SWIM, moveFlags,
+        SendMovePacket(s, mover, pose.swimming ? MSG_MOVE_START_SWIM : MSG_MOVE_STOP_SWIM, moveFlags,
             m.curX, m.curY, m.curZ, m.curO, transport);
         m.lastPacketMs = nowMs;
         Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", opcode)
             .Add("moveId", m.moveId).Add("cause", "water").Add("meshZ", (double)meshZ)
-            .Add("collisionHeight", (double)player->GetCollisionHeight())
+            .Add("collisionHeight", (double)mover->GetCollisionHeight())
             .Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO)).Str());
     }
 
@@ -5347,11 +5593,12 @@ namespace WrathBench
             FinishMove(s, "interrupted");
             return;
         }
-        if (static_cast<Unit*>(player->m_mover) != player)
+        // The unit the walk drives must still be the one the client moves
+        // (ActiveMover): a handover mid-walk, either way, means the server
+        // drops this walk's packets from here on.
+        Unit* mover = ActiveMover(player);
+        if (!mover || (m.moverGuid ? mover->GetGUID().GetRawValue() != m.moverGuid : mover != player))
         {
-            // Control went to a vehicle or a possessed unit mid-walk
-            // (OnClientControlUpdate): the server drops the character's own
-            // packets from here on, and the walker does not drive that unit yet.
             FinishMove(s, "controlling");
             return;
         }
@@ -5360,7 +5607,7 @@ namespace WrathBench
         {
             // MSG_MOVE_STOP is queued; arrival is confirmed when the server-side
             // position reaches the destination.
-            if (player->GetExactDist2d(m.destX, m.destY) < 2.5f)
+            if (mover->GetExactDist2d(m.destX, m.destY) < 2.5f)
                 FinishMove(s, "arrived");
             else if (nowMs > m.stopDeadlineMs)
                 FinishMove(s, "interrupted");
@@ -5371,11 +5618,11 @@ namespace WrathBench
         // the ground. A released spirit (ghost flag) can and must move: the
         // corpse run is the normal 3.3.5a death recovery. Conflating the two
         // death states made every corpse run impossible.
-        if (!player->IsAlive() && !player->HasPlayerFlag(PLAYER_FLAGS_GHOST))
+        if (!mover->IsAlive() && !(mover == player && player->HasPlayerFlag(PLAYER_FLAGS_GHOST)))
         {
-            SendMovePacket(s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE,
-                player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation(),
-                player->GetTransport());
+            SendMovePacket(s, mover, MSG_MOVE_STOP, MOVEMENTFLAG_NONE,
+                mover->GetPositionX(), mover->GetPositionY(), mover->GetPositionZ(), mover->GetOrientation(),
+                mover->GetTransport());
             FinishMove(s, "interrupted");
             return;
         }
@@ -5384,7 +5631,7 @@ namespace WrathBench
         // and its root ack already carried the stop at the mover's point, so
         // the move ends here with no further packet. After the death check:
         // dying roots too (Player::KillPlayer), and a death is `interrupted`.
-        if (s.rooted.load())
+        if (RootedFor(s, mover, player))
         {
             FinishMove(s, "rooted");
             return;
@@ -5398,7 +5645,12 @@ namespace WrathBench
         // Advance along the polyline at the character's current speed: swim
         // speed while swimming (base 4.72y/s, swim-speed auras included, no
         // mount bonus), run speed otherwise (wading included), as a client.
-        float advance = player->GetSpeed(m.swimming ? MOVE_SWIM : MOVE_RUN) * float(dt) / 1000.0f;
+        // A flying mover at its flight speed (the server's MOVE_FLIGHT, or
+        // its run speed when it has none: FlightEtaMs reads the same).
+        float pace = mover->GetSpeed(m.flying ? MOVE_FLIGHT : (m.swimming ? MOVE_SWIM : MOVE_RUN));
+        if (m.flying && !(pace > 0.01f))
+            pace = mover->GetSpeed(MOVE_RUN);
+        float advance = pace * float(dt) / 1000.0f;
         while (m.seg + 1 < m.points.size())
         {
             WbVec const& a = m.points[m.seg];
@@ -5433,18 +5685,18 @@ namespace WrathBench
             // refused forced or not: no client walks up a ledge. So is a
             // step whose foot lies under the ground (FootUnderSurface): no
             // client falls through terrain.
-            if (m.segDone <= 0.0f)
+            if (!m.flying && m.segDone <= 0.0f)
             {
                 float dz = 0.0f;
                 if (IsDropSegment(a, b, &dz))
                 {
                     float surfaceZ = 0.0f;
-                    bool buried = dz < 0.0f && FootUnderSurface(player, a, b, &surfaceZ);
+                    bool buried = dz < 0.0f && FootUnderSurface(mover, a, b, &surfaceZ);
                     if (!m.force || dz > 0.0f || buried)
                     {
-                        PlaceMover(s, player, a.x, a.y, a.z, MOVEMENTFLAG_FORWARD, nowMs);
-                        SendMovePacket(s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, m.curX, m.curY, m.curZ, m.curO,
-                            FindTransportAt(player->GetMap(), m.curX, m.curY, m.curZ));
+                        PlaceMover(s, mover, a.x, a.y, a.z, MOVEMENTFLAG_FORWARD, nowMs);
+                        SendMovePacket(s, mover, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, m.curX, m.curY, m.curZ, m.curO,
+                            TransportUnder(s, mover, m.curX, m.curY, m.curZ));
                         Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_STOP")
                             .Add("moveId", m.moveId).Add("cause", "drop").Add("dz", (double)dz)
                             .Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO)).Str());
@@ -5458,16 +5710,16 @@ namespace WrathBench
                     if (dz < 0.0f && !m.inFall)
                     {
                         m.curO = Position::NormalizeOrientation(std::atan2(sy, sx));
-                        PlaceMover(s, player, a.x, a.y, a.z, MOVEMENTFLAG_FORWARD, nowMs);
-                        SendMovePacket(s, player, MSG_MOVE_HEARTBEAT, MOVEMENTFLAG_FORWARD, m.curX, m.curY, m.curZ, m.curO,
-                            FindTransportAt(player->GetMap(), a.x, a.y, a.z));
+                        PlaceMover(s, mover, a.x, a.y, a.z, MOVEMENTFLAG_FORWARD, nowMs);
+                        SendMovePacket(s, mover, MSG_MOVE_HEARTBEAT, MOVEMENTFLAG_FORWARD, m.curX, m.curY, m.curZ, m.curO,
+                            TransportUnder(s, mover, a.x, a.y, a.z));
                         m.lastPacketMs = nowMs;
                         Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_HEARTBEAT")
                             .Add("moveId", m.moveId).Add("cause", "drop_forced").Add("dz", (double)dz)
                             .Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO)).Str());
                         m.inFall = true;
                         m.fallStartMs = nowMs;
-                        m.fallMs = FallMs(player, a, b);
+                        m.fallMs = FallMs(mover, a, b);
                     }
                 }
             }
@@ -5515,13 +5767,13 @@ namespace WrathBench
                 // landing (Player::HandleFall), and treats the swim start as
                 // the end of the fall (ProcessMovementInfo).
                 m.inFall = false;
-                Transport* landT = FindTransportAt(player->GetMap(), b.x, b.y, b.z);
-                WaterPose const pose = landT ? WaterPose{false, b.z} : WaterPoseAt(player, b.x, b.y, b.z);
+                Transport* landT = TransportUnder(s, mover, b.x, b.y, b.z);
+                WaterPose const pose = landT ? WaterPose{false, b.z} : WaterPoseAt(mover, b.x, b.y, b.z);
                 m.curX = b.x; m.curY = b.y; m.curZ = pose.z;
                 bool const intoWater = pose.swimming && !m.swimming;
                 m.swimming = pose.swimming;
                 char const* landOpcode = intoWater ? "MSG_MOVE_START_SWIM" : "MSG_MOVE_FALL_LAND";
-                SendMovePacket(s, player, intoWater ? MSG_MOVE_START_SWIM : MSG_MOVE_FALL_LAND, MOVEMENTFLAG_FORWARD,
+                SendMovePacket(s, mover, intoWater ? MSG_MOVE_START_SWIM : MSG_MOVE_FALL_LAND, MOVEMENTFLAG_FORWARD,
                     m.curX, m.curY, m.curZ, m.curO, landT);
                 m.lastPacketMs = nowMs;
                 Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", landOpcode)
@@ -5538,9 +5790,9 @@ namespace WrathBench
             // Geometric end of path: send the stop at the exact destination
             // (the body's z there: under the surface when swimming) and wait
             // for the server to confirm.
-            PlaceMover(s, player, m.destX, m.destY, m.destZ, MOVEMENTFLAG_FORWARD, nowMs);
-            SendMovePacket(s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, m.curX, m.curY, m.curZ, m.curO,
-                FindTransportAt(player->GetMap(), m.destX, m.destY, m.destZ));
+            PlaceMover(s, mover, m.destX, m.destY, m.destZ, MOVEMENTFLAG_FORWARD, nowMs);
+            SendMovePacket(s, mover, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, m.curX, m.curY, m.curZ, m.curO,
+                TransportUnder(s, mover, m.destX, m.destY, m.destZ));
             Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_STOP")
                 .Add("moveId", m.moveId).Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO)).Str());
             m.stopping = true;
@@ -5550,7 +5802,7 @@ namespace WrathBench
 
         // The body over the point just reached: under the surface or on the
         // bed in water, with the swim transition when it changes.
-        PlaceMover(s, player, m.curX, m.curY, m.curZ, MOVEMENTFLAG_FORWARD, nowMs);
+        PlaceMover(s, mover, m.curX, m.curY, m.curZ, MOVEMENTFLAG_FORWARD, nowMs);
 
         // Heartbeat cadence, as a real client: ~500ms. Before each heartbeat,
         // verify the server actually applied the previous packets; a large gap
@@ -5562,13 +5814,20 @@ namespace WrathBench
         // runs before a turn report (below), which restarts the interval: on a
         // bending route at a mount's speed turns can come faster than 500ms,
         // and the check must not wait on a heartbeat that never falls due.
+        // The character's own walk keeps the 15y it always had. A flight, or
+        // a walk of another unit, follows the pace: the server's position is
+        // the last packet's, up to a heartbeat (500 ms) plus a map update
+        // behind the walker, so a mover at several times run speed is
+        // legitimately farther from its walker than a runner — 0.8 s of the
+        // pace plus 10y, never under 15.
+        float const driftTolerance = (m.flying || m.moverGuid) ? std::max(15.0f, pace * 0.8f + 10.0f) : 15.0f;
         auto drifted = [&]() -> bool
         {
-            if (player->GetExactDist2d(m.curX, m.curY) <= 15.0f)
+            if (mover->GetExactDist2d(m.curX, m.curY) <= driftTolerance)
                 return false;
-            SendMovePacket(s, player, MSG_MOVE_STOP, MOVEMENTFLAG_NONE,
-                player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation(),
-                player->GetTransport());
+            SendMovePacket(s, mover, MSG_MOVE_STOP, MOVEMENTFLAG_NONE,
+                mover->GetPositionX(), mover->GetPositionY(), mover->GetPositionZ(), mover->GetOrientation(),
+                mover->GetTransport());
             FinishMove(s, "interrupted");
             return true;
         };
@@ -5576,8 +5835,8 @@ namespace WrathBench
         {
             if (drifted())
                 return;
-            SendMovePacket(s, player, MSG_MOVE_HEARTBEAT, MOVEMENTFLAG_FORWARD, m.curX, m.curY, m.curZ, m.curO,
-                FindTransportAt(player->GetMap(), m.curX, m.curY, m.curZ));
+            SendMovePacket(s, mover, MSG_MOVE_HEARTBEAT, MOVEMENTFLAG_FORWARD, m.curX, m.curY, m.curZ, m.curO,
+                TransportUnder(s, mover, m.curX, m.curY, m.curZ));
             m.lastPacketMs = nowMs;
             Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_HEARTBEAT")
                 .Add("moveId", m.moveId).Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO)).Str());
@@ -5597,8 +5856,8 @@ namespace WrathBench
         {
             if (drifted())
                 return;
-            SendMovePacket(s, player, MSG_MOVE_SET_FACING, MOVEMENTFLAG_FORWARD, m.curX, m.curY, m.curZ, m.curO,
-                FindTransportAt(player->GetMap(), m.curX, m.curY, m.curZ));
+            SendMovePacket(s, mover, MSG_MOVE_SET_FACING, MOVEMENTFLAG_FORWARD, m.curX, m.curY, m.curZ, m.curO,
+                TransportUnder(s, mover, m.curX, m.curY, m.curZ));
             m.lastPacketMs = nowMs;
             Audit(s, "action", Json::Writer().Add("op", "move_pkt").Add("opcode", "MSG_MOVE_SET_FACING")
                 .Add("moveId", m.moveId).Add("cause", "turn")
@@ -5611,18 +5870,26 @@ namespace WrathBench
         // applied position is as close as possible to the one tested here.
         // Not mid-fall: the body is in the air on a line the fall's packets
         // never report, and the landing's column is tested on the next tick.
-        if (!m.inFall)
-            CheckAreaTriggers(s, player, m.curX, m.curY, m.curZ, nowMs);
+        // Only where the character itself travels: on its own feet, or on a
+        // vehicle it sits in. A possessed unit flies off while the character
+        // stands, and a client tests the character's own position.
+        if (!m.inFall && !m.flying && (mover == player || player->GetVehicleBase() == mover))
+            CheckAreaTriggers(s, player, mover, m.curX, m.curY, m.curZ, nowMs);
         if (!m.active)
             return; // (defensive: a synchronous finish is not expected here)
 
         // Progress events: the position the module's client-side movement engine
-        // is at — knowledge a real client has locally.
+        // is at — knowledge a real client has locally. A walk of another
+        // unit names it (`mover`): the position is that unit's.
         if (nowMs - m.lastProgressMs >= 1000)
         {
             m.lastProgressMs = nowMs;
             Json::Writer w;
             w.Add("moveId", m.moveId);
+            if (m.moverGuid)
+                w.AddGuid("mover", m.moverGuid);
+            if (m.flying)
+                w.Add("flight", true);
             w.Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO));
             w.Add("pathLength", (double)m.pathLength);
             if (m.etaMs > 0)
@@ -5908,10 +6175,16 @@ namespace WrathBench
                 return;
             }
             uint64 guid = 0; p.readPackGUID(guid);
-            if (guid != self)
-                return; // a vehicle or a charmed mover: never driven by the module
+            // The character's own, or the unit the client moves (a vehicle's
+            // driving seat, a possession: OnClientControlUpdate), whose root
+            // packets come to this client with that unit's guid once it is
+            // the mover (Unit::SendMoveRoot, GetClientControlling); any other
+            // unit's is not this client's state.
+            bool const forMover = guid != self && guid == s.activeMover.load();
+            if (guid != self && !forMover)
+                return;
             bool const root = opcode == SMSG_FORCE_MOVE_ROOT || opcode == SMSG_SPLINE_MOVE_ROOT;
-            s.rooted.store(root);
+            (forMover ? s.moverRooted : s.rooted).store(root);
             if (opcode == SMSG_FORCE_MOVE_ROOT || opcode == SMSG_FORCE_MOVE_UNROOT)
             {
                 uint32 counter = 0; p >> counter;
@@ -5937,25 +6210,34 @@ namespace WrathBench
     void Manager::AnswerForceRoot(BenchSession& s, WorldSession* ws, bool root, uint64_t guid, uint32_t counter)
     {
         Player* player = ws->GetPlayer();
-        if (!player || player->GetGUID().GetRawValue() != guid)
+        if (!player)
+            return;
+        // The character, or the unit the client moves (OnRootPacket admits no
+        // other): the ack carries that unit's guid and its point, as
+        // HandleMoveRootAck wants the mover's.
+        Unit* unit = guid == player->GetGUID().GetRawValue() ? static_cast<Unit*>(player) : ObjectAccessor::GetUnit(*player, ObjectGuid(guid));
+        if (!unit)
             return;
         MoveState const& m = s.move;
-        bool const walking = m.active && !m.inFall;
-        float const x = walking ? m.curX : player->GetPositionX();
-        float const y = walking ? m.curY : player->GetPositionY();
-        float const z = walking ? m.curZ : player->GetPositionZ();
-        float const o = walking ? m.curO : player->GetOrientation();
-        Transport* transport = walking ? FindTransportAt(player->GetMap(), x, y, z) : player->GetTransport();
+        bool const walking = m.active && !m.inFall && WalkDrives(s, unit, player);
+        float const x = walking ? m.curX : unit->GetPositionX();
+        float const y = walking ? m.curY : unit->GetPositionY();
+        float const z = walking ? m.curZ : unit->GetPositionZ();
+        float const o = walking ? m.curO : unit->GetOrientation();
+        Transport* transport = walking ? TransportUnder(s, unit, x, y, z) : unit->GetTransport();
         uint16 const opcode = root ? CMSG_FORCE_MOVE_ROOT_ACK : CMSG_FORCE_MOVE_UNROOT_ACK;
         WorldPacket* p = new WorldPacket(opcode, 8 + 4 + 4 + 2 + 4 + 16 + 8 + 16 + 4 + 1 + 4 + 4);
-        *p << player->GetPackGUID();
+        *p << unit->GetPackGUID();
         *p << uint32(counter);
-        AppendMovementInfo(*p, s, player, root ? MOVEMENTFLAG_ROOT : MOVEMENTFLAG_NONE, x, y, z, o, transport);
+        AppendAckMovementInfo(*p, s, unit, root ? MOVEMENTFLAG_ROOT : MOVEMENTFLAG_NONE, x, y, z, o, transport);
         ws->QueuePacket(p);
-        Audit(s, "action", Json::Writer().Add("op", "root_ack")
+        Json::Writer a;
+        a.Add("op", "root_ack")
             .Add("opcode", root ? "CMSG_FORCE_MOVE_ROOT_ACK" : "CMSG_FORCE_MOVE_UNROOT_ACK")
-            .Add("counter", counter).Add("moveId", walking ? m.moveId : uint64_t(0))
-            .Raw("pos", PosJson(x, y, z, o)).Str());
+            .Add("counter", counter).Add("moveId", walking ? m.moveId : uint64_t(0));
+        if (unit != player)
+            a.AddGuid("mover", guid);
+        Audit(s, "action", a.Raw("pos", PosJson(x, y, z, o)).Str());
     }
 
     // Forced speed changes. A unit its client controls changes speed by
@@ -6029,20 +6311,24 @@ namespace WrathBench
         uint64_t moveId;  // the walk it was sent during, 0 outside one
     };
 
-    static AckPose ClientPoseForAck(BenchSession& s, Player* player)
+    // For `unit`: the character, or the unit the client moves. The walk's
+    // point only when the walk drives this unit (WalkDrives); the rooted
+    // state is this unit's (RootedFor).
+    static AckPose ClientPoseForAck(BenchSession& s, Player* player, Unit* unit)
     {
         MoveState const& m = s.move;
-        bool const rooted = s.rooted.load();
-        bool const atMover = m.active && !m.inFall && player->IsInWorld();
-        bool const running = m.active && !m.stopping && !rooted;
+        bool const rooted = RootedFor(s, unit, player);
+        bool const drives = WalkDrives(s, unit, player);
+        bool const atMover = drives && !m.inFall && unit->IsInWorld();
+        bool const running = drives && !m.stopping && !rooted;
         AckPose a;
-        a.x = atMover ? m.curX : player->GetPositionX();
-        a.y = atMover ? m.curY : player->GetPositionY();
-        a.z = atMover ? m.curZ : player->GetPositionZ();
-        a.o = atMover ? m.curO : player->GetOrientation();
-        a.transport = atMover ? FindTransportAt(player->GetMap(), a.x, a.y, a.z) : player->GetTransport();
+        a.x = atMover ? m.curX : unit->GetPositionX();
+        a.y = atMover ? m.curY : unit->GetPositionY();
+        a.z = atMover ? m.curZ : unit->GetPositionZ();
+        a.o = atMover ? m.curO : unit->GetOrientation();
+        a.transport = atMover ? TransportUnder(s, unit, a.x, a.y, a.z) : unit->GetTransport();
         a.flags = rooted ? MOVEMENTFLAG_ROOT : (running ? MOVEMENTFLAG_FORWARD : MOVEMENTFLAG_NONE);
-        a.moveId = m.active ? m.moveId : uint64_t(0);
+        a.moveId = drives ? m.moveId : uint64_t(0);
         return a;
     }
 
@@ -6124,7 +6410,7 @@ namespace WrathBench
         uint8 const outstanding = player->m_forced_speed_changes[type];
         bool const last = outstanding <= alreadySent + 1;
         float const serverSpeed = player->GetSpeed(type);
-        AckPose const a = ClientPoseForAck(s, player);
+        AckPose const a = ClientPoseForAck(s, player, player);
         if (last && std::fabs(serverSpeed - speed) > 0.01f)
         {
             Audit(s, "action", Json::Writer().Add("op", "move_ack").Add("kind", "speed")
@@ -6138,7 +6424,7 @@ namespace WrathBench
         WorldPacket* p = new WorldPacket(ackOpcode, 8 + 4 + 4 + 2 + 4 + 16 + 8 + 16 + 4 + 1 + 4 + 4 + 4);
         *p << player->GetPackGUID();
         *p << uint32(counter);
-        AppendMovementInfo(*p, s, player, a.flags, a.x, a.y, a.z, a.o, a.transport);
+        AppendAckMovementInfo(*p, s, player, a.flags, a.x, a.y, a.z, a.o, a.transport);
         *p << float(speed);
         ws->QueuePacket(p);
         Audit(s, "action", Json::Writer().Add("op", "move_ack").Add("kind", "speed")
@@ -6299,16 +6585,22 @@ namespace WrathBench
         {
             return; // a short packet (ByteBufferException): nothing to answer
         }
-        if (guid != player->GetGUID().GetRawValue())
-            return; // another unit's spline change, or a vehicle's: not this client's state
+        // The character's own, or the unit the client moves (its can-fly and
+        // the rest come to this client with that unit's guid: Unit::SetCanFly
+        // on a client-controlled unit); any other unit's spline change is not
+        // this client's state.
+        bool const forMover = guid != player->GetGUID().GetRawValue() && guid == s.activeMover.load();
+        if (guid != player->GetGUID().GetRawValue() && !forMover)
+            return;
         if (!c.ack)
         {
             // The spline twin: the server has set the flag itself; the client
             // only takes it as its own state.
+            std::atomic<uint32_t>& flags = forMover ? s.moverMoveFlags : s.stateMoveFlags;
             if (c.apply)
-                s.stateMoveFlags.fetch_or(c.flag);
+                flags.fetch_or(c.flag);
             else
-                s.stateMoveFlags.fetch_and(~c.flag);
+                flags.fetch_and(~c.flag);
             return;
         }
         AnswerMoveFlag(s, ws, opcode, guid, counter);
@@ -6319,36 +6611,46 @@ namespace WrathBench
     // deliberate gaps: a can-fly ack is still sent (it tells observers, and
     // clears the server's pending flight change) but says the character
     // cannot fly, and a water-walk ack sent mid-swim drops the flag. The ack's MovementInfo is
-    // ClientPoseForAck's, as the speed acks'. Only while the character is its
-    // own mover: HandleMoveFlagChangeOpcode writes the flags onto whatever
-    // unit the session moves without checking the guid, so an ack for the
-    // character while it drives a vehicle or a charmed unit would set them on
-    // that unit; the module never drives one, and the flag is still kept.
+    // ClientPoseForAck's, as the speed acks'. Only for the unit the session
+    // moves right now: HandleMoveFlagChangeOpcode writes the ack's flags onto
+    // Player::m_mover without checking the guid, so an ack for the character
+    // while it drives a vehicle or a possessed unit would set them on that
+    // unit, and one for the unit after control returned would set them on the
+    // character; the flag is kept either way, for the unit it was sent to
+    // (stateMoveFlags, moverMoveFlags), and the ack follows when it is the mover.
     void Manager::AnswerMoveFlag(BenchSession& s, WorldSession* ws, uint16_t opcode, uint64_t guid, uint32_t counter)
     {
         MoveFlagChange c;
         Player* player = ws->GetPlayer();
-        if (!player || player->GetGUID().GetRawValue() != guid || !LookupMoveFlagChange(opcode, c) || !c.ack)
+        if (!player || !LookupMoveFlagChange(opcode, c) || !c.ack)
             return;
+        bool const self = player->GetGUID().GetRawValue() == guid;
+        if (!self && guid != s.activeMover.load())
+            return;
+        std::atomic<uint32_t>& flags = self ? s.stateMoveFlags : s.moverMoveFlags;
         if (c.apply)
-            s.stateMoveFlags.fetch_or(c.flag);
+            flags.fetch_or(c.flag);
         else
-            s.stateMoveFlags.fetch_and(~c.flag);
-        if (static_cast<Unit*>(player->m_mover) != player)
+            flags.fetch_and(~c.flag);
+        Unit* unit = self ? static_cast<Unit*>(player) : ObjectAccessor::GetUnit(*player, ObjectGuid(guid));
+        if (!unit || static_cast<Unit*>(player->m_mover) != unit)
             return;
 
-        AckPose const a = ClientPoseForAck(s, player);
+        AckPose const a = ClientPoseForAck(s, player, unit);
         WorldPacket* p = new WorldPacket(c.ack, 8 + 4 + 4 + 2 + 4 + 16 + 8 + 16 + 4 + 1 + 4 + 4 + 4);
-        *p << player->GetPackGUID();
+        *p << unit->GetPackGUID();
         *p << uint32(counter);
-        AppendMovementInfo(*p, s, player, a.flags, a.x, a.y, a.z, a.o, a.transport);
+        AppendAckMovementInfo(*p, s, unit, a.flags, a.x, a.y, a.z, a.o, a.transport);
         *p << uint32(c.apply ? 1 : 0);  // read as a u32 and never used (HandleMoveFlagChangeOpcode)
         ws->QueuePacket(p);
-        Audit(s, "action", Json::Writer().Add("op", "move_ack").Add("kind", c.kind)
+        Json::Writer w;
+        w.Add("op", "move_ack").Add("kind", c.kind)
             .Add("opcode", c.ackName)
             .Add("counter", counter).Add("apply", c.apply)
-            .Add("moveId", a.moveId)
-            .Raw("pos", PosJson(a.x, a.y, a.z, a.o)).Str());
+            .Add("moveId", a.moveId);
+        if (!self)
+            w.AddGuid("mover", guid);
+        Audit(s, "action", w.Raw("pos", PosJson(a.x, a.y, a.z, a.o)).Str());
     }
 
     // Client control. Player::SetClientControl tells the client which unit
@@ -6393,6 +6695,26 @@ namespace WrathBench
         if (allowMove)
         {
             s.activeMover.store(guid == self ? 0 : guid);
+            // The unit's state as this client now holds it: rooted when its
+            // create block carried ROOT (a spline root set before the
+            // handover, when no client controlled it), and the
+            // movement-state flags its create block and spline packets
+            // carried (a flying creature's can-fly or no gravity, a hover,
+            // its water walking, its feather fall: each set by a core
+            // function that sends the set/unset to the set while no client
+            // controls the unit). Not FLYING: the core adds it to a possessed
+            // flyer in place (Unit::SetCharmedBy) and tells no client, so the
+            // walk sets it on its own packets while it flies, as a client's
+            // physics do (AppendMovementInfo). The packets for its guid keep
+            // both from here (OnRootPacket, OnMoveFlagPacket).
+            if (guid != self)
+            {
+                Unit* unit = ObjectAccessor::GetUnit(*player, ObjectGuid(guid));
+                s.moverRooted.store(unit && unit->m_movementInfo.HasMovementFlag(MOVEMENTFLAG_ROOT));
+                s.moverMoveFlags.store(!unit ? 0 : unit->m_movementInfo.GetMovementFlags()
+                    & uint32(MOVEMENTFLAG_CAN_FLY | MOVEMENTFLAG_DISABLE_GRAVITY | MOVEMENTFLAG_HOVER
+                        | MOVEMENTFLAG_WATERWALKING | MOVEMENTFLAG_FALLING_SLOW));
+            }
             WorldPacket* p = new WorldPacket(CMSG_SET_ACTIVE_MOVER, 8);
             *p << uint64(guid);
             ws->QueuePacket(p);
@@ -6403,6 +6725,8 @@ namespace WrathBench
         if (guid == self || before != guid)
             return; // control of the character itself withheld (a fear), or a unit this client was not moving
         s.activeMover.store(0);
+        s.moverRooted.store(false);
+        s.moverMoveFlags.store(0);
         // The unit's own position and flags, as the server holds them: the
         // tap runs inside the map update, where reading it is safe (as
         // AnswerForceRoot reads the character).
@@ -6675,6 +6999,8 @@ namespace WrathBench
             // (Player::SendInitialPacketsAfterAddToMap, SetMover(this)), and
             // no boarding spline survives a map change.
             s->activeMover.store(0);
+            s->moverRooted.store(false);
+            s->moverMoveFlags.store(0);
             s->pendingSplineDone.store(0);
         }
 

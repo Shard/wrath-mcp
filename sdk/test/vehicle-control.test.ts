@@ -267,15 +267,15 @@ describe("client: moveTo while controlling another unit", () => {
   const verdict = (moveId: number, seq: number, extra: Record<string, unknown> = {}) =>
     JSON.stringify(frame(seq, "WB_MOVE_RESULT", { moveId, status: "controlling", mover: VEHICLE_GUID, pos: { x: -1205.0, y: 981.0, z: 42.0, o: 1.2 }, ...extra }));
 
-  test("the refusal carries the controlling hint and names no route", async () => {
+  test("the refusal carries the controlling hint, names the mover and no route", async () => {
     const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate, control(20, VEHICLE_GUID, true)]) });
     const client = await inWorld(stub);
     const pending = client.moveTo({ x: 1, y: 2, z: 3 }, { timeout: 2000 });
     stub.push(verdict(1, 30));
     const result = await pending;
-    expect(result).toMatchObject({ ok: false, status: "controlling", moveId: 1 });
+    expect(result).toMatchObject({ ok: false, status: "controlling", moveId: 1, mover: VEHICLE_GUID });
     if (result.ok) throw new Error("unreachable");
-    expect(result.hint).toContain("controlling another unit");
+    expect(result.hint).toContain("the unit you control");
     expect(result.hint).toContain("leaveVehicle()");
     expect(client.drainActionHints()[0]).toMatchObject({ action: "moveTo", status: "controlling" });
     client.close();
@@ -292,6 +292,107 @@ describe("client: moveTo while controlling another unit", () => {
     expect(result).toMatchObject({ ok: false, status: "controlling", pathLength: 40 });
     if (result.ok) throw new Error("unreachable");
     expect(result.hint).toContain("mid-walk");
+    client.close();
+    await stub.stop();
+  });
+});
+
+describe("driving the mover: verdicts and positions of another unit", () => {
+  const progress = (seq: number, mover: string, pos: { x: number; y: number; z: number; o: number }) =>
+    frame(seq, "WB_MOVE_PROGRESS", { moveId: 1, pos, pathLength: 80, mover });
+  const nearbyUnit = (seq: number, guid: string) =>
+    frame(seq, "SMSG_UPDATE_OBJECT", {
+      blocks: 1,
+      objects: [{ update: "create", guid, objectType: "unit", moveFlags: 0, runSpeed: 7, pos: { x: 0, y: 0, z: 0, o: 0 }, fields: { entry: 28782, health: 100, maxHealth: 100 } }],
+    });
+
+  test("a walk of a possessed unit moves that unit in view and leaves our own position alone", () => {
+    const at = { x: -1300, y: 900, z: 60, o: 2 };
+    const cache = replay([...loginSequence, selfCreate, nearbyUnit(20, VEHICLE_GUID), control(21, VEHICLE_GUID, true), progress(22, VEHICLE_GUID, at)]);
+    expect(cache.self.position?.value).toMatchObject({ x: -1234.5, y: 987.25, z: 42.125 });
+    expect(cache.nearby.get(VEHICLE_GUID)?.position?.value).toEqual(at);
+  });
+
+  test("a walk of the vehicle we sit in carries our own position with it", () => {
+    const at = { x: -1300, y: 900, z: 60, o: 2 };
+    const cache = replay([...loginSequence, selfCreate, nearbyUnit(20, VEHICLE_GUID), board(21, SELF_GUID, 0), control(22, VEHICLE_GUID, true), progress(23, VEHICLE_GUID, at)]);
+    expect(cache.self.position?.value).toMatchObject({ x: -1300, y: 900, z: 60 });
+    expect(cache.nearby.get(VEHICLE_GUID)?.position?.value).toEqual(at);
+  });
+
+  test("an arrival of the mover's walk names it and is flown when it was", async () => {
+    const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate]), moveToAck: () => ({ pathLength: 80 }) });
+    const client = await inWorld(stub);
+    const pending = client.moveTo({ x: 1, y: 2, z: 3 }, { timeout: 2000 });
+    await untilAction(stub, "move_to");
+    stub.push(JSON.stringify(frame(30, "WB_MOVE_RESULT", { moveId: 1, status: "arrived", mover: VEHICLE_GUID, flight: true, pathLength: 80, pos: { x: 1, y: 2, z: 3, o: 0 } })));
+    expect(await pending).toMatchObject({ ok: true, status: "arrived", mover: VEHICLE_GUID, flight: true, pathLength: 80 });
+    client.close();
+    await stub.stop();
+  });
+
+  test("a blocked flight line reads as a flight, with the clear point and the way out", async () => {
+    const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate]) });
+    const client = await inWorld(stub);
+    const pending = client.moveTo({ x: 100, y: 200, z: 30 }, { timeout: 2000 });
+    await untilAction(stub, "move_to");
+    stub.push(JSON.stringify(frame(30, "WB_MOVE_RESULT", { moveId: 1, status: "path_incomplete", mover: VEHICLE_GUID, flight: true, reachedPos: { x: 50, y: 100, z: 40 }, pos: { x: 0, y: 0, z: 50, o: 0 } })));
+    const result = await pending;
+    expect(result).toMatchObject({ ok: false, status: "path_incomplete", flight: true, reachedPos: { x: 50, y: 100, z: 40 } });
+    if (result.ok) throw new Error("unreachable");
+    expect(result.hint).toContain("flight line");
+    expect(result.hint).toContain("Fly higher");
+    client.close();
+    await stub.stop();
+  });
+
+  test("a verdict naming a unit no longer in view conjures no entry and still parses with its pos", () => {
+    const cache = replay([...loginSequence, selfCreate, frame(20, "WB_MOVE_RESULT", { moveId: 1, status: "arrived", mover: VEHICLE_GUID, pos: { x: 5, y: 6, z: 7, o: 0 } })]);
+    expect(cache.nearby.has(VEHICLE_GUID)).toBe(false);
+    expect(cache.self.position?.value).toMatchObject({ x: -1234.5, y: 987.25 });
+    expect(cache.anomalies).toEqual([]);
+  });
+
+  test("a controlling refusal names the unit but folds nothing: its pos is the character's", () => {
+    const at = { x: -1300, y: 900, z: 60, o: 2 };
+    const cache = replay([...loginSequence, selfCreate, nearbyUnit(20, VEHICLE_GUID), frame(21, "WB_MOVE_RESULT", { moveId: 1, status: "controlling", mover: VEHICLE_GUID, pos: at })]);
+    expect(cache.nearby.get(VEHICLE_GUID)?.position?.value).toEqual({ x: 0, y: 0, z: 0, o: 0 });
+    expect(cache.self.position?.value).toMatchObject({ x: -1234.5, y: 987.25 });
+  });
+});
+
+describe("petCast at a ground point: the controlled unit's bar with a cursor target", () => {
+  const petBar = (seq: number, guid: string) =>
+    frame(seq, "SMSG_PET_SPELLS", {
+      guid,
+      removed: false,
+      family: 0,
+      durationMs: 0,
+      reactState: 0,
+      commandState: 0,
+      flags: 0x800,
+      actionBar: [],
+      spells: [{ spellId: 52435, active: 0x81, autocast: false, name: "Cannon Shot" }],
+      cooldowns: [],
+    });
+
+  test("sends CMSG_PET_CAST_SPELL with TARGET_FLAG_DEST_LOCATION and the point", async () => {
+    const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate, petBar(20, VEHICLE_GUID)]) });
+    const client = await inWorld(stub);
+    await client.events.waitForOpcode("SMSG_PET_SPELLS", { timeout: 2000 });
+    const res = await client.petCast("Cannon Shot", { x: 1, y: 2, z: 3 });
+    expect(res).toMatchObject({ ok: true, status: "sent" });
+    const at = await untilAction(stub, "raw");
+    expect(stub.actions[at]).toMatchObject({ action: "raw", opcode: "CMSG_PET_CAST_SPELL" });
+    const payload = stub.actions[at]?.payload as string;
+    const le = (n: number, w: number) => Array.from({ length: w }, (_, i) => ((n >> (8 * i)) & 0xff).toString(16).padStart(2, "0")).join("");
+    const f32 = (v: number) => {
+      const dv = new DataView(new ArrayBuffer(4));
+      dv.setFloat32(0, v, true);
+      return Array.from(new Uint8Array(dv.buffer), (b) => b.toString(16).padStart(2, "0")).join("");
+    };
+    const guidHex = BigInt(VEHICLE_GUID).toString(16).padStart(16, "0").match(/../g)!.reverse().join("");
+    expect(payload).toBe(`${guidHex}01${le(52435, 4)}00${le(0x40, 4)}00${f32(1)}${f32(2)}${f32(3)}`);
     client.close();
     await stub.stop();
   });

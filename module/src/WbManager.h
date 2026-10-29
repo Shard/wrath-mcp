@@ -135,6 +135,8 @@ namespace WrathBench
         uint64_t fallMs{0};         // ... how long the fall takes (FallMs): the segment is timed by it, not by the run
         bool swimming{false};       // the "client" is swimming: packets carry MOVEMENTFLAG_SWIMMING, pace is swim speed
         float sentO{0};             // orientation of the last movement packet sent (SendMovePacket): what the server and observers hold
+        uint64_t moverGuid{0};      // the unit this walk drives when it is not the character (a vehicle, a possessed unit); 0 for the character
+        bool flying{false};         // a flying mover's straight leg: flight speed, no water, no ledges, no areatriggers
     };
 
     // Per-token headless session. See docs/METHODOLOGY.md ("Client fidelity")
@@ -280,6 +282,20 @@ namespace WrathBench
         // the core makes the character its own mover again. Written on tap
         // threads, read on the world thread, hence atomic.
         std::atomic<uint64_t> activeMover{0};
+
+        // The same two states for the unit activeMover names, kept apart from
+        // the character's own (which stand while it sits on a seat): whether
+        // that unit is rooted, from the ROOT its create block carried at the
+        // handover and the root packets for its guid since (OnRootPacket),
+        // and the movement-state flags it has been told it has (the flags its
+        // create block and spline packets carried, read at the handover:
+        // can-fly, no gravity, hover, water walking, feather fall — never
+        // FLYING, which the core adds to a possessed flyer without a packet
+        // and the walk sets itself while it flies; then the SMSG_MOVE_*
+        // packets for its guid, OnMoveFlagPacket). Written on tap threads,
+        // read on the world thread.
+        std::atomic<bool> moverRooted{false};
+        std::atomic<uint32_t> moverMoveFlags{0};
 
         // The id of a boarding or exit spline the server launched the
         // character on (OnSelfSpline) and whose end this "client" still owes
@@ -533,18 +549,18 @@ namespace WrathBench
         };
         // One pass of the cause ladder at x,y,z; reqZ is the z the agent asked
         // for (meshZ is reported relative to it).
-        PathResolve ResolvePathAt(Player* player, float x, float y, float z, float reqZ, bool force = false);
+        PathResolve ResolvePathAt(Unit* mover, float x, float y, float z, float reqZ, bool force = false);
         // The tail of the cause ladder over a resolved polyline, the mesh's own
         // route and a steep re-plan alike: the endpoint lift, the start-snap leg,
         // the drop guard and meshZ. `refusing`, when given, collects every
         // segment the guard refuses (the verdict is the first).
-        void SettleRoute(Player* player, PathResolve& r, float z, float reqZ, bool force,
+        void SettleRoute(Unit* mover, PathResolve& r, float z, float reqZ, bool force,
             std::vector<size_t>* refusing = nullptr);
         // After the guard refused the mesh's route from (sx, sy, sz): plan again
         // with the polygons under the refused segments excluded and take the
         // first route the guard passes. `r` is replaced only then; otherwise
         // only its `replan` record changes.
-        void ReplanSteep(Player* player, float sx, float sy, float sz, float x, float y, float z, float reqZ,
+        void ReplanSteep(Unit* mover, float sx, float sy, float sz, float x, float y, float z, float reqZ,
             bool force, std::vector<size_t> const& refusing, PathResolve& r);
         // A path_incomplete whose request lies below the end of the mesh's
         // route (`partial`, from the planned start): walk on from that end
@@ -553,13 +569,13 @@ namespace WrathBench
         // (a `drop` unforced, walked forced), only when the fall is its one
         // ledge and the leg below reaches the request; otherwise only its
         // `edgeDrop` record changes.
-        void TryEdgeDrop(Player* player, std::vector<WbVec> const& partial, float x, float y, float z, float reqZ,
+        void TryEdgeDrop(Unit* mover, std::vector<WbVec> const& partial, float x, float y, float z, float reqZ,
             bool force, PathResolve& r);
         // The z-ladder around it: ground height at x,y first for a unit
         // target, as a fallback after target_off_mesh otherwise; then the
         // mesh's walkable level over x,y when it is the column's only one
         // (`usedMeshZ`, with the level in `groundZOut`).
-        PathResolve ResolvePath(Player* player, float x, float y, float z, bool unitTarget,
+        PathResolve ResolvePath(Unit* mover, float x, float y, float z, bool unitTarget,
             bool* usedGroundZ = nullptr, float* groundZOut = nullptr, bool force = false, bool* usedMeshZ = nullptr);
 
         // AreaTrigger.dbc as the client ships it: the
@@ -571,7 +587,7 @@ namespace WrathBench
         // Edge-triggered: queues CMSG_AREATRIGGER (and emits WB_AREATRIGGER)
         // when the interpolated position enters a volume the session was not
         // already inside. World thread only.
-        void CheckAreaTriggers(BenchSession& s, Player* player, float x, float y, float z, int64_t nowMs);
+        void CheckAreaTriggers(BenchSession& s, Player* player, Unit* mover, float x, float y, float z, int64_t nowMs);
         std::unordered_map<uint32, std::vector<AreaTriggerRec>> _areaTriggers; // by map
         bool _areaTriggersLoaded{false};
 
@@ -643,7 +659,7 @@ namespace WrathBench
         // Put the mover's body where a client's physics would over (x, y)
         // whose walkable surface is meshZ (m.curX/Y/Z), entering or leaving
         // the water with MSG_MOVE_START_SWIM / MSG_MOVE_STOP_SWIM. World thread.
-        void PlaceMover(BenchSession& s, Player* player, float x, float y, float meshZ, uint32 moveFlags, int64_t nowMs);
+        void PlaceMover(BenchSession& s, Unit* mover, float x, float y, float meshZ, uint32 moveFlags, int64_t nowMs);
         // The character when no move_to is driving it (world thread only): a
         // taxi landing is dropped to the ground the way a client's physics
         // drops it, and the live position is tested against the areatrigger

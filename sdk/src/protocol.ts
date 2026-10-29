@@ -845,6 +845,14 @@ export const moveProgressDataSchema = z.looseObject({
   pos: positionSchema,
   /** The length in yards of the route this move walks (the module's resolved polyline); absent from an older module. */
   pathLength: z.number().optional(),
+  /**
+   * The unit this walk drives when it is not the character: the vehicle or
+   * possessed unit the client moves (`state.self.control`). `pos` is then
+   * that unit's. Absent on the character's own walk.
+   */
+  mover: guidSchema.optional(),
+  /** The leg is flown (a flying mover: a straight line at flight speed), not walked over the mesh. */
+  flight: z.boolean().optional(),
 });
 export type MoveProgressData = z.infer<typeof moveProgressDataSchema>;
 
@@ -885,6 +893,15 @@ export const moveResultDataSchema = z.looseObject({
   nearest: z.looseObject({ x: z.number(), y: z.number(), z: z.number() }).nullable().optional(),
   /** Present when the character ended the move aboard a transport the server is carrying it on. */
   onTransport: z.looseObject({ guid: guidSchema, entry: z.number() }).optional(),
+  /**
+   * The unit this move drove, or was asked to drive, when it is not the
+   * character (`state.self.control`): `pos` is that unit's. On `controlling`
+   * it is the unit the server holds as the mover and the walker cannot
+   * reach.
+   */
+  mover: guidSchema.optional(),
+  /** The leg was flown: a flying mover's straight line, judged against the client's own geometry. */
+  flight: z.boolean().optional(),
 });
 export type MoveResultData = z.infer<typeof moveResultDataSchema>;
 
