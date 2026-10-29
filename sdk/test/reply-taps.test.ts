@@ -26,11 +26,11 @@ describe("reply and observation taps decode", () => {
   test.each([
     ["SMSG_PLAYED_TIME", { totalSec: 86_400, levelSec: 3_600, show: true }],
     ["SMSG_QUERY_TIME_RESPONSE", { serverTime: 1_700_000_000, dailyResetInSec: 7_200 }],
-    ["SMSG_NPC_TEXT_UPDATE", { textId: 68, texts: [{ probability: 1, text: "Greetings, $N.", textFemale: "Greetings, $N.", language: 0 }] }],
+    ["SMSG_NPC_TEXT_UPDATE", { textId: 68, texts: [{ probability: 1, text: "Well met, $N.", textFemale: "Well met, $N.", language: 0 }] }],
     ["SMSG_TAXINODE_STATUS", { guid: CREATURE_GUID, known: true }],
     ["SMSG_NEW_TAXI_PATH", {}],
     ["SMSG_SET_PROFICIENCY", { itemClass: 2, subclassMask: 0x4011 }],
-    ["SMSG_SPELLORDAMAGE_IMMUNE", { casterGuid: SELF_GUID, targetGuid: CREATURE_GUID, spellId: 133, rank: 1, name: "Fireball" }],
+    ["SMSG_SPELLORDAMAGE_IMMUNE", { casterGuid: SELF_GUID, targetGuid: CREATURE_GUID, spellId: 133, rank: 1, name: "Test Bolt" }],
     ["SMSG_ENVIRONMENTAL_DAMAGE_LOG", { victimGuid: SELF_GUID, type: 2, amount: 120, resist: 0, absorb: 0 }],
     ["SMSG_SPELL_DELAYED", { casterGuid: SELF_GUID, delayMs: 500 }],
   ])("%s", (opcode, data) => {
