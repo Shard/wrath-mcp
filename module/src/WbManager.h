@@ -322,13 +322,17 @@ namespace WrathBench
         bool autoLootPending{false};
 
         // The audit log (PROTOCOL.md "Audit log"): one file per UTC day,
-        // `<token>.<YYYY-MM-DD>.jsonl`, rolled by the writer at the first
+        // `<fingerprint>.<YYYY-MM-DD>.jsonl`, rolled by the writer at the first
         // record after a day boundary. auditDay is the day the open file is
         // for (days since the epoch), -1 until session create opens the first.
         // Both guarded by auditMutex.
         std::ofstream audit;
         std::mutex auditMutex;
         int64_t auditDay{-1};
+        // The audit file stem (16 hex of the token's SHA-256) and the tag every
+        // record carries ("tok:" + 8 hex), set by the first OpenAudit.
+        std::string auditStem;
+        std::string auditTag;
     };
 
     // A lease binds a session token to one account and — once the first
@@ -733,7 +737,7 @@ namespace WrathBench
 
         // config
         bool _enabled{false};
-        std::string _bindAddress{"0.0.0.0"};
+        std::string _bindAddress{"127.0.0.1"};
         uint16_t _port{8086};
         unsigned _threads{2};
         // _account/_accounts are written by Configure() (world thread, re-run

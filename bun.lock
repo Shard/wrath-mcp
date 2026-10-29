@@ -11,7 +11,7 @@
     },
     "mcp": {
       "name": "@wrathbench/mcp",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "dependencies": {
         "@wrathbench/sdk": "workspace:*",
         "zod": "4.4.3",
@@ -19,7 +19,7 @@
     },
     "sdk": {
       "name": "@wrathbench/sdk",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "dependencies": {
         "zod": "4.4.3",
       },

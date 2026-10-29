@@ -176,13 +176,33 @@ namespace WrathBench
         w.Raw("worldLoad", c.Str());
     }
 
-    static std::string Sanitize(std::string const& token)
+    // The first `bytes` bytes of the token's SHA-256, as lowercase hex.
+    static std::string TokenDigestHex(std::string const& token, size_t bytes)
     {
+        auto const digest = Acore::Crypto::SHA256::GetDigestOf(
+            reinterpret_cast<uint8 const*>(token.data()), token.size());
+        static char const hex[] = "0123456789abcdef";
         std::string out;
-        for (char c : token)
-            out += (std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_') ? c : '_';
-        if (out.empty()) out = "session";
+        for (size_t i = 0; i < bytes && i < digest.size(); ++i)
+        {
+            out += hex[digest[i] >> 4];
+            out += hex[digest[i] & 0x0F];
+        }
         return out;
+    }
+
+    // The stem of a session's audit files: the first 16 hex characters of the
+    // token's SHA-256 (PROTOCOL.md, "Audit log"). Its first 8 are TokenTag's,
+    // so a worldserver log line's tag is a prefix of its session's file name.
+    // Longer than the tag because a file name must stay unique across every
+    // session the audit directory holds over its retention window: at 32 bits
+    // two of ten thousand sessions share a tag about one time in a hundred,
+    // and two sessions in one file would interleave silently. At 64 bits that
+    // does not happen; and the hash of a 32-character random token, which is
+    // what a session token is, names it without giving it away.
+    static std::string TokenFingerprint(std::string const& token)
+    {
+        return TokenDigestHex(token, 8);
     }
 
     Manager& Manager::Instance()
@@ -195,7 +215,7 @@ namespace WrathBench
     void Manager::Configure()
     {
         _enabled = sConfigMgr->GetOption<bool>("WrathBench.Enable", false);
-        _bindAddress = sConfigMgr->GetOption<std::string>("WrathBench.BindAddress", "0.0.0.0");
+        _bindAddress = sConfigMgr->GetOption<std::string>("WrathBench.BindAddress", "127.0.0.1");
         _port = static_cast<uint16_t>(sConfigMgr->GetOption<uint32>("WrathBench.Port", 8086));
         _threads = std::max<unsigned>(1, sConfigMgr->GetOption<uint32>("WrathBench.Threads", 2));
         std::string account = sConfigMgr->GetOption<std::string>("WrathBench.Account", "RUNNER");
@@ -411,11 +431,7 @@ namespace WrathBench
     // ------------------------------------------------------------- HTTP
     std::string TokenTag(std::string const& token)
     {
-        auto const digest = Acore::Crypto::SHA256::GetDigestOf(
-            reinterpret_cast<uint8 const*>(token.data()), token.size());
-        char hex[9];
-        std::snprintf(hex, sizeof(hex), "%02x%02x%02x%02x", digest[0], digest[1], digest[2], digest[3]);
-        return std::string("tok:") + hex;
+        return std::string("tok:") + TokenDigestHex(token, 4);
     }
 
     // Constant-time equality for secrets. Length is not secret (both sides
@@ -1199,6 +1215,21 @@ namespace WrathBench
             return fail("unknown_account");
         s->accountId = accountId;
 
+        // Player accounts only (PROTOCOL.md, "POST /session"). A session runs
+        // at its account's security level, and the stock chat handler runs a
+        // GM's dot commands, so a GM account would give `say` the server's
+        // command set: actions no client of a player could send. Decided first,
+        // before any teardown or reclaim, so a refused create disturbs nothing.
+        // The highest level the account holds on any realm decides, read from
+        // account_access directly: AccountMgr::GetSecurity(id) takes whichever
+        // row comes first.
+        uint32 security = SEC_PLAYER;
+        if (QueryResult access = LoginDatabase.Query("SELECT MAX(gmlevel) AS gmlevel FROM account_access WHERE id = {}", accountId))
+            if (!access->Fetch()[0].IsNull())
+                security = access->Fetch()[0].Get<uint8>();
+        if (security > SEC_PLAYER)
+            return fail("gm_account", 403);
+
         // --- Same-token create (idempotent liftoff / self-reclaim) ---------
         // A repeated createSession under the same token must never dead-end. If
         // that token already owns a live in-world session for the SAME account
@@ -1304,7 +1335,7 @@ namespace WrathBench
                     if (auto victim = TeardownByToken(t))   // idempotent: already-tearing-down holders are skipped
                     {
                         Audit(*victim, "action", Json::Writer().Add("op", "session_reclaimed")
-                            .Add("account", s->account).Add("byToken", s->token).Str());
+                            .Add("account", s->account).Add("bySession", TokenTag(s->token)).Str());
                         LOG_INFO("module", "wrathbench: reclaiming leaked account '{}' (session {}) for create {}",
                             s->account, TokenTag(t), TokenTag(s->token));
                     }
@@ -1371,11 +1402,11 @@ namespace WrathBench
             return fail(std::string("socket_setup_failed"));
         }
 
-        uint32 security = AccountMgr::GetSecurity(accountId);
+        // A player account, checked above: the session runs as one.
         std::string name = s->account;
         WorldSession* ws = new WorldSession(accountId, std::move(name), flags, s->socket,
-            static_cast<AccountTypes>(security), expansion, static_cast<time_t>(mutetime),
-            static_cast<LocaleConstant>(locale), recruiter, false, security != 0, totaltime);
+            SEC_PLAYER, expansion, static_cast<time_t>(mutetime),
+            static_cast<LocaleConstant>(locale), recruiter, false, false, totaltime);
         ws->ValidateAccountFlags();
         s->ws = ws;
 
@@ -6278,7 +6309,15 @@ namespace WrathBench
         char date[16] = "";
         if (gmtime_r(&t, &tm))
             std::strftime(date, sizeof date, "%Y-%m-%d", &tm);
-        s.audit.open(_auditDir + "/" + Sanitize(s.token) + "." + date + ".jsonl", std::ios::out | std::ios::app);
+        // Named, and every record tagged, by the token's fingerprint, never the
+        // token: the files are operational records an operator reads, copies
+        // and prunes, and a token never leaves the session it names.
+        if (s.auditStem.empty())
+        {
+            s.auditStem = TokenFingerprint(s.token);
+            s.auditTag = TokenTag(s.token);
+        }
+        s.audit.open(_auditDir + "/" + s.auditStem + "." + date + ".jsonl", std::ios::out | std::ios::app);
         s.auditDay = day;
     }
 
@@ -6296,7 +6335,7 @@ namespace WrathBench
         if (!s.audit.is_open())
             return;
         Json::Writer w;
-        w.Add("ts", ts).Add("session", s.token).Add("kind", kind);
+        w.Add("ts", ts).Add("session", s.auditTag).Add("kind", kind);
         w.Raw("payload", json);
         s.audit << w.Str() << '\n';
         s.audit.flush();

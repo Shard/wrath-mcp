@@ -74,7 +74,8 @@ A harness plugs in through hooks, each a narrow interface:
 
 The SDK has its own version, `SDK_VERSION` (`sdk/src/version.ts`, the same
 string as `sdk/package.json`), and `@wrathbench/mcp` carries the same one: the
-stack releases as one. `sdk/src/index.ts` is the SDK's whole public surface.
+stack releases as one, under semantic versioning (`CONTRIBUTING.md`,
+"Versioning"; `CHANGELOG.md`). `sdk/src/index.ts` is the SDK's whole public surface.
 
 The module's wire has an integer version of its own, `protocol` on
 `GET /health` (`module/PROTOCOL.md`, "Versioning"). It moves only for a change
@@ -100,10 +101,10 @@ A thin bridge. It does two things and should never learn to do a third.
   applies unchanged.
 - Events: taps the outbound packet stream for the session (`SMSG_*`), filters
   it to the observation contract, and publishes it over a WebSocket as JSON.
-- Session management: creates or logs in a character for a session token, logs
-  out on release.
+- Session management: creates or logs in a character on a player account for a
+  session token, logs out on release.
 - Audit log: every action dispatched and every observation served, with a
-  timestamp and the session id.
+  timestamp and the session's tag (a fingerprint of its token, never the token).
 
 It knows about opcodes and sessions. It does not know what a quest, a rotation
 or a route is.

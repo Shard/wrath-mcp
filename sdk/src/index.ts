@@ -3,11 +3,12 @@
  *
  * This file is the package's whole public surface, deliberately: nothing
  * outside sdk/ imports a path under it (infra/stack-boundary.ts). The SDK is
- * versioned on its own (`SDK_VERSION`, `version.ts`; docs/METHODOLOGY.md,
- * "Fixed harness, frozen per version"); a change here that a model can see is
- * still a harness change ("Changing this document" there).
- * TODO: which changes to this surface bump which part of SDK_VERSION is not
- * settled.
+ * versioned on its own (`SDK_VERSION`, `version.ts`) by semantic versioning
+ * (CONTRIBUTING.md, "Versioning"): a breaking change to this surface moves the
+ * major, an addition the minor, a fix the patch, and before 1.0 the same
+ * meanings apply to 0.MINOR.PATCH. A change here that a model can see is
+ * still a harness change for a harness that measures models (WrathBench's
+ * docs/METHODOLOGY.md, "Changing this document").
  */
 
 export {

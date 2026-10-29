@@ -228,6 +228,16 @@ export class EventAbortedError extends Error {
   }
 }
 
+/** `url` with no query, fragment or credentials: what an error message may name. */
+function withoutQuery(url: string): string {
+  try {
+    const u = new URL(url);
+    return `${u.protocol}//${u.host}${u.pathname}`;
+  } catch {
+    return url.replace(/[?#].*$/s, "");
+  }
+}
+
 export class EventStreamClosedError extends Error {
   override readonly name = "EventStreamClosedError";
   constructor(message = "event stream closed") {
@@ -274,6 +284,12 @@ export class EventStream implements AsyncIterable<StreamEvent> {
   readonly token: string;
 
   private readonly url: string;
+  /**
+   * The stream's address as error text names it: the URL without its query,
+   * so the session token never reaches an error message, a snippet's result
+   * or whatever records it.
+   */
+  private readonly where: string;
   /** Set by `connect({ replay: true })`, consumed by the next socket opened. */
   private replayOnOpen = false;
   // An ECMAScript private field, not TS `private`: the sandbox shares the
@@ -317,6 +333,7 @@ export class EventStream implements AsyncIterable<StreamEvent> {
   constructor(options: EventStreamOptions) {
     this.token = options.token;
     this.url = `${options.url}?token=${encodeURIComponent(options.token)}`;
+    this.where = withoutQuery(options.url);
     this.#secret = options.secret;
     this.bufferSize = options.bufferSize ?? 500;
     this.expectedSeq = options.expectFromSeq ?? 0;
@@ -490,7 +507,7 @@ export class EventStream implements AsyncIterable<StreamEvent> {
         /* a half-open socket that refuses to close is still abandoned here */
       }
       this.attemptFailed(
-        new EventStreamClosedError(`connection to ${this.url} did not open within ${this.connectTimeout}ms`),
+        new EventStreamClosedError(`connection to ${this.where} did not open within ${this.connectTimeout}ms`),
       );
       this.scheduleReconnect();
     }, this.connectTimeout);
@@ -517,7 +534,7 @@ export class EventStream implements AsyncIterable<StreamEvent> {
       this.clearOpenTimer();
       if (!settled) {
         settled = true;
-        this.attemptFailed(new EventStreamClosedError(`failed to connect to ${this.url}`));
+        this.attemptFailed(new EventStreamClosedError(`failed to connect to ${this.where}`));
       }
     });
     ws.addEventListener("close", () => {
@@ -526,11 +543,11 @@ export class EventStream implements AsyncIterable<StreamEvent> {
       this.socket = undefined;
       if (!settled) {
         settled = true;
-        this.attemptFailed(new EventStreamClosedError(`connection to ${this.url} closed before open`));
+        this.attemptFailed(new EventStreamClosedError(`connection to ${this.where} closed before open`));
       } else if (this.closedByUser || !this.reconnectEnabled) {
         // An open socket dropped and nothing will retry: a caller that joined
         // during CLOSING must not wait for an attempt that never comes.
-        this.rejectConnectWaiters(new EventStreamClosedError(`connection to ${this.url} closed`));
+        this.rejectConnectWaiters(new EventStreamClosedError(`connection to ${this.where} closed`));
       }
       this.scheduleReconnect();
     });

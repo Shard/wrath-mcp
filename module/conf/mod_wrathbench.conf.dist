@@ -21,14 +21,17 @@ WrathBench.Enable = 1
 #
 #    WrathBench.BindAddress
 #        Description: Address the module's HTTP/WebSocket server binds to.
-#                     Keep the port on a private network: 0.0.0.0 is safe only
-#                     where nothing publishes it beyond the hosts that should
-#                     reach it (in a container, an unpublished port on a
-#                     private network).
-#        Default:     "0.0.0.0"
+#                     Loopback by default: only processes on the
+#                     worldserver's own host reach it. The port is plain HTTP
+#                     with bearer secrets, so widen it ("0.0.0.0", or one
+#                     interface's address) only onto a private network that
+#                     nothing publishes beyond the hosts that should reach it
+#                     (in a container, an unpublished port on a private
+#                     network), or put a TLS proxy in front of it.
+#        Default:     "127.0.0.1"
 #
 
-WrathBench.BindAddress = "0.0.0.0"
+WrathBench.BindAddress = "127.0.0.1"
 
 #
 #    WrathBench.Port

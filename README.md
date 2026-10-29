@@ -41,9 +41,11 @@ Tested against AzerothCore
      environment.
    - `WrathBench.Accounts`, the game accounts sessions may use. Each must exist
      in the auth database (`account create <name> <password>` on the
-     worldserver console).
-   - `WrathBench.BindAddress` and `WrathBench.Port` (default `0.0.0.0:8086`).
-     Keep that port on a private network.
+     worldserver console) and be a player account: the module refuses one
+     with a GM security level (`gm_account`).
+   - `WrathBench.BindAddress` and `WrathBench.Port` (default `127.0.0.1:8086`,
+     loopback only). To serve callers on other hosts, set the address and keep
+     the port on a private network: it is plain HTTP with bearer secrets.
    - `WrathBench.AuditDir`, where the per-session audit logs go. Its default is
      the AzerothCore Docker image's log path; outside that image, point it at a
      writable directory.
@@ -82,7 +84,8 @@ WRATHBENCH_MODULE_SECRET=<the port secret> \
 ```
 
 It speaks MCP over stdio, so the agent launches it as its server command. It
-leases a session secret with the port secret and hands the sandbox only that.
+leases a session secret with the port secret and hands the sandbox only that,
+and when it exits cleanly it logs the character out and releases the lease.
 The sandbox needs Linux 6.7 or later (Landlock with TCP rules) and refuses to
 start without it. `mcp/README.md` has the options; `sdk/README.md` covers
 using the SDK directly.
@@ -99,6 +102,13 @@ bun run docs:api:check   # sdk/API.md matches the source it is generated from
 None of these needs a game stack or any game data. The module compiles only
 inside an AzerothCore tree; see `CONTRIBUTING.md` for how a module change is
 verified.
+
+## Versions
+
+The stack follows semantic versioning (`CONTRIBUTING.md`, "Versioning"):
+major for a breaking change, minor for a feature or addition, patch for a fix,
+and the same meanings on 0.MINOR.PATCH before 1.0. `CHANGELOG.md` lists what
+each release changed and what an operator must do about it.
 
 ## Licence
 

@@ -196,6 +196,12 @@ describe("error-code hints", () => {
     expect(unknown.message).toContain("auth database");
     expect(unknown.message).not.toContain("is not on the module's allowlist");
   });
+
+  test("a GM account's refusal says the module serves player accounts only", () => {
+    const gm = new WrathRequestError(403, { ok: false, error: "gm_account" });
+    expect(gm.code).toBe("gm_account");
+    expect(gm.message).toContain("player accounts only");
+  });
 });
 
 describe("labeled event timeouts", () => {

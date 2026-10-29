@@ -32,11 +32,12 @@ namespace WrathBench
         std::string body; // JSON
     };
 
-    // A session token as the worldserver log names it: "tok:" and the first 8
-    // lowercase hex characters of its SHA-256. Enough to tie one session's
-    // lines together, not to recover the token; an operator holding a token
-    // finds its lines with `printf %s "$TOKEN" | sha256sum | cut -c1-8`. No
-    // token value is ever logged (PROTOCOL.md, "Authentication").
+    // A session token as the worldserver log and the audit records name it:
+    // "tok:" and the first 8 lowercase hex characters of its SHA-256. Enough
+    // to tie one session's lines together, not to recover the token; an
+    // operator holding a token finds its lines with
+    // `printf %s "$TOKEN" | sha256sum | cut -c1-8`. No token value is ever
+    // logged (PROTOCOL.md, "Authentication").
     std::string TokenTag(std::string const& token);
 
     // The game-facing surface the HTTP/WS server calls into. Implemented by the
