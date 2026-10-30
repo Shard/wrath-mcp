@@ -9096,7 +9096,7 @@ namespace WrathBench
     {
         std::string rows = "[";
         bool first = true;
-        for (int i = 0; i < 5; ++i)
+        for (int i = 0; i < MAX_ITEM_EXTENDED_COST_REQUIREMENTS; ++i)
         {
             uint32 itemId, count; p >> itemId >> count;
             if (!itemId)
@@ -11762,7 +11762,7 @@ namespace WrathBench
                     name = "SMSG_ITEM_REFUND_RESULT";
                     uint64 item; uint32 result; p >> item >> result;
                     w.AddGuid("itemGuid", (uint64_t)item).Add("result", result);
-                    if (result == 0 && p.size() - p.rpos() >= 3 * 4 + 5 * 8)
+                    if (result == 0 && p.size() - p.rpos() >= 3 * 4 + MAX_ITEM_EXTENDED_COST_REQUIREMENTS * 8)
                     {
                         uint32 money, honor, arena; p >> money >> honor >> arena;
                         std::string cost = RefundCostRows(p);
