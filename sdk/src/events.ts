@@ -61,9 +61,20 @@ export function moveEtaMs(event: StreamEvent | undefined): number | undefined {
  * events out in under a minute and with them the chat lines `waitForChat`
  * looks back over. The state cache folds every one (`group().members[i].stats`
  * keeps the latest values), and the runner's event window treats them as
- * ambient (operator decision, Mark, 2026-10-21).
+ * ambient (operator decision, Mark, 2026-10-21). A creature's threat list
+ * comes the same way, about once a second for each creature fighting in
+ * range, and so does a world state's change, about three a second for each
+ * moving capture-point slider in an outdoor PvP zone; the cache folds both
+ * (a unit's `threat`, `self.worldStates`). The threat list's removal and
+ * clear, and the zone's initial world states, are kept.
  */
-const UNRETAINED_OPCODES: ReadonlySet<string> = new Set(["SMSG_PARTY_MEMBER_STATS", "SMSG_PARTY_MEMBER_STATS_FULL"]);
+const UNRETAINED_OPCODES: ReadonlySet<string> = new Set([
+  "SMSG_PARTY_MEMBER_STATS",
+  "SMSG_PARTY_MEMBER_STATS_FULL",
+  "SMSG_THREAT_UPDATE",
+  "SMSG_HIGHEST_THREAT_UPDATE",
+  "SMSG_UPDATE_WORLD_STATE",
+]);
 
 const STREAM_GAP_ID = -1;
 const STREAM_ERROR_ID = -2;
@@ -117,8 +128,10 @@ export interface EventStreamOptions {
   secret?: string;
   /**
    * How many events to retain for `waitFor`/`recent`. Default 500. The party
-   * frame packets (`SMSG_PARTY_MEMBER_STATS`, `_FULL`) are never retained:
-   * listeners and waits see them as they arrive, and the state cache keeps them.
+   * frame packets (`SMSG_PARTY_MEMBER_STATS`, `_FULL`), the threat list
+   * updates (`SMSG_THREAT_UPDATE`, `SMSG_HIGHEST_THREAT_UPDATE`) and world
+   * state changes (`SMSG_UPDATE_WORLD_STATE`) are never retained: listeners
+   * and waits see them as they arrive, and the state cache keeps them.
    */
   bufferSize?: number;
   /** First seq expected on a fresh session. Default 0 (the module starts there). */

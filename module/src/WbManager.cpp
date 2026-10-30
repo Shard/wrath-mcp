@@ -1121,6 +1121,18 @@ namespace WrathBench
         // seat are actions: both carry the client's own MovementInfo.
         { "CMSG_SPELLCLICK", CMSG_SPELLCLICK },
         { "CMSG_PLAYER_VEHICLE_ENTER", CMSG_PLAYER_VEHICLE_ENTER },
+        // instances: the raid frame's saved-instance list (empty body,
+        // answered with SMSG_RAID_INSTANCE_INFO), the portrait menu's "Reset
+        // all instances" (empty body, MiscHandler.cpp
+        // HandleResetInstancesOpcode: answered per instance with
+        // SMSG_INSTANCE_RESET or SMSG_INSTANCE_RESET_FAILED), and its
+        // difficulty choice (body u32 difficulty; the handler refuses inside
+        // an instance and a group member who is not the leader). The two
+        // difficulty opcodes are bidirectional, as MSG_TALENT_WIPE_CONFIRM is.
+        { "CMSG_REQUEST_RAID_INFO", CMSG_REQUEST_RAID_INFO },
+        { "CMSG_RESET_INSTANCES", CMSG_RESET_INSTANCES },
+        { "MSG_SET_DUNGEON_DIFFICULTY", MSG_SET_DUNGEON_DIFFICULTY },
+        { "MSG_SET_RAID_DIFFICULTY", MSG_SET_RAID_DIFFICULTY },
         { nullptr, 0 },
     };
     static constexpr size_t kRawPayloadMaxBytes = 512;
@@ -5449,14 +5461,19 @@ namespace WrathBench
     // (ByteBuffer::AppendPackedTime: (year-2000)<<24 | month<<20 | (day-1)<<14
     // | weekday<<11 | hour<<6 | minute). Both the raw field and a readable
     // "YYYY-MM-DD HH:MM" are served; the reading is a client-local decode.
-    std::string Manager::AchievementJson(uint32 id, uint32 packedDate) const
+    static std::string PackedTimeText(uint32 packed)
     {
         char when[24];
         std::snprintf(when, sizeof(when), "%04u-%02u-%02u %02u:%02u",
-            2000u + ((packedDate >> 24) & 0x1F), ((packedDate >> 20) & 0xF) + 1, ((packedDate >> 14) & 0x3F) + 1,
-            (packedDate >> 6) & 0x1F, packedDate & 0x3F);
+            2000u + ((packed >> 24) & 0x1F), ((packed >> 20) & 0xF) + 1, ((packed >> 14) & 0x3F) + 1,
+            (packed >> 6) & 0x1F, packed & 0x3F);
+        return when;
+    }
+
+    std::string Manager::AchievementJson(uint32 id, uint32 packedDate) const
+    {
         Json::Writer w;
-        w.Add("achievementId", id).Add("date", packedDate).Add("time", when);
+        w.Add("achievementId", id).Add("date", packedDate).Add("time", PackedTimeText(packedDate));
         auto it = _achievements.find(id);
         if (it != _achievements.end())
             w.Add("name", it->second.name).Add("points", it->second.points).Add("categoryId", it->second.categoryId);
@@ -6882,6 +6899,23 @@ namespace WrathBench
         }
     }
 
+    // Each change's own name, for its event.
+    static char const* SpeedChangeName(uint16 opcode)
+    {
+        switch (opcode)
+        {
+            case SMSG_FORCE_WALK_SPEED_CHANGE:        return "SMSG_FORCE_WALK_SPEED_CHANGE";
+            case SMSG_FORCE_RUN_SPEED_CHANGE:         return "SMSG_FORCE_RUN_SPEED_CHANGE";
+            case SMSG_FORCE_RUN_BACK_SPEED_CHANGE:    return "SMSG_FORCE_RUN_BACK_SPEED_CHANGE";
+            case SMSG_FORCE_SWIM_SPEED_CHANGE:        return "SMSG_FORCE_SWIM_SPEED_CHANGE";
+            case SMSG_FORCE_SWIM_BACK_SPEED_CHANGE:   return "SMSG_FORCE_SWIM_BACK_SPEED_CHANGE";
+            case SMSG_FORCE_TURN_RATE_CHANGE:         return "SMSG_FORCE_TURN_RATE_CHANGE";
+            case SMSG_FORCE_FLIGHT_SPEED_CHANGE:      return "SMSG_FORCE_FLIGHT_SPEED_CHANGE";
+            case SMSG_FORCE_FLIGHT_BACK_SPEED_CHANGE: return "SMSG_FORCE_FLIGHT_BACK_SPEED_CHANGE";
+            default:                                  return "SMSG_FORCE_PITCH_RATE_CHANGE";
+        }
+    }
+
     static char const* SpeedChangeAckName(uint16 ack)
     {
         switch (ack)
@@ -8164,7 +8198,7 @@ namespace WrathBench
     // set a client has at this moment, and the server's later destroys and
     // creates apply to it unchanged. Packets whose opcode is not on the event
     // whitelist (the action bar, equipment sets, forced reactions, the social
-    // list, world states, time speed) are not re-sent: the tap would drop
+    // list) are not re-sent: the tap would drop
     // them, so they would only feed the drop census. This is the one place to
     // add them when one is whitelisted.
     //
@@ -8261,6 +8295,38 @@ namespace WrathBench
             // the core's own sender.
             player->SendProficiency(ITEM_CLASS_WEAPON, player->GetWeaponProficiency());
             player->SendProficiency(ITEM_CLASS_ARMOR, player->GetArmorProficiency());
+
+            // The difficulty, by the core's own senders: the dungeon one as
+            // the login sends it (WorldSession::HandlePlayerLoginFromDB),
+            // and the raid one on the branch every map arrival takes
+            // (Player::SendInitialPacketsAfterAddToMap), read-only: inside a
+            // raid whose difficulty is not the character's, the map's, which
+            // that arrival already stored (StoreRaidMapDifficulty is not
+            // called again here); elsewhere the character's own whenever it
+            // differs from the stored one, which starts at 0, so a solo
+            // character with a raid difficulty set gets it too. Then the game
+            // clock built as SendInitialPacketsBeforeAddToMap builds it; and
+            // what Player::UpdateZone sends on entering the zone: its world
+            // states and its weather (Map::SendZoneWeather, which sends
+            // nothing for a zone without weather, as the zone entry does).
+            bool const grouped = player->GetGroup() != nullptr;
+            player->SendDungeonDifficulty(grouped);
+            if (map->IsRaid())
+            {
+                if (map->GetDifficulty() != player->GetRaidDifficulty())
+                    player->SendRaidDifficulty(grouped, player->GetStoredRaidDifficulty());
+            }
+            else if (player->GetRaidDifficulty() != player->GetStoredRaidDifficulty())
+                player->SendRaidDifficulty(grouped);
+            {
+                WorldPacket data(SMSG_LOGIN_SETTIMESPEED, 4 + 4 + 4);
+                data.AppendPackedTime(GameTime::GetGameTime().count());
+                data << float(0.01666667f);
+                data << uint32(0);
+                player->SendDirectMessage(&data);
+            }
+            player->SendInitWorldStates(player->GetZoneId(), player->GetAreaId());
+            map->SendZoneWeather(player->GetZoneId(), player);
         }
         catch (std::exception const& e)
         {
@@ -8377,6 +8443,17 @@ namespace WrathBench
             o.Add("moveFlags", mflags);
             o.Raw("pos", PosJson(x, y, z, ori));
             o.Add("runSpeed", (double)speeds[1]);
+            // The character's own block carries every speed it moves at, in
+            // Object::BuildMovementUpdate's order (walk, run, run back, swim,
+            // swim back, flight, flight back, turn rate, pitch rate; not
+            // UnitMoveType's). Served on our own block only: every
+            // creature's create would otherwise carry nine more numbers.
+            if (flags & UPDATEFLAG_SELF)
+                o.Raw("speeds", Json::Writer()
+                    .Add("walk", (double)speeds[0]).Add("run", (double)speeds[1]).Add("runBack", (double)speeds[2])
+                    .Add("swim", (double)speeds[3]).Add("swimBack", (double)speeds[4])
+                    .Add("flight", (double)speeds[5]).Add("flightBack", (double)speeds[6])
+                    .Add("turnRate", (double)speeds[7]).Add("pitchRate", (double)speeds[8]).Str());
         }
         else if (flags & UPDATEFLAG_POSITION)
         {
@@ -9875,6 +9952,118 @@ namespace WrathBench
                     p >> victim >> type >> amount >> resisted >> absorbed;
                     w.AddGuid("victimGuid", (uint64_t)victim).Add("type", (uint32)type).Add("amount", amount)
                      .Add("resist", resisted).Add("absorb", absorbed);
+                    break;
+                }
+                // A dispel or a Spellsteal that took auras off a unit
+                // (Spell::EffectDispel / EffectStealBeneficialBuff,
+                // SpellEffects.cpp; to every client in range): target
+                // packGUID, caster packGUID, u32 dispel spell, u8 unused,
+                // u32 count, then per aura u32 spell and u8 (0 dispelled or
+                // stolen, else cleansed or transferred; the core writes 0).
+                case SMSG_SPELLDISPELLOG:
+                case SMSG_SPELLSTEALLOG:
+                {
+                    name = opcode == SMSG_SPELLDISPELLOG ? "SMSG_SPELLDISPELLOG" : "SMSG_SPELLSTEALLOG";
+                    uint64 target = 0, caster = 0;
+                    p.readPackGUID(target);
+                    p.readPackGUID(caster);
+                    uint32 spellId; uint8 unused; uint32 count;
+                    p >> spellId >> unused >> count;
+                    std::string auras = "[";
+                    for (uint32 i = 0; i < count; ++i)
+                    {
+                        uint32 auraSpell; uint8 kind; p >> auraSpell >> kind;
+                        Json::Writer a; a.Add("spellId", auraSpell);
+                        AddSpellFields(a, auraSpell);
+                        if (i) auras += ',';
+                        auras += a.Str();
+                    }
+                    auras += "]";
+                    w.AddGuid("targetGuid", (uint64_t)target).AddGuid("casterGuid", (uint64_t)caster)
+                     .Add("spellId", spellId);
+                    AddSpellFields(w, spellId);
+                    w.Raw("auras", auras);
+                    break;
+                }
+                // The auras a dispel or Spellsteal tried and failed to take
+                // (the same two effects, SpellEffects.cpp): u64 caster, u64
+                // target (both unpacked), u32 dispel spell, then a u32 aura
+                // spell per resisted try to the end of the packet; no count.
+                case SMSG_DISPEL_FAILED:
+                {
+                    name = "SMSG_DISPEL_FAILED";
+                    uint64 caster, target; uint32 spellId;
+                    p >> caster >> target >> spellId;
+                    std::string auras = "[";
+                    bool firstAura = true;
+                    while (p.rpos() + 4 <= p.size())
+                    {
+                        uint32 auraSpell; p >> auraSpell;
+                        Json::Writer a; a.Add("spellId", auraSpell);
+                        AddSpellFields(a, auraSpell);
+                        if (!firstAura) auras += ',';
+                        auras += a.Str();
+                        firstAura = false;
+                    }
+                    auras += "]";
+                    w.AddGuid("casterGuid", (uint64_t)caster).AddGuid("targetGuid", (uint64_t)target)
+                     .Add("spellId", spellId);
+                    AddSpellFields(w, spellId);
+                    w.Raw("auras", auras);
+                    break;
+                }
+                // ------------------------------------------------- threat
+                // A creature's threat list, to every client in range
+                // (ThreatManager::SendThreatListToClients, SendMessageToSet):
+                // the unit's packGUID, for SMSG_HIGHEST_THREAT_UPDATE its new
+                // victim's packGUID, u32 count, then per entry packGUID and
+                // u32 threat x 100. ThreatManager::UpdateVictim sends it at
+                // most once per THREAT_UPDATE_INTERVAL (1 s) per creature,
+                // and only when the list or the victim changed (a taunt
+                // sends at once).
+                case SMSG_THREAT_UPDATE:
+                case SMSG_HIGHEST_THREAT_UPDATE:
+                {
+                    name = opcode == SMSG_THREAT_UPDATE ? "SMSG_THREAT_UPDATE" : "SMSG_HIGHEST_THREAT_UPDATE";
+                    uint64 unit = 0; p.readPackGUID(unit);
+                    w.AddGuid("unitGuid", (uint64_t)unit);
+                    if (opcode == SMSG_HIGHEST_THREAT_UPDATE)
+                    {
+                        uint64 top = 0; p.readPackGUID(top);
+                        w.AddGuid("topGuid", (uint64_t)top);
+                    }
+                    uint32 count; p >> count;
+                    std::string entries = "[";
+                    for (uint32 i = 0; i < count; ++i)
+                    {
+                        uint64 g = 0; p.readPackGUID(g);
+                        uint32 threat; p >> threat;
+                        if (i) entries += ',';
+                        entries += Json::Writer().AddGuid("guid", (uint64_t)g).Add("threat", threat).Str();
+                    }
+                    entries += "]";
+                    w.Raw("entries", entries);
+                    break;
+                }
+                // One unit off a creature's threat list
+                // (ThreatManager::SendRemoveToClients): the creature's
+                // packGUID, the removed unit's packGUID.
+                case SMSG_THREAT_REMOVE:
+                {
+                    name = "SMSG_THREAT_REMOVE";
+                    uint64 unit = 0, victim = 0;
+                    p.readPackGUID(unit);
+                    p.readPackGUID(victim);
+                    w.AddGuid("unitGuid", (uint64_t)unit).AddGuid("guid", (uint64_t)victim);
+                    break;
+                }
+                // A creature's threat list emptied
+                // (ThreatManager::SendClearAllThreatToClients): its packGUID.
+                case SMSG_THREAT_CLEAR:
+                {
+                    name = "SMSG_THREAT_CLEAR";
+                    uint64 unit = 0; p.readPackGUID(unit);
+                    w.AddGuid("unitGuid", (uint64_t)unit);
                     break;
                 }
                 case SMSG_AURA_UPDATE:
@@ -12071,6 +12260,190 @@ namespace WrathBench
                     if (!text.empty() && text.back() == '\n')
                         text.pop_back();
                     w.Add("text", text);
+                    break;
+                }
+                // ------------------------------------------------ instances
+                // The raid frame's saved instances, the answer to raw
+                // CMSG_REQUEST_RAID_INFO and sent again on a reset
+                // (Player::SendRaidInfo, PlayerStorage.cpp): u32 count, then
+                // per permanent bind u32 map, u32 Difficulty, u64 instance
+                // guid (HighGuid::Instance over the instance id, written raw
+                // by ObjectGuid's operator<<), u8 locked (the core writes 1),
+                // u8 extended, u32 seconds until the reset.
+                case SMSG_RAID_INSTANCE_INFO:
+                {
+                    name = "SMSG_RAID_INSTANCE_INFO";
+                    uint32 count; p >> count;
+                    std::string locks = "[";
+                    for (uint32 i = 0; i < count; ++i)
+                    {
+                        uint32 mapId, difficulty; uint64 instance; uint8 locked, extended; uint32 resetSec;
+                        p >> mapId >> difficulty >> instance >> locked >> extended >> resetSec;
+                        if (i) locks += ',';
+                        locks += Json::Writer().Add("map", mapId).Add("difficulty", difficulty)
+                            .Add("instanceId", ObjectGuid(instance).GetCounter())
+                            .Add("locked", locked != 0).Add("extended", extended != 0)
+                            .Add("resetInSec", resetSec).Str();
+                    }
+                    locks += "]";
+                    w.Raw("locks", locks);
+                    break;
+                }
+                // One instance reset (Player::SendResetInstanceSuccess,
+                // PlayerMisc.cpp): u32 map.
+                case SMSG_INSTANCE_RESET:
+                {
+                    name = "SMSG_INSTANCE_RESET";
+                    uint32 mapId; p >> mapId;
+                    w.Add("map", mapId);
+                    break;
+                }
+                // One instance the reset could not reset
+                // (Player::SendResetInstanceFailed): u32
+                // InstanceResetFailureReason (0 players still inside, 1 a
+                // party member offline, 2 one zoning in), u32 map.
+                case SMSG_INSTANCE_RESET_FAILED:
+                {
+                    name = "SMSG_INSTANCE_RESET_FAILED";
+                    uint32 reason, mapId; p >> reason >> mapId;
+                    w.Add("reason", reason).Add("map", mapId);
+                    break;
+                }
+                // Whether the character holds any permanent bind, on every
+                // map arrival (Player::SendSavedInstances): u32 0 or 1. Each
+                // bound map then follows as SMSG_UPDATE_LAST_INSTANCE (u32 map).
+                case SMSG_UPDATE_INSTANCE_OWNERSHIP:
+                {
+                    name = "SMSG_UPDATE_INSTANCE_OWNERSHIP";
+                    uint32 saved; p >> saved;
+                    w.Add("saved", saved != 0);
+                    break;
+                }
+                case SMSG_UPDATE_LAST_INSTANCE:
+                {
+                    name = "SMSG_UPDATE_LAST_INSTANCE";
+                    uint32 mapId; p >> mapId;
+                    w.Add("map", mapId);
+                    break;
+                }
+                // The character was saved to the instance it stands in
+                // (Player::BindToInstance; Map.cpp's raid bind): u32 0.
+                case SMSG_INSTANCE_SAVE_CREATED:
+                    name = "SMSG_INSTANCE_SAVE_CREATED";
+                    break;
+                // A raid instance's welcome or reset warning
+                // (Player::SendInstanceResetWarning): u32
+                // InstanceResetWarningType (1 hours left, 2 minutes, 3
+                // minutes and leave, 4 welcome), u32 map, u32 Difficulty, u32
+                // seconds left, and for the welcome alone u8 locked, u8
+                // extended.
+                case SMSG_RAID_INSTANCE_MESSAGE:
+                {
+                    name = "SMSG_RAID_INSTANCE_MESSAGE";
+                    uint32 type, mapId, difficulty, timeSec;
+                    p >> type >> mapId >> difficulty >> timeSec;
+                    w.Add("type", type).Add("map", mapId).Add("difficulty", difficulty).Add("timeLeftSec", timeSec);
+                    if (type == 4 && p.rpos() + 2 <= p.size())
+                    {
+                        uint8 locked, extended; p >> locked >> extended;
+                        w.Add("locked", locked != 0).Add("extended", extended != 0);
+                    }
+                    break;
+                }
+                // The character's dungeon or raid difficulty
+                // (Player::SendDungeonDifficulty / SendRaidDifficulty,
+                // InstancePackets.cpp): u32 Difficulty, u32 1, u32 in a group.
+                // The dungeon one at login; the raid one on a map arrival
+                // whose raid difficulty differs from the stored one
+                // (Player::SendInitialPacketsAfterAddToMap); both on joining
+                // a group and on the leader's change; either one when the
+                // server refuses a change. A solo change the server accepts
+                // is not answered.
+                case MSG_SET_DUNGEON_DIFFICULTY:
+                case MSG_SET_RAID_DIFFICULTY:
+                {
+                    name = opcode == MSG_SET_DUNGEON_DIFFICULTY ? "MSG_SET_DUNGEON_DIFFICULTY" : "MSG_SET_RAID_DIFFICULTY";
+                    uint32 difficulty, unk, inGroup; p >> difficulty >> unk >> inGroup;
+                    w.Add("difficulty", difficulty).Add("inGroup", inGroup != 0);
+                    break;
+                }
+                // ------------------------------- world states, weather, time
+                // The zone's world states on entering it
+                // (Player::SendInitWorldStates, WorldStatePackets.cpp): i32
+                // map, i32 zone, i32 area, u16 count, then per state i32 id,
+                // i32 value. Ids are the client's WorldStateUI numbers.
+                case SMSG_INIT_WORLD_STATES:
+                {
+                    name = "SMSG_INIT_WORLD_STATES";
+                    int32 mapId, zoneId, areaId; uint16 count;
+                    p >> mapId >> zoneId >> areaId >> count;
+                    std::string states = "[";
+                    for (uint16 i = 0; i < count; ++i)
+                    {
+                        int32 id, value; p >> id >> value;
+                        if (i) states += ',';
+                        states += Json::Writer().Add("id", id).Add("value", value).Str();
+                    }
+                    states += "]";
+                    w.Add("map", mapId).Add("zone", zoneId).Add("area", areaId).Raw("states", states);
+                    break;
+                }
+                // One world state changed (WorldPackets::WorldState::
+                // UpdateWorldState): i32 id, i32 value.
+                case SMSG_UPDATE_WORLD_STATE:
+                {
+                    name = "SMSG_UPDATE_WORLD_STATE";
+                    int32 id, value; p >> id >> value;
+                    w.Add("id", id).Add("value", value);
+                    break;
+                }
+                // The zone's weather (WorldPackets::Misc::Weather,
+                // MiscPackets.cpp): u32 WeatherState, float intensity 0-1,
+                // u8 abrupt. Sent on entering a zone that has weather and on
+                // each change there.
+                case SMSG_WEATHER:
+                {
+                    name = "SMSG_WEATHER";
+                    uint32 state; float intensity; uint8 abrupt;
+                    p >> state >> intensity >> abrupt;
+                    w.Add("weather", state).Add("intensity", (double)intensity).Add("abrupt", abrupt != 0);
+                    break;
+                }
+                // The game clock at login
+                // (Player::SendInitialPacketsBeforeAddToMap): the server's
+                // local time packed (ByteBuffer::AppendPackedTime), float game
+                // speed (game minutes per real second, 1/60), u32 0.
+                case SMSG_LOGIN_SETTIMESPEED:
+                {
+                    name = "SMSG_LOGIN_SETTIMESPEED";
+                    uint32 packed; float speed; p >> packed >> speed;
+                    w.Add("date", packed).Add("time", PackedTimeText(packed)).Add("speed", (double)speed);
+                    break;
+                }
+                // ---------------------------------------- own speed changes
+                // Unit::SendSpeedToController, to the controlling client
+                // only: packGUID, u32 movement counter, a u8 on the run-speed
+                // packet alone, float speed (yards per second; radians per
+                // second for turn and pitch). The module acks each one for
+                // the character (OnSpeedChangePacket); served so the agent
+                // sees the speed it now moves at.
+                case SMSG_FORCE_WALK_SPEED_CHANGE:
+                case SMSG_FORCE_RUN_SPEED_CHANGE:
+                case SMSG_FORCE_RUN_BACK_SPEED_CHANGE:
+                case SMSG_FORCE_SWIM_SPEED_CHANGE:
+                case SMSG_FORCE_SWIM_BACK_SPEED_CHANGE:
+                case SMSG_FORCE_TURN_RATE_CHANGE:
+                case SMSG_FORCE_FLIGHT_SPEED_CHANGE:
+                case SMSG_FORCE_FLIGHT_BACK_SPEED_CHANGE:
+                case SMSG_FORCE_PITCH_RATE_CHANGE:
+                {
+                    name = SpeedChangeName(opcode);
+                    uint64 guid = 0; p.readPackGUID(guid);
+                    uint32 counter; p >> counter;
+                    if (opcode == SMSG_FORCE_RUN_SPEED_CHANGE)
+                        p.read_skip<uint8>();
+                    float speed; p >> speed;
+                    w.AddGuid("guid", (uint64_t)guid).Add("speed", (double)speed);
                     break;
                 }
                 // ------------------------------------------ client control

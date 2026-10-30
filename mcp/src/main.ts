@@ -39,8 +39,12 @@ import { McpServer, serveStdio } from "./server";
 import { coreTools, ToolSet, type CoreToolContext, type CoreToolRender, type ToolResult } from "./tools";
 import { MCP_PACKAGE_VERSION } from "./version";
 
-/** Ambient motion and out-of-sight party frames: folded out of `recent_events` unless asked for, as its fold note says. */
-const AMBIENT = /^(SMSG_MONSTER_MOVE|MSG_MOVE_|SMSG_PARTY_MEMBER_STATS)/;
+/**
+ * Ambient motion, out-of-sight party frames, threat list updates and world
+ * state changes: folded out of `recent_events` unless asked for, as its fold
+ * note says. The state cache keeps them all.
+ */
+const AMBIENT = /^(SMSG_MONSTER_MOVE|MSG_MOVE_|SMSG_PARTY_MEMBER_STATS|SMSG_THREAT_UPDATE|SMSG_HIGHEST_THREAT_UPDATE|SMSG_UPDATE_WORLD_STATE)/;
 
 /** The bare stack's rendering: one event per line, and the snapshot's own fields as JSON. */
 export const PLAIN_RENDER: CoreToolRender<CoreToolContext> = {
