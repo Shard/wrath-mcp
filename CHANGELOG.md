@@ -210,6 +210,16 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   `SMSG_TEXT_EMOTE` (a player's text emote, with the target's name as the
   packet carries it) and `SMSG_CHANNEL_NOTIFY` (a channel notice: its type,
   the channel and the type's tail).
+- Item odds and ends on the raw allowlist: `CMSG_SOCKET_GEMS`,
+  `CMSG_CANCEL_TEMP_ENCHANTMENT`, `CMSG_ITEM_REFUND_INFO`, `CMSG_ITEM_REFUND`,
+  `CMSG_REMOVE_GLYPH` and `CMSG_BUY_ITEM_IN_SLOT` (buy into a chosen bag).
+  The replies the server sends are events: `SMSG_SOCKET_GEMS_RESULT` (the
+  enchantment ids now in the sockets and the bonus),
+  `SMSG_ITEM_REFUND_INFO_RESPONSE` and `SMSG_ITEM_REFUND_RESULT`.
+- Single-item repair: `repairAll(vendor, item?)` and the `repair_all` action
+  take an optional item (a name, guid or `{ bag, slot }`, worn or carried;
+  `itemGuid` on the wire) and repair that one item. Without one, repair-all is
+  unchanged.
 
 ### Changed
 

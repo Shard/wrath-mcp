@@ -1707,6 +1707,56 @@ export const sellItemDataSchema = z.looseObject({
 export type SellItemData = z.infer<typeof sellItemDataSchema>;
 
 /**
+ * `SMSG_SOCKET_GEMS_RESULT`: the answer to a raw `CMSG_SOCKET_GEMS` that went
+ * through (a refusal is mostly silence): the item and the enchantment id now
+ * in each of its three sockets and in its socket bonus, 0 for none.
+ */
+export const socketGemsResultDataSchema = z.looseObject({
+  itemGuid: guidSchema,
+  socket0: z.number(),
+  socket1: z.number(),
+  socket2: z.number(),
+  bonus: z.number(),
+});
+export type SocketGemsResultData = z.infer<typeof socketGemsResultDataSchema>;
+
+/** One item of a refund's cost; rows with no item are not served. */
+export const refundCostItemSchema = z.looseObject({ itemId: z.number(), count: z.number() });
+
+/**
+ * `SMSG_ITEM_REFUND_INFO_RESPONSE`: the answer to a raw `CMSG_ITEM_REFUND_INFO`
+ * for an item bought with an extended cost and still refundable. `money` is
+ * copper; `items` is what the refund would hand back; `elapsedSeconds` is the
+ * played time since the purchase.
+ */
+export const itemRefundInfoResponseDataSchema = z.looseObject({
+  itemGuid: guidSchema,
+  money: z.number(),
+  honorPoints: z.number(),
+  arenaPoints: z.number(),
+  items: z.array(refundCostItemSchema),
+  elapsedSeconds: z.number(),
+});
+export type ItemRefundInfoResponseData = z.infer<typeof itemRefundInfoResponseDataSchema>;
+
+/**
+ * `SMSG_ITEM_REFUND_RESULT`: the verdict on a raw `CMSG_ITEM_REFUND`. `result`
+ * 0 is a refund done, with what came back (`money` in copper, `honorPoints`,
+ * `arenaPoints`, `items`); 10 is a refusal (the refund window has run out, or
+ * the returned items would not fit in the bags) and carries nothing more.
+ * Other refusals send no packet.
+ */
+export const itemRefundResultDataSchema = z.looseObject({
+  itemGuid: guidSchema,
+  result: z.number(),
+  money: z.number().optional(),
+  honorPoints: z.number().optional(),
+  arenaPoints: z.number().optional(),
+  items: z.array(refundCostItemSchema).optional(),
+});
+export type ItemRefundResultData = z.infer<typeof itemRefundResultDataSchema>;
+
+/**
  * One row of a trainer's spell list. `cost` is copper, already discounted by
  * the server for reputation; `reqSkill` is a skill-line id (0 = none).
  * `state` is the availability the server computed — see
@@ -2305,6 +2355,9 @@ export const eventDataSchemas = {
   SMSG_BUY_ITEM: buyItemDataSchema,
   SMSG_BUY_FAILED: buyFailedDataSchema,
   SMSG_SELL_ITEM: sellItemDataSchema,
+  SMSG_SOCKET_GEMS_RESULT: socketGemsResultDataSchema,
+  SMSG_ITEM_REFUND_INFO_RESPONSE: itemRefundInfoResponseDataSchema,
+  SMSG_ITEM_REFUND_RESULT: itemRefundResultDataSchema,
   // trainers
   SMSG_TRAINER_LIST: trainerListDataSchema,
   SMSG_TRAINER_BUY_SUCCEEDED: trainerBuySucceededDataSchema,
