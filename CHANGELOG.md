@@ -220,6 +220,35 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   take an optional item (a name, guid or `{ bag, slot }`, worn or carried;
   `itemGuid` on the wire) and repair that one item. Without one, repair-all is
   unchanged.
+- Instances on the raw allowlist: `CMSG_REQUEST_RAID_INFO`,
+  `CMSG_RESET_INSTANCES`, `MSG_SET_DUNGEON_DIFFICULTY` and
+  `MSG_SET_RAID_DIFFICULTY`. Their answers are events: the saved instances
+  (`SMSG_RAID_INSTANCE_INFO`, read as `state.self.instanceLocks`: map,
+  difficulty, instance id, locked, extended, `resetsAt`), each reset or
+  failure (`SMSG_INSTANCE_RESET`, `SMSG_INSTANCE_RESET_FAILED`), the
+  server's difficulty (both `MSG_SET_*_DIFFICULTY`, read as
+  `state.self.dungeonDifficulty` and `raidDifficulty`), and on their own
+  `SMSG_UPDATE_INSTANCE_OWNERSHIP`, `SMSG_UPDATE_LAST_INSTANCE`,
+  `SMSG_INSTANCE_SAVE_CREATED` and the raid warnings
+  `SMSG_RAID_INSTANCE_MESSAGE`. A solo difficulty change the server accepts
+  is not answered.
+- World states, weather and the game clock: `SMSG_INIT_WORLD_STATES` and
+  `SMSG_UPDATE_WORLD_STATE` (read as `state.self.worldStates`, id → value
+  with the map, zone and area the init named), `SMSG_WEATHER`
+  (`state.self.weather`, named by `WeatherState`) and
+  `SMSG_LOGIN_SETTIMESPEED` (`state.self.gameTime`). The reattach replay
+  restates them with the difficulty.
+- Threat: `SMSG_THREAT_UPDATE`, `SMSG_HIGHEST_THREAT_UPDATE`,
+  `SMSG_THREAT_REMOVE` and `SMSG_THREAT_CLEAR`, read as a `threat` list on
+  the creature's `units()` row (each unit's threat, highest first, and
+  `topGuid` the one it attacks). The server sends a creature's list at most
+  once a second while it fights, to every client in range.
+- Own speeds: our own create block carries `speeds` (walk, run, run back,
+  swim, swim back, flight, flight back, turn and pitch rate), and each
+  `SMSG_FORCE_*_SPEED_CHANGE` is an event as well as acked as before;
+  `state.self.speeds` reads them.
+- Dispel logs: `SMSG_SPELLDISPELLOG`, `SMSG_SPELLSTEALLOG` and
+  `SMSG_DISPEL_FAILED`, with the dispel and each aura named.
 
 ### Changed
 

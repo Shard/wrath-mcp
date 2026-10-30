@@ -92,6 +92,17 @@ import {
   type SpellGoData,
   type SpellStartData,
   type UpdateComboPointsData,
+  type ForceSpeedChangeData,
+  type InitWorldStatesData,
+  type LoginSetTimeSpeedData,
+  type MovementSpeeds,
+  type RaidInstanceInfoData,
+  type SetDifficultyData,
+  type ThreatClearData,
+  type ThreatRemoveData,
+  type ThreatUpdateData,
+  type UpdateWorldStateData,
+  type WeatherData,
   type ConvertRuneData,
   type ChannelStartData,
   type ChannelUpdateData,
@@ -196,6 +207,30 @@ const TOTEM_ELEMENTS = ["fire", "earth", "water", "air"] as const;
 
 /** `MirrorTimerType` (AzerothCore `Player.h`) by value. */
 const MIRROR_TIMER_TYPES = ["fatigue", "breath", "fire"] as const;
+
+/** The `SelfState.speeds` key each forced speed change sets. */
+const FORCE_SPEED_KEYS: Readonly<Record<string, keyof MovementSpeeds>> = {
+  SMSG_FORCE_WALK_SPEED_CHANGE: "walk",
+  SMSG_FORCE_RUN_SPEED_CHANGE: "run",
+  SMSG_FORCE_RUN_BACK_SPEED_CHANGE: "runBack",
+  SMSG_FORCE_SWIM_SPEED_CHANGE: "swim",
+  SMSG_FORCE_SWIM_BACK_SPEED_CHANGE: "swimBack",
+  SMSG_FORCE_FLIGHT_SPEED_CHANGE: "flight",
+  SMSG_FORCE_FLIGHT_BACK_SPEED_CHANGE: "flightBack",
+  SMSG_FORCE_TURN_RATE_CHANGE: "turnRate",
+  SMSG_FORCE_PITCH_RATE_CHANGE: "pitchRate",
+};
+
+/** `Difficulty` (AzerothCore `DBCEnums.h`) by value, read as a dungeon's and as a raid's. */
+const DUNGEON_DIFFICULTY_NAMES = ["normal", "heroic"] as const;
+const RAID_DIFFICULTY_NAMES = ["normal10", "normal25", "heroic10", "heroic25"] as const;
+
+/** `WeatherState` (AzerothCore `Weather.h`) by value: the ids the client draws. */
+const WEATHER_NAMES: Readonly<Record<number, string>> = {
+  0: "fine", 1: "fog", 3: "lightRain", 4: "mediumRain", 5: "heavyRain", 6: "lightSnow", 7: "mediumSnow",
+  8: "heavySnow", 22: "lightSandstorm", 41: "mediumSandstorm", 42: "heavySandstorm", 86: "thunders",
+  90: "blackRain", 106: "blackSnow",
+};
 
 /** `ItemClass` (AzerothCore `ItemTemplate.h`): the two classes `SMSG_SET_PROFICIENCY` names. */
 const ITEM_CLASS_WEAPON = 2;
@@ -804,6 +839,55 @@ export interface SelfState extends UnitFieldsState {
    */
   vehicle: Observed<{ readonly guid: GuidKey; readonly seat: number }> | undefined;
   /**
+   * The speeds the character moves at: yards per second, radians per second
+   * for `turnRate` and `pitchRate`. Seeded by our own create block (all nine)
+   * and moved by each `SMSG_FORCE_*_SPEED_CHANGE` the server sends this
+   * client (a mount, a slow, a sprint, a ghost's speed). While the character
+   * is feared, confused or charmed the server sends a change to every
+   * client in range as a creature's instead, which is not read here, so
+   * then this can lag until the next forced change.
+   */
+  speeds: Observed<MovementSpeeds> | undefined;
+  /**
+   * The character's dungeon and raid difficulty as the server last stated it
+   * (`MSG_SET_DUNGEON_DIFFICULTY` / `MSG_SET_RAID_DIFFICULTY`): `id` the
+   * `Difficulty` and `name` its reading: dungeon "normal" or "heroic", raid
+   * "normal10", "normal25", "heroic10", "heroic25". The dungeon one comes
+   * at login; the raid one only from a group or a refused change. A solo
+   * change the server accepts is not answered, so after a raw difficulty
+   * send without an answer this still holds the old value.
+   */
+  dungeonDifficulty: Observed<{ readonly id: number; readonly name: string | undefined }> | undefined;
+  raidDifficulty: Observed<{ readonly id: number; readonly name: string | undefined }> | undefined;
+  /**
+   * The saved instances the raid frame lists (`SMSG_RAID_INSTANCE_INFO`, the
+   * answer to raw `CMSG_REQUEST_RAID_INFO`, sent again after a reset):
+   * `undefined` until one arrived, `[]` when nothing is saved.
+   */
+  instanceLocks: Observed<readonly InstanceLock[]> | undefined;
+  /**
+   * The world states the client holds for its zone: `SMSG_INIT_WORLD_STATES`
+   * on entering the zone names the map, zone and area ids and every state,
+   * and each `SMSG_UPDATE_WORLD_STATE` sets one. `states` is id → value;
+   * the ids are the client's own (`WorldStateUI.dbc`), unnamed here.
+   */
+  worldStates: Observed<WorldStates> | undefined;
+  /**
+   * The weather the client draws (`SMSG_WEATHER`): `id` the `WeatherState`,
+   * `name` its reading ("fine", "lightRain", "heavySnow", …), `intensity`
+   * 0-1. Sent on entering a zone that has weather and on each change there;
+   * a zone without weather of its own sends none, so this can still be the
+   * last zone's.
+   */
+  weather: Observed<{ readonly id: number; readonly name: string | undefined; readonly intensity: number }> | undefined;
+  /**
+   * The game clock the login set (`SMSG_LOGIN_SETTIMESPEED`): the server's
+   * local time then, `time` "YYYY-MM-DD HH:MM" (`date` the wire's packed
+   * form), and `speed` in game minutes per real second. The client runs the
+   * clock on from there; no later packet restates it.
+   */
+  gameTime: Observed<{ readonly time: string; readonly date: number; readonly speed: number }> | undefined;
+  /**
    * The last `SMSG_ACTIVATETAXIREPLY` (the answer to a raw `CMSG_ACTIVATETAXI`).
    * Kept because it is the only thing that says a flight was *accepted*; the
    * ride itself shows on `taxiFlight`.
@@ -815,6 +899,38 @@ export interface SelfState extends UnitFieldsState {
    * current word. `undefined` only before the login packet has been seen.
    */
   bindPoint: Observed<BindPoint> | undefined;
+}
+
+/** One saved instance (`SelfState.instanceLocks`). */
+export interface InstanceLock {
+  readonly map: number;
+  /** `Difficulty` 0-3: for a raid 10-player, 25-player, 10 heroic, 25 heroic; for a dungeon 1 is heroic. */
+  readonly difficulty: number;
+  readonly instanceId: number;
+  readonly locked: boolean;
+  readonly extended: boolean;
+  /** Wall-clock ms when it resets: the packet's `ts` plus the seconds it gave. */
+  readonly resetsAt: number;
+}
+
+/** The world states the client holds (`SelfState.worldStates`). */
+export interface WorldStates {
+  readonly map: number;
+  readonly zone: number;
+  readonly area: number;
+  /** World state id → value. */
+  readonly states: Readonly<Record<number, number>>;
+}
+
+/**
+ * A creature's threat list as a client's threat meter reads it
+ * (`SMSG_THREAT_UPDATE` and the rest): `threat` in the core's units (the wire
+ * carries it × 100), highest first as the server sorts it, and `topGuid` the
+ * unit the creature attacks as the last `SMSG_HIGHEST_THREAT_UPDATE` named it.
+ */
+export interface ThreatList {
+  readonly topGuid: GuidKey | undefined;
+  readonly entries: readonly { readonly guid: GuidKey; readonly threat: number }[];
 }
 
 /** A Death Knight rune slot (`SelfState.runes`). */
@@ -1652,6 +1768,13 @@ export interface NearbyObject extends UnitFieldsState {
    */
   questGiver: Observed<number> | undefined;
   /**
+   * A creature's threat list, from the threat packets the server sends every
+   * client in range while it fights (`SMSG_THREAT_UPDATE`,
+   * `SMSG_HIGHEST_THREAT_UPDATE`, `SMSG_THREAT_REMOVE`, `SMSG_THREAT_CLEAR`).
+   * Undefined until one named it; an empty list after a clear.
+   */
+  threat: Observed<ThreatList> | undefined;
+  /**
    * The string update fields the module serves beside an id as client-cache
    * knowledge (an item's `suffixName`, each `enchant<n>Text`); `fields`
    * holds numbers only. Empty on everything but items.
@@ -1788,6 +1911,14 @@ export interface UnitView {
    */
   readonly sitting: boolean | undefined;
   readonly shapeshiftForm: string | undefined;
+  /**
+   * Creatures in combat: their threat list as a client's threat meter reads
+   * it (`ThreatList`: each unit on it with its threat, highest first, and
+   * `topGuid` the one it attacks). Sent while it fights, at most once a
+   * second; undefined for a unit no threat packet has named, an empty list
+   * once it was cleared.
+   */
+  readonly threat: ThreatList | undefined;
 }
 
 /** How a unit regards this character (`UnitView.reaction`). */
@@ -2210,6 +2341,13 @@ export class StateCache {
     restedXp: undefined,
     control: undefined,
     vehicle: undefined,
+    speeds: undefined,
+    dungeonDifficulty: undefined,
+    raidDifficulty: undefined,
+    instanceLocks: undefined,
+    worldStates: undefined,
+    weather: undefined,
+    gameTime: undefined,
     taxiReply: undefined,
     bindPoint: undefined,
     health: undefined,
@@ -4083,6 +4221,104 @@ export class StateCache {
         };
         return;
       }
+      case "SMSG_FORCE_WALK_SPEED_CHANGE":
+      case "SMSG_FORCE_RUN_SPEED_CHANGE":
+      case "SMSG_FORCE_RUN_BACK_SPEED_CHANGE":
+      case "SMSG_FORCE_SWIM_SPEED_CHANGE":
+      case "SMSG_FORCE_SWIM_BACK_SPEED_CHANGE":
+      case "SMSG_FORCE_TURN_RATE_CHANGE":
+      case "SMSG_FORCE_FLIGHT_SPEED_CHANGE":
+      case "SMSG_FORCE_FLIGHT_BACK_SPEED_CHANGE":
+      case "SMSG_FORCE_PITCH_RATE_CHANGE": {
+        // Sent to the client that moves the unit: a vehicle or a possessed
+        // unit gets its own, which is not our speed.
+        const d = event.data as ForceSpeedChangeData;
+        const key = FORCE_SPEED_KEYS[event.opcode];
+        const was = this.self.speeds?.value;
+        if (!this.isSelfGuid(d.guid) || key === undefined || was === undefined) return;
+        this.self.speeds = { value: { ...was, [key]: d.speed }, seq: event.seq, ts: event.ts };
+        return;
+      }
+      case "MSG_SET_DUNGEON_DIFFICULTY":
+      case "MSG_SET_RAID_DIFFICULTY": {
+        const d = event.data as SetDifficultyData;
+        const dungeon = event.opcode === "MSG_SET_DUNGEON_DIFFICULTY";
+        const value = { id: d.difficulty, name: (dungeon ? DUNGEON_DIFFICULTY_NAMES : RAID_DIFFICULTY_NAMES)[d.difficulty] };
+        if (dungeon) this.self.dungeonDifficulty = { value, seq: event.seq, ts: event.ts };
+        else this.self.raidDifficulty = { value, seq: event.seq, ts: event.ts };
+        return;
+      }
+      case "SMSG_RAID_INSTANCE_INFO": {
+        const d = event.data as RaidInstanceInfoData;
+        const locks: InstanceLock[] = d.locks.map((l) => ({
+          map: l.map,
+          difficulty: l.difficulty,
+          instanceId: l.instanceId,
+          locked: l.locked,
+          extended: l.extended,
+          resetsAt: event.ts + l.resetInSec * 1000,
+        }));
+        this.self.instanceLocks = { value: locks, seq: event.seq, ts: event.ts };
+        return;
+      }
+      case "SMSG_INIT_WORLD_STATES": {
+        const d = event.data as InitWorldStatesData;
+        const states: Record<number, number> = {};
+        for (const ws of d.states) states[ws.id] = ws.value;
+        this.self.worldStates = { value: { map: d.map, zone: d.zone, area: d.area, states }, seq: event.seq, ts: event.ts };
+        return;
+      }
+      case "SMSG_UPDATE_WORLD_STATE": {
+        const d = event.data as UpdateWorldStateData;
+        const was = this.self.worldStates?.value;
+        if (was === undefined) return;
+        this.self.worldStates = { value: { ...was, states: { ...was.states, [d.id]: d.value } }, seq: event.seq, ts: event.ts };
+        return;
+      }
+      case "SMSG_WEATHER": {
+        const d = event.data as WeatherData;
+        this.self.weather = { value: { id: d.weather, name: WEATHER_NAMES[d.weather], intensity: d.intensity }, seq: event.seq, ts: event.ts };
+        return;
+      }
+      case "SMSG_LOGIN_SETTIMESPEED": {
+        const d = event.data as LoginSetTimeSpeedData;
+        this.self.gameTime = { value: { time: d.time, date: d.date, speed: d.speed }, seq: event.seq, ts: event.ts };
+        return;
+      }
+      case "SMSG_THREAT_UPDATE":
+      case "SMSG_HIGHEST_THREAT_UPDATE": {
+        const d = event.data as ThreatUpdateData;
+        const obj = this.nearby.get(d.unitGuid);
+        if (obj === undefined) return;
+        const entries = d.entries.map((e) => ({ guid: e.guid, threat: e.threat / 100 }));
+        // A plain update names no victim: the last one named stands while it is still on the list.
+        const was = obj.threat?.value.topGuid;
+        const topGuid = d.topGuid ?? (was !== undefined && entries.some((e) => e.guid === was) ? was : undefined);
+        obj.threat = { value: { topGuid, entries }, seq: event.seq, ts: event.ts };
+        obj.lastSeq = Math.max(obj.lastSeq, event.seq);
+        return;
+      }
+      case "SMSG_THREAT_REMOVE": {
+        const d = event.data as ThreatRemoveData;
+        const obj = this.nearby.get(d.unitGuid);
+        const was = obj?.threat?.value;
+        if (obj === undefined || was === undefined) return;
+        obj.threat = {
+          value: { topGuid: was.topGuid === d.guid ? undefined : was.topGuid, entries: was.entries.filter((e) => e.guid !== d.guid) },
+          seq: event.seq,
+          ts: event.ts,
+        };
+        obj.lastSeq = Math.max(obj.lastSeq, event.seq);
+        return;
+      }
+      case "SMSG_THREAT_CLEAR": {
+        const d = event.data as ThreatClearData;
+        const obj = this.nearby.get(d.unitGuid);
+        if (obj === undefined) return;
+        obj.threat = { value: { topGuid: undefined, entries: [] }, seq: event.seq, ts: event.ts };
+        obj.lastSeq = Math.max(obj.lastSeq, event.seq);
+        return;
+      }
       case "SMSG_SPELL_COOLDOWN": {
         const d = event.data as SpellCooldownData;
         // Sent to this session for its own character (or its pet): a guid
@@ -5057,9 +5293,10 @@ export class StateCache {
         return;
       }
       case "movement": {
-        const b = block as { guid: GuidKey; pos?: PositionData; moveFlags?: number };
+        const b = block as { guid: GuidKey; pos?: PositionData; moveFlags?: number; speeds?: MovementSpeeds };
         if (this.isSelfGuid(b.guid)) {
           if (b.pos) this.applySelfPosition(b.pos, seq, ts);
+          if (b.speeds !== undefined) this.self.speeds = { value: b.speeds, seq, ts };
           return;
         }
         this.upsertNearby(b.guid, seq, (obj) => {
@@ -5107,6 +5344,7 @@ export class StateCache {
       if (block.runSpeed !== undefined) {
         this.self.fields.set("runSpeed", { value: block.runSpeed, seq, ts });
       }
+      if (block.speeds !== undefined) this.self.speeds = { value: block.speeds, seq, ts };
       if (this.replayPending) {
         // The replay's own create is the whole field block, as a login's is
         // to a fresh cache: what it leaves out is zero, not "unchanged".
@@ -5674,6 +5912,7 @@ export class StateCache {
         charmedByGuid: undefined,
         transport: undefined,
         questGiver: undefined,
+        threat: undefined,
         fields: new Map<string, Observed<number>>(),
         texts: new Map<string, Observed<string>>(),
         firstSeq: seq,
@@ -5735,6 +5974,7 @@ function toUnitView(
     reaction: type === "unit" || type === "player" ? reactionOf(obj) : undefined,
     ...unitStateOf(type, obj.fields.get("unitFlags")?.value, obj.fields.get("dynamicFlags")?.value),
     ...postureOf(type, obj.fields.get("standState")?.value, obj.fields.get("shapeshiftForm")?.value),
+    threat: obj.threat?.value,
   };
 }
 

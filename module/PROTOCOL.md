@@ -923,6 +923,17 @@ whose handler does nothing a non-GM client could not do:
   takes raid members within interaction range only). Leaving and changing
   seat are actions (`vehicle_exit`, `vehicle_change_seat`): both carry the
   client's own MovementInfo
+- instances: `CMSG_REQUEST_RAID_INFO` (empty — the raid frame's saved-instance
+  list, answered with `SMSG_RAID_INSTANCE_INFO`), `CMSG_RESET_INSTANCES`
+  (empty — the portrait menu's "Reset all instances"; `HandleResetInstancesOpcode`
+  resets the character's own, or as a group's leader the group's, and answers
+  each instance with `SMSG_INSTANCE_RESET` or `SMSG_INSTANCE_RESET_FAILED`),
+  `MSG_SET_DUNGEON_DIFFICULTY` and `MSG_SET_RAID_DIFFICULTY` (`u32
+  difficulty` — the portrait menu's difficulty; the handlers refuse inside an
+  instance, from a group member who is not the leader, and out of range, by
+  echoing the current difficulty or by silence. A solo change the server
+  accepts is not answered either. Both opcodes are bidirectional and the
+  server's are whitelisted)
 
 Deliberately absent: movement opcodes (the module drives them; a stray one
 desyncs the mover), session lifecycle (login, logout, character create/delete),
@@ -930,7 +941,9 @@ every opcode that already has an action (one audited path per opcode), and
 anything GM-gated or teleport-shaped. Answers to raw actions reach the agent
 only through the event whitelist: the pet, party, mail, bank and trade
 replies are whitelisted, as are those to `CMSG_NPC_TEXT_QUERY`,
-`CMSG_TAXINODE_STATUS_QUERY`, `CMSG_PLAYED_TIME` and `CMSG_QUERY_TIME`; the
+`CMSG_TAXINODE_STATUS_QUERY`, `CMSG_PLAYED_TIME`, `CMSG_QUERY_TIME`,
+`CMSG_REQUEST_RAID_INFO`, `CMSG_RESET_INSTANCES` and the two difficulty
+opcodes; the
 rest have none yet, which is exactly the evidence the hatch exists to produce.
 
 ### POST /lease
@@ -1561,6 +1574,8 @@ one of:
   "self": true,                 // present only on the bench character's own block
   "moveFlags": 0,               // living objects only
   "runSpeed": 7.0,              // living objects only
+  "speeds": { "walk": 2.5, "run": 7.0, "runBack": 4.5, "swim": 4.72, "swimBack": 2.5,
+              "flight": 7.0, "flightBack": 4.5, "turnRate": 3.14, "pitchRate": 3.14 },  // our own living block only
   "pos": { "x": -8949.9, "y": -132.5, "z": 83.5, "o": 5.2 },  // conditional, see below
   "targetGuid": "0",            // present when the block carries a target
   "pathProgress": 12345,        // transports only: ms into the TransportAnimation.dbc period
@@ -1570,7 +1585,10 @@ one of:
   Every field beyond `update`/`guid`/`objectType` is conditional on the block's
   update flags. `pos` appears only when the block carries UPDATEFLAG_LIVING,
   UPDATEFLAG_POSITION, or UPDATEFLAG_STATIONARY_POSITION — an item or container
-  create has no `pos`. `moveFlags`/`runSpeed` appear only on living blocks.
+  create has no `pos`. `moveFlags`/`runSpeed` appear only on living blocks;
+  `speeds`, every speed the block carries (yards per second; radians per
+  second for the turn and pitch rates), only on our own living block, the
+  create and a movement block alike.
   `fields` is always present but may be `{}` when the mask carried no
   whitelisted field. `objectType` is `"unknown"` for a type id outside the
   known enum (forward compatibility, not an expected case).
@@ -2061,6 +2079,13 @@ Combat:
 | `SMSG_SPELLENERGIZELOG` | 0x151 | `{ "targetGuid", "casterGuid", "spellId", "rank"?, "name"?, "powerType": <u32>, "amount" }` — one power gain from a spell (`Unit::SendEnergizeSpellLog`); `powerType` 0 mana, 1 rage, 2 focus, 3 energy, 4 happiness, 5 runes, 6 runic power |
 | `SMSG_SPELLORDAMAGE_IMMUNE` | 0x263 | `{ "casterGuid", "targetGuid", "spellId", "rank"?, "name"? }` — "Immune" in the combat log (`Unit::SendSpellDamageImmune`): the target was immune to the caster's spell; the debug-format byte is consumed |
 | `SMSG_ENVIRONMENTAL_DAMAGE_LOG` | 0x1FC | `{ "victimGuid", "type": <u8>, "amount", "resist", "absorb" }` — damage from the world (`Player::EnvironmentalDamage`): `type` 0 fatigue, 1 drowning, 2 falling (a fall into the void is sent as 2), 3 lava, 4 slime, 5 fire |
+| `SMSG_SPELLDISPELLOG` | 0x27B | `{ "targetGuid", "casterGuid", "spellId", "rank"?, "name"?, "auras": [{ "spellId", "rank"?, "name"? }] }` — a dispel took `auras` off the target (`Spell::EffectDispel`, to every client in range); the unused byte and each aura's dispelled-or-cleansed byte (the core writes 0) are consumed |
+| `SMSG_SPELLSTEALLOG` | 0x333 | same shape — a Spellsteal took `auras` from the target (`Spell::EffectStealBeneficialBuff`) |
+| `SMSG_DISPEL_FAILED` | 0x262 | `{ "casterGuid", "targetGuid", "spellId", "rank"?, "name"?, "auras": [{ "spellId", "rank"?, "name"? }] }` — the auras that resisted a dispel or Spellsteal (the same two effects): unpacked guids and no count on the wire, an aura per resisted try to the packet's end |
+| `SMSG_THREAT_UPDATE` | 0x483 | `{ "unitGuid", "entries": [{ "guid", "threat" }] }` — a creature's threat list, highest first, `threat` the core's threat × 100 (`ThreatManager::SendThreatListToClients`, to every client in range). `ThreatManager::UpdateVictim` sends it at most once a second per creature, and only when the list changed: about one a second for each creature fighting in range, its whole list each time |
+| `SMSG_HIGHEST_THREAT_UPDATE` | 0x482 | `{ "unitGuid", "topGuid", "entries" }` — the same, when the creature's victim changed (a taunt sends it at once); `topGuid` is the new victim |
+| `SMSG_THREAT_REMOVE` | 0x484 | `{ "unitGuid", "guid" }` — `guid` left the creature's threat list (`ThreatManager::SendRemoveToClients`) |
+| `SMSG_THREAT_CLEAR` | 0x485 | `{ "unitGuid" }` — the creature's threat list emptied (`ThreatManager::SendClearAllThreatToClients`) |
 | `SMSG_AURA_UPDATE` | 0x496 | `{ "targetGuid", "auras": [<aura>] }` |
 | `SMSG_UPDATE_COMBO_POINTS` | 0x39D | `{ "targetGuid", "points": <u8> }` — the combo points held and on whom (`"0"` for no one); `Unit::SendComboPoints`, to the player alone, on every change |
 | `SMSG_CONVERT_RUNE` | 0x486 | `{ "index": <u8>, "runeType": <u8> }` — Death Knight rune slot 0-5 became `RuneType` 0 blood, 1 unholy, 2 frost, 3 death (`Player::ConvertRune`). `SMSG_RESYNC_RUNES` and `SMSG_ADD_RUNE_POWER` have no caller at the pinned commit; readiness rides `SMSG_SPELL_GO` |
@@ -2404,6 +2429,29 @@ Client queries and proficiencies:
 | `SMSG_PLAYED_TIME` | 0x1CD | `{ "totalSec", "levelSec", "show": <bool> }` — the answer to raw `CMSG_PLAYED_TIME` (`u8 show`): time played in total and at this level |
 | `SMSG_QUERY_TIME_RESPONSE` | 0x1CF | `{ "serverTime", "dailyResetInSec" }` — the answer to raw `CMSG_QUERY_TIME` (empty): the server's clock in unix seconds and the seconds until the daily quests reset |
 | `SMSG_SET_PROFICIENCY` | 0x127 | `{ "itemClass": <u8>, "subclassMask" }` — the item subclasses this character can use for one item class, 2 weapon or 4 armour, the whole mask each time (`Player::SendProficiency`, on learning a proficiency; the reattach replay re-sends both) |
+
+Instances, world states and own speeds:
+
+| opcode | id | `data` fields |
+|---|---|---|
+| `SMSG_RAID_INSTANCE_INFO` | 0x2CC | `{ "locks": [{ "map", "difficulty", "instanceId", "locked": <bool>, "extended": <bool>, "resetInSec" }] }` — the raid frame's saved instances (`Player::SendRaidInfo`): the answer to raw `CMSG_REQUEST_RAID_INFO`, sent again after a reset. One row per permanent bind; `difficulty` is the `Difficulty` 0-3, `instanceId` the counter of the instance guid the wire carries |
+| `SMSG_INSTANCE_RESET` | 0x31E | `{ "map" }` — one instance reset (`Player::SendResetInstanceSuccess`), answering raw `CMSG_RESET_INSTANCES` |
+| `SMSG_INSTANCE_RESET_FAILED` | 0x31F | `{ "reason", "map" }` — one it could not reset (`Player::SendResetInstanceFailed`): `reason` 0 players still inside, 1 a party member offline, 2 one zoning in |
+| `SMSG_UPDATE_INSTANCE_OWNERSHIP` | 0x32B | `{ "saved": <bool> }` — whether the character holds any permanent bind (`Player::SendSavedInstances`, on every map arrival) |
+| `SMSG_UPDATE_LAST_INSTANCE` | 0x320 | `{ "map" }` — one bound map, after the ownership packet when it says saved |
+| `SMSG_INSTANCE_SAVE_CREATED` | 0x2CB | `{}` — the character was saved to the instance it is in (`Player::BindToInstance`); the u32 0 is consumed |
+| `SMSG_RAID_INSTANCE_MESSAGE` | 0x2FA | `{ "type", "map", "difficulty", "timeLeftSec", "locked"?, "extended"? }` — a raid instance's welcome or reset warning (`Player::SendInstanceResetWarning`): `type` 1 hours left, 2 minutes left, 3 minutes left and leave, 4 welcome, which alone carries `locked` and `extended` |
+| `MSG_SET_DUNGEON_DIFFICULTY` | 0x329 | `{ "difficulty", "inGroup": <bool> }` — the character's dungeon difficulty, 0 normal or 1 heroic (`Player::SendDungeonDifficulty`): at login, on joining a group whose difficulty differs, on the leader's change, and when the server refuses a raw change; a solo change it accepts is not answered. The constant u32 1 is consumed |
+| `MSG_SET_RAID_DIFFICULTY` | 0x4EB | same shape — the raid difficulty, 0 10-player, 1 25-player, 2 10-player heroic, 3 25-player heroic (`Player::SendRaidDifficulty`): from a group, or a refused change; never at a solo login |
+| `SMSG_INIT_WORLD_STATES` | 0x2C2 | `{ "map", "zone", "area", "states": [{ "id", "value" }] }` — the zone's world states on entering it (`Player::SendInitWorldStates`): the scourge invasion and arena season states everywhere, a battleground's or an outdoor objective's, an instance script's counters |
+| `SMSG_UPDATE_WORLD_STATE` | 0x2C3 | `{ "id", "value" }` — one world state changed. A battleground, Wintergrasp or an instance encounter can send these often |
+| `SMSG_WEATHER` | 0x2F4 | `{ "weather", "intensity", "abrupt": <bool> }` — the zone's weather (`WorldPackets::Misc::Weather`): `weather` the `WeatherState` id, `intensity` 0-1. On entering a zone that has weather (`Map::SendZoneWeather`) and on each change there; a zone without weather sends none |
+| `SMSG_LOGIN_SETTIMESPEED` | 0x042 | `{ "date", "time", "speed" }` — the game clock at login (`Player::SendInitialPacketsBeforeAddToMap`): the server's local time as the wire's packed `date` and its reading `time` ("YYYY-MM-DD HH:MM", as achievement dates), and `speed` in game minutes per real second. The trailing u32 is consumed |
+| `SMSG_FORCE_RUN_SPEED_CHANGE` | 0x0E2 | `{ "guid", "speed" }` — a new speed for the unit this client moves (`Unit::SendSpeedToController`), which the module acks for the character as before; the movement counter and the run packet's extra byte are consumed. The same shape for `SMSG_FORCE_WALK_SPEED_CHANGE` (0x2DA), `_RUN_BACK_` (0x0E4), `_SWIM_` (0x0E6), `_SWIM_BACK_` (0x2DC), `_FLIGHT_` (0x381), `_FLIGHT_BACK_` (0x383), `SMSG_FORCE_TURN_RATE_CHANGE` (0x2DE) and `SMSG_FORCE_PITCH_RATE_CHANGE` (0x45C). A change while the character is feared, confused or charmed is sent to every client in range as the creature form (`SMSG_SPLINE_SET_*_SPEED`), which is not whitelisted |
+
+The reattach replay restates what a login and the zone entry sent: the
+dungeon difficulty (and the raid one in a group), the game clock built as the
+login builds it, the zone's world states and its weather.
 
 #### Death
 

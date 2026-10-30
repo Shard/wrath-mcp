@@ -730,6 +730,24 @@ export const updateFieldsSchema = z.looseObject({
 export type UpdateFields = z.infer<typeof updateFieldsSchema>;
 
 /**
+ * The nine movement speeds a living block carries (`Object::BuildMovementUpdate`),
+ * served on our own block: yards per second, and radians per second for the
+ * turn and pitch rates.
+ */
+export const movementSpeedsSchema = z.looseObject({
+  walk: z.number(),
+  run: z.number(),
+  runBack: z.number(),
+  swim: z.number(),
+  swimBack: z.number(),
+  flight: z.number(),
+  flightBack: z.number(),
+  turnRate: z.number(),
+  pitchRate: z.number(),
+});
+export type MovementSpeeds = z.infer<typeof movementSpeedsSchema>;
+
+/**
  * A full object on first sight. `pos` is present only when the packet carried a
  * position block (LIVING / POSITION / STATIONARY_POSITION); `moveFlags` and
  * `runSpeed` only for living objects; `self` only on our own block.
@@ -741,6 +759,8 @@ export const createBlockSchema = z.looseObject({
   self: z.boolean().optional(),
   moveFlags: z.number().optional(),
   runSpeed: z.number().optional(),
+  /** Our own living block only: every speed the character moves at. */
+  speeds: movementSpeedsSchema.optional(),
   pos: positionSchema.optional(),
   targetGuid: guidSchema.optional(),
   /** Transports only: ms into the `TransportAnimation.dbc` period when the block was built. */
@@ -761,6 +781,7 @@ export const movementBlockSchema = z.looseObject({
   guid: guidSchema,
   moveFlags: z.number().optional(),
   runSpeed: z.number().optional(),
+  speeds: movementSpeedsSchema.optional(),
   pos: positionSchema.optional(),
   targetGuid: guidSchema.optional(),
 });
@@ -1063,6 +1084,97 @@ export type TransferAbortedData = z.infer<typeof transferAbortedDataSchema>;
  * event per line of the server's text; no transfer follows.
  */
 export const areaTriggerMessageDataSchema = z.looseObject({ text: z.string() });
+
+// -------------------------------------------------------------- instances
+
+/**
+ * `SMSG_RAID_INSTANCE_INFO`: the saved instances the raid frame lists, the
+ * answer to raw `CMSG_REQUEST_RAID_INFO`. Per permanent bind: the map, its
+ * `Difficulty` (0-3), the instance id, whether it is locked and extended, and
+ * the seconds until it resets.
+ */
+export const raidInstanceInfoDataSchema = z.looseObject({
+  locks: z.array(
+    z.looseObject({
+      map: z.number(),
+      difficulty: z.number(),
+      instanceId: z.number(),
+      locked: z.boolean(),
+      extended: z.boolean(),
+      resetInSec: z.number(),
+    }),
+  ),
+});
+export type RaidInstanceInfoData = z.infer<typeof raidInstanceInfoDataSchema>;
+
+/** `SMSG_INSTANCE_RESET` / `SMSG_UPDATE_LAST_INSTANCE`: one map, reset or held. */
+export const instanceMapDataSchema = z.looseObject({ map: z.number() });
+export type InstanceMapData = z.infer<typeof instanceMapDataSchema>;
+
+/**
+ * `SMSG_INSTANCE_RESET_FAILED`: the reset left `map` as it was; `reason` 0
+ * players still inside, 1 a party member offline, 2 one zoning in.
+ */
+export const instanceResetFailedDataSchema = z.looseObject({ reason: z.number(), map: z.number() });
+export type InstanceResetFailedData = z.infer<typeof instanceResetFailedDataSchema>;
+
+/** `SMSG_UPDATE_INSTANCE_OWNERSHIP`: whether the character holds any saved instance, on every map arrival. */
+export const updateInstanceOwnershipDataSchema = z.looseObject({ saved: z.boolean() });
+export type UpdateInstanceOwnershipData = z.infer<typeof updateInstanceOwnershipDataSchema>;
+
+/**
+ * `SMSG_RAID_INSTANCE_MESSAGE`: a raid instance's welcome or reset warning.
+ * `type` 1 hours left, 2 minutes left, 3 minutes left and leave, 4 welcome;
+ * `locked`/`extended` on the welcome only.
+ */
+export const raidInstanceMessageDataSchema = z.looseObject({
+  type: z.number(),
+  map: z.number(),
+  difficulty: z.number(),
+  timeLeftSec: z.number(),
+  locked: z.boolean().optional(),
+  extended: z.boolean().optional(),
+});
+export type RaidInstanceMessageData = z.infer<typeof raidInstanceMessageDataSchema>;
+
+/**
+ * `MSG_SET_DUNGEON_DIFFICULTY` / `MSG_SET_RAID_DIFFICULTY` from the server:
+ * the character's difficulty (dungeon 0 normal, 1 heroic; raid 0 10-player,
+ * 1 25-player, 2 10-player heroic, 3 25-player heroic).
+ */
+export const setDifficultyDataSchema = z.looseObject({ difficulty: z.number(), inGroup: z.boolean() });
+export type SetDifficultyData = z.infer<typeof setDifficultyDataSchema>;
+
+// -------------------------------------------- world states, weather, time
+
+/** `SMSG_INIT_WORLD_STATES`: the zone's world states (id → value) on entering it. */
+export const initWorldStatesDataSchema = z.looseObject({
+  map: z.number(),
+  zone: z.number(),
+  area: z.number(),
+  states: z.array(z.looseObject({ id: z.number(), value: z.number() })),
+});
+export type InitWorldStatesData = z.infer<typeof initWorldStatesDataSchema>;
+
+/** `SMSG_UPDATE_WORLD_STATE`: one world state changed. */
+export const updateWorldStateDataSchema = z.looseObject({ id: z.number(), value: z.number() });
+export type UpdateWorldStateData = z.infer<typeof updateWorldStateDataSchema>;
+
+/** `SMSG_WEATHER`: the zone's `WeatherState` id, its intensity 0-1, and whether it changed abruptly. */
+export const weatherDataSchema = z.looseObject({ weather: z.number(), intensity: z.number(), abrupt: z.boolean() });
+export type WeatherData = z.infer<typeof weatherDataSchema>;
+
+/**
+ * `SMSG_LOGIN_SETTIMESPEED`: the server's local time at login, the wire's
+ * packed `date` and its reading `time` ("YYYY-MM-DD HH:MM"), and the game
+ * speed (game minutes per real second).
+ */
+export const loginSetTimeSpeedDataSchema = z.looseObject({ date: z.number(), time: z.string(), speed: z.number() });
+export type LoginSetTimeSpeedData = z.infer<typeof loginSetTimeSpeedDataSchema>;
+
+/** `SMSG_FORCE_*_SPEED_CHANGE` / `_RATE_CHANGE`: the speed the server set for the unit this client moves. */
+export const forceSpeedChangeDataSchema = z.looseObject({ guid: guidSchema, speed: z.number() });
+export type ForceSpeedChangeData = z.infer<typeof forceSpeedChangeDataSchema>;
 export type AreaTriggerMessageData = z.infer<typeof areaTriggerMessageDataSchema>;
 
 // ----------------------------------------------- quest / combat extension
@@ -1231,6 +1343,59 @@ export const environmentalDamageLogDataSchema = z.looseObject({
   absorb: z.number(),
 });
 export type EnvironmentalDamageLogData = z.infer<typeof environmentalDamageLogDataSchema>;
+
+/** One aura a dispel took or failed to take, with the client's Spell.dbc reading of it. */
+const dispelledAuraSchema = z.looseObject({
+  spellId: z.number(),
+  rank: z.number().optional(),
+  name: z.string().optional(),
+});
+
+/**
+ * `SMSG_SPELLDISPELLOG` / `SMSG_SPELLSTEALLOG`: `casterGuid`'s `spellId`
+ * dispelled (or stole) `auras` from `targetGuid`. Sent to every client in range.
+ */
+export const spellDispelLogDataSchema = z.looseObject({
+  targetGuid: guidSchema,
+  casterGuid: guidSchema,
+  spellId: z.number(),
+  rank: z.number().optional(),
+  name: z.string().optional(),
+  auras: z.array(dispelledAuraSchema),
+});
+export type SpellDispelLogData = z.infer<typeof spellDispelLogDataSchema>;
+
+/** `SMSG_DISPEL_FAILED`: the `auras` on `targetGuid` that resisted `casterGuid`'s dispel or Spellsteal. */
+export const dispelFailedDataSchema = z.looseObject({
+  casterGuid: guidSchema,
+  targetGuid: guidSchema,
+  spellId: z.number(),
+  rank: z.number().optional(),
+  name: z.string().optional(),
+  auras: z.array(dispelledAuraSchema),
+});
+export type DispelFailedData = z.infer<typeof dispelFailedDataSchema>;
+
+/**
+ * `SMSG_THREAT_UPDATE` / `SMSG_HIGHEST_THREAT_UPDATE`: a creature's threat
+ * list, sent at most once a second per creature in combat in range. `threat`
+ * is the core's threat × 100; `topGuid` (the highest-threat update only) is
+ * the creature's new victim.
+ */
+export const threatUpdateDataSchema = z.looseObject({
+  unitGuid: guidSchema,
+  topGuid: guidSchema.optional(),
+  entries: z.array(z.looseObject({ guid: guidSchema, threat: z.number() })),
+});
+export type ThreatUpdateData = z.infer<typeof threatUpdateDataSchema>;
+
+/** `SMSG_THREAT_REMOVE`: `guid` left `unitGuid`'s threat list. */
+export const threatRemoveDataSchema = z.looseObject({ unitGuid: guidSchema, guid: guidSchema });
+export type ThreatRemoveData = z.infer<typeof threatRemoveDataSchema>;
+
+/** `SMSG_THREAT_CLEAR`: `unitGuid`'s threat list emptied. */
+export const threatClearDataSchema = z.looseObject({ unitGuid: guidSchema });
+export type ThreatClearData = z.infer<typeof threatClearDataSchema>;
 
 /**
  * One visible aura slot. `spellId: 0` means the slot was cleared, and then the
@@ -2275,6 +2440,33 @@ export const eventDataSchemas = {
   // that dungeon (MapMgr::PlayerCannotEnter); no transfer starts.
   SMSG_CORPSE_NOT_IN_INSTANCE: emptyDataSchema,
   SMSG_AREA_TRIGGER_MESSAGE: areaTriggerMessageDataSchema,
+  // instances: saved instances (raw CMSG_REQUEST_RAID_INFO), resets (raw
+  // CMSG_RESET_INSTANCES), the raid warnings and the difficulty
+  SMSG_RAID_INSTANCE_INFO: raidInstanceInfoDataSchema,
+  SMSG_INSTANCE_RESET: instanceMapDataSchema,
+  SMSG_INSTANCE_RESET_FAILED: instanceResetFailedDataSchema,
+  SMSG_UPDATE_INSTANCE_OWNERSHIP: updateInstanceOwnershipDataSchema,
+  SMSG_UPDATE_LAST_INSTANCE: instanceMapDataSchema,
+  // Bodiless (a u32 0 on the wire): the character was saved to this instance.
+  SMSG_INSTANCE_SAVE_CREATED: emptyDataSchema,
+  SMSG_RAID_INSTANCE_MESSAGE: raidInstanceMessageDataSchema,
+  MSG_SET_DUNGEON_DIFFICULTY: setDifficultyDataSchema,
+  MSG_SET_RAID_DIFFICULTY: setDifficultyDataSchema,
+  // world states, weather, the game clock
+  SMSG_INIT_WORLD_STATES: initWorldStatesDataSchema,
+  SMSG_UPDATE_WORLD_STATE: updateWorldStateDataSchema,
+  SMSG_WEATHER: weatherDataSchema,
+  SMSG_LOGIN_SETTIMESPEED: loginSetTimeSpeedDataSchema,
+  // own speed changes
+  SMSG_FORCE_WALK_SPEED_CHANGE: forceSpeedChangeDataSchema,
+  SMSG_FORCE_RUN_SPEED_CHANGE: forceSpeedChangeDataSchema,
+  SMSG_FORCE_RUN_BACK_SPEED_CHANGE: forceSpeedChangeDataSchema,
+  SMSG_FORCE_SWIM_SPEED_CHANGE: forceSpeedChangeDataSchema,
+  SMSG_FORCE_SWIM_BACK_SPEED_CHANGE: forceSpeedChangeDataSchema,
+  SMSG_FORCE_TURN_RATE_CHANGE: forceSpeedChangeDataSchema,
+  SMSG_FORCE_FLIGHT_SPEED_CHANGE: forceSpeedChangeDataSchema,
+  SMSG_FORCE_FLIGHT_BACK_SPEED_CHANGE: forceSpeedChangeDataSchema,
+  SMSG_FORCE_PITCH_RATE_CHANGE: forceSpeedChangeDataSchema,
   // quest/combat extension — combat
   SMSG_ATTACKSTART: attackStartDataSchema,
   SMSG_ATTACKSTOP: attackStopDataSchema,
@@ -2298,6 +2490,14 @@ export const eventDataSchemas = {
   SMSG_SPELLENERGIZELOG: spellEnergizeLogDataSchema,
   SMSG_SPELLORDAMAGE_IMMUNE: spellOrDamageImmuneDataSchema,
   SMSG_ENVIRONMENTAL_DAMAGE_LOG: environmentalDamageLogDataSchema,
+  SMSG_SPELLDISPELLOG: spellDispelLogDataSchema,
+  SMSG_SPELLSTEALLOG: spellDispelLogDataSchema,
+  SMSG_DISPEL_FAILED: dispelFailedDataSchema,
+  // threat lists
+  SMSG_THREAT_UPDATE: threatUpdateDataSchema,
+  SMSG_HIGHEST_THREAT_UPDATE: threatUpdateDataSchema,
+  SMSG_THREAT_REMOVE: threatRemoveDataSchema,
+  SMSG_THREAT_CLEAR: threatClearDataSchema,
   SMSG_AURA_UPDATE: auraUpdateDataSchema,
   SMSG_AURA_UPDATE_ALL: auraUpdateDataSchema,
   // class resources, channels, totems, mirror timers
