@@ -144,7 +144,8 @@ describe("threat", () => {
       selfCreate,
       creatureCreate,
       frame(40, "SMSG_HIGHEST_THREAT_UPDATE", { unitGuid: CREATURE_GUID, topGuid: SELF_GUID, entries: [{ guid: SELF_GUID, threat: 12_550 }] }),
-      frame(41, "SMSG_THREAT_UPDATE", { unitGuid: CREATURE_GUID, entries: [{ guid: SELF_GUID, threat: 20_000 }, { guid: PLAYER_GUID, threat: 500 }] }),
+      // the core's heap order, not sorted
+      frame(41, "SMSG_THREAT_UPDATE", { unitGuid: CREATURE_GUID, entries: [{ guid: PLAYER_GUID, threat: 500 }, { guid: SELF_GUID, threat: 20_000 }] }),
     ]);
     const row = () => cache.units().find((u) => u.guid === CREATURE_GUID);
     expect(row()?.threat).toEqual({

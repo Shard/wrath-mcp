@@ -925,8 +925,9 @@ export interface WorldStates {
 /**
  * A creature's threat list as a client's threat meter reads it
  * (`SMSG_THREAT_UPDATE` and the rest): `threat` in the core's units (the wire
- * carries it × 100), highest first as the server sorts it, and `topGuid` the
- * unit the creature attacks as the last `SMSG_HIGHEST_THREAT_UPDATE` named it.
+ * carries it × 100), sorted highest first (the wire carries them in the
+ * core's heap order), and `topGuid` the unit the creature attacks as the last
+ * `SMSG_HIGHEST_THREAT_UPDATE` named it.
  */
 export interface ThreatList {
   readonly topGuid: GuidKey | undefined;
@@ -4290,7 +4291,9 @@ export class StateCache {
         const d = event.data as ThreatUpdateData;
         const obj = this.nearby.get(d.unitGuid);
         if (obj === undefined) return;
-        const entries = d.entries.map((e) => ({ guid: e.guid, threat: e.threat / 100 }));
+        // The core writes its threat heap in iteration order, not sorted: a
+        // threat meter sorts, highest first.
+        const entries = d.entries.map((e) => ({ guid: e.guid, threat: e.threat / 100 })).sort((a, b) => b.threat - a.threat);
         // A plain update names no victim: the last one named stands while it is still on the list.
         const was = obj.threat?.value.topGuid;
         const topGuid = d.topGuid ?? (was !== undefined && entries.some((e) => e.guid === was) ? was : undefined);
