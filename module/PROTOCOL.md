@@ -929,11 +929,15 @@ whose handler does nothing a non-GM client could not do:
   resets the character's own, or as a group's leader the group's, and answers
   each instance with `SMSG_INSTANCE_RESET` or `SMSG_INSTANCE_RESET_FAILED`),
   `MSG_SET_DUNGEON_DIFFICULTY` and `MSG_SET_RAID_DIFFICULTY` (`u32
-  difficulty` — the portrait menu's difficulty; the handlers refuse inside an
-  instance, from a group member who is not the leader, and out of range, by
-  echoing the current difficulty or by silence. A solo change the server
-  accepts is not answered either. Both opcodes are bidirectional and the
-  server's are whitelisted)
+  difficulty` — the portrait menu's difficulty; the handlers refuse a solo
+  character inside an instance, a group member who is not the leader, and a
+  value out of range, by echoing the current difficulty or by silence. A
+  group's leader may change the raid difficulty while the group is inside
+  Icecrown Citadel or the Ruby Sanctum on a realm that shares their lockout
+  across difficulties (`IsSharedDifficultyMap`), which takes every member out of it and back in at the new
+  difficulty, and kicks one the teleport fails for (`HandleSetRaidDifficultyOpcode`).
+  A solo change the server accepts is not answered. Both opcodes are
+  bidirectional and the server's are whitelisted)
 
 Deliberately absent: movement opcodes (the module drives them; a stray one
 desyncs the mover), session lifecycle (login, logout, character create/delete),
@@ -2434,24 +2438,32 @@ Instances, world states and own speeds:
 
 | opcode | id | `data` fields |
 |---|---|---|
-| `SMSG_RAID_INSTANCE_INFO` | 0x2CC | `{ "locks": [{ "map", "difficulty", "instanceId", "locked": <bool>, "extended": <bool>, "resetInSec" }] }` — the raid frame's saved instances (`Player::SendRaidInfo`): the answer to raw `CMSG_REQUEST_RAID_INFO`, sent again after a reset. One row per permanent bind; `difficulty` is the `Difficulty` 0-3, `instanceId` the counter of the instance guid the wire carries |
+| `SMSG_RAID_INSTANCE_INFO` | 0x2CC | `{ "locks": [{ "map", "difficulty", "instanceId", "locked": <bool>, "extended": <bool>, "resetInSec" }] }` — the raid frame's saved instances (`Player::SendRaidInfo`): the answer to raw `CMSG_REQUEST_RAID_INFO`, and sent unasked only after the scheduled global reset (`InstanceSaveMgr::Update`), never after a `CMSG_RESET_INSTANCES`. One row per permanent bind; `difficulty` is the `Difficulty` 0-3, `instanceId` the counter of the instance guid the wire carries |
 | `SMSG_INSTANCE_RESET` | 0x31E | `{ "map" }` — one instance reset (`Player::SendResetInstanceSuccess`), answering raw `CMSG_RESET_INSTANCES` |
 | `SMSG_INSTANCE_RESET_FAILED` | 0x31F | `{ "reason", "map" }` — one it could not reset (`Player::SendResetInstanceFailed`): `reason` 0 players still inside, 1 a party member offline, 2 one zoning in |
 | `SMSG_UPDATE_INSTANCE_OWNERSHIP` | 0x32B | `{ "saved": <bool> }` — whether the character holds any permanent bind (`Player::SendSavedInstances`, on every map arrival) |
 | `SMSG_UPDATE_LAST_INSTANCE` | 0x320 | `{ "map" }` — one bound map, after the ownership packet when it says saved |
-| `SMSG_INSTANCE_SAVE_CREATED` | 0x2CB | `{}` — the character was saved to the instance it is in (`Player::BindToInstance`); the u32 0 is consumed |
+| `SMSG_INSTANCE_SAVE_CREATED` | 0x2CB | `{}` — the character was saved to the instance it is in (`Player::BindToInstance`); the u32 0 is consumed. It names nothing, so the save shows in the list only on the next `SMSG_RAID_INSTANCE_INFO` |
 | `SMSG_RAID_INSTANCE_MESSAGE` | 0x2FA | `{ "type", "map", "difficulty", "timeLeftSec", "locked"?, "extended"? }` — a raid instance's welcome or reset warning (`Player::SendInstanceResetWarning`): `type` 1 hours left, 2 minutes left, 3 minutes left and leave, 4 welcome, which alone carries `locked` and `extended` |
 | `MSG_SET_DUNGEON_DIFFICULTY` | 0x329 | `{ "difficulty", "inGroup": <bool> }` — the character's dungeon difficulty, 0 normal or 1 heroic (`Player::SendDungeonDifficulty`): at login, on joining a group whose difficulty differs, on the leader's change, and when the server refuses a raw change; a solo change it accepts is not answered. The constant u32 1 is consumed |
-| `MSG_SET_RAID_DIFFICULTY` | 0x4EB | same shape — the raid difficulty, 0 10-player, 1 25-player, 2 10-player heroic, 3 25-player heroic (`Player::SendRaidDifficulty`): from a group, or a refused change; never at a solo login |
-| `SMSG_INIT_WORLD_STATES` | 0x2C2 | `{ "map", "zone", "area", "states": [{ "id", "value" }] }` — the zone's world states on entering it (`Player::SendInitWorldStates`): the scourge invasion and arena season states everywhere, a battleground's or an outdoor objective's, an instance script's counters |
-| `SMSG_UPDATE_WORLD_STATE` | 0x2C3 | `{ "id", "value" }` — one world state changed. A battleground, Wintergrasp or an instance encounter can send these often |
+| `MSG_SET_RAID_DIFFICULTY` | 0x4EB | same shape — the raid difficulty, 0 10-player, 1 25-player, 2 10-player heroic, 3 25-player heroic (`Player::SendRaidDifficulty`): on a map arrival, the login's included, when the character's differs from the one the server last stored for it (which starts at 0), and inside a raid whose difficulty differs from the character's as the raid's (`Player::SendInitialPacketsAfterAddToMap`); on joining a group whose difficulty differs and on the leader's change; and on a refused change |
+| `SMSG_INIT_WORLD_STATES` | 0x2C2 | `{ "map", "zone", "area", "states": [{ "id", "value" }] }` — the zone's world states on entering it (`Player::SendInitWorldStates`): the scourge invasion and arena season states everywhere, a battleground's or an outdoor objective's, an instance script's counters. `area` is the area at the zone's entry; an area change within the zone sends none. It comes before the zone's weather, and a zone without weather (an instance among them) sends no `SMSG_WEATHER` after it |
+| `SMSG_UPDATE_WORLD_STATE` | 0x2C3 | `{ "id", "value" }` — one world state changed. An outdoor PvP capture point sends three a second to the whole zone while its slider moves (`OPvPCapturePoint::SendChangePhase`); a battleground, Wintergrasp or an instance encounter sends them on its own changes |
 | `SMSG_WEATHER` | 0x2F4 | `{ "weather", "intensity", "abrupt": <bool> }` — the zone's weather (`WorldPackets::Misc::Weather`): `weather` the `WeatherState` id, `intensity` 0-1. On entering a zone that has weather (`Map::SendZoneWeather`) and on each change there; a zone without weather sends none |
 | `SMSG_LOGIN_SETTIMESPEED` | 0x042 | `{ "date", "time", "speed" }` — the game clock at login (`Player::SendInitialPacketsBeforeAddToMap`): the server's local time as the wire's packed `date` and its reading `time` ("YYYY-MM-DD HH:MM", as achievement dates), and `speed` in game minutes per real second. The trailing u32 is consumed |
 | `SMSG_FORCE_RUN_SPEED_CHANGE` | 0x0E2 | `{ "guid", "speed" }` — a new speed for the unit this client moves (`Unit::SendSpeedToController`), which the module acks for the character as before; the movement counter and the run packet's extra byte are consumed. The same shape for `SMSG_FORCE_WALK_SPEED_CHANGE` (0x2DA), `_RUN_BACK_` (0x0E4), `_SWIM_` (0x0E6), `_SWIM_BACK_` (0x2DC), `_FLIGHT_` (0x381), `_FLIGHT_BACK_` (0x383), `SMSG_FORCE_TURN_RATE_CHANGE` (0x2DE) and `SMSG_FORCE_PITCH_RATE_CHANGE` (0x45C). A change while the character is feared, confused or charmed is sent to every client in range as the creature form (`SMSG_SPLINE_SET_*_SPEED`), which is not whitelisted |
 
 The reattach replay restates what a login and the zone entry sent: the
-dungeon difficulty (and the raid one in a group), the game clock built as the
-login builds it, the zone's world states and its weather.
+dungeon difficulty, the raid difficulty on the core's own map-arrival branch
+(read-only: the stored raid-map difficulty is read, never stored again), the
+game clock built as the login builds it, the zone's world states and its
+weather.
+
+The SDK folds `SMSG_THREAT_UPDATE`, `SMSG_HIGHEST_THREAT_UPDATE` and
+`SMSG_UPDATE_WORLD_STATE` into its state cache but does not keep them in its
+retained event buffer, and the bare MCP's `recent_events` folds them as
+ambient, as it does movement: in a fight, threat alone is about one a second
+per creature.
 
 #### Death
 

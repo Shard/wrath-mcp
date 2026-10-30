@@ -231,18 +231,32 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   `SMSG_UPDATE_INSTANCE_OWNERSHIP`, `SMSG_UPDATE_LAST_INSTANCE`,
   `SMSG_INSTANCE_SAVE_CREATED` and the raid warnings
   `SMSG_RAID_INSTANCE_MESSAGE`. A solo difficulty change the server accepts
-  is not answered.
+  is not answered. The saved-instance list is as of the last reply: a new
+  save shows on the next `CMSG_REQUEST_RAID_INFO`.
 - World states, weather and the game clock: `SMSG_INIT_WORLD_STATES` and
   `SMSG_UPDATE_WORLD_STATE` (read as `state.self.worldStates`, id → value
   with the map, zone and area the init named), `SMSG_WEATHER`
   (`state.self.weather`, named by `WeatherState`) and
-  `SMSG_LOGIN_SETTIMESPEED` (`state.self.gameTime`). The reattach replay
-  restates them with the difficulty.
+  `SMSG_LOGIN_SETTIMESPEED` (`state.self.gameTime`). Entering a new zone
+  clears the last zone's weather until the new zone's own arrives (an
+  instance sends none). The reattach replay restates them with the
+  difficulty, the raid one on the core's own map-arrival branch. A relog
+  clears the new readings and every threat list until the new session
+  restates them, all but the dungeon difficulty, which the login sends
+  first.
 - Threat: `SMSG_THREAT_UPDATE`, `SMSG_HIGHEST_THREAT_UPDATE`,
   `SMSG_THREAT_REMOVE` and `SMSG_THREAT_CLEAR`, read as a `threat` list on
   the creature's `units()` row (each unit's threat, highest first, and
   `topGuid` the one it attacks). The server sends a creature's list at most
   once a second while it fights, to every client in range.
+- `SMSG_THREAT_UPDATE`, `SMSG_HIGHEST_THREAT_UPDATE` and
+  `SMSG_UPDATE_WORLD_STATE` are folded into state but never retained in the
+  SDK's event buffer (`recent()`, a wait's lookback), as the party frames
+  are, and the bare MCP's `recent_events` folds them as ambient, as it does
+  movement: about one threat list a second per creature fighting in range,
+  and three world state changes a second while an outdoor PvP capture slider
+  moves. The threat list's removal and clear and the zone's initial world
+  states stay ordinary events.
 - Own speeds: our own create block carries `speeds` (walk, run, run back,
   swim, swim back, flight, flight back, turn and pitch rate), and each
   `SMSG_FORCE_*_SPEED_CHANGE` is an event as well as acked as before;

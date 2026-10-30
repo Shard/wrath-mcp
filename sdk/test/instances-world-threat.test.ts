@@ -5,9 +5,11 @@
  */
 import { describe, expect, test } from "bun:test";
 
+import { connect } from "../src/client";
 import { isKnownOpcode, parseEventFrame, type GameEvent } from "../src/protocol";
 import { StateCache } from "../src/state";
-import { CREATURE_GUID, creatureCreate, loginSequence, PLAYER_GUID, SELF_GUID, selfCreate } from "./fixtures";
+import { CREATURE_GUID, creatureCreate, frames, loginSequence, PLAYER_GUID, SELF_GUID, selfCreate } from "./fixtures";
+import { startStub } from "./server";
 
 const TS = 1_700_000_000_000;
 const frame = (seq: number, opcode: string, data: unknown) => ({ seq, opcode, opcodeId: 0x100, ts: TS + seq, data });
@@ -184,5 +186,95 @@ describe("threat", () => {
     ]);
     expect(cache.units().find((u) => u.guid === CREATURE_GUID)?.threat).toBeUndefined();
     expect(cache.units().find((u) => u.guid === "999")).toBeUndefined();
+  });
+});
+
+describe("zone changes and a relog", () => {
+  const zone = (seq: number, zoneId: number, map = 0) =>
+    frame(seq, "SMSG_INIT_WORLD_STATES", { map, zone: zoneId, area: zoneId, states: [{ id: 3191, value: 0 }] });
+
+  test("entering a zone with no weather (an instance) clears the last zone's", () => {
+    const cache = replay([
+      ...loginSequence,
+      selfCreate,
+      zone(40, 12),
+      frame(41, "SMSG_WEATHER", { weather: 3, intensity: 0.4, abrupt: false }),
+      // the Deadmines: its world states, and no weather packet after them
+      zone(42, 1581, 36),
+    ]);
+    expect(cache.self.weather).toBeUndefined();
+    expect(cache.self.worldStates?.value.zone).toBe(1581);
+  });
+
+  test("a new init for the same zone keeps its weather; a new zone's own weather replaces it", () => {
+    let cache = replay([
+      ...loginSequence,
+      selfCreate,
+      zone(40, 12),
+      frame(41, "SMSG_WEATHER", { weather: 3, intensity: 0.4, abrupt: false }),
+      zone(42, 12),
+    ]);
+    expect(cache.self.weather?.value.name).toBe("lightRain");
+    cache = replay([
+      ...loginSequence,
+      selfCreate,
+      zone(40, 12),
+      frame(41, "SMSG_WEATHER", { weather: 3, intensity: 0.4, abrupt: false }),
+      zone(42, 40),
+      frame(43, "SMSG_WEATHER", { weather: 0, intensity: 0, abrupt: false }),
+    ]);
+    expect(cache.self.weather?.value).toEqual({ id: 0, name: "fine", intensity: 0 });
+  });
+
+  test("a relog clears what the new session restates, and keeps the dungeon difficulty sent just before it", () => {
+    const verify = (loginSequence as { opcode: string; data: unknown }[]).find((f) => f.opcode === "SMSG_LOGIN_VERIFY_WORLD");
+    const cache = replay([
+      ...loginSequence,
+      selfCreateWithSpeeds,
+      creatureCreate,
+      frame(40, "MSG_SET_RAID_DIFFICULTY", { difficulty: 1, inGroup: false }),
+      frame(41, "SMSG_RAID_INSTANCE_INFO", { locks: [] }),
+      zone(42, 12),
+      frame(43, "SMSG_WEATHER", { weather: 3, intensity: 0.4, abrupt: false }),
+      frame(44, "SMSG_LOGIN_SETTIMESPEED", { date: 0x1a96_94b2, time: "2026-10-27 18:50", speed: 0.01666667 }),
+      frame(45, "SMSG_THREAT_UPDATE", { unitGuid: CREATURE_GUID, entries: [{ guid: SELF_GUID, threat: 100 }] }),
+      // the relog: the dungeon difficulty precedes its SMSG_LOGIN_VERIFY_WORLD
+      frame(50, "MSG_SET_DUNGEON_DIFFICULTY", { difficulty: 1, inGroup: false }),
+      frame(51, "SMSG_LOGIN_VERIFY_WORLD", verify?.data),
+    ]);
+    expect(cache.self.dungeonDifficulty?.value).toEqual({ id: 1, name: "heroic" });
+    expect(cache.self.raidDifficulty).toBeUndefined();
+    expect(cache.self.speeds).toBeUndefined();
+    expect(cache.self.instanceLocks).toBeUndefined();
+    expect(cache.self.worldStates).toBeUndefined();
+    expect(cache.self.weather).toBeUndefined();
+    expect(cache.self.gameTime).toBeUndefined();
+    expect(cache.units().find((u) => u.guid === CREATURE_GUID)?.threat).toBeUndefined();
+  });
+});
+
+describe("threat and world-state updates are not retained in the event buffer", () => {
+  test("the fold sees every one; recent() keeps the removal, the clear and the zone's init", async () => {
+    const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate, creatureCreate]) });
+    const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
+    await client.createSession({ character: "Fenwick" });
+    await client.events.waitForOpcode("SMSG_LOGIN_VERIFY_WORLD", { timeout: 2000 });
+    const push = (f: unknown) => stub.push(JSON.stringify(f));
+    push(frame(30, "SMSG_INIT_WORLD_STATES", { map: 0, zone: 12, area: 87, states: [{ id: 3191, value: 0 }] }));
+    push(frame(31, "SMSG_HIGHEST_THREAT_UPDATE", { unitGuid: CREATURE_GUID, topGuid: SELF_GUID, entries: [{ guid: SELF_GUID, threat: 100 }] }));
+    push(frame(32, "SMSG_THREAT_UPDATE", { unitGuid: CREATURE_GUID, entries: [{ guid: SELF_GUID, threat: 300 }] }));
+    push(frame(33, "SMSG_UPDATE_WORLD_STATE", { id: 3191, value: 7 }));
+    push(frame(34, "SMSG_THREAT_REMOVE", { unitGuid: CREATURE_GUID, guid: PLAYER_GUID }));
+    push(frame(35, "SMSG_THREAT_CLEAR", { unitGuid: CREATURE_GUID }));
+    await client.events.waitFor((e) => e.seq === 35, { timeout: 2000 });
+    const kept = client.events
+      .recent()
+      .filter((e) => e.seq >= 30 && e.opcode !== "stream_gap")
+      .map((e) => e.opcode);
+    expect(kept).toEqual(["SMSG_INIT_WORLD_STATES", "SMSG_THREAT_REMOVE", "SMSG_THREAT_CLEAR"]);
+    expect(client.state.self.worldStates?.value.states).toEqual({ 3191: 7 });
+    expect(client.state.units().find((u) => u.guid === CREATURE_GUID)?.threat).toEqual({ topGuid: undefined, entries: [] });
+    client.close();
+    await stub.stop();
   });
 });

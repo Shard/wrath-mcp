@@ -94,6 +94,13 @@ describe("ToolSet", () => {
       "(+1 ambient movement and party-frame events folded into state — pass {includeMovement: true} for the raw stream)",
     ]);
   });
+
+  test("the bare render folds threat list updates and world state changes, not their removal, clear or init", () => {
+    for (const op of ["SMSG_THREAT_UPDATE", "SMSG_HIGHEST_THREAT_UPDATE", "SMSG_UPDATE_WORLD_STATE"])
+      expect(PLAIN_RENDER.isAmbient(op)).toBe(true);
+    for (const op of ["SMSG_THREAT_REMOVE", "SMSG_THREAT_CLEAR", "SMSG_INIT_WORLD_STATES"])
+      expect(PLAIN_RENDER.isAmbient(op)).toBe(false);
+  });
 });
 
 describe("McpServer", () => {

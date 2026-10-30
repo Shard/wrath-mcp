@@ -853,16 +853,24 @@ export interface SelfState extends UnitFieldsState {
    * (`MSG_SET_DUNGEON_DIFFICULTY` / `MSG_SET_RAID_DIFFICULTY`): `id` the
    * `Difficulty` and `name` its reading: dungeon "normal" or "heroic", raid
    * "normal10", "normal25", "heroic10", "heroic25". The dungeon one comes
-   * at login; the raid one only from a group or a refused change. A solo
-   * change the server accepts is not answered, so after a raw difficulty
-   * send without an answer this still holds the old value.
+   * at login. The raid one comes on a map arrival (the login's included)
+   * when the character's differs from the one the server last stored for
+   * it, which starts at 10-player normal, and inside a raid whose
+   * difficulty differs from the character's it is the raid's; otherwise it
+   * comes from a group or a refused change, so `undefined` reads as
+   * 10-player normal. A solo change the server accepts is not answered, so
+   * after a raw difficulty send without an answer this still holds the old
+   * value.
    */
   dungeonDifficulty: Observed<{ readonly id: number; readonly name: string | undefined }> | undefined;
   raidDifficulty: Observed<{ readonly id: number; readonly name: string | undefined }> | undefined;
   /**
    * The saved instances the raid frame lists (`SMSG_RAID_INSTANCE_INFO`, the
-   * answer to raw `CMSG_REQUEST_RAID_INFO`, sent again after a reset):
-   * `undefined` until one arrived, `[]` when nothing is saved.
+   * answer to raw `CMSG_REQUEST_RAID_INFO`), as of the last reply:
+   * `undefined` until one arrived, `[]` when nothing is saved. A new save
+   * (`SMSG_INSTANCE_SAVE_CREATED`, which names nothing) is not in it until
+   * the next request; the server resends the list unasked only after the
+   * scheduled global reset, never after a `CMSG_RESET_INSTANCES`.
    */
   instanceLocks: Observed<readonly InstanceLock[]> | undefined;
   /**
@@ -870,14 +878,17 @@ export interface SelfState extends UnitFieldsState {
    * on entering the zone names the map, zone and area ids and every state,
    * and each `SMSG_UPDATE_WORLD_STATE` sets one. `states` is id → value;
    * the ids are the client's own (`WorldStateUI.dbc`), unnamed here.
+   * `area` is the area at the zone's entry and does not follow area changes
+   * within the zone (`area` above does).
    */
   worldStates: Observed<WorldStates> | undefined;
   /**
    * The weather the client draws (`SMSG_WEATHER`): `id` the `WeatherState`,
    * `name` its reading ("fine", "lightRain", "heavySnow", …), `intensity`
-   * 0-1. Sent on entering a zone that has weather and on each change there;
-   * a zone without weather of its own sends none, so this can still be the
-   * last zone's.
+   * 0-1. Sent on entering a zone that has weather and on each change there.
+   * A zone without weather of its own (an instance among them) sends none,
+   * so entering a new zone (its `SMSG_INIT_WORLD_STATES`, which comes
+   * first) clears this until the zone's own weather arrives.
    */
   weather: Observed<{ readonly id: number; readonly name: string | undefined; readonly intensity: number }> | undefined;
   /**
@@ -3922,6 +3933,20 @@ export class StateCache {
           this.runeReadyMask = undefined;
           this.runeTypes = undefined;
           this.self.runes = undefined;
+          // What the new session restates after this packet (the self
+          // block's speeds, the zone's world states and weather, the clock,
+          // a raid difficulty that differs from the stored one) or only on
+          // request (the saved instances), and every threat list: a fight
+          // the logout left is the server's to restate. The dungeon
+          // difficulty is kept: the login sends it just before this packet
+          // (WorldSession::HandlePlayerLoginFromDB).
+          this.self.speeds = undefined;
+          this.self.raidDifficulty = undefined;
+          this.self.instanceLocks = undefined;
+          this.self.worldStates = undefined;
+          this.self.weather = undefined;
+          this.self.gameTime = undefined;
+          for (const obj of this.nearby.values()) obj.threat = undefined;
         }
         // The new map's name arrives on its WB_AREA; until then only the id
         // (position.map) is known, so the old map's name is not kept.
@@ -4266,6 +4291,10 @@ export class StateCache {
         const d = event.data as InitWorldStatesData;
         const states: Record<number, number> = {};
         for (const ws of d.states) states[ws.id] = ws.value;
+        // A new zone: its weather, if it has any, follows this packet
+        // (Player::UpdateZone sends the states first). An instance has none,
+        // so the last zone's weather must not stand.
+        if (this.self.worldStates?.value.zone !== d.zone) this.self.weather = undefined;
         this.self.worldStates = { value: { map: d.map, zone: d.zone, area: d.area, states }, seq: event.seq, ts: event.ts };
         return;
       }
