@@ -5787,7 +5787,9 @@ export class WrathClient {
   }
 
   /**
-   * `CMSG_REPAIR_ITEM` with item guid 0 — repair everything.
+   * `CMSG_REPAIR_ITEM` with item guid 0 — repair everything; with `item`, the
+   * one item (its name, guid or `{ bag, slot }`, worn or carried, as
+   * `castSpell`'s `targetItem` takes it) — and nothing else.
    *
    * The core drops the packet without a word when the NPC has no repair
    * flag (`GetNPCIfCanInteractWith(guid, UNIT_NPC_FLAG_REPAIR)`), so the ack
@@ -5795,9 +5797,14 @@ export class WrathClient {
    * unchanged at a vendor with no repair role). When the NPC's flags are
    * observed and lack the bit, the call is refused as `no_repair` and nothing
    * is sent; unobserved flags are sent as before, since only the server knows.
+   * An item the character does not hold throws before anything is sent; one it
+   * holds that needs no repair is a repair of nothing, as at a client.
    */
-  repairAll(target: GuidOrUnit): Promise<WithResolved<RepairAllResult>> {
-    return this.byName(target, "repairAll(guid)", async (guid): Promise<RepairAllResult> => {
+  repairAll(target: GuidOrUnit, item?: ItemTargetRef): Promise<WithResolved<RepairAllResult>> {
+    // Resolved where the caller stands, so a bad item throws before the vendor
+    // lookup and nothing is sent.
+    const aim = item === undefined ? undefined : resolveItemTarget(this.state, item, "repairAll(vendor, item)");
+    return this.byName(target, "repairAll(guid)", async (guid): Promise<WithResolved<RepairAllResult>> => {
       const npc = this.state.nearby.get(guidKey(guid));
       const flags = npc?.fields.get("npcFlags")?.value;
       if (typeof flags === "number" && (flags & NPC_FLAG_REPAIR) === 0) {
@@ -5808,7 +5815,8 @@ export class WrathClient {
         this.noteActionHint("repairAll", "no_repair", hint);
         return { ok: false, status: "no_repair", hint };
       }
-      return this.action({ action: "repair_all", guid });
+      const ack = await this.action({ action: "repair_all", guid, ...(aim === undefined ? {} : { itemGuid: aim.guid }) });
+      return aim === undefined ? ack : withResolved(aim, ack);
     });
   }
 

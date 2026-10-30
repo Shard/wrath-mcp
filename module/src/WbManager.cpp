@@ -990,6 +990,28 @@ namespace WrathBench
         // the ammo slot: a hunter's arrows or bullets by item id (body u32
         // item id, 0 clears); CMSG_AUTOEQUIP_ITEM cannot equip ammo
         { "CMSG_SET_AMMO", CMSG_SET_AMMO },
+        // the item frames' own buttons. Gems into sockets (body u64 item
+        // guid, u64 gem guid x 3, 0 for an empty socket; ItemHandler.cpp
+        // HandleSocketOpcode; answered with SMSG_SOCKET_GEMS_RESULT, a
+        // refusal mostly with silence);
+        // cancel a temporary enchant (body u32 equipment slot 0-18,
+        // HandleCancelTempEnchantmentOpcode); the refund window's query and
+        // button (body u64 item guid each, HandleItemRefundInfoRequest and
+        // HandleItemRefund; answered with SMSG_ITEM_REFUND_INFO_RESPONSE and
+        // SMSG_ITEM_REFUND_RESULT); take a glyph out (body u32 glyph slot
+        // 0-5, CharacterHandler.cpp HandleRemoveGlyph; answered with
+        // SMSG_TALENTS_INFO)
+        { "CMSG_SOCKET_GEMS", CMSG_SOCKET_GEMS },
+        { "CMSG_CANCEL_TEMP_ENCHANTMENT", CMSG_CANCEL_TEMP_ENCHANTMENT },
+        { "CMSG_ITEM_REFUND_INFO", CMSG_ITEM_REFUND_INFO },
+        { "CMSG_ITEM_REFUND", CMSG_ITEM_REFUND },
+        { "CMSG_REMOVE_GLYPH", CMSG_REMOVE_GLYPH },
+        // buy into a chosen bag (body u64 vendor guid, u32 item id, u32
+        // 1-based vendor slot, u64 bag guid, u8 slot in the bag, u32 count;
+        // HandleBuyItemInSlotOpcode: the bag guid is the character's own for
+        // the backpack, or a worn bag's item guid; buy_item sends the
+        // bag-less CMSG_BUY_ITEM)
+        { "CMSG_BUY_ITEM_IN_SLOT", CMSG_BUY_ITEM_IN_SLOT },
         // spell/aura control
         { "CMSG_CANCEL_AURA", CMSG_CANCEL_AURA },
         // the client's Dismount (empty body; MiscHandler.cpp
@@ -4700,8 +4722,15 @@ namespace WrathBench
         }
         else if (action == "repair_all")
         {
+            // Optional itemGuid: repair that one item (carried or worn;
+            // HandleRepairItemOpcode finds it by guid), as the client's
+            // repair cursor does. Absent or 0 = repair all. The u8 is the
+            // guild-funds flag, never set.
+            uint64_t itemGuid = ParseGuid(req, "itemGuid");
             p = new WorldPacket(CMSG_REPAIR_ITEM, 8 + 8 + 1);
-            *p << uint64(guid) << uint64(0) << uint8(0);     // item guid 0 = repair all
+            *p << uint64(guid) << uint64(itemGuid) << uint8(0);
+            if (itemGuid != 0)
+                auditW.AddGuid("itemGuid", itemGuid);
         }
         else if (action == "trainer_list")
         {
@@ -9061,6 +9090,24 @@ namespace WrathBench
             w.Add("name", info->SpellName[0]);
     }
 
+    // The five (u32 item id, u32 count) cost rows of a refund packet
+    // (MAX_ITEM_EXTENDED_COST_REQUIREMENTS); rows with no item are left out.
+    static std::string RefundCostRows(WorldPacket& p)
+    {
+        std::string rows = "[";
+        bool first = true;
+        for (int i = 0; i < 5; ++i)
+        {
+            uint32 itemId, count; p >> itemId >> count;
+            if (!itemId)
+                continue;
+            if (!first) rows += ',';
+            rows += Json::Writer().Add("itemId", itemId).Add("count", count).Str();
+            first = false;
+        }
+        return rows + "]";
+    }
+
     // The forms a Spell.dbc shapeshift mask names: bit n-1 is form n
     // (SpellInfo::CheckShapeshift reads it the same way).
     static std::string FormListJson(uint32 mask)
@@ -11670,6 +11717,57 @@ namespace WrathBench
                     uint8 result; p >> result;
                     w.AddGuid("vendorGuid", (uint64_t)vendor).AddGuid("itemGuid", (uint64_t)item)
                      .Add("result", (uint32)result);
+                    break;
+                }
+                // The gems just set into an item (Item::SendUpdateSockets,
+                // after HandleSocketOpcode took the gems): u64 item guid, then
+                // the enchantment id in each of the three sockets and the
+                // socket bonus (SOCK_ENCHANTMENT_SLOT .. BONUS_ENCHANTMENT_SLOT),
+                // 0 for none. Only a socketing that went through answers.
+                case SMSG_SOCKET_GEMS_RESULT:
+                {
+                    name = "SMSG_SOCKET_GEMS_RESULT";
+                    uint64 item; uint32 socket0, socket1, socket2, bonus;
+                    p >> item >> socket0 >> socket1 >> socket2 >> bonus;
+                    w.AddGuid("itemGuid", (uint64_t)item).Add("socket0", socket0).Add("socket1", socket1)
+                     .Add("socket2", socket2).Add("bonus", bonus);
+                    break;
+                }
+                // The refund window's figures for a purchase paid with an
+                // extended cost (Player::SendRefundInfo, the answer to
+                // CMSG_ITEM_REFUND_INFO): u64 item guid, u32 money (copper),
+                // u32 honor points, u32 arena points, five (u32 item id, u32
+                // count) cost rows, an unused u32, u32 played seconds since
+                // the purchase. Sent only for an item still refundable.
+                case SMSG_ITEM_REFUND_INFO_RESPONSE:
+                {
+                    name = "SMSG_ITEM_REFUND_INFO_RESPONSE";
+                    uint64 item; uint32 money, honor, arena;
+                    p >> item >> money >> honor >> arena;
+                    std::string cost = RefundCostRows(p);
+                    uint32 unused, elapsed; p >> unused >> elapsed;
+                    w.AddGuid("itemGuid", (uint64_t)item).Add("money", money).Add("honorPoints", honor)
+                     .Add("arenaPoints", arena).Raw("items", cost).Add("elapsedSeconds", elapsed);
+                    break;
+                }
+                // The verdict on CMSG_ITEM_REFUND (Player::RefundItem): u64
+                // item guid, u32 result. The refusal form (10: the refund
+                // window has run out, or the returned items would not fit in
+                // the bags) ends there; a refund that goes through has result
+                // 0 and the figures of the INFO_RESPONSE after it: u32 money,
+                // u32 honor, u32 arena, five (u32 item id, u32 count) rows.
+                // RefundItem's other refusals send nothing.
+                case SMSG_ITEM_REFUND_RESULT:
+                {
+                    name = "SMSG_ITEM_REFUND_RESULT";
+                    uint64 item; uint32 result; p >> item >> result;
+                    w.AddGuid("itemGuid", (uint64_t)item).Add("result", result);
+                    if (result == 0 && p.size() - p.rpos() >= 3 * 4 + 5 * 8)
+                    {
+                        uint32 money, honor, arena; p >> money >> honor >> arena;
+                        std::string cost = RefundCostRows(p);
+                        w.Add("money", money).Add("honorPoints", honor).Add("arenaPoints", arena).Raw("items", cost);
+                    }
                     break;
                 }
                 case SMSG_INVENTORY_CHANGE_FAILURE:

@@ -747,7 +747,7 @@ them: `{ "ok": true, "action": "<name>" }`.
 | `vendor_list` | `guid` | `CMSG_LIST_INVENTORY` | `SMSG_LIST_INVENTORY` follows |
 | `buy_item` | `guid`, `itemId`, `slot`, `count?` | `CMSG_BUY_ITEM` | `slot` is the 1-based vendor slot from `SMSG_LIST_INVENTORY`; `count` default 1 |
 | `sell_item` | `guid`, `itemGuid`, `count?` | `CMSG_SELL_ITEM` | `count` 0/omitted = whole stack |
-| `repair_all` | `guid` | `CMSG_REPAIR_ITEM` | item guid 0 = repair everything |
+| `repair_all` | `guid`, `itemGuid?` | `CMSG_REPAIR_ITEM` | item guid 0 or omitted = repair everything; `itemGuid` (an item the character holds, worn or carried) repairs that one item (`HandleRepairItemOpcode`; a guid it does not hold repairs nothing, silently). The guild-funds flag is always 0. The audit row carries `itemGuid` when sent |
 | `equip_item` | `bag`, `slot` | `CMSG_AUTOEQUIP_ITEM` | `bag` 255 = backpack/equipment container, `slot` 23-38 = backpack slots |
 | `use_item` | `bag`, `slot`, `targetGuid?`, `itemTargetGuid?`, `destX?`, `destY?`, `destZ?`, `glyphSlot?` | `CMSG_USE_ITEM`, `CMSG_QUESTGIVER_QUERY_QUEST` or `CMSG_OPEN_ITEM` | module fills item guid + on-use spell id from the item (client-cache knowledge) and the cast count from the counter `cast_spell` uses. The targets are `cast_spell`'s, in the same target block after the cast flags (`HandleUseItemOpcode` reads it with `SpellCastTargets::Read`), with the same refusals; an item that starts a quest or opens for loot takes no item or ground target (`400 no_spell_to_target`). `glyphSlot` (0-5, default 0) is the glyph slot a client's glyph frame sends with a glyph, the u32 after the item guid; the server judges the slot's level lock and glyph type (`SMSG_CAST_FAILED`), and anything past the six slots is `400 invalid_glyph_slot` before dispatch. An item with no on-use spell but a `startquest` is right-clicked the way a client does it: `CMSG_QUESTGIVER_QUERY_QUEST` with the item guid as the questgiver and the template's quest id (`HandleUseItemOpcode` drops spell id 0 as unknown, so `CMSG_USE_ITEM` is never the packet for it); the server answers `SMSG_QUESTGIVER_QUEST_DETAILS`, and `quest_accept` with the same item guid takes it. An item with neither, whose template has `ITEM_FLAG_HAS_LOOT` (a clam, a satchel, a lockbox), is opened the way a client's right-click opens it: `CMSG_OPEN_ITEM` (`u8 bag, u8 slot`, `HandleOpenItemOpcode`); the window arrives as `SMSG_LOOT_RESPONSE` under the item's guid, and `loot_item`, `loot_money` and `loot_release` with that guid empty it (no replay is armed: a refusal, locked or dead, is `SMSG_INVENTORY_CHANGE_FAILURE` and opens nothing). `400 no_item_at_slot`; `400 item_not_usable` only when the item has no on-use spell, no quest to start and does not open for loot. The audit row carries `spellId`, `itemGuid`, `startQuest`, `glyphSlot` when it is not 0, `itemTargetGuid` and `destX`/`destY`/`destZ` when sent, and `open: true` for an open |
 | `destroy_item` | `bag`, `slot`, `count?` | `CMSG_DESTROYITEM` | `count` 0/omitted = whole stack |
@@ -818,6 +818,20 @@ whose handler does nothing a non-GM client could not do:
   `CMSG_OPEN_ITEM`, `CMSG_BUYBACK_ITEM`, `CMSG_SET_AMMO` (`u32 item id`, 0
   clears — the ammo slot, which `CMSG_AUTOEQUIP_ITEM` cannot fill; `ammoId`
   on self reads it back)
+- item frames: `CMSG_SOCKET_GEMS` (`u64 item guid, u64 gem guid × 3`, 0 for an
+  empty socket; `HandleSocketOpcode` judges the sockets and answers a
+  socketing that goes through with `SMSG_SOCKET_GEMS_RESULT`; most refusals
+  are silent, a unique-equipped clash is `SMSG_INVENTORY_CHANGE_FAILURE`),
+  `CMSG_CANCEL_TEMP_ENCHANTMENT` (`u32 equipment slot`; silent, the item's
+  `enchant<n>*` fields change), `CMSG_ITEM_REFUND_INFO` (`u64 item guid`,
+  answered with `SMSG_ITEM_REFUND_INFO_RESPONSE` for a refundable item, else
+  silence), `CMSG_ITEM_REFUND` (`u64 item guid`, answered with
+  `SMSG_ITEM_REFUND_RESULT`), `CMSG_REMOVE_GLYPH` (`u32 glyph slot` 0-5;
+  answered with `SMSG_TALENTS_INFO`), `CMSG_BUY_ITEM_IN_SLOT` (`u64 vendor
+  guid, u32 item id, u32 1-based vendor slot, u64 bag guid, u8 slot in the
+  bag, u32 count`; the bag guid is the character's own for the backpack or a
+  worn bag's item guid, and the slot is the position inside it; answered like
+  `buy_item`, with `SMSG_BUY_ITEM` or `SMSG_BUY_FAILED`)
 - spell/aura control: `CMSG_CANCEL_AURA`, `CMSG_CANCEL_MOUNT_AURA` (empty
   body — the client's Dismount; `HandleCancelMountAuraOpcode` dismounts and
   removes every mount aura, and answers a character not mounted or in flight
@@ -2154,6 +2168,9 @@ Loot, vendor, inventory:
 | `SMSG_BUY_ITEM` | 0x1A4 | `{ "vendorGuid", "slot", "count" }` |
 | `SMSG_BUY_FAILED` | 0x1A5 | `{ "vendorGuid", "itemId", "result": <u8> }` |
 | `SMSG_SELL_ITEM` | 0x1A1 | `{ "vendorGuid", "itemGuid", "result": <u8> }` (0 = success) |
+| `SMSG_SOCKET_GEMS_RESULT` | 0x50B | `{ "itemGuid", "socket0", "socket1", "socket2", "bonus" }` — the answer to a raw `CMSG_SOCKET_GEMS` that went through (`Item::SendUpdateSockets`): the enchantment id in each of the three sockets and in the socket bonus, 0 for none |
+| `SMSG_ITEM_REFUND_INFO_RESPONSE` | 0x4B2 | `{ "itemGuid", "money" (copper), "honorPoints", "arenaPoints", "items": [{ "itemId", "count" }], "elapsedSeconds" }` — the answer to a raw `CMSG_ITEM_REFUND_INFO` for an item bought with an extended cost and still refundable (`Player::SendRefundInfo`; any other item gets silence): what a refund would hand back, and the played time since the purchase. Cost rows with no item are left out; the wire's unused word is consumed |
+| `SMSG_ITEM_REFUND_RESULT` | 0x4B5 | `{ "itemGuid", "result": <u32>, "money"?, "honorPoints"?, "arenaPoints"?, "items"? }` — the verdict on a raw `CMSG_ITEM_REFUND` (`Player::RefundItem`). Result 0 is a refund done, with what came back (the fields of the info response); 10 is a refusal (the refund window has run out, or the returned items would not fit in the bags) and carries only the guid and the code. The other refusals (not refundable, traded, no extended-cost row) send nothing |
 | `SMSG_TRAINER_LIST` | 0x1B1 | `{ "guid", "trainerType": <i32>, "spells": [{ "spellId", "state": <u8>, "cost" (copper, discounted), "reqLevel", "reqSkill" (skill line id, 0 = none), "reqSkillValue" }], "greeting" }` — `trainerType` 0 class, 1 mount, 2 tradeskill, 3 pet; `state` 0 available (green), 1 unavailable (red: level/skill/prerequisite/class), 2 known (gray). `state` says nothing about money: a green spell still fails with reason 1 if unaffordable |
 | `SMSG_TRAINER_BUY_SUCCEEDED` | 0x1B3 | `{ "guid", "spellId" }` |
 | `SMSG_TRAINER_BUY_FAILED` | 0x1B4 | `{ "guid", "spellId", "reason": <i32> }` — 0 unavailable, 1 not enough money, 2 not enough skill (also level/prerequisites) |
