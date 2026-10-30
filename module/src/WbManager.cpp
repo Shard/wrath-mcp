@@ -8296,18 +8296,28 @@ namespace WrathBench
             player->SendProficiency(ITEM_CLASS_WEAPON, player->GetWeaponProficiency());
             player->SendProficiency(ITEM_CLASS_ARMOR, player->GetArmorProficiency());
 
-            // The difficulty, as the login sends it (WorldSession::
-            // HandlePlayerLoginFromDB: the dungeon one) and a group adds
-            // (Group::AddMember and the leader's change: the raid one too), by the core's
-            // own senders; the game clock built as
-            // SendInitialPacketsBeforeAddToMap builds it; and what
-            // Player::UpdateZone sends on entering the zone: its world
+            // The difficulty, by the core's own senders: the dungeon one as
+            // the login sends it (WorldSession::HandlePlayerLoginFromDB),
+            // and the raid one on the branch every map arrival takes
+            // (Player::SendInitialPacketsAfterAddToMap), read-only: inside a
+            // raid whose difficulty is not the character's, the map's, which
+            // that arrival already stored (StoreRaidMapDifficulty is not
+            // called again here); elsewhere the character's own whenever it
+            // differs from the stored one, which starts at 0, so a solo
+            // character with a raid difficulty set gets it too. Then the game
+            // clock built as SendInitialPacketsBeforeAddToMap builds it; and
+            // what Player::UpdateZone sends on entering the zone: its world
             // states and its weather (Map::SendZoneWeather, which sends
             // nothing for a zone without weather, as the zone entry does).
             bool const grouped = player->GetGroup() != nullptr;
             player->SendDungeonDifficulty(grouped);
-            if (grouped)
-                player->SendRaidDifficulty(true);
+            if (map->IsRaid())
+            {
+                if (map->GetDifficulty() != player->GetRaidDifficulty())
+                    player->SendRaidDifficulty(grouped, player->GetStoredRaidDifficulty());
+            }
+            else if (player->GetRaidDifficulty() != player->GetStoredRaidDifficulty())
+                player->SendRaidDifficulty(grouped);
             {
                 WorldPacket data(SMSG_LOGIN_SETTIMESPEED, 4 + 4 + 4);
                 data.AppendPackedTime(GameTime::GetGameTime().count());
@@ -12343,9 +12353,12 @@ namespace WrathBench
                 // The character's dungeon or raid difficulty
                 // (Player::SendDungeonDifficulty / SendRaidDifficulty,
                 // InstancePackets.cpp): u32 Difficulty, u32 1, u32 in a group.
-                // The dungeon one at login; both on joining a group and on the
-                // leader's change; either one when the server refuses a change.
-                // A solo change the server accepts is not answered.
+                // The dungeon one at login; the raid one on a map arrival
+                // whose raid difficulty differs from the stored one
+                // (Player::SendInitialPacketsAfterAddToMap); both on joining
+                // a group and on the leader's change; either one when the
+                // server refuses a change. A solo change the server accepts
+                // is not answered.
                 case MSG_SET_DUNGEON_DIFFICULTY:
                 case MSG_SET_RAID_DIFFICULTY:
                 {
