@@ -38,7 +38,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { EventSummary } from "./sandbox/ipc";
 import { compactJson } from "./jsonsafe";
-import { leaseRunSecret, logoutSession, moduleAuthHeaders, releaseSessionSecret, tokenFingerprint, tokenTag } from "./module-auth";
+import { leaseRunSecret, logoutSession, moduleAuthHeaders, moduleIdentity, releaseSessionSecret, tokenFingerprint, tokenTag } from "./module-auth";
 import { DEFAULT_RETENTION_MS, SessionStore } from "./record/store";
 import { SessionWriter } from "./record/writer";
 import { SecretRedactor } from "./redact";
@@ -161,18 +161,6 @@ export function recordOption(argv: readonly string[], stateDir: string): { root:
     retentionMs = n * 24 * 60 * 60_000;
   }
   return { root: flag("record-dir") ?? join(dirname(stateDir), "sessions"), retentionMs };
-}
-
-/** What the module says of itself on `GET /health`, for `session.json`; null when it does not answer. */
-export async function moduleIdentity(moduleUrl: string, headers: Record<string, string>, fetchImpl: typeof fetch = fetch): Promise<{ build: string | null; protocol: number | null } | null> {
-  try {
-    const res = await fetchImpl(new URL("/health", moduleUrl), { headers, signal: AbortSignal.timeout(3_000) });
-    if (!res.ok) return null;
-    const j = (await res.json()) as { build?: unknown; protocol?: unknown };
-    return { build: typeof j.build === "string" ? j.build : null, protocol: typeof j.protocol === "number" ? j.protocol : null };
-  } catch {
-    return null;
-  }
 }
 
 /**

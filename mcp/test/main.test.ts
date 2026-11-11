@@ -8,9 +8,9 @@ import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { moduleIdentity, recordOption, resolveSession, sessionShutdown, TOKEN_FILE } from "../src/main";
+import { recordOption, resolveSession, sessionShutdown, TOKEN_FILE } from "../src/main";
 import { DEFAULT_RETENTION_MS } from "../src/record/store";
-import { logoutSession, tokenFingerprint, tokenTag } from "../src/module-auth";
+import { logoutSession, moduleIdentity, tokenFingerprint, tokenTag } from "../src/module-auth";
 
 const dirs: string[] = [];
 function scratch(): string {
