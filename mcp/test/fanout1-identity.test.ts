@@ -8,7 +8,10 @@
  * `f58802a`, the `v1` head before fan-out existed, and is not regenerated to
  * make this pass: a difference here is a change to what a single-character
  * model is served, which is WrathBench's `docs/METHODOLOGY.md` ("The model
- * surface") to decide, not a fixture to refresh.
+ * surface") to decide, not a fixture to refresh. The one refresh since was
+ * such a decision: a sandbox killed for a blocked event loop stopped naming
+ * the snippet whose timeout noticed as the one that blocked it, which changed
+ * that result's error and its notice and nothing else.
  */
 
 import { expect, test } from "bun:test";

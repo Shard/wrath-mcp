@@ -10,6 +10,10 @@
  *    and the child is pinged; only if the ping also goes
  *    unanswered (the event loop is blocked) is the child killed and respawned.
  *    The loss is recorded as a harness notice the model will see.
+ *  - A kill names no culprit. A blocked loop cannot say what blocked it: the
+ *    snippet whose timeout noticed, another snippet in flight, a routine an
+ *    earlier snippet left running or the client's own work. Every snippet in
+ *    flight on the killed child is told the same (`stalledText`).
  *  - Consecutive restarts are counted for the `snippet-runaway` watchdog; a
  *    successful evaluation resets the count.
  */
@@ -234,6 +238,8 @@ export const RECORD_TICK_MS = 2_000;
 interface Pending {
   resolve: (v: unknown) => void;
   reject: (e: Error) => void;
+  /** The child it was sent to: its exit fails this request and no other child's. */
+  proc: Subprocess | null;
 }
 
 /**
@@ -325,6 +331,10 @@ export class SandboxHost {
   private nextId = 1;
   private readonly pending = new Map<number, Pending>();
   private readonly abandonedEvals = new Set<number>();
+  /** The evals awaiting their result, by id: a kill tells each of them the same thing. */
+  private readonly evalsInFlight = new Set<number>();
+  /** Children this host killed because their event loop stopped answering. */
+  private readonly stalledProcs = new WeakSet<Subprocess>();
   private ready: Promise<void> = Promise.resolve();
   private readonly notices: HarnessNotice[] = [];
   /**
@@ -489,8 +499,11 @@ export class SandboxHost {
           };
           void Promise.race([stderr.done, new Promise((r) => setTimeout(r, 100))]).then(emit);
         }
-        for (const [, p] of this.pending) p.reject(new SandboxExitedError());
-        this.pending.clear();
+        for (const [id, p] of this.pending) {
+          if (p.proc !== sub) continue;
+          this.pending.delete(id);
+          p.reject(new SandboxExitedError());
+        }
         this.abandonedEvals.clear();
       },
     });
@@ -826,6 +839,7 @@ export class SandboxHost {
           clearTimeout(timer);
           reject(e);
         },
+        proc: this.proc,
       });
       try {
         this.send(msg);
@@ -844,7 +858,9 @@ export class SandboxHost {
    */
   async evalSnippet(code: string, link?: EvalLink, character?: string): Promise<SnippetResult> {
     await this.start();
+    const proc = this.proc;
     const id = this.nextId++;
+    const started = performance.now();
     if (link !== undefined) {
       this.evalLinks.set(id, link);
       for (const key of this.evalLinks.keys()) {
@@ -852,6 +868,7 @@ export class SandboxHost {
         this.evalLinks.delete(key);
       }
     }
+    this.evalsInFlight.add(id);
     try {
       const res = await this.request<EvalResultMsg>(
         // The budget is the host's fact, so the host states it: the child hands
@@ -881,6 +898,10 @@ export class SandboxHost {
         durationMs: res.durationMs,
       };
     } catch (err) {
+      if (err instanceof SandboxStalledError) {
+        // Killed while this snippet waited, on another snippet's timeout.
+        return { ok: false, restarted: true, error: this.stalledText(), logs: [], durationMs: Math.round(performance.now() - started) };
+      }
       if (err instanceof SandboxExitedError) {
         return {
           ok: false,
@@ -939,18 +960,49 @@ export class SandboxHost {
           durationMs: this.opts.snippetTimeoutMs,
         };
       }
-      await this.restart("a snippet blocked the event loop past the timeout");
+      // Another snippet's timeout may have replaced the child while this one
+      // pinged it, or the child may have died on its own: that loss is already
+      // reported, and a second restart would kill the fresh child.
+      if (this.proc !== proc) {
+        return {
+          ok: false,
+          timedOut: true,
+          restarted: true,
+          error:
+            proc !== null && this.stalledProcs.has(proc)
+              ? this.stalledText()
+              : `the sandbox process exited while this snippet was running — ${this.stateLoss}`,
+          logs: [],
+          durationMs: this.opts.snippetTimeoutMs,
+        };
+      }
+      await this.restart("its event loop was blocked past the timeout; what blocked it is not known");
       return {
         ok: false,
         timedOut: true,
         restarted: true,
-        error:
-          `snippet blocked the sandbox event loop past ${this.opts.snippetTimeoutMs}ms; ` +
-          `the sandbox process was killed and restarted — ${this.stateLoss}`,
+        error: this.stalledText(),
         logs: [],
         durationMs: this.opts.snippetTimeoutMs,
       };
+    } finally {
+      this.evalsInFlight.delete(id);
     }
+  }
+
+  /**
+   * What every snippet in flight on a child killed for a blocked loop is told.
+   * It names no culprit because none is known: the host sees only that the
+   * child stopped answering, and the snippet whose timeout noticed is often a
+   * bystander parked in `sleep` while a routine or the client's own work held
+   * the loop.
+   */
+  private stalledText(): string {
+    return (
+      `the sandbox event loop was blocked past ${this.opts.snippetTimeoutMs}ms while this snippet was running, ` +
+      `so the sandbox process was killed and restarted; what blocked it is not known (this snippet, ` +
+      `a background routine, another snippet or the client's own work) — ${this.stateLoss}`
+    );
   }
 
   private async pingAlive(): Promise<{ alive: boolean; logs: LogEntry[]; note?: string; hints: ActionHintNote[] }> {
@@ -978,6 +1030,15 @@ export class SandboxHost {
     this.proc = null;
     this.abandonedEvals.clear();
     if (old !== null) {
+      this.stalledProcs.add(old);
+      // Every other snippet still waiting on this child hears why it went,
+      // before the exit sweep could call it a crash.
+      for (const id of this.evalsInFlight) {
+        const p = this.pending.get(id);
+        if (p === undefined || p.proc !== old) continue;
+        this.pending.delete(id);
+        p.reject(new SandboxStalledError());
+      }
       try {
         old.kill(9);
       } catch {
@@ -1105,6 +1166,13 @@ export class SandboxHost {
 class SandboxExitedError extends Error {
   constructor() {
     super("sandbox process exited");
+  }
+}
+
+/** The child an eval waited on was killed because its event loop stopped answering. */
+class SandboxStalledError extends Error {
+  constructor() {
+    super("sandbox event loop blocked");
   }
 }
 
