@@ -1,0 +1,1223 @@
+{
+  "static": {
+    "names": [
+      "run_snippet",
+      "recent_events",
+      "state_summary",
+      "write_scratchpad",
+      "edit_scratchpad"
+    ],
+    "defs": [
+      {
+        "name": "run_snippet",
+        "description": "Execute a TypeScript snippet in the persistent game sandbox. Top-level bindings persist across snippets; `sdk`, `state`, `events`, `connect()`, `sleep(ms)`, `scratchpad` and `signal` (aborted if this snippet is abandoned) are ambient. A single expression returns its value. This is the only way to act in the world.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string",
+              "description": "TypeScript source to evaluate."
+            }
+          },
+          "required": [
+            "code"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "recent_events",
+        "description": "Return the most recent game events (server packets as JSON), oldest first. Use after acting to see what the server said. Ambient movement packets (SMSG_MONSTER_MOVE, MSG_MOVE_*) are folded out by default — they fold into cached state instead, and a trailing note says how many were dropped. Pass includeMovement: true for the raw stream.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "description": "How many events to return, counted AFTER the movement fold. Default 50."
+            },
+            "includeMovement": {
+              "type": "boolean",
+              "description": "Include ambient movement packets (SMSG_MONSTER_MOVE, MSG_MOVE_*). Default false."
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "state_summary",
+        "description": "A formatted summary of the cached game state: character, level, position, recent chat and notifications, whether any events were missed.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "write_scratchpad",
+        "description": "Replace the entire scratchpad with new markdown. Keep it current: plan, progress, durable facts. It survives restarts; conversation history does not.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "content": {
+              "type": "string",
+              "description": "The full new scratchpad content (markdown)."
+            }
+          },
+          "required": [
+            "content"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "edit_scratchpad",
+        "description": "Change part of the scratchpad in place: replace the exact text `old` with `new`. Use this for ordinary upkeep — striking a done item, correcting a coordinate, adding a line under a heading — and write_scratchpad only to start the pad or rewrite it wholesale. `old` must match the pad byte for byte, whitespace included, and must appear exactly once unless replaceAll is set.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "old": {
+              "type": "string",
+              "description": "The exact existing text to replace, copied from the scratchpad."
+            },
+            "new": {
+              "type": "string",
+              "description": "What to put in its place. Empty string deletes the text."
+            },
+            "replaceAll": {
+              "type": "boolean",
+              "description": "Replace every occurrence instead of requiring a unique one. Default false."
+            }
+          },
+          "required": [
+            "old",
+            "new"
+          ],
+          "additionalProperties": false
+        }
+      }
+    ],
+    "specs": [
+      {
+        "name": "run_snippet",
+        "help": "run_snippet expects { code: string } — the TypeScript source to evaluate.",
+        "aliases": {
+          "cmd": "code",
+          "snippet": "code",
+          "source": "code",
+          "script": "code",
+          "ts": "code"
+        },
+        "schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "code"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "recent_events",
+        "help": "recent_events expects { limit?: number, includeMovement?: boolean } — how many events to return (1-200, default 50, counted after ambient movement is folded out), and whether to include ambient movement packets (SMSG_MONSTER_MOVE, MSG_MOVE_*; default false). includeMovement is new: it used to serve every packet unconditionally.",
+        "aliases": {
+          "include_movement": "includeMovement",
+          "includemovement": "includeMovement"
+        },
+        "schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "default": {},
+          "type": "object",
+          "properties": {
+            "limit": {
+              "type": "number"
+            },
+            "includeMovement": {
+              "type": [
+                "boolean",
+                "string",
+                "number"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "state_summary",
+        "help": "state_summary takes no parameters ({}).",
+        "aliases": null,
+        "schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "default": {},
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "write_scratchpad",
+        "help": "write_scratchpad expects { content: string } — the full new scratchpad markdown.",
+        "aliases": {
+          "text": "content",
+          "markdown": "content"
+        },
+        "schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "properties": {
+            "content": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "content"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "edit_scratchpad",
+        "help": "edit_scratchpad expects { old: string, new: string, replaceAll?: boolean } — the exact existing text to replace, what to put there, and whether to replace every occurrence (default false, which requires old to appear exactly once).",
+        "aliases": {
+          "old_string": "old",
+          "oldString": "old",
+          "old_text": "old",
+          "search": "old",
+          "new_string": "new",
+          "newString": "new",
+          "new_text": "new",
+          "replace": "new",
+          "replace_all": "replaceAll",
+          "replaceall": "replaceAll"
+        },
+        "schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "properties": {
+            "old": {
+              "type": "string"
+            },
+            "new": {
+              "type": "string"
+            },
+            "replaceAll": {
+              "type": [
+                "boolean",
+                "string",
+                "number"
+              ]
+            }
+          },
+          "required": [
+            "old",
+            "new"
+          ],
+          "additionalProperties": false
+        }
+      }
+    ],
+    "stateLossRecovery": "All top-level bindings and routines were lost; the game session was not, and your character is where it was. Run `await connect()`: resubscribing replays your own state (health, power, xp, money, bags, quest log, spells, skills, factions, bind point) and everything in view, and `connect()` returns once that replay has landed, so `state` and `sdk` are whole again. Call `await sdk.createSession({...})` only if `connect()` fails because the session is gone.",
+    "hintBlock": "--- harness ---\nmoveTo too_far ×3: the destination is farther than one move reaches\ncastSpell not_ready (from an earlier snippet: loop()): the spell is on cooldown"
+  },
+  "stdio": [
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {}
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+          "protocolVersion": "2024-11-05",
+          "capabilities": {
+            "tools": {}
+          },
+          "serverInfo": {
+            "name": "wrathbench-mcp",
+            "version": "0.2.0"
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list"
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {
+          "tools": [
+            {
+              "name": "run_snippet",
+              "description": "Execute a TypeScript snippet in the persistent game sandbox. Top-level bindings persist across snippets; `sdk`, `state`, `events`, `connect()`, `sleep(ms)`, `scratchpad` and `signal` (aborted if this snippet is abandoned) are ambient. A single expression returns its value. This is the only way to act in the world.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "code": {
+                    "type": "string",
+                    "description": "TypeScript source to evaluate."
+                  }
+                },
+                "required": [
+                  "code"
+                ],
+                "additionalProperties": false
+              }
+            },
+            {
+              "name": "recent_events",
+              "description": "Return the most recent game events (server packets as JSON), oldest first. Use after acting to see what the server said. Ambient movement packets (SMSG_MONSTER_MOVE, MSG_MOVE_*) are folded out by default — they fold into cached state instead, and a trailing note says how many were dropped. Pass includeMovement: true for the raw stream.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 200,
+                    "description": "How many events to return, counted AFTER the movement fold. Default 50."
+                  },
+                  "includeMovement": {
+                    "type": "boolean",
+                    "description": "Include ambient movement packets (SMSG_MONSTER_MOVE, MSG_MOVE_*). Default false."
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            {
+              "name": "state_summary",
+              "description": "A formatted summary of the cached game state: character, level, position, recent chat and notifications, whether any events were missed.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+              }
+            },
+            {
+              "name": "write_scratchpad",
+              "description": "Replace the entire scratchpad with new markdown. Keep it current: plan, progress, durable facts. It survives restarts; conversation history does not.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "content": {
+                    "type": "string",
+                    "description": "The full new scratchpad content (markdown)."
+                  }
+                },
+                "required": [
+                  "content"
+                ],
+                "additionalProperties": false
+              }
+            },
+            {
+              "name": "edit_scratchpad",
+              "description": "Change part of the scratchpad in place: replace the exact text `old` with `new`. Use this for ordinary upkeep — striking a done item, correcting a coordinate, adding a line under a heading — and write_scratchpad only to start the pad or rewrite it wholesale. `old` must match the pad byte for byte, whitespace included, and must appear exactly once unless replaceAll is set.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "old": {
+                    "type": "string",
+                    "description": "The exact existing text to replace, copied from the scratchpad."
+                  },
+                  "new": {
+                    "type": "string",
+                    "description": "What to put in its place. Empty string deletes the text."
+                  },
+                  "replaceAll": {
+                    "type": "boolean",
+                    "description": "Replace every occurrence instead of requiring a unique one. Default false."
+                  }
+                },
+                "required": [
+                  "old",
+                  "new"
+                ],
+                "additionalProperties": false
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "ping"
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "result": {}
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": {
+          "name": "run_snippet",
+          "arguments": {
+            "code": "((names) => ({ count: names.length, hash: String(Bun.hash(names.join(','))), ambient: ['sdk','state','events','connect','sleep','scratchpad','signal','API_MD_PATH','chars','character','characters'].map((k) => `${k}:${k in globalThis ? typeof globalThis[k] : 'absent'}`), env: Object.keys(process.env).sort(), api: API_MD_PATH, token: sdk.token }))(Object.getOwnPropertyNames(globalThis).sort())"
+          }
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 4,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "ok (<n>ms)\n=> {\n  count: 167,\n  hash: \"10015829674909719079\",\n  ambient: [\n    \"sdk:object\", \"state:object\", \"events:object\", \"connect:function\", \"sleep:function\", \"scratchpad:object\",\n    \"signal:object\", \"API_MD_PATH:string\", \"chars:absent\", \"character:absent\", \"characters:absent\"\n  ],\n  env: [ \"HOME\", \"PATH\", \"TMPDIR\", \"WRATHBENCH_MODULE_URL\", \"WRATHBENCH_RECORD\", \"WRATHBENCH_TOKEN\" ],\n  api: \"<root>/sdk/API.md\",\n  token: \"<token>\",\n}"
+            }
+          ],
+          "isError": false
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "tools/call",
+        "params": {
+          "name": "state_summary",
+          "arguments": {}
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 5,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"sessionLive\":false,\"self\":{\"totems\":[],\"mirrorTimers\":[],\"fields\":{}},\"questLog\":[],\"eventCount\":0,\"lastSeq\":-1,\"observation\":{\"connected\":false},\"move\":null}"
+            }
+          ],
+          "isError": false
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "tools/call",
+        "params": {
+          "name": "recent_events",
+          "arguments": {}
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 6,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "no events yet"
+            }
+          ],
+          "isError": false
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": {
+          "name": "run_snippet",
+          "arguments": {
+            "code": "await (async () => { await connect(); const s = await sdk.createSession({ character: 'fixa', race: 1, class: 1 }); await sleep(150, { wake: false }); return { character: s.character, guid: s.guid, self: state.self.guid, level: state.self.level?.value }; })()"
+          }
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "ok (<n>ms)\n=> {\n  character: \"Fixa\",\n  guid: \"101\",\n  self: \"101\",\n  level: 3,\n}"
+            }
+          ],
+          "isError": false
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "tools/call",
+        "params": {
+          "name": "run_snippet",
+          "arguments": {
+            "snippet": "await sleep(150, { wake: false }); events.recent().length"
+          }
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 8,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "ok (<n>ms)"
+            }
+          ],
+          "isError": false
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "tools/call",
+        "params": {
+          "name": "recent_events",
+          "arguments": {}
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 9,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "#0 SMSG_UPDATE_OBJECT {\"blocks\":1,\"objects\":[{\"update\":\"create\",\"guid\":\"101\",\"objectType\":\"player\",\"self\":true,\"moveFlags\":0,\"runSpeed\":7,\"pos\":{\"x\":-1234.5,\"y\":987.25,\"z\":42.125,\"o\":3.5},\"fields\":{\"entry\":0,\"health\":80,\"maxHealth\":100,\"pow …\n#1 SMSG_MESSAGECHAT {\"type\":1,\"language\":7,\"senderGuid\":\"8\",\"message\":\"fixture hello\",\"chatTag\":0}\n#2 SMSG_UPDATE_OBJECT {\"blocks\":1,\"objects\":[{\"update\":\"create\",\"guid\":\"17365880163140632581\",\"objectType\":\"unit\",\"moveFlags\":0,\"runSpeed\":7.5,\"pos\":{\"x\":-1200,\"y\":980,\"z\":42,\"o\":1.5},\"fields\":{\"entry\":90210,\"health\":120,\"maxHealth\":120,\"po …\n#4 SMSG_NOTIFICATION {\"text\":\"fixture notice\"}\n(+1 ambient movement and party-frame events folded into state — pass {includeMovement: true} for the raw stream)"
+            }
+          ],
+          "isError": false
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": {
+          "name": "recent_events",
+          "arguments": {
+            "limit": "1"
+          }
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 10,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "#4 SMSG_NOTIFICATION {\"text\":\"fixture notice\"}"
+            }
+          ],
+          "isError": false
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 11,
+        "method": "tools/call",
+        "params": {
+          "name": "recent_events",
+          "arguments": {
+            "include_movement": "true",
+            "limit": 3
+          }
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 11,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "#2 SMSG_UPDATE_OBJECT {\"blocks\":1,\"objects\":[{\"update\":\"create\",\"guid\":\"17365880163140632581\",\"objectType\":\"unit\",\"moveFlags\":0,\"runSpeed\":7.5,\"pos\":{\"x\":-1200,\"y\":980,\"z\":42,\"o\":1.5},\"fields\":{\"entry\":90210,\"health\":120,\"maxHealth\":120,\"po …\n#3 MSG_MOVE_HEARTBEAT {\"guid\":\"17365880163140632581\",\"flags\":1,\"pos\":{\"x\":-1210,\"y\":985,\"z\":42,\"o\":2}}\n#4 SMSG_NOTIFICATION {\"text\":\"fixture notice\"}"
+            }
+          ],
+          "isError": false
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 12,
+        "method": "tools/call",
+        "params": {
+          "name": "state_summary",
+          "arguments": {}
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 12,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"sessionLive\":true,\"self\":{\"guid\":\"101\",\"name\":\"Fixa\",\"level\":{\"value\":3,\"seq\":0,\"ts\":<ts>},\"taxiFlight\":{\"value\":false,\"seq\":0,\"ts\":<ts>},\"resting\":{\"value\":false,\"seq\":0,\"ts\":<ts>},\"ghost\":{\"value\":false,\"seq\":0,\"ts\":<ts>},\"inCombat\":{\"value\":false,\"seq\":0,\"ts\":<ts>},\"stunned\":{\"value\":false,\"seq\":0,\"ts\":<ts>},\"mounted\":{\"value\":false,\"seq\":0,\"ts\":<ts>},\"totems\":[],\"mirrorTimers\":[],\"standState\":{\"value\":{\"id\":0,\"name\":\"stand\"},\"seq\":0,\"ts\":<ts>},\"sitting\":{\"value\":false,\"seq\":0,\"ts\":<ts>},\"shapeshiftForm\":{\"value\":{\"id\":0,\"name\":\"none\"},\"seq\":0,\"ts\":<ts>},\"restedXp\":{\"value\":0,\"seq\":0,\"ts\":<ts>},\"health\":{\"value\":{\"current\":80,\"max\":100},\"seq\":0,\"ts\":<ts>},\"power\":{\"value\":{\"current\":40,\"max\":90},\"seq\":0,\"ts\":<ts>},\"fields\":{\"moveFlags\":{\"value\":0,\"seq\":0,\"ts\":<ts>},\"runSpeed\":{\"value\":7,\"seq\":0,\"ts\":<ts>},\"entry\":{\"value\":0,\"seq\":0,\"ts\":<ts>},\"health\":{\"value\":80,\"seq\":0,\"ts\":<ts>},\"maxHealth\":{\"value\":100,\"seq\":0,\"ts\":<ts>},\"power1\":{\"value\":40,\"seq\":0,\"ts\":<ts>},\"maxPower1\":{\"value\":90,\"seq\":0,\"ts\":<ts>},\"level\":{\"value\":3,\"seq\":0,\"ts\":<ts>},\"unitFlags\":{\"value\":0,\"seq\":0,\"ts\":<ts>},\"race\":{\"value\":1,\"seq\":0,\"ts\":<ts>},\"class\":{\"value\":1,\"seq\":0,\"ts\":<ts>},\"powerType\":{\"value\":0,\"seq\":0,\"ts\":<ts>},\"playerFlags\":{\"value\":0,\"seq\":0,\"ts\":<ts>},\"dynamicFlags\":{\"value\":0,\"seq\":0,\"ts\":<ts>},\"standState\":{\"value\":0,\"seq\":0,\"ts\":<ts>},\"shapeshiftForm\":{\"value\":0,\"seq\":0,\"ts\":<ts>},\"restedXp\":{\"value\":0,\"seq\":0,\"ts\":<ts>}}},\"questLog\":[],\"eventCount\":5,\"lastSeq\":4,\"observation\":{\"connected\":true},\"move\":null}"
+            }
+          ],
+          "isError": false
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 13,
+        "method": "tools/call",
+        "params": {
+          "name": "run_snippet",
+          "arguments": {
+            "code": "console.log('a line'); console.warn('a warning'); throw new RangeError('fixture failure')"
+          }
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 13,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "error (<n>ms)\nRangeError: fixture failure\n--- console ---\n[log] a line\n[warn] a warning"
+            }
+          ],
+          "isError": true
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 14,
+        "method": "tools/call",
+        "params": {
+          "name": "run_snippet",
+          "arguments": {
+            "code": "async () => 1"
+          }
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 14,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "ok (<n>ms)\n=> [AsyncFunction]\nthe snippet returned a function it never called — call it (await fn()) or return its result; nothing in that function body has run."
+            }
+          ],
+          "isError": false
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 15,
+        "method": "tools/call",
+        "params": {
+          "name": "run_snippet",
+          "arguments": {
+            "code": "const kept = 41; kept + 1"
+          }
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 15,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "ok (<n>ms)"
+            }
+          ],
+          "isError": false
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 16,
+        "method": "tools/call",
+        "params": {
+          "name": "run_snippet",
+          "arguments": {
+            "code": "kept"
+          }
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 16,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "ok (<n>ms)\n=> 41"
+            }
+          ],
+          "isError": false
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 17,
+        "method": "tools/call",
+        "params": {
+          "name": "run_snippet",
+          "arguments": {
+            "code": "(await sdk.say('fixture line')).ok"
+          }
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 17,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "ok (<n>ms)\n=> true"
+            }
+          ],
+          "isError": false
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 18,
+        "method": "tools/call",
+        "params": {
+          "name": "write_scratchpad",
+          "arguments": {
+            "content": "# plan\n- one\n- two\n"
+          }
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 18,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "written (19 chars)"
+            }
+          ],
+          "isError": false
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 19,
+        "method": "tools/call",
+        "params": {
+          "name": "edit_scratchpad",
+          "arguments": {
+            "old": "- one",
+            "new": "- ~~one~~"
+          }
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 19,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "edited (1 replacement; 23 chars, 3 lines)"
+            }
+          ],
+          "isError": false
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 20,
+        "method": "tools/call",
+        "params": {
+          "name": "edit_scratchpad",
+          "arguments": {
+            "old": "- nine",
+            "new": "x"
+          }
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 20,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "edit_scratchpad: old was not found in the scratchpad; copy the text exactly, whitespace included. The scratchpad as last written is in this turn's context."
+            }
+          ],
+          "isError": true
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 21,
+        "method": "tools/call",
+        "params": {
+          "name": "edit_scratchpad",
+          "arguments": {
+            "old": "- ",
+            "new": "* "
+          }
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 21,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "edit_scratchpad: old matches 2 places; include more surrounding text or set replaceAll."
+            }
+          ],
+          "isError": true
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 22,
+        "method": "tools/call",
+        "params": {
+          "name": "edit_scratchpad",
+          "arguments": {
+            "old": "",
+            "new": "x"
+          }
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 22,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "edit_scratchpad: old was empty. There is nothing to match — use write_scratchpad to start a pad, then edit it."
+            }
+          ],
+          "isError": true
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 23,
+        "method": "tools/call",
+        "params": {
+          "name": "run_snippet",
+          "arguments": {
+            "code": "await scratchpad.read()"
+          }
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 23,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "ok (<n>ms)\n=> \"# plan\\n- ~~one~~\\n- two\\n\""
+            }
+          ],
+          "isError": false
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 24,
+        "method": "tools/call",
+        "params": {
+          "name": "run_snipet",
+          "arguments": {
+            "code": "1"
+          }
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 24,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "unknown tool: run_snipet. Valid tools: run_snippet, recent_events, state_summary, write_scratchpad, edit_scratchpad. Did you mean run_snippet?"
+            }
+          ],
+          "isError": true
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 25,
+        "method": "tools/call",
+        "params": {
+          "name": "state_summary",
+          "arguments": {
+            "character": "Fixa"
+          }
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 25,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "invalid arguments for state_summary: unknown key(s) \"character\" — valid keys for state_summary: (none). Received: {\"character\":\"Fixa\"}. state_summary takes no parameters ({})."
+            }
+          ],
+          "isError": true
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 26,
+        "method": "tools/call",
+        "params": {
+          "name": "recent_events",
+          "arguments": {
+            "limit": 5,
+            "character": "Fixa"
+          }
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 26,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "invalid arguments for recent_events: unknown key(s) \"character\" — valid keys for recent_events: limit, includeMovement. Received: {\"limit\":5,\"character\":\"Fixa\"}. recent_events expects { limit?: number, includeMovement?: boolean } — how many events to return (1-200, default 50, counted after ambient movement is folded out), and whether to include ambient movement packets (SMSG_MONSTER_MOVE, MSG_MOVE_*; default false). includeMovement is new: it used to serve every packet unconditionally."
+            }
+          ],
+          "isError": true
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 27,
+        "method": "tools/call",
+        "params": {
+          "name": "run_snippet",
+          "arguments": {
+            "code": "1",
+            "character": "Fixa"
+          }
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 27,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "invalid arguments for run_snippet: unknown key(s) \"character\" — valid keys for run_snippet: code. Received: {\"code\":\"1\",\"character\":\"Fixa\"}. run_snippet expects { code: string } — the TypeScript source to evaluate."
+            }
+          ],
+          "isError": true
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 28,
+        "method": "tools/call",
+        "params": {
+          "name": "login_character",
+          "arguments": {
+            "name": "Fixb"
+          }
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 28,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "unknown tool: login_character. Valid tools: run_snippet, recent_events, state_summary, write_scratchpad, edit_scratchpad."
+            }
+          ],
+          "isError": true
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 29,
+        "method": "tools/call",
+        "params": {
+          "name": "list_characters",
+          "arguments": {}
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 29,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "unknown tool: list_characters. Valid tools: run_snippet, recent_events, state_summary, write_scratchpad, edit_scratchpad."
+            }
+          ],
+          "isError": true
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 30,
+        "method": "tools/call",
+        "params": {
+          "name": "run_snippet",
+          "arguments": "```json\n{\"code\": \"2 + 2\",}\n```"
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 30,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "ok (<n>ms)\n=> 4"
+            }
+          ],
+          "isError": false
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 31,
+        "method": "tools/call",
+        "params": {
+          "name": "run_snippet",
+          "arguments": "{not json"
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 31,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "tool arguments were not valid JSON (SyntaxError: JSON Parse error: Expected '}'); received: {not json. run_snippet expects { code: string } — the TypeScript source to evaluate."
+            }
+          ],
+          "isError": true
+        }
+      }
+    },
+    {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 32,
+        "method": "resources/list"
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 32,
+        "error": {
+          "code": -32601,
+          "message": "method not found: resources/list"
+        }
+      }
+    }
+  ],
+  "host": {
+    "calls": [
+      {
+        "tool": "run_snippet",
+        "args": {
+          "code": "await connect(); (await sdk.createSession({ character: 'hosta', race: 1, class: 1 })).character"
+        },
+        "result": {
+          "text": "ok (<n>ms)",
+          "isError": false
+        }
+      },
+      {
+        "tool": "run_snippet",
+        "args": {
+          "code": "globalThis.kept = 7; await sleep(5000, { wake: false })"
+        },
+        "result": {
+          "text": "error (<n>ms)\nsnippet evaluation exceeded 2000ms and was abandoned: its `signal` was aborted, so pending SDK waits (moveTo, killTarget, waitForTransfer, …) rejected with EventAbortedError and any move in flight was stopped. a sleep(5000) was still waiting when this was abandoned: it was asked for 5000ms and the snippet time limit is 2000ms, so a sleep that long can never finish inside one snippet. The runtime (bindings, routines, session) is still alive. A walk longer than this limit is dispatched, not awaited: sdk.moveToAsync(target) returns as soon as the move is queued, and you poll state.self.position or the WB_MOVE_RESULT event for the verdict. Work longer than 2s belongs in a background routine (launch it without awaiting, e.g. `globalThis.trip = (async () => { for (const p of waypoints) await sdk.moveTo(p); return \"done\"; })().catch(String); \"started\"` — the trailing value keeps the snippet from awaiting the promise REPL-style; it returns instantly, then a later snippet checks `await Promise.race([trip, \"running\"])`); code that was not awaiting the SDK may still be running, so check state/events before assuming it failed.",
+          "isError": true
+        }
+      },
+      {
+        "tool": "run_snippet",
+        "args": {
+          "code": "kept"
+        },
+        "result": {
+          "text": "ok (<n>ms)\n=> 7",
+          "isError": false
+        }
+      },
+      {
+        "tool": "run_snippet",
+        "args": {
+          "code": "for (;;) {}"
+        },
+        "result": {
+          "text": "error (<n>ms)\nsnippet blocked the sandbox event loop past 2000ms; the sandbox process was killed and restarted — All top-level bindings and routines were lost; the game session was not, and your character is where it was. Run `await connect()`: resubscribing replays your own state (health, power, xp, money, bags, quest log, spells, skills, factions, bind point) and everything in view, and `connect()` returns once that replay has landed, so `state` and `sdk` are whole again. Call `await sdk.createSession({...})` only if `connect()` fails because the session is gone.",
+          "isError": true
+        },
+        "notices": [
+          {
+            "kind": "sandbox_restarted",
+            "text": "sandbox restarted (a snippet blocked the event loop past the timeout). All top-level bindings and routines were lost; the game session was not, and your character is where it was. Run `await connect()`: resubscribing replays your own state (health, power, xp, money, bags, quest log, spells, skills, factions, bind point) and everything in view, and `connect()` returns once that replay has landed, so `state` and `sdk` are whole again. Call `await sdk.createSession({...})` only if `connect()` fails because the session is gone."
+          }
+        ]
+      },
+      {
+        "tool": "run_snippet",
+        "args": {
+          "code": "typeof kept"
+        },
+        "result": {
+          "text": "ok (<n>ms)\n=> \"undefined\"",
+          "isError": false
+        }
+      },
+      {
+        "tool": "run_snippet",
+        "args": {
+          "code": "await connect(); await sleep(100, { wake: false }); ({ connected: events.connected, self: state.self.guid })"
+        },
+        "result": {
+          "text": "ok (<n>ms)",
+          "isError": false
+        }
+      },
+      {
+        "tool": "state_summary",
+        "args": {},
+        "result": {
+          "text": "{\"sessionLive\":true,\"self\":{\"guid\":\"102\",\"name\":\"Hosta\",\"level\":{\"value\":3,\"seq\":2,\"ts\":<ts>},\"position\":{\"value\":{\"map\":0,\"x\":-1234.5,\"y\":987.25,\"z\":42.125,\"o\":3.5},\"seq\":2,\"ts\":<ts>},\"taxiFlight\":{\"value\":false,\"seq\":2,\"ts\":<ts>},\"resting\":{\"value\":false,\"seq\":2,\"ts\":<ts>},\"ghost\":{\"value\":false,\"seq\":2,\"ts\":<ts>},\"inCombat\":{\"value\":false,\"seq\":2,\"ts\":<ts>},\"stunned\":{\"value\":false,\"seq\":2,\"ts\":<ts>},\"mounted\":{\"value\":false,\"seq\":2,\"ts\":<ts>},\"totems\":[],\"mirrorTimers\":[],\"standState\":{\"value\":{\"id\":0,\"name\":\"stand\"},\"seq\":2,\"ts\":<ts>},\"sitting\":{\"value\":false,\"seq\":2,\"ts\":<ts>},\"shapeshiftForm\":{\"value\":{\"id\":0,\"name\":\"none\"},\"seq\":2,\"ts\":<ts>},\"restedXp\":{\"value\":0,\"seq\":2,\"ts\":<ts>},\"health\":{\"value\":{\"current\":80,\"max\":100},\"seq\":2,\"ts\":<ts>},\"power\":{\"value\":{\"current\":40,\"max\":90},\"seq\":2,\"ts\":<ts>},\"fields\":{\"moveFlags\":{\"value\":0,\"seq\":2,\"ts\":<ts>},\"runSpeed\":{\"value\":7,\"seq\":2,\"ts\":<ts>},\"entry\":{\"value\":0,\"seq\":2,\"ts\":<ts>},\"health\":{\"value\":80,\"seq\":2,\"ts\":<ts>},\"maxHealth\":{\"value\":100,\"seq\":2,\"ts\":<ts>},\"power1\":{\"value\":40,\"seq\":2,\"ts\":<ts>},\"maxPower1\":{\"value\":90,\"seq\":2,\"ts\":<ts>},\"level\":{\"value\":3,\"seq\":2,\"ts\":<ts>},\"unitFlags\":{\"value\":0,\"seq\":2,\"ts\":<ts>},\"race\":{\"value\":1,\"seq\":2,\"ts\":<ts>},\"class\":{\"value\":1,\"seq\":2,\"ts\":<ts>},\"powerType\":{\"value\":0,\"seq\":2,\"ts\":<ts>},\"playerFlags\":{\"value\":0,\"seq\":2,\"ts\":<ts>},\"dynamicFlags\":{\"value\":0,\"seq\":2,\"ts\":<ts>},\"standState\":{\"value\":0,\"seq\":2,\"ts\":<ts>},\"shapeshiftForm\":{\"value\":0,\"seq\":2,\"ts\":<ts>},\"restedXp\":{\"value\":0,\"seq\":2,\"ts\":<ts>}}},\"questLog\":[],\"eventCount\":4,\"lastSeq\":3,\"observation\":{\"connected\":true},\"move\":null}"
+        }
+      },
+      {
+        "tool": "run_snippet",
+        "args": {
+          "code": "process.exit(3)"
+        },
+        "result": {
+          "text": "error (<n>ms)\nthe sandbox process exited while this snippet was running — All top-level bindings and routines were lost; the game session was not, and your character is where it was. Run `await connect()`: resubscribing replays your own state (health, power, xp, money, bags, quest log, spells, skills, factions, bind point) and everything in view, and `connect()` returns once that replay has landed, so `state` and `sdk` are whole again. Call `await sdk.createSession({...})` only if `connect()` fails because the session is gone.",
+          "isError": true
+        },
+        "notices": [
+          {
+            "kind": "sandbox_restarted",
+            "text": "sandbox process exited unexpectedly (exit code 3, signal none). All top-level bindings and routines were lost; the game session was not, and your character is where it was. Run `await connect()`: resubscribing replays your own state (health, power, xp, money, bags, quest log, spells, skills, factions, bind point) and everything in view, and `connect()` returns once that replay has landed, so `state` and `sdk` are whole again. Call `await sdk.createSession({...})` only if `connect()` fails because the session is gone."
+          }
+        ]
+      },
+      {
+        "tool": "run_snippet",
+        "args": {
+          "code": "1"
+        },
+        "result": {
+          "text": "ok (<n>ms)\n=> 1",
+          "isError": false
+        }
+      }
+    ],
+    "restarts": 2
+  },
+  "wire": [
+    "operator POST /lease",
+    "operator GET /health",
+    "session WS /events?replay=1",
+    "session POST /session",
+    "session POST /action say",
+    "operator DELETE /session",
+    "operator DELETE /lease",
+    "operator POST /lease",
+    "session WS /events?replay=1",
+    "session POST /session",
+    "session WS /events?replay=1"
+  ]
+}

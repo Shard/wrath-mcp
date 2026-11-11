@@ -1,6 +1,7 @@
 /**
  * Sandbox child process. Spawned by `host.ts` with an IPC channel; holds the
- * one long-lived SDK client for the session and evaluates snippets against it.
+ * one long-lived SDK client for the session and evaluates snippets against it
+ * (at fan-out above 1, one client per logged-in character: "Fan-out", below).
  * A child entry imports this module and calls `startSandboxChild` with a
  * harness's extensions (`SandboxChildExtension`, below), or with none
  * (`entry.ts`); an extension watches and reports, and adds nothing a snippet
@@ -40,6 +41,27 @@
  * Top-level `const`/`let`/`var`/`function`/`class` declarations persist across
  * snippets (copied onto globalThis after each evaluation — see rewrite.ts for
  * the exact mechanics and limitations). `import` is not available.
+ *
+ * ### Fan-out (a host started with `maxCharacters` above 1)
+ *
+ * One process, one runtime, one client per character (`Seat`): the host opens
+ * a seat for each character it logs in (`seat_open`), with that character's
+ * own token and lease secret, handed over IPC and never in the environment.
+ * Each client folds only its own stream, so the observation contract holds
+ * per character. What a snippet sees then:
+ *
+ *   chars       every logged-in character by name: `chars.Name.sdk`, `.state`
+ *               and `.events` are that character's client, cache and stream
+ *   sdk, state, events
+ *               the character the snippet was run for (`run_snippet`'s
+ *               `character`), for the whole evaluation and for anything it
+ *               leaves running; a snippet run for none gets a stand-in that
+ *               says so on first use
+ *   connect()   reopens that character's stream, or with none every closed one
+ *   sleep(ms)   wakes for that character's world; a pure timer with none
+ *
+ * At fan-out 1 none of this exists: there is no `chars`, and the surface above
+ * is the whole of it.
  *
  * ### Network posture — stated honestly
  *
@@ -88,7 +110,7 @@ import { keepsAnswer, reparseFrame } from "./client-cache";
 import { toJsonSafe } from "../jsonsafe";
 import { compileSnippet } from "./rewrite";
 import { REATTACH_REPLAY_WAIT_MS, REATTACH_STATE_WAIT_MS } from "./reattach-waits";
-import type { ActionBatch, ActionHintNote, ActionNote, ChildToHost, EventSummary, HostToChild, HostcallResult, LogEntry, MoveIntentNote } from "./ipc";
+import type { ActionBatch, ActionHintNote, ActionNote, ChildToHost, EventSummary, HostToChild, HostcallResult, LogEntry, MoveIntentNote, SeatClosed, SeatOpened } from "./ipc";
 
 import { SessionRecorder, type RecordedMove } from "../record/recorder";
 
@@ -111,6 +133,11 @@ const ACCOUNT = ACCOUNT_ENV !== undefined && ACCOUNT_ENV.length > 0 ? ACCOUNT_EN
 // module, or running this file by hand), and the client sends no header.
 // Whether the host keeps a session record: it sets this itself, never forwards it.
 const RECORD = process.env["WRATHBENCH_RECORD"] === "1";
+// Fan-out: how many characters this child may hold. Set by the host above 1
+// and absent at 1, where the one client is built from the environment as it
+// always was; above 1 every client is built at `seat_open` and none from here.
+const MAX_CHARACTERS = Number(process.env["WRATHBENCH_MAX_CHARACTERS"] ?? "1");
+const MULTI = Number.isInteger(MAX_CHARACTERS) && MAX_CHARACTERS > 1;
 const SECRET_ENV = process.env["WRATHBENCH_SECRET"];
 const SECRET = SECRET_ENV !== undefined && SECRET_ENV.length > 0 ? SECRET_ENV : undefined;
 // Read once, above, into the one client this process will build — then struck
@@ -211,6 +238,44 @@ class GuardedWebSocket {
 }
 globalThis.WebSocket = GuardedWebSocket as unknown as typeof WebSocket;
 
+// ------------------------------------------------------------------- seats
+
+/**
+ * One character's client and everything this process keeps per client: its
+ * movement intention, its action log, its recorder and its extensions. At
+ * fan-out 1 there is exactly one, `primary`, built from the environment as
+ * this file loads; above 1 there is none until the host opens one
+ * (`openSeat`), and each is keyed by its character's name once that is known.
+ */
+interface Seat {
+  /** The character's name as the server gave it; empty for the one seat of fan-out 1. */
+  name: string;
+  client: WrathClient;
+  /** See "movement intention", below. */
+  moveIntent: MoveIntentNote | null;
+  earlyVerdicts: Map<number, { status: string; ts: number }>;
+  /** See "action log", below. */
+  actionBatches: Map<number | null, PendingBatch>;
+  /** The session recorder, when the host keeps a record (`installSeat`). */
+  recorder: SessionRecorder | null;
+  extensions: SandboxChildExtension[];
+  clientCacheForwarded: boolean;
+}
+
+/** The seats by character name, at fan-out above 1. */
+const seats = new Map<string, Seat>();
+/** The one seat of fan-out 1; null above it. */
+let primary: Seat | null = null;
+
+/** The seat the running code acts for: its eval's character, else the one seat of fan-out 1. */
+function currentSeat(): Seat | null {
+  return evalContext.getStore()?.seat ?? primary;
+}
+
+function allSeats(): Seat[] {
+  return primary !== null ? [primary] : [...seats.values()];
+}
+
 // ------------------------------------------------------- movement intention
 
 /**
@@ -228,15 +293,12 @@ globalThis.WebSocket = GuardedWebSocket as unknown as typeof WebSocket;
  * One slot: the module runs one move at a time per session, and a newer
  * dispatch is what supersedes an older one.
  */
-let moveIntent: MoveIntentNote | null = null;
-
 /**
  * Verdicts whose `moveId` no intent has learned yet, kept until the POST that
  * carries it answers. An immediate refusal (`target_off_mesh`) lands on the
  * event stream while the ack is still in flight, and dropping it would leave
  * that move drawn as if it were still walking.
  */
-const earlyVerdicts = new Map<number, { status: string; ts: number }>();
 const EARLY_VERDICT_MAX = 8;
 
 /**
@@ -247,7 +309,8 @@ const EARLY_VERDICT_MAX = 8;
 const moveRecord = new WeakMap<MoveIntentNote, { evalId: number | null; guid: string | null }>();
 
 /** Hand the session recorder a move as it stands now: at its dispatch, and again at its verdict. */
-function recordMove(note: MoveIntentNote): void {
+function recordMove(seat: Seat, note: MoveIntentNote): void {
+  const recorder = seat.recorder;
   if (recorder === null) return;
   const extra = moveRecord.get(note);
   const evalId = extra?.evalId ?? null;
@@ -268,13 +331,15 @@ function recordMove(note: MoveIntentNote): void {
   recorder.noteMove(move);
 }
 
-function settleMoveIntent(moveId: number, status: string, ts: number): void {
+function settleMoveIntent(seat: Seat, moveId: number, status: string, ts: number): void {
+  const moveIntent = seat.moveIntent;
   if (moveIntent !== null && moveIntent.moveId === moveId) {
     moveIntent.status = status;
     moveIntent.endedAt = ts;
-    recordMove(moveIntent);
+    recordMove(seat, moveIntent);
     return;
   }
+  const earlyVerdicts = seat.earlyVerdicts;
   earlyVerdicts.set(moveId, { status, ts });
   for (const key of earlyVerdicts.keys()) {
     if (earlyVerdicts.size <= EARLY_VERDICT_MAX) break;
@@ -283,7 +348,8 @@ function settleMoveIntent(moveId: number, status: string, ts: number): void {
 }
 
 /** The `move_to` body the SDK is about to POST, as a fresh intent. Null for anything else. */
-function noteMoveDispatch(body: unknown): MoveIntentNote | null {
+function noteMoveDispatch(seat: Seat, body: unknown): MoveIntentNote | null {
+  const client = seat.client;
   if (typeof body !== "object" || body === null) return null;
   const b = body as Record<string, unknown>;
   if (b["action"] !== "move_to") return null;
@@ -306,7 +372,7 @@ function noteMoveDispatch(body: unknown): MoveIntentNote | null {
     ts: Date.now(),
     endedAt: null,
   };
-  moveIntent = note;
+  seat.moveIntent = note;
   moveRecord.set(note, { evalId: evalContext.getStore()?.evalId ?? null, guid: guid ?? null });
   return note;
 }
@@ -338,8 +404,6 @@ interface PendingBatch {
   actions: ActionNote[];
   dropped: Record<string, number>;
 }
-const actionBatches = new Map<number | null, PendingBatch>();
-
 function clipText(s: string, max: number): string {
   return s.length <= max ? s : `${s.slice(0, max - 1)}…(+${s.length - max + 1})`;
 }
@@ -355,7 +419,7 @@ function actionArgs(body: Record<string, unknown>): Record<string, unknown> | un
 }
 
 /** A guid's name as the cache holds it: the unit in view, else a name query's answer. */
-function unitName(guid: string): string | undefined {
+function unitName(client: WrathClient, guid: string): string | undefined {
   return client.state.units().find((u) => u.guid === guid)?.name ?? client.state.nameOf(guid);
 }
 
@@ -364,13 +428,13 @@ function unitName(guid: string): string | undefined {
  * changes anything (a destroyed item has no slot to read afterwards). Only
  * what the session already observed; never a lookup of its own.
  */
-function actionNames(body: Record<string, unknown>): ActionNote["names"] {
+function actionNames(client: WrathClient, body: Record<string, unknown>): ActionNote["names"] {
   const names: NonNullable<ActionNote["names"]> = {};
   try {
     const state = client.state;
     const guid = typeof body["targetGuid"] === "string" ? body["targetGuid"] : body["guid"];
     if (typeof guid === "string") {
-      const n = unitName(guid);
+      const n = unitName(client, guid);
       if (n !== undefined) names.target = n;
     }
     if (typeof body["spellId"] === "number") {
@@ -401,13 +465,13 @@ function actionNames(body: Record<string, unknown>): ActionNote["names"] {
 }
 
 /** Start a note for an action about to be sent, in the dispatching snippet's context. */
-function beginAction(body: Record<string, unknown>): { note: ActionNote; evalId: number | null } {
+function beginAction(seat: Seat, body: Record<string, unknown>): { note: ActionNote; evalId: number | null } {
   const evalId = evalContext.getStore()?.evalId ?? null;
   const action = String(body["action"]);
   const note: ActionNote = { ts: Date.now(), action, status: 0, ms: 0 };
   const args = actionArgs(body);
   if (args !== undefined) note.args = args;
-  const names = actionNames(body);
+  const names = actionNames(seat.client, body);
   if (names !== undefined) note.names = names;
   if (evalId === null && CLIENT_PARITY_ACTIONS.has(action)) note.auto = true;
   return { note, evalId };
@@ -415,6 +479,7 @@ function beginAction(body: Record<string, unknown>): { note: ActionNote; evalId:
 
 /** The module's answer arrived (or never will): fold or append the finished note. */
 function finishAction(
+  seat: Seat,
   pending: { note: ActionNote; evalId: number | null },
   status: number,
   answer: unknown,
@@ -430,10 +495,10 @@ function finishAction(
   }
   if (typeof a["hint"] === "string") note.hint = clipText(a["hint"], ACTION_TEXT_MAX_CHARS);
   if (typeof a["moveId"] === "number") note.moveId = a["moveId"];
-  let batch = actionBatches.get(evalId);
+  let batch = seat.actionBatches.get(evalId);
   if (batch === undefined) {
     batch = { evalId, actions: [], dropped: {} };
-    actionBatches.set(evalId, batch);
+    seat.actionBatches.set(evalId, batch);
   }
   const last = batch.actions.at(-1);
   if (last !== undefined && sameAction(last, note)) {
@@ -469,16 +534,19 @@ function sameAction(a: ActionNote, b: ActionNote): boolean {
  * snippet had already returned is a background routine's.
  */
 function flushActions(finishing?: number): void {
-  if (actionBatches.size === 0) return;
   const batches: ActionBatch[] = [];
-  for (const b of actionBatches.values()) {
-    if (b.actions.length === 0 && Object.keys(b.dropped).length === 0) continue;
-    const out: ActionBatch = { evalId: b.evalId, actions: b.actions };
-    if (b.evalId !== null && b.evalId !== finishing && !evalControllers.has(b.evalId)) out.routine = true;
-    if (Object.keys(b.dropped).length > 0) out.dropped = b.dropped;
-    batches.push(out);
+  for (const seat of allSeats()) {
+    if (seat.actionBatches.size === 0) continue;
+    for (const b of seat.actionBatches.values()) {
+      if (b.actions.length === 0 && Object.keys(b.dropped).length === 0) continue;
+      const out: ActionBatch = { evalId: b.evalId, actions: b.actions };
+      if (MULTI) out.seat = seat.name;
+      if (b.evalId !== null && b.evalId !== finishing && !evalControllers.has(b.evalId)) out.routine = true;
+      if (Object.keys(b.dropped).length > 0) out.dropped = b.dropped;
+      batches.push(out);
+    }
+    seat.actionBatches.clear();
   }
-  actionBatches.clear();
   if (batches.length > 0) send({ t: "actions", batches });
 }
 
@@ -504,15 +572,15 @@ function isActionPost(input: FetchInput, init?: RequestInit): boolean {
  * is the client's own path and a snippet's `globalThis.fetch` — which refuses
  * every host — is not read here.
  */
-const watchedFetch = ((input: FetchInput, init?: RequestInit): Promise<Response> => {
+const watchedFetchFor = (seat: Seat): typeof fetch => ((input: FetchInput, init?: RequestInit): Promise<Response> => {
   let note: MoveIntentNote | null = null;
   let logged: { note: ActionNote; evalId: number | null } | null = null;
   try {
     if (typeof init?.body === "string") {
       const body: unknown = JSON.parse(init.body);
-      note = noteMoveDispatch(body);
+      note = noteMoveDispatch(seat, body);
       if (body !== null && typeof body === "object" && !Array.isArray(body) && isActionPost(input, init)) {
-        logged = beginAction(body as Record<string, unknown>);
+        logged = beginAction(seat, body as Record<string, unknown>);
       }
     }
   } catch {
@@ -529,7 +597,7 @@ const watchedFetch = ((input: FetchInput, init?: RequestInit): Promise<Response>
       try {
         text = await r.text();
       } catch (err) {
-        if (logged !== null) finishAction(logged, r.status, null, `body: ${String(err)}`);
+        if (logged !== null) finishAction(seat, logged, r.status, null, `body: ${String(err)}`);
         throw err;
       }
       let j: unknown = null;
@@ -538,27 +606,27 @@ const watchedFetch = ((input: FetchInput, init?: RequestInit): Promise<Response>
       } catch {
         // The SDK reports a non-JSON body itself; the log keeps the status.
       }
-      if (logged !== null) finishAction(logged, r.status, j);
+      if (logged !== null) finishAction(seat, logged, r.status, j);
       // Learn the module's move id from the ack.
       const id = (j as { moveId?: unknown } | null)?.moveId;
-      if (note !== null && typeof id === "number" && moveIntent === note) {
+      if (note !== null && typeof id === "number" && seat.moveIntent === note) {
         note.moveId = id;
-        const early = earlyVerdicts.get(id);
+        const early = seat.earlyVerdicts.get(id);
         if (early !== undefined) {
-          earlyVerdicts.delete(id);
+          seat.earlyVerdicts.delete(id);
           note.status = early.status;
           note.endedAt = early.ts;
         }
       }
       // The dispatch, once the module has acknowledged it (with its verdict
       // already, when that overtook the ack).
-      if (note !== null && r.status >= 200 && r.status < 300) recordMove(note);
+      if (note !== null && r.status >= 200 && r.status < 300) recordMove(seat, note);
       return new Response(text, { status: r.status, statusText: r.statusText, headers: r.headers });
     },
     (err: unknown) => {
       // Nothing was dispatched, so there is no intention to draw.
-      if (note !== null && moveIntent === note) moveIntent = null;
-      if (logged !== null) finishAction(logged, 0, null, `transport: ${String(err)}`);
+      if (note !== null && seat.moveIntent === note) seat.moveIntent = null;
+      if (logged !== null) finishAction(seat, logged, 0, null, `transport: ${String(err)}`);
       throw err;
     },
   );
@@ -631,6 +699,16 @@ function drainLogs(): LogEntry[] {
  * healer fought its own walker for six minutes).
  */
 function drainHints(current?: number): ActionHintNote[] {
+  const out: ActionHintNote[] = [];
+  // Each client tallies its own; above fan-out 1 a line says whose it is.
+  for (const seat of allSeats()) {
+    const mine = drainSeatHints(seat.client, current);
+    out.push(...(MULTI ? mine.map((h) => ({ ...h, character: seat.name })) : mine));
+  }
+  return out;
+}
+
+function drainSeatHints(client: WrathClient, current?: number): ActionHintNote[] {
   const out: ActionHintNote[] = [];
   // The current snippet's own lines, one per (action, status) as before: its
   // call sites are told apart only for an earlier snippet's code.
@@ -718,7 +796,7 @@ function callOrigin(): number | undefined {
  * is the host's id for it, which the action log groups by: a routine a snippet
  * launched shares that snippet's context, and so its id.
  */
-const evalContext = new AsyncLocalStorage<{ evalId: number; signal: AbortSignal; deadline?: number; timeoutMs?: number }>();
+const evalContext = new AsyncLocalStorage<{ evalId: number; signal: AbortSignal; deadline?: number; timeoutMs?: number; seat?: Seat }>();
 const currentSignal = (): AbortSignal | undefined => evalContext.getStore()?.signal;
 /** When the host will abandon the snippet we are inside, if it said. */
 const currentDeadline = (): number | undefined => evalContext.getStore()?.deadline;
@@ -747,33 +825,49 @@ let abandonedEval: number | undefined;
 /** Live controllers by eval id, for the host's `abort`. */
 const evalControllers = new Map<number, AbortController>();
 
-const client = new WrathClient({
-  baseUrl: MODULE_URL,
-  token: TOKEN,
-  secret: SECRET,
-  account: ACCOUNT,
-  subscribeEvents: false,
-  signal: currentSignal,
-  deadline: currentDeadline,
-  // The eval whose code is calling, and the routine in it that called: a
-  // routine keeps the id of the snippet that launched it, so its harness
-  // lines can say whose they are (`drainHints`, `callOrigin`).
-  origin: callOrigin,
-  fetchImpl: watchedFetch,
-  // The real WebSocket, captured before `globalThis.WebSocket` was replaced
-  // with the refusing guard: this is the ambient client's own event stream,
-  // the one module connection a snippet cannot open for itself.
-  events: { webSocketImpl: RealWebSocket },
-});
+/** A seat and its client, on the credentials given: the environment's at fan-out 1, a `seat_open`'s above it. */
+function makeSeat(o: { name: string; token: string; secret: string | undefined; account: string | undefined }): Seat {
+  const seat = {
+    name: o.name,
+    moveIntent: null,
+    earlyVerdicts: new Map(),
+    actionBatches: new Map(),
+    recorder: null,
+    extensions: [],
+    clientCacheForwarded: false,
+  } as Omit<Seat, "client"> as Seat;
+  const client = new WrathClient({
+    baseUrl: MODULE_URL,
+    token: o.token,
+    secret: o.secret,
+    account: o.account,
+    subscribeEvents: false,
+    signal: currentSignal,
+    deadline: currentDeadline,
+    // The eval whose code is calling, and the routine in it that called: a
+    // routine keeps the id of the snippet that launched it, so its harness
+    // lines can say whose they are (`drainHints`, `callOrigin`).
+    origin: callOrigin,
+    fetchImpl: watchedFetchFor(seat),
+    // The real WebSocket, captured before `globalThis.WebSocket` was replaced
+    // with the refusing guard: this is the ambient client's own event stream,
+    // the one module connection a snippet cannot open for itself.
+    events: { webSocketImpl: RealWebSocket },
+  });
+  seat.client = client;
 
-// The module's verdict on a move, whoever issued it: an awaited `moveTo`
-// resolves from the same event, and this sees the ones nothing awaited.
-client.events.on("WB_MOVE_RESULT", (e) => {
-  const d = e.data as { moveId?: unknown; status?: unknown } | null;
-  if (typeof d?.moveId === "number" && typeof d.status === "string") {
-    settleMoveIntent(d.moveId, d.status, typeof e.ts === "number" ? e.ts : Date.now());
-  }
-});
+  // The module's verdict on a move, whoever issued it: an awaited `moveTo`
+  // resolves from the same event, and this sees the ones nothing awaited.
+  client.events.on("WB_MOVE_RESULT", (e) => {
+    const d = e.data as { moveId?: unknown; status?: unknown } | null;
+    if (typeof d?.moveId === "number" && typeof d.status === "string") {
+      settleMoveIntent(seat, d.moveId, d.status, typeof e.ts === "number" ? e.ts : Date.now());
+    }
+  });
+  return seat;
+}
+
+if (!MULTI) primary = makeSeat({ name: "", token: TOKEN, secret: SECRET, account: ACCOUNT });
 
 let hostcallId = 0;
 const hostcallPending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
@@ -1052,7 +1146,7 @@ function withSleepAbandon(reason: unknown, note: string): Error {
 const UNIT_FLAG_IN_COMBAT = 0x0008_0000;
 
 /** The combat bit on our own `unitFlags`; false while no block has carried the field. */
-function selfInCombat(): boolean {
+function selfInCombat(client: WrathClient): boolean {
   const flags = client.state.self.fields.get("unitFlags")?.value;
   return typeof flags === "number" && (flags & UNIT_FLAG_IN_COMBAT) !== 0;
 }
@@ -1082,13 +1176,16 @@ function sleep(ms: number, options?: { wake?: boolean }): Promise<SleepReason> {
     // Read as the sleep begins: "the time the snippet had left" is the time it
     // had left when this sleep started, not when it was abandoned.
     const overrun = sleepOverrunNote(ms);
-    const selfDead = (): boolean => client.state.self.health?.value.current === 0;
+    // Whose world wakes it: the snippet's character. With none (fan-out above
+    // 1, a snippet run for no character) there is no "us", and it is a timer.
+    const client = currentSeat()?.client;
+    const selfDead = (): boolean => client?.state.self.health?.value.current === 0;
     // Already dead when the sleep started: this snippet is handling that death,
     // so only a *later* one wakes it.
     let deadAtLastCheck = selfDead();
     // Armed for a spell-hit wake only while out of combat (see above): set as
     // the sleep begins, re-armed by the bit seen clear, never disarmed.
-    let spellWakeArmed = !selfInCombat();
+    let spellWakeArmed = client === undefined || !selfInCombat(client);
     let offAttack: (() => void) | undefined;
     let offSpellHit: (() => void) | undefined;
     let offChat: (() => void) | undefined;
@@ -1116,7 +1213,7 @@ function sleep(ms: number, options?: { wake?: boolean }): Promise<SleepReason> {
     // Registered after the client's own state fold (`onAny` handlers run in
     // registration order and the cache is the first one), so all of these see
     // a state cache that already has this event in it.
-    if (wakeOpt === false) return;
+    if (wakeOpt === false || client === undefined) return;
     offChat = client.events.on("SMSG_MESSAGECHAT", (e) => {
       const d = e.data as { type?: unknown; senderGuid?: unknown };
       const me = client.state.self.guid;
@@ -1136,7 +1233,7 @@ function sleep(ms: number, options?: { wake?: boolean }): Promise<SleepReason> {
       }
     });
     offAny = client.events.onAny(() => {
-      if (!selfInCombat()) spellWakeArmed = true;
+      if (!selfInCombat(client)) spellWakeArmed = true;
       const dead = selfDead();
       if (!dead) {
         // Alive again (a reclaim, a resurrect): a later death is a new one.
@@ -1158,7 +1255,7 @@ function sleep(ms: number, options?: { wake?: boolean }): Promise<SleepReason> {
  * `connect()` returning and the cache filling as frames arrive. The snippet's
  * own abort ends the wait too.
  */
-async function awaitReattachReplay(): Promise<void> {
+async function awaitReattachReplay(client: WrathClient): Promise<void> {
   const signal = currentSignal();
   const live = (predicate: (e: StreamEvent) => boolean, timeout: number): Promise<StreamEvent | undefined> =>
     client.events.waitFor(predicate, { timeout, includeBuffered: false, signal }).catch(() => undefined);
@@ -1166,6 +1263,16 @@ async function awaitReattachReplay(): Promise<void> {
   if (state === undefined) return;
   if ((state.data as { replay?: unknown } | null)?.replay !== true) return;
   await live((e) => e.opcode === "WB_REPLAY_DONE" && e.seq > state.seq, REATTACH_REPLAY_WAIT_MS);
+}
+
+async function connectSeat(client: WrathClient): Promise<void> {
+  if (client.events.connected) return;
+  // An explicit connect() onto a session already in world is a consumer
+  // that holds nothing (a restarted child, a resumed run, a snippet that
+  // closed the stream), so it asks for the replay; the stream's own
+  // reconnects after a drop never do.
+  await client.events.connect({ replay: true });
+  await awaitReattachReplay(client);
 }
 
 const ambient: Record<string, unknown> = {
@@ -1191,13 +1298,9 @@ const ambient: Record<string, unknown> = {
    * the refusal is the honest answer, and it is the caller's to read.
    */
   connect: async (): Promise<void> => {
-    if (client.events.connected) return;
-    // An explicit connect() onto a session already in world is a consumer
-    // that holds nothing (a restarted child, a resumed run, a snippet that
-    // closed the stream), so it asks for the replay; the stream's own
-    // reconnects after a drop never do.
-    await client.events.connect({ replay: true });
-    await awaitReattachReplay();
+    // The snippet's character; with none (fan-out above 1), every seat's.
+    const seat = currentSeat();
+    await Promise.all((seat !== null ? [seat] : allSeats()).map((s) => connectSeat(s.client)));
   },
   sleep,
   scratchpad: {
@@ -1228,9 +1331,47 @@ Object.defineProperty(globalThis, "signal", {
 // reopens the stream under it. The getters are not the credential boundary (the
 // `#secret` field and the net guard are); they keep the session reachable.
 for (const name of ["sdk", "state", "events"] as const) {
-  const get = name === "sdk" ? (): unknown => client : name === "state" ? (): unknown => client.state : (): unknown => client.events;
+  const of = (client: WrathClient): unknown => (name === "sdk" ? client : name === "state" ? client.state : client.events);
+  const get = (): unknown => {
+    const seat = currentSeat();
+    return seat !== null ? of(seat.client) : noCharacter(name);
+  };
   Object.defineProperty(globalThis, name, { get, set: () => {}, configurable: true, enumerable: true });
 }
+
+/**
+ * What `sdk`, `state` and `events` are in a snippet run for no character
+ * (fan-out above 1 only): a stand-in that says so the first time it is used.
+ * An object rather than a throwing getter or `undefined`, so `typeof sdk` and
+ * a truthiness check still read as they do with a client, and the error names
+ * the cause rather than "undefined is not an object". Awaiting or printing it
+ * touches only symbols and `then`, which answer undefined.
+ */
+export const NO_CHARACTER_SELECTED =
+  "no character selected: this snippet was run without `character`. Pass `character` to run_snippet, or use chars[name].sdk, chars[name].state and chars[name].events.";
+const noCharacterStandIns = new Map<string, unknown>();
+function noCharacter(name: string): unknown {
+  let p = noCharacterStandIns.get(name);
+  if (p === undefined) {
+    p = new Proxy(Object.freeze({}), {
+      get: (_t, key) => {
+        if (typeof key === "symbol" || key === "then" || key === "toJSON") return undefined;
+        throw new Error(`${name}.${key}: ${NO_CHARACTER_SELECTED}`);
+      },
+    });
+    noCharacterStandIns.set(name, p);
+  }
+  return p;
+}
+
+/**
+ * `chars`, at fan-out above 1: every logged-in character by name, each with
+ * its own `sdk`, `state` and `events`. One object for the process's life,
+ * gaining and losing keys as the host opens and closes seats; a getter with a
+ * swallowing setter, like `sdk`. Not defined at fan-out 1.
+ */
+const chars: Record<string, { readonly name: string; readonly sdk: WrathClient; readonly state: WrathClient["state"]; readonly events: WrathClient["events"] }> = Object.create(null) as never;
+if (MULTI) Object.defineProperty(globalThis, "chars", { get: () => chars, set: () => {}, configurable: true, enumerable: true });
 
 // ---------------------------------------------------------------- evaluate
 
@@ -1301,8 +1442,16 @@ export function renderError(err: unknown): string {
 // A timed-out evaluation's late result is discarded host-side (the host
 // abandons the id), so the child always reports. What it does track is the
 // eval's AbortController, so a host `abort` can fire the snippet's signal.
-async function evaluate(id: number, code: string, deadline?: number, timeoutMs?: number): Promise<void> {
+async function evaluate(id: number, code: string, deadline?: number, timeoutMs?: number, seatName?: string): Promise<void> {
   const started = Date.now();
+  // The character this snippet runs for, at fan-out above 1. The host checks
+  // the name against its roster first; one that closed in between is refused
+  // here rather than run for nobody.
+  const seat = seatName === undefined ? undefined : seats.get(seatName);
+  if (seatName !== undefined && seat === undefined) {
+    send({ t: "result", id, ok: false, error: `unknown character: ${seatName}`, logs: [], hints: [], durationMs: 0 });
+    return;
+  }
   const controller = new AbortController();
   evalControllers.set(id, controller);
   noteSnippetHead(id, code);
@@ -1325,7 +1474,7 @@ async function evaluate(id: number, code: string, deadline?: number, timeoutMs?:
     snippetBodies.set(id, body);
     if (snippetBodies.size > SNIPPET_HEADS_MAX) snippetBodies.delete(snippetBodies.keys().next().value as number);
     const run = fn;
-    const value: unknown = await evalContext.run({ evalId: id, signal: controller.signal, deadline, timeoutMs }, () =>
+    const value: unknown = await evalContext.run({ evalId: id, signal: controller.signal, deadline, timeoutMs, ...(seat !== undefined ? { seat } : {}) }, () =>
       run.call(globalThis),
     );
     // A scratchpad write the snippet did not await and the cap refused is this
@@ -1459,12 +1608,10 @@ function isHarnessAbandonment(reason: unknown): boolean {
  * installed: `onAny` listeners run in registration order and one that throws
  * stops the rest, so where this one sits is part of the child's behaviour.
  */
-let clientCacheForwarded = false;
-
-function forwardClientCache(): void {
-  if (clientCacheForwarded) return;
-  clientCacheForwarded = true;
-  client.events.onAny((event) => {
+function forwardClientCache(seat: Seat): void {
+  if (seat.clientCacheForwarded) return;
+  seat.clientCacheForwarded = true;
+  seat.client.events.onAny((event) => {
     if (!keepsAnswer(event)) return;
     send({
       t: "client_cache",
@@ -1482,7 +1629,7 @@ function forwardClientCache(): void {
  * these frames are new to. The cache's own stream counters are put back as
  * they were, because the HUD prints them and no event has arrived.
  */
-function seedClientCache(frames: readonly unknown[]): void {
+function seedClientCache(client: WrathClient, frames: readonly unknown[]): void {
   const state = client.state;
   const { eventCount, lastSeq, lastTs } = state;
   for (const raw of frames) {
@@ -1534,22 +1681,35 @@ export interface SandboxChildApi {
 
 export type SandboxChildExtensionFactory = (api: SandboxChildApi) => SandboxChildExtension;
 
-const extensions: SandboxChildExtension[] = [];
+/** The harness's extensions, as `startSandboxChild` was handed them: installed on every seat (`installSeat`). */
+let extensionFactories: readonly SandboxChildExtensionFactory[] = [];
 
 /**
- * The session recorder (`record/recorder.ts`): the stack's own watch on the
- * session, built when the host asked for a record (`WRATHBENCH_RECORD`) and
- * drained by its record tick (`record_drain`). Record only: it reads the
+ * Give a seat what watches its client, in the order the listeners must run:
+ * the session recorder first (`record/recorder.ts`: the stack's own watch on
+ * the session, built when the host asked for a record (`WRATHBENCH_RECORD`)
+ * and drained by its record tick (`record_drain`); record only, it reads the
  * client's cache and broadcast subscriptions, sends nothing, and is not
- * reachable from a snippet.
+ * reachable from a snippet), so its listeners sit right after the client's
+ * own state fold and ahead of any extension's; then each extension; then the
+ * client-cache forward, unless an extension placed it earlier.
  */
-let recorder: SessionRecorder | null = null;
+function installSeat(seat: Seat): void {
+  if (RECORD) {
+    seat.recorder = new SessionRecorder(seat.client);
+    seat.recorder.start();
+  }
+  for (const factory of extensionFactories) {
+    seat.extensions.push(factory({ client: seat.client, summarize: (e) => eventSummary(seat, e), forwardClientCache: () => forwardClientCache(seat) }));
+  }
+  forwardClientCache(seat);
+}
 
 /**
  * An event as every reader of the buffer gets it: JSON-safe and depth-limited,
  * plus what each extension resolved for it as it arrived.
  */
-function eventSummary(e: StreamEvent): EventSummary {
+function eventSummary(seat: Seat, e: StreamEvent): EventSummary {
   const summary: EventSummary = {
     seq: e.seq,
     ts: e.ts,
@@ -1558,15 +1718,15 @@ function eventSummary(e: StreamEvent): EventSummary {
     schemaError:
       "schemaError" in e && e.schemaError !== undefined ? String(e.schemaError) : undefined,
   };
-  for (const ext of extensions) {
+  for (const ext of seat.extensions) {
     const extra = ext.summarize?.(e);
     if (extra !== undefined) Object.assign(summary, extra);
   }
   return summary;
 }
 
-function recentEvents(limit: number): EventSummary[] {
-  return client.events.recent(limit).map(eventSummary);
+function recentEvents(seat: Seat, limit: number): EventSummary[] {
+  return seat.client.events.recent(limit).map((e) => eventSummary(seat, e));
 }
 
 /**
@@ -1575,9 +1735,11 @@ function recentEvents(limit: number): EventSummary[] {
  * then two fields that are this session's own rather than the world's. All
  * pure reads over what the cache already holds — no new observation.
  */
-function stateSnapshot(): unknown {
+function stateSnapshot(seat: Seat): unknown {
+  const client = seat.client;
+  const moveIntent = seat.moveIntent;
   const snap = toJsonSafe(client.state.snapshot(), 6) as Record<string, unknown>;
-  for (const ext of extensions) ext.snapshot?.(snap);
+  for (const ext of seat.extensions) ext.snapshot?.(snap);
   // Whether this child's own event stream is still open. Not an observation of
   // the world and never printed by a HUD that reads named fields: the cache
   // above is a pure local read, so a stream that stopped folding into it
@@ -1592,23 +1754,114 @@ function stateSnapshot(): unknown {
 }
 
 /** An rpc by name: the core's three, else an extension's, else the snapshot. */
-function answerRpc(method: string, params: { limit?: number }): unknown {
-  if (method === "recent_events") return recentEvents(params.limit ?? 50);
+function answerRpc(method: string, params: { limit?: number }, seatName?: string): unknown {
   if (method === "action_hints") return drainHints();
-  if (method === "record_drain") return recorder === null ? null : recorder.drain();
+  if (MULTI && seatName === undefined) return answerForEverySeat(method, params);
+  const seat = seatName === undefined ? primary : seats.get(seatName);
+  if (seat === null || seat === undefined) throw new Error(`unknown character: ${seatName ?? ""}`);
+  return answerSeatRpc(seat, method, params);
+}
+
+function answerSeatRpc(seat: Seat, method: string, params: { limit?: number }): unknown {
+  if (method === "recent_events") return recentEvents(seat, params.limit ?? 50);
+  if (method === "record_drain") return seat.recorder === null ? null : seat.recorder.drain();
   if (method !== "state_summary") {
-    for (const ext of extensions) {
+    for (const ext of seat.extensions) {
       const fn = ext.rpc?.[method];
       if (fn !== undefined) return fn(params);
     }
   }
-  return stateSnapshot();
+  return stateSnapshot(seat);
+}
+
+/**
+ * Fan-out above 1, an rpc that names no character: `<method>_all` answers
+ * `<method>` for every seat, keyed by character name, in the order they were
+ * opened. Any other name has nobody to answer it.
+ */
+function answerForEverySeat(method: string, params: { limit?: number }): unknown {
+  if (!method.endsWith("_all")) throw new Error(`${method} needs a character at fan-out above 1`);
+  const each = method.slice(0, -"_all".length);
+  const out: Record<string, unknown> = {};
+  for (const seat of seats.values()) out[seat.name] = answerSeatRpc(seat, each, params);
+  return out;
+}
+
+// ------------------------------------------------------------------ fan-out
+
+/**
+ * Open a seat (`seat_open`): a client on the token and lease secret the host
+ * took for this character, its stream opened before the create so the login
+ * burst folds into its cache, then the create itself, which logs an existing
+ * character in and makes a new one only when the account has none by that
+ * name. A reattach asks for the replay first, because the session may already
+ * be in the world, and the create that follows is then the module's
+ * idempotent one. A seat that does not reach the world is dropped whole.
+ */
+async function openSeat(msg: Extract<HostToChild, { t: "seat_open" }>): Promise<SeatOpened> {
+  if (!MULTI) throw new Error("this sandbox holds one character");
+  if (seats.size + opening.size >= MAX_CHARACTERS) throw new Error(`${seats.size + opening.size} of ${MAX_CHARACTERS} characters are logged in`);
+  const seat = makeSeat({ name: msg.character, token: msg.token, secret: msg.secret, account: msg.account });
+  installSeat(seat);
+  seedClientCache(seat.client, msg.frames);
+  const mine = { abandoned: false };
+  opening.set(msg.character, mine);
+  try {
+    if (msg.reattach) await connectSeat(seat.client);
+    else await seat.client.events.connect();
+    const res = await seat.client.createSession({ character: msg.character, ...(msg.create ?? {}) } as Parameters<WrathClient["createSession"]>[0]);
+    // The host gave up waiting and holds no seat for this: keeping one here would hold the name for good.
+    if (mine.abandoned) throw new Error(`${res.character} reached the world after the host stopped waiting`);
+    if (seats.has(res.character)) throw new Error(`${res.character} is already logged in`);
+    seat.name = res.character;
+    seats.set(seat.name, seat);
+    chars[seat.name] = Object.freeze({ name: seat.name, sdk: seat.client, state: seat.client.state, events: seat.client.events });
+    return { character: res.character, guid: String(res.guid) };
+  } catch (err) {
+    disposeSeat(seat);
+    throw err;
+  } finally {
+    if (opening.get(msg.character) === mine) opening.delete(msg.character);
+  }
+}
+
+/** The opens in flight, by the name they were asked for, so a host that stopped waiting for one can say so (`closeSeat`). */
+const opening = new Map<string, { abandoned: boolean }>();
+
+function disposeSeat(seat: Seat): void {
+  seat.recorder?.stop();
+  try {
+    seat.client.close();
+  } catch {
+    // closing anyway
+  }
+}
+
+/** Close a seat (`seat_close`): log its character out when asked, hand back the last of its record, drop its client. */
+async function closeSeat(name: string, logout: boolean): Promise<SeatClosed> {
+  const pending = opening.get(name);
+  if (pending !== undefined) pending.abandoned = true;
+  const seat = seats.get(name);
+  if (seat === undefined) return { drain: null };
+  if (logout) {
+    try {
+      await seat.client.deleteSession();
+    } catch {
+      // The host logs it out with the port secret as well; a refusal here costs nothing.
+    }
+  }
+  seats.delete(name);
+  delete chars[name];
+  flushActions();
+  const drain = seat.recorder === null ? null : seat.recorder.drain();
+  disposeSeat(seat);
+  return { drain };
 }
 
 function handle(msg: HostToChild | HostcallResult): void {
   switch (msg.t) {
     case "eval":
-      void evaluate(msg.id, msg.code, msg.deadline, msg.timeoutMs);
+      void evaluate(msg.id, msg.code, msg.deadline, msg.timeoutMs, msg.seat);
       return;
     case "abort":
       abortEval(msg.id);
@@ -1640,7 +1893,7 @@ function handle(msg: HostToChild | HostcallResult): void {
       return;
     case "rpc": {
       try {
-        const value = answerRpc(msg.method, msg.params);
+        const value = answerRpc(msg.method, msg.params, msg.seat);
         send({ t: "rpc_result", id: msg.id, ok: true, value });
       } catch (err) {
         send({ t: "rpc_result", id: msg.id, ok: false, error: String(err) });
@@ -1648,7 +1901,19 @@ function handle(msg: HostToChild | HostcallResult): void {
       return;
     }
     case "client_cache_seed":
-      seedClientCache(msg.frames);
+      if (primary !== null) seedClientCache(primary.client, msg.frames);
+      return;
+    case "seat_open":
+      openSeat(msg).then(
+        (value) => send({ t: "rpc_result", id: msg.id, ok: true, value }),
+        (err: unknown) => send({ t: "rpc_result", id: msg.id, ok: false, error: err instanceof Error ? err.message : String(err) }),
+      );
+      return;
+    case "seat_close":
+      closeSeat(msg.seat, msg.logout).then(
+        (value) => send({ t: "rpc_result", id: msg.id, ok: true, value }),
+        (err: unknown) => send({ t: "rpc_result", id: msg.id, ok: false, error: err instanceof Error ? err.message : String(err) }),
+      );
       return;
     case "hostcall_result": {
       const pending = hostcallPending.get(msg.id);
@@ -1661,10 +1926,12 @@ function handle(msg: HostToChild | HostcallResult): void {
     }
     case "shutdown":
       flushActions();
-      try {
-        client.close();
-      } catch {
-        // closing anyway
+      for (const seat of allSeats()) {
+        try {
+          seat.client.close();
+        } catch {
+          // closing anyway
+        }
       }
       process.exit(0);
   }
@@ -1823,13 +2090,8 @@ process.on("uncaughtException", (err) => {
  * bare stack (`entry.ts`). The host sends no eval, rpc or seed before ready.
  */
 export function startSandboxChild(factories: readonly SandboxChildExtensionFactory[] = []): void {
-  // The session recorder first, so its listeners sit right after the client's
-  // own state fold and ahead of any extension's.
-  if (RECORD) {
-    recorder = new SessionRecorder(client);
-    recorder.start();
-  }
-  for (const factory of factories) extensions.push(factory({ client, summarize: eventSummary, forwardClientCache }));
-  forwardClientCache();
+  extensionFactories = factories;
+  // Fan-out 1: the one seat, now. Above it each seat is installed as it is opened.
+  if (primary !== null) installSeat(primary);
   send({ t: "ready" });
 }
