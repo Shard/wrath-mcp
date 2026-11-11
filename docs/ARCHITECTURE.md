@@ -6,7 +6,7 @@
 flowchart TB
     agent["Agent<br/>(any MCP client)"]
     harness["Harness, optional<br/>(e.g. WrathBench)"]
-    reader["Readers<br/>(a viewer, a scorer, a collector)"]
+    reader["Readers<br/>(wrath-inspector, a harness's<br/>viewer, scorer, collector)"]
 
     subgraph mcp["mcp/"]
         server["MCP server + core tools<br/>holds the port secret"]
@@ -59,13 +59,15 @@ flowchart TB
 ```
 
 Thin arrows carry calls and actions, thick arrows carry observations and what
-is recorded of them. The stack is three pieces, a client-equivalent agent
-surface over a stock AzerothCore: packets, not pixels. It knows what a client
+is recorded of them. The stack is a client-equivalent agent surface over a
+stock AzerothCore, packets not pixels, in three pieces, and a reader of what
+it records. It knows what a client
 knows and does what a client does, and serves it to any MCP-capable agent.
 
 It records what its own sessions did and knows nothing of what drove them. The
 session record (the trace and character sheet, game events, tool calls and
-their results) is the stack's: `mcp/` writes it to the session store. Episodes,
+their results) is the stack's: `mcp/` writes it to the session store and
+`inspector/` reads it. Episodes,
 scores, model trajectories (requests, responses, tokens, cost, turns,
 compaction) and anything that compares one run with another are a harness's,
 plugged in through its hooks. The stack never reads them, and no record of its
@@ -75,6 +77,8 @@ own carries a harness's ids or configuration.
   client would send and serves the packets a client would receive.
 - `sdk/` is the typed client over that wire.
 - `mcp/` is the agent surface over the SDK.
+- `inspector/` is wrath-inspector, a read-only server and views over a
+  session store. It is coupled to the record's format and to nothing else.
 
 What an agent may observe and do is `docs/CONTRACTS.md`; the wire is
 `module/PROTOCOL.md`. Together they are the stack's specification, and
@@ -92,11 +96,15 @@ is one such harness and the stack's first consumer.
 
 The line between the two is enforced rather than hoped for. `bun run boundary`
 (`scripts/boundary.ts`, also run by `bun test` and CI) fails when a TypeScript
-file in `sdk/` or `mcp/` imports anything but its own package, Bun and Node
-built-ins and the dependencies its `package.json` declares, at an exported
-subpath, or when a module include names a path out of `module/`. `sdk/` declares
-no stack dependency, so it never imports `mcp/`; `mcp/` reaches the SDK through
-`@wrathbench/sdk` alone. The other half, that a consumer reaches the stack only
+file in `sdk/`, `mcp/` or `inspector/` imports anything but its own package,
+Bun and Node built-ins and the dependencies its `package.json` declares, at an
+exported subpath, or when a module include names a path out of `module/`.
+`sdk/` declares no stack dependency, so it never imports `mcp/`; `mcp/`
+reaches the SDK through `@wrathbench/sdk` alone. The inspector takes
+`@wrathbench/mcp/record/read` (the store reader and the format's types) and
+nothing else of the stack, its browser-side files import no runtime built-in
+and nothing of its server half, and the UI's dependencies (Solid, Vite) are
+its alone: `sdk/` and `mcp/` never declare them. The other half, that a consumer reaches the stack only
 through package names and exported entry points, is each consumer's to check.
 
 A harness plugs in through hooks, each a narrow interface:
@@ -132,11 +140,19 @@ A harness plugs in through hooks, each a narrow interface:
   place. `SessionWriterOptions.onRows` hands it the rows as they were written,
   for a harness that also acts on them; `own` tells the write gate which
   player guids are the deployment's own sessions.
+- **Reading it back** (`inspector/`). The inspector reads through one
+  interface, `SessionSource`: list sessions, open one, read `session.json`
+  and `live.json`, read a stream's segments for a range, tail a stream, each
+  scoped to who is asking (the operator sees every session, a user their
+  own). `storeSource(dir)` is the store's; a harness that lays its records out
+  its own way implements the interface over its layout and mounts
+  `createInspectorApi` and the views (`@wrathbench/inspector/views`) in its
+  own pages. It never calls the module and never holds the port secret.
 
 ## Versions
 
 The SDK has its own version, `SDK_VERSION` (`sdk/src/version.ts`, the same
-string as `sdk/package.json`), and `@wrathbench/mcp` carries the same one: the
+string as `sdk/package.json`), and `@wrathbench/mcp` and `@wrathbench/inspector` carry the same one: the
 stack releases as one, under semantic versioning (`CONTRIBUTING.md`,
 "Versioning"; `CHANGELOG.md`). `sdk/src/index.ts` is the SDK's whole public surface.
 

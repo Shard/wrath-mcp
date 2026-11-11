@@ -17,3 +17,9 @@ test("the wire's session.json, live.json and stream names are the format's", () 
   const streams: Same<StreamName, StreamNameWire> = true;
   expect([session, live, streams]).toBeDefined();
 });
+
+test("the inspector releases with the stack: its version is the SDK's and the MCP package's", async () => {
+  const version = async (pkg: string): Promise<string> => ((await Bun.file(new URL(`../../${pkg}/package.json`, import.meta.url)).json()) as { version: string }).version;
+  expect(await version("inspector")).toBe(await version("sdk"));
+  expect(await version("inspector")).toBe(await version("mcp"));
+});

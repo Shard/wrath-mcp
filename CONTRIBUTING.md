@@ -70,10 +70,11 @@ number moves. A change anyone using the stack would notice also gets a line in
 
 ## Versioning
 
-The stack follows [semantic versioning](https://semver.org/). `@wrathbench/sdk`
-and `@wrathbench/mcp` release together at one version (`SDK_VERSION`,
-`sdk/package.json`, `mcp/package.json`, `MCP_PACKAGE_VERSION`), and that
-version covers the module built from the same commit:
+The stack follows [semantic versioning](https://semver.org/). `@wrathbench/sdk`,
+`@wrathbench/mcp` and `@wrathbench/inspector` release together at one version
+(`SDK_VERSION`, `sdk/package.json`, `mcp/package.json`, `MCP_PACKAGE_VERSION`,
+`inspector/package.json`), and that version covers the module built from the
+same commit:
 
 - **Major** for a breaking change: something that worked stops working, or
   works differently, without the user changing anything on their side.
