@@ -364,10 +364,18 @@ forty servers would put forty copies of the tool list in a model's context.
   with the recorders running (`mcp/test/fixtures/fanout-load.ts`, one room of
   60 units seen by every character at 200 frames a second each): at 5
   characters the loop runs under a millisecond late at p99 on a tenth of a
-  core; at 40, 8,000 frames a second, 26 ms late at p99 on four tenths of a
-  core, and a killed child has all forty seats back a quarter of a second
-  after it starts. A worker per client would isolate a blocked loop at the
-  cost of the shared runtime; these numbers do not ask for it.
+  core; at 40, 8,000 frames a second, a few milliseconds late at p99 on four
+  tenths of a core, and a killed child has all forty seats back a quarter of
+  a second after it starts. Against a real worldserver, every character
+  pacing in one starting area: at 5, about 100 events a second, 3 ms late at
+  p99 on a twentieth of a core; at 40, about 4,400 events a second (each
+  character sees the other thirty-nine), 12 ms late at p99 on a fifth of a
+  core, with every seat back between one and five seconds after a killed
+  child starts. What held the loop longest at 40 was not the fold but a
+  roll-up shipping forty whole snapshots (a quarter of a second each time),
+  which is why it reads a brief of each instead (`stateBriefs`, 2 ms).
+  A worker per client would isolate a blocked loop at the cost of the shared
+  runtime; these numbers do not ask for it.
 - **Cost grows with what differs.** With no `character`, `state_summary` is a
   roll-up (counts, where the group is, one line per exception) and
   `recent_events` one merged feed in which an event several characters

@@ -295,6 +295,12 @@ describe("a fan-out sandbox", () => {
     const summary = JSON.parse((await r.call("state_summary", { character: "Bravo" })).text) as { self: { name: string } };
     expect(summary.self.name).toBe("Bravo");
     expect((await r.call("state_summary", {})).text).toStartWith("2 of 3 characters logged in: 2 alive, 0 dead");
+    // The roll-up reads a brief of each seat: the snapshot's own fields, and only the ones a digest takes.
+    const brief = (await r.host.stateBriefs())["Bravo"]!;
+    const whole = await r.host.stateSnapshot("Bravo");
+    expect(Object.keys(brief).sort()).toEqual(["eventCount", "lastSeq", "move", "observation", "self"]);
+    expect(digestCharacter("Bravo", brief)).toEqual(digestCharacter("Bravo", whole));
+    expect(digestCharacter("Bravo", brief)).toMatchObject({ inWorld: true, connected: true, level: 3, health: { current: 80, max: 100 }, mana: true });
     expect((await r.call("list_characters", {})).text.split("\n")).toEqual(["Alfa: level 3, health 80/100", "Bravo: level 3, health 80/100", "2 of 3 characters logged in."]);
   }, 30_000);
 

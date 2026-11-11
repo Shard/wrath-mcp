@@ -1762,8 +1762,44 @@ function answerRpc(method: string, params: { limit?: number }, seatName?: string
   return answerSeatRpc(seat, method, params);
 }
 
+/**
+ * A seat's state reduced to what a roll-up of many characters reads
+ * (`fanout.ts`, `digestCharacter`): who it is, its level, bars and flags,
+ * where it stands, its stream and its last move. The same fields the full
+ * snapshot carries under the same names, and none of the rest: forty whole
+ * snapshots, each with every unit in view, held the event loop a quarter of
+ * a second in one room of forty, and a roll-up reads a dozen fields of each.
+ */
+function stateBrief(seat: Seat): unknown {
+  const state = seat.client.state;
+  const self = state.self;
+  return toJsonSafe(
+    {
+      self: {
+        guid: self.guid,
+        name: self.name,
+        level: self.level,
+        health: self.health,
+        power: self.power,
+        position: self.position,
+        zone: self.zone,
+        ghost: self.ghost,
+        inCombat: self.inCombat,
+        casting: self.casting,
+        fields: { powerType: self.fields.get("powerType") },
+      },
+      eventCount: state.eventCount,
+      lastSeq: state.lastSeq,
+      observation: { connected: seat.client.events.connected },
+      move: seat.moveIntent === null ? null : { ...seat.moveIntent },
+    },
+    5,
+  );
+}
+
 function answerSeatRpc(seat: Seat, method: string, params: { limit?: number }): unknown {
   if (method === "recent_events") return recentEvents(seat, params.limit ?? 50);
+  if (method === "state_brief") return stateBrief(seat);
   if (method === "record_drain") return seat.recorder === null ? null : seat.recorder.drain();
   if (method !== "state_summary") {
     for (const ext of seat.extensions) {

@@ -116,13 +116,14 @@ export interface FanoutSandbox {
   recentEvents(limit: number, character?: string): Promise<EventSummary[]>;
   recentEventsAll(limit: number): Promise<Record<string, EventSummary[]>>;
   stateSnapshot(character?: string): Promise<Record<string, unknown>>;
-  stateSnapshots(): Promise<Record<string, Record<string, unknown>>>;
+  /** Every seat's state reduced to what a roll-up reads, by character: the snapshot's fields `digestCharacter` takes. */
+  stateBriefs(): Promise<Record<string, Record<string, unknown>>>;
 }
 
 /** What the fan-out tools need: the roster, or a stand-in. */
 export interface FanoutSurface {
   readonly maxCharacters: number;
-  readonly sandbox: Pick<FanoutSandbox, "evalSnippet" | "recentEvents" | "recentEventsAll" | "stateSnapshot" | "stateSnapshots">;
+  readonly sandbox: Pick<FanoutSandbox, "evalSnippet" | "recentEvents" | "recentEventsAll" | "stateSnapshot" | "stateBriefs">;
   login(req: LoginRequest): Promise<LoginOutcome>;
   logout(character: string): Promise<{ ok: true } | { ok: false; error: string }>;
   views(): CharacterView[];
@@ -446,7 +447,7 @@ export class FanoutCalls implements CallRecord {
 
 // ---------------------------------------------------------------- roll-up
 
-/** One character's state, reduced to what a roll-up counts. Read off the state snapshot, nothing new observed. */
+/** One character's state, reduced to what a roll-up counts. Read off the state snapshot (or its brief), nothing new observed. */
 export interface CharacterDigest {
   character: string;
   /** In the world: its own guid has been observed. */
@@ -709,7 +710,7 @@ export function fanoutTools<C extends FanoutToolContext>(render: CoreToolRender<
   const core = coreTools(render);
   const digests = async (ctx: C): Promise<CharacterDigest[]> => {
     if (!ctx.fanout.views().some((v) => v.state === "in")) return [];
-    return Object.entries(await ctx.fanout.sandbox.stateSnapshots()).map(([name, snap]) => digestCharacter(name, snap));
+    return Object.entries(await ctx.fanout.sandbox.stateBriefs()).map(([name, snap]) => digestCharacter(name, snap));
   };
   return {
     run_snippet: {
