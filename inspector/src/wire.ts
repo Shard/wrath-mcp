@@ -35,7 +35,6 @@ export interface MoveIntentView {
   status: string | null;
 }
 
-
 /* --------------------------------------------------------------- trace --- */
 
 /*
