@@ -12,12 +12,14 @@
  * This root loads the whole package. A process that needs one helper and runs
  * no sandbox — a viewer, a supervisor, a trajectory writer — imports the leaf
  * entry point instead: `@wrathbench/mcp/module-auth`, `/redact`, `/jsonsafe`,
- * `/scratchpad`, `/client-cache` or `/paths`.
+ * `/scratchpad`, `/client-cache`, `/paths`, or `/record` for the session
+ * record's format, writer, reader and store.
  */
 
 export { MCP_BRIDGE_PATH, SANDBOX_CONFINE_PATH, SANDBOX_ENTRY_PATH } from "./paths";
 
 export {
+  RECORD_TICK_MS,
   SANDBOX_FORWARDED_ENV,
   SandboxHost,
   sandboxChildEnv,
@@ -42,6 +44,7 @@ export {
   leaseSessionSecret,
   MODULE_SECRET_ENV,
   moduleAuthHeaders,
+  moduleIdentity,
   moduleSecret,
   releaseSessionSecret,
 } from "./module-auth";
@@ -112,6 +115,7 @@ export {
 } from "./tools";
 export type {
   CallOrigin,
+  CallRecord,
   CoreToolContext,
   CoreToolName,
   CoreToolRender,

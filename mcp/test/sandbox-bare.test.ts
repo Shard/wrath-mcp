@@ -68,7 +68,7 @@ describe("the bare sandbox child", () => {
   test("the named env list is what the child actually reads", () => {
     const child = readFileSync(join(import.meta.dir, "..", "src", "sandbox", "child.ts"), "utf8");
     const read = [...child.matchAll(/process\.env\["([A-Z0-9_]+)"\]/g)].map((m) => m[1]!);
-    const provided = new Set([...SANDBOX_FORWARDED_ENV, "WRATHBENCH_MODULE_URL", "WRATHBENCH_TOKEN", "WRATHBENCH_SECRET", "WRATHBENCH_ACCOUNT"]);
+    const provided = new Set([...SANDBOX_FORWARDED_ENV, "WRATHBENCH_MODULE_URL", "WRATHBENCH_TOKEN", "WRATHBENCH_SECRET", "WRATHBENCH_ACCOUNT", "WRATHBENCH_RECORD"]);
     expect(read.length).toBeGreaterThan(0);
     expect(read.filter((k) => !provided.has(k))).toEqual([]);
   });

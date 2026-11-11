@@ -267,8 +267,19 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   one directory per session of append-only JSONL segments (`trace`, `events`,
   `calls` and a live-only `nearby` ring), `session.json`, `live.json` and a
   manifest, with a validator (`mcp/src/record/validate.ts`) and fixture
-  sessions. Unstable until v1 ships. The format only; the writer and the
-  recorders follow.
+  sessions. Unstable until v1 ships.
+- **Sessions are recorded.** `mcp/src/record/` holds the session writer, the
+  reader, the store and the recorders (the trace, the character sheet, the
+  nearby ring and the death, flight and party watchers, moved here from
+  WrathBench's runner, and a new events recorder). A `SandboxHost` given
+  `record: { writer }` runs the recorder in its child and drains it on its own
+  tick; `ToolSet.call` writes every tool call and result through
+  `CoreToolContext.record`. `bun mcp/src/main.ts` records by default into
+  `--record-dir` (a `sessions` directory beside the state directory), prunes
+  sessions closed more than `--record-retention-days` ago (default 3), and
+  `--no-record` turns it off. Players who are not sessions of the same
+  deployment are never written (`mcp/src/record/gate.ts`). New entry point
+  `@wrathbench/mcp/record`.
 
 ### Changed
 

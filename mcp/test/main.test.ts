@@ -8,8 +8,9 @@ import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { resolveSession, sessionShutdown, TOKEN_FILE } from "../src/main";
-import { logoutSession, tokenFingerprint, tokenTag } from "../src/module-auth";
+import { recordOption, resolveSession, sessionShutdown, TOKEN_FILE } from "../src/main";
+import { DEFAULT_RETENTION_MS } from "../src/record/store";
+import { logoutSession, moduleIdentity, tokenFingerprint, tokenTag } from "../src/module-auth";
 
 const dirs: string[] = [];
 function scratch(): string {
@@ -121,5 +122,51 @@ describe("sessionShutdown", () => {
     await logoutSession({ moduleUrl: "http://module:8086", token: "tok-abc", env: {}, fetch: stubFetch(calls, true) });
     expect(calls).toHaveLength(1);
     expect(calls[0]!.auth).toBeNull();
+  });
+});
+
+describe("the session record's options", () => {
+  test("on by default, in a store beside the state directory, kept three days", () => {
+    expect(recordOption([], "/var/lib/wrath/state/abcd")).toEqual({ root: "/var/lib/wrath/state/sessions", retentionMs: DEFAULT_RETENTION_MS });
+    expect(DEFAULT_RETENTION_MS).toBe(3 * 24 * 60 * 60_000);
+  });
+
+  test("--record-dir names the store, --record-retention-days the window, --no-record turns it off", () => {
+    expect(recordOption(["--record-dir", "/srv/sessions", "--record-retention-days", "0.5"], "/x/y")).toEqual({ root: "/srv/sessions", retentionMs: 12 * 60 * 60_000 });
+    expect(recordOption(["--no-record", "--record-dir", "/srv/sessions"], "/x/y")).toBeNull();
+    for (const bad of ["0", "-1", "soon"]) expect(() => recordOption(["--record-retention-days", bad], "/x/y")).toThrow();
+  });
+
+  test("the module's identity is read from /health, and a module that does not answer is null", async () => {
+    const seen: string[] = [];
+    const ok = (async (url: URL | string) => {
+      seen.push(String(url));
+      return new Response(JSON.stringify({ build: "abc123", protocol: 1, startedAtMs: 5 }));
+    }) as unknown as typeof fetch;
+    expect(await moduleIdentity("http://worldserver:8086", {}, ok)).toEqual({ build: "abc123", protocol: 1 });
+    expect(seen).toEqual(["http://worldserver:8086/health"]);
+    const down = (async () => {
+      throw new Error("refused");
+    }) as unknown as typeof fetch;
+    expect(await moduleIdentity("http://worldserver:8086", {}, down)).toBeNull();
+    const denied = (async () => new Response("{}", { status: 401 })) as unknown as typeof fetch;
+    expect(await moduleIdentity("http://worldserver:8086", {}, denied)).toBeNull();
+  });
+
+  test("a clean exit closes the record after the sandbox has stopped", async () => {
+    const order: string[] = [];
+    const shutdown = sessionShutdown({
+      sandbox: { stop: async () => void order.push("sandbox") },
+      record: { close: async () => void order.push("record") },
+      moduleUrl: "http://worldserver:8086",
+      token: "t",
+      env: {},
+      fetch: (async () => {
+        order.push("module");
+        return new Response("{}");
+      }) as unknown as typeof fetch,
+    });
+    await shutdown();
+    expect(order.slice(0, 2)).toEqual(["sandbox", "record"]);
   });
 });

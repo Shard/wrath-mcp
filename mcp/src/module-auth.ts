@@ -188,3 +188,15 @@ export async function releaseSessionSecret(o: Omit<LeaseOptions, "account">): Pr
     // the lease is one small record on the module; the next deploy clears it
   }
 }
+
+/** What the module says of itself on `GET /health`, for `session.json`; null when it does not answer. */
+export async function moduleIdentity(moduleUrl: string, headers: Record<string, string>, fetchImpl: typeof fetch = fetch): Promise<{ build: string | null; protocol: number | null } | null> {
+  try {
+    const res = await fetchImpl(new URL("/health", moduleUrl), { headers, signal: AbortSignal.timeout(3_000) });
+    if (!res.ok) return null;
+    const j = (await res.json()) as { build?: unknown; protocol?: unknown };
+    return { build: typeof j.build === "string" ? j.build : null, protocol: typeof j.protocol === "number" ? j.protocol : null };
+  } catch {
+    return null;
+  }
+}

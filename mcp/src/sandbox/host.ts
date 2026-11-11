@@ -21,6 +21,8 @@ import { overCapText, type Scratchpad } from "../scratchpad";
 import type { ClientCacheStore } from "./client-cache";
 import type { ActionHintNote, ActionNote, ChildToHost, EventSummary, EvalResultMsg, HostToChild, HostcallResult, LogEntry } from "./ipc";
 import { RepeatFolder } from "./log-fold";
+import type { RecordDrain } from "../record/recorder";
+import type { DispatchLink, SessionWriter } from "../record/writer";
 
 export interface SnippetResult {
   ok: boolean;
@@ -145,8 +147,23 @@ export interface SandboxHostOptions {
    * Undefined keeps nothing, and every child starts with an empty cache.
    */
   clientCache?: ClientCacheStore;
+  /**
+   * The session record (`docs/SESSION-FORMAT.md`). With a writer, every child
+   * this host starts runs the session recorder, and the host drains it into
+   * the writer on its own tick, with the action log. The host owns the tick
+   * and the final drain; whoever built the writer opens and closes it.
+   * Undefined records nothing, and the child runs no recorder.
+   */
+  record?: {
+    writer: SessionWriter;
+    /** How often the child's recorder is drained. Default `RECORD_TICK_MS`. */
+    tickMs?: number;
+  };
   now?: () => number;
 }
+
+/** How often the host drains the child's recorder into the session record. */
+export const RECORD_TICK_MS = 2_000;
 
 interface Pending {
   resolve: (v: unknown) => void;
@@ -259,6 +276,9 @@ export class SandboxHost {
   private drained: Promise<void> = Promise.resolve();
   /** Scrubs the child's output, its crash tail and its pad writes; it knows only `opts.secret`. */
   private readonly redactor = new SecretRedactor();
+  /** The record tick, running from the first start until `stop`. */
+  private recordTimer: ReturnType<typeof setInterval> | undefined;
+  private recordDraining: Promise<void> | null = null;
 
   constructor(private readonly opts: SandboxHostOptions) {
     this.redactor.redact(opts.secret);
@@ -294,6 +314,7 @@ export class SandboxHost {
       await this.ready;
       return;
     }
+    this.startRecordTick();
     this.ready = new Promise((r) => {
       this.markReady = r;
     });
@@ -336,6 +357,9 @@ export class SandboxHost {
         // the account this run was actually assigned, never a stray one, and
         // sandboxChildEnv forwards no WRATHBENCH_ACCOUNT of its own.
         WRATHBENCH_ACCOUNT: this.opts.account ?? "",
+        // Whether this child runs the session recorder: set here and nowhere
+        // else, so a stray value in the operator's shell decides nothing.
+        WRATHBENCH_RECORD: this.opts.record !== undefined ? "1" : "",
       }),
       stdio: ["ignore", "pipe", "pipe"],
       serialization: "json",
@@ -483,8 +507,11 @@ export class SandboxHost {
         return;
       case "actions": {
         const sink = this.opts.onActions;
-        if (sink === undefined) return;
+        const writer = this.opts.record?.writer;
+        if (sink === undefined && writer === undefined) return;
         for (const b of msg.batches) {
+          writer?.actions(this.dispatchLink(b.evalId, b.routine === true), b.actions, b.dropped);
+          if (sink === undefined) continue;
           const link = b.evalId === null ? undefined : this.evalLinks.get(b.evalId);
           const flush: ActionsFlush = { actions: b.actions };
           if (link?.turn !== undefined) flush.turn = link.turn;
@@ -500,6 +527,46 @@ export class SandboxHost {
         return;
       }
     }
+  }
+
+  /** Who dispatched something, for the session record: the call an eval was, when the host still knows. */
+  private dispatchLink(evalId: number | null, routine: boolean): DispatchLink {
+    if (evalId === null) return { inCall: false };
+    return { inCall: true, call: this.evalLinks.get(evalId)?.callTs, routine };
+  }
+
+  private startRecordTick(): void {
+    const record = this.opts.record;
+    if (record === undefined || this.recordTimer !== undefined) return;
+    this.recordTimer = setInterval(() => void this.recordDrain(), record.tickMs ?? RECORD_TICK_MS);
+    this.recordTimer.unref?.();
+  }
+
+  /**
+   * One record tick: drain the child's session recorder into the writer.
+   * Coalesced, so a slow drain is never raced by the next tick, and it never
+   * spawns a child: with none running the writer only beats its heartbeat. A
+   * host that needs what was just recorded (a harness acting on a row) awaits
+   * this rather than waiting for the timer. Never throws.
+   */
+  recordDrain(): Promise<void> {
+    const writer = this.opts.record?.writer;
+    if (writer === undefined) return Promise.resolve();
+    if (this.recordDraining !== null) return this.recordDraining;
+    const p = (async () => {
+      let drained: RecordDrain | null = null;
+      try {
+        drained = ((await this.drain("record_drain"))?.value ?? null) as RecordDrain | null;
+      } catch {
+        // A child that cannot answer now is drained on the next tick.
+        return;
+      }
+      writer.ingest(drained, (evalId, routine) => this.dispatchLink(evalId, routine));
+    })().finally(() => {
+      if (this.recordDraining === p) this.recordDraining = null;
+    });
+    this.recordDraining = p;
+    return p;
   }
 
   private send(msg: HostToChild): void {
@@ -743,6 +810,10 @@ export class SandboxHost {
   }
 
   async stop(): Promise<void> {
+    // The last of the record, while there is still a child to ask.
+    if (this.recordTimer !== undefined) clearInterval(this.recordTimer);
+    this.recordTimer = undefined;
+    if (this.proc !== null) await Promise.race([this.recordDrain(), new Promise((r) => setTimeout(r, this.opts.pingGraceMs))]);
     const proc = this.proc;
     this.proc = null;
     if (proc === null) {

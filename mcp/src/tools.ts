@@ -36,6 +36,17 @@ export interface CallOrigin {
   dispatchTs?: number;
 }
 
+/**
+ * The session record's side of a tool call (`record/writer.ts`,
+ * `SessionWriter`): the call as dispatched, its answer, and an event batch it
+ * served. `call` returns the call's id, its dispatch stamp.
+ */
+export interface CallRecord {
+  call(tool: string, args: unknown, dispatchTs?: number): number;
+  result(id: number, result: ToolResult): void;
+  eventsServed(call: number | undefined, events: EventSummary[], folded?: number): void;
+}
+
 /** What the core tools need of the sandbox: its host, or a stand-in. */
 export interface ToolSandbox {
   evalSnippet(code: string, link?: { callTs?: number | undefined; turn?: number | undefined }): Promise<SnippetResult>;
@@ -69,6 +80,12 @@ export interface CoreToolContext {
    * dispatcher without it would hand the model the raw text on one path only.
    */
   secrets: { scrub(text: string): string };
+  /**
+   * The session record, when the host keeps one: `ToolSet.call` writes every
+   * call and its scrubbed result to it, and `recent_events` the batch it
+   * served. Undefined records nothing.
+   */
+  record?: CallRecord;
 }
 
 /**
@@ -404,9 +421,15 @@ export class ToolSet<C extends CoreToolContext> {
    * result is scrubbed of registered secrets (`scrubResult`).
    */
   async call(ctx: C, name: string, args: unknown, origin: CallOrigin = {}): Promise<ToolResult> {
+    // The record's id for the call is its dispatch stamp, and from here on it
+    // is the stamp: what the call sends is linked to it by that number.
+    const id = ctx.record?.call(name, args, origin.dispatchTs);
+    if (id !== undefined) origin = { ...origin, dispatchTs: id };
     const result = await this.run(ctx, name, args, origin);
     // `EVALUATED` is keyed on identity, so it is read before the scrub copies.
-    return EVALUATED.has(result) ? scrubResult(ctx, result) : appendPendingActionHints(ctx, result);
+    const out = EVALUATED.has(result) ? scrubResult(ctx, result) : await appendPendingActionHints(ctx, result);
+    if (id !== undefined) ctx.record?.result(id, out);
+    return out;
   }
 
   /** `result` with whatever hints are pending (`appendPendingActionHints`). */
@@ -585,11 +608,12 @@ export function coreTools<C extends CoreToolContext>(render: CoreToolRender<C>):
         "movement packets (SMSG_MONSTER_MOVE, MSG_MOVE_*; default false). includeMovement is new: it used to " +
         "serve every packet unconditionally.",
       aliases: { include_movement: "includeMovement", includemovement: "includeMovement" },
-      run: async (ctx, args) => {
+      run: async (ctx, args, origin) => {
         const { limit, includeMovement } = args as { limit: number; includeMovement: boolean };
         if (includeMovement) {
           const events = await ctx.sandbox.recentEvents(limit);
           ctx.onEventsServed?.(events, 0);
+          ctx.record?.eventsServed(origin.dispatchTs, events, 0);
           if (events.length === 0) return { text: "no events yet" };
           return { text: events.map((e) => render.eventLine(e)).join("\n") };
         }
@@ -612,6 +636,7 @@ export function coreTools<C extends CoreToolContext>(render: CoreToolRender<C>):
           visible.length < limit ? 0 : scanned.indexOf(visible[0]!);
         const folded = scanned.slice(spanStart).filter(ambient).length;
         ctx.onEventsServed?.(visible, folded);
+        ctx.record?.eventsServed(origin.dispatchTs, visible, folded);
         const note =
           folded === 0
             ? undefined

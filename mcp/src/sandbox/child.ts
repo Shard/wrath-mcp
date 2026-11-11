@@ -90,6 +90,8 @@ import { compileSnippet } from "./rewrite";
 import { REATTACH_REPLAY_WAIT_MS, REATTACH_STATE_WAIT_MS } from "./reattach-waits";
 import type { ActionBatch, ActionHintNote, ActionNote, ChildToHost, EventSummary, HostToChild, HostcallResult, LogEntry, MoveIntentNote } from "./ipc";
 
+import { SessionRecorder, type RecordedMove } from "../record/recorder";
+
 export type { EventSummary } from "./ipc";
 
 const MODULE_URL = process.env["WRATHBENCH_MODULE_URL"] ?? "http://worldserver:8086";
@@ -107,6 +109,8 @@ const ACCOUNT = ACCOUNT_ENV !== undefined && ACCOUNT_ENV.length > 0 ? ACCOUNT_EN
 // "Authentication"): the one credential this process holds, good for this
 // token's session and nothing else. Empty means none was leased (a pre-auth
 // module, or running this file by hand), and the client sends no header.
+// Whether the host keeps a session record: it sets this itself, never forwards it.
+const RECORD = process.env["WRATHBENCH_RECORD"] === "1";
 const SECRET_ENV = process.env["WRATHBENCH_SECRET"];
 const SECRET = SECRET_ENV !== undefined && SECRET_ENV.length > 0 ? SECRET_ENV : undefined;
 // Read once, above, into the one client this process will build — then struck
@@ -235,10 +239,40 @@ let moveIntent: MoveIntentNote | null = null;
 const earlyVerdicts = new Map<number, { status: string; ts: number }>();
 const EARLY_VERDICT_MAX = 8;
 
+/**
+ * What the session record keeps of an intent beside the note itself: the eval
+ * that dispatched it and the guid it was aimed at. Apart from the note, which
+ * rides the state snapshot a tool renders, so nothing here reaches a model.
+ */
+const moveRecord = new WeakMap<MoveIntentNote, { evalId: number | null; guid: string | null }>();
+
+/** Hand the session recorder a move as it stands now: at its dispatch, and again at its verdict. */
+function recordMove(note: MoveIntentNote): void {
+  if (recorder === null) return;
+  const extra = moveRecord.get(note);
+  const evalId = extra?.evalId ?? null;
+  const move: RecordedMove = {
+    ts: note.endedAt ?? note.ts,
+    at: note.ts,
+    evalId,
+    moveId: note.moveId,
+    map: note.map,
+    x: note.x,
+    y: note.y,
+    z: note.z,
+    target: extra?.guid ?? null,
+    status: note.status,
+  };
+  if (evalId !== null && !evalControllers.has(evalId)) move.routine = true;
+  if (note.target !== null) move.name = note.target;
+  recorder.noteMove(move);
+}
+
 function settleMoveIntent(moveId: number, status: string, ts: number): void {
   if (moveIntent !== null && moveIntent.moveId === moveId) {
     moveIntent.status = status;
     moveIntent.endedAt = ts;
+    recordMove(moveIntent);
     return;
   }
   earlyVerdicts.set(moveId, { status, ts });
@@ -273,6 +307,7 @@ function noteMoveDispatch(body: unknown): MoveIntentNote | null {
     endedAt: null,
   };
   moveIntent = note;
+  moveRecord.set(note, { evalId: evalContext.getStore()?.evalId ?? null, guid: guid ?? null });
   return note;
 }
 
@@ -515,6 +550,9 @@ const watchedFetch = ((input: FetchInput, init?: RequestInit): Promise<Response>
           note.endedAt = early.ts;
         }
       }
+      // The dispatch, once the module has acknowledged it (with its verdict
+      // already, when that overtook the ack).
+      if (note !== null && r.status >= 200 && r.status < 300) recordMove(note);
       return new Response(text, { status: r.status, statusText: r.statusText, headers: r.headers });
     },
     (err: unknown) => {
@@ -1499,6 +1537,15 @@ export type SandboxChildExtensionFactory = (api: SandboxChildApi) => SandboxChil
 const extensions: SandboxChildExtension[] = [];
 
 /**
+ * The session recorder (`record/recorder.ts`): the stack's own watch on the
+ * session, built when the host asked for a record (`WRATHBENCH_RECORD`) and
+ * drained by its record tick (`record_drain`). Record only: it reads the
+ * client's cache and broadcast subscriptions, sends nothing, and is not
+ * reachable from a snippet.
+ */
+let recorder: SessionRecorder | null = null;
+
+/**
  * An event as every reader of the buffer gets it: JSON-safe and depth-limited,
  * plus what each extension resolved for it as it arrived.
  */
@@ -1548,6 +1595,7 @@ function stateSnapshot(): unknown {
 function answerRpc(method: string, params: { limit?: number }): unknown {
   if (method === "recent_events") return recentEvents(params.limit ?? 50);
   if (method === "action_hints") return drainHints();
+  if (method === "record_drain") return recorder === null ? null : recorder.drain();
   if (method !== "state_summary") {
     for (const ext of extensions) {
       const fn = ext.rpc?.[method];
@@ -1775,6 +1823,12 @@ process.on("uncaughtException", (err) => {
  * bare stack (`entry.ts`). The host sends no eval, rpc or seed before ready.
  */
 export function startSandboxChild(factories: readonly SandboxChildExtensionFactory[] = []): void {
+  // The session recorder first, so its listeners sit right after the client's
+  // own state fold and ahead of any extension's.
+  if (RECORD) {
+    recorder = new SessionRecorder(client);
+    recorder.start();
+  }
   for (const factory of factories) extensions.push(factory({ client, summarize: eventSummary, forwardClientCache }));
   forwardClientCache();
   send({ t: "ready" });

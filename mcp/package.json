@@ -14,7 +14,9 @@
     "./scratchpad": "./src/scratchpad.ts",
     "./client-cache": "./src/sandbox/client-cache.ts",
     "./paths": "./src/paths.ts",
-    "./tools": "./src/tools.ts"
+    "./tools": "./src/tools.ts",
+    "./record": "./src/record/index.ts",
+    "./record/recorder": "./src/record/recorder.ts"
   },
   "scripts": {
     "start": "bun src/main.ts",
