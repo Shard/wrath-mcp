@@ -21,6 +21,7 @@
 import { createHash } from "node:crypto";
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { SecretRedactor } from "../redact";
 import type { ActionNote, EventSummary } from "../sandbox/ipc";
 import {
   CAPTURED_STREAMS,
@@ -76,6 +77,12 @@ export interface SessionWriterOptions {
   own?: OwnGuid;
   /** Applied to every line before it is written: the host's secret scrub. */
   scrub?: (text: string) => string;
+  /**
+   * The session token, so the writer can strike it: an agent can print its
+   * own token, and no file of the record may hold it. Held in memory for
+   * that and never written.
+   */
+  token?: string;
   /**
    * Called with the rows of each stream as they were written, after the gate.
    * For a host that also acts on what was recorded; nothing it returns is read.
@@ -302,8 +309,13 @@ export class SessionWriter {
       this.jobs.add(job);
       void job.finally(() => this.jobs.delete(job));
     };
+    // Every line of the captured streams passes the host's scrub and then the
+    // token's own strike. The ring holds no free text, so it is written as it is.
+    const token = new SecretRedactor();
+    token.redact(o.token);
+    const scrub = (text: string): string => token.scrub(o.scrub === undefined ? text : o.scrub(text));
     const make = (stream: StreamName): StreamFiles =>
-      new StreamFiles(stream, this.dir, { compress: stream !== "nearby", scrub: stream === "nearby" ? undefined : o.scrub, log: this.log, closed });
+      new StreamFiles(stream, this.dir, { compress: stream !== "nearby", scrub: stream === "nearby" ? undefined : scrub, log: this.log, closed });
     this.files = { trace: make("trace"), events: make("events"), calls: make("calls"), nearby: make("nearby") };
   }
 
