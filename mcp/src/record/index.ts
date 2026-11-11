@@ -8,10 +8,12 @@
  */
 
 export * from "./format";
-export { WriteGate, type OwnGuid } from "./gate";
-export { compressSegment, listSegments, parseLines, readSegment, readSegmentBytes, type ParsedLines, type SegmentRef } from "./segments";
+export { WriteGate, ownGuidIndex, type OwnGuid } from "./gate";
+export { compressSegment } from "./compress";
+export { listSegments, parseLines, readSegment, readSegmentBytes, type ParsedLines, type SegmentRef } from "./segments";
 export { SessionReader, readSessionFile, type StreamCursor } from "./reader";
-export { DEFAULT_RETENTION_MS, SessionStore, ownGuidIndex, type StoredSession } from "./store";
+export { SessionStore, type StoredSession } from "./store";
+export { DEFAULT_RETENTION_MS, pruneSessions } from "./retention";
 export { SessionWriter, isSessionDir, type DispatchLink, type SessionWriterOptions } from "./writer";
 export { liveFileSchema, manifestFileSchema, sessionFileSchema, validateRow, validateSession, type SessionValidation } from "./validate";
 export type { RecordDrain, RecordedMove } from "./recorder";

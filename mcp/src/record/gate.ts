@@ -14,9 +14,35 @@
  */
 
 import { PLAYER_REF, isPlayerGuid, type CallRow, type EventRow, type EventsState, type NearbyRow, type NearbyState, type NearbyUnit, type StreamName, type StreamRows, type TraceRow } from "./format";
+import { readSessionFile } from "./reader";
 
 /** Whether a player guid is a session of the same deployment. The session's own character always is. */
 export type OwnGuid = (guid: string) => boolean;
+
+/**
+ * The guids that are sessions of one deployment, read from a set of session
+ * directories and refreshed when a guid it does not know is asked for, at
+ * most once every `refreshMs`. A guid it cannot place is foreign.
+ */
+export function ownGuidIndex(sessionDirs: () => string[], o: { refreshMs?: number; now?: () => number } = {}): OwnGuid {
+  const refreshMs = o.refreshMs ?? 5_000;
+  const now = o.now ?? Date.now;
+  let known = new Set<string>();
+  let readAt = -Infinity;
+  return (guid) => {
+    if (!isPlayerGuid(guid)) return false;
+    if (known.has(guid)) return true;
+    if (now() - readAt < refreshMs) return false;
+    readAt = now();
+    const next = new Set<string>();
+    for (const dir of sessionDirs()) {
+      const g = readSessionFile(dir)?.character?.guid;
+      if (typeof g === "string") next.add(g);
+    }
+    known = next;
+    return known.has(guid);
+  };
+}
 
 export class WriteGate {
   /** The session's own character, once a row has named it. */

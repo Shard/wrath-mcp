@@ -1,7 +1,8 @@
 /**
- * Segment files: listing a stream's, reading one whether it is plain or
- * compressed, and compressing one that has closed. The only place a segment
- * is opened for reading, so "readers accept both" is one function.
+ * Segment files: listing a stream's and reading one whether it is plain or
+ * compressed. The only place a segment is opened for reading, so "readers
+ * accept both" is one function. Compressing one that has closed is the
+ * writer's (`compress.ts`).
  *
  * A closed segment never changes. Compressing it writes `<name>.zst` beside
  * it under a temporary name, renames that into place and only then unlinks
@@ -9,7 +10,7 @@
  * copy, and when it finds both it takes the compressed one.
  */
 
-import { existsSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseSegmentName, segmentFileName, type StreamName } from "./format";
 
@@ -90,27 +91,4 @@ export function readSegment<T = unknown>(ref: Pick<SegmentRef, "path">): ParsedL
   } catch {
     return { rows: [], skipped: 0, consumed: 0 };
   }
-}
-
-/**
- * Compress a closed plain segment in place of itself. Idempotent: one already
- * compressed, or gone, is left alone. Returns the compressed file's path, or
- * null when there was nothing to do.
- */
-export async function compressSegment(plainPath: string): Promise<string | null> {
-  if (!plainPath.endsWith(".jsonl")) return null;
-  const out = `${plainPath}.zst`;
-  if (!existsSync(plainPath)) return existsSync(out) ? out : null;
-  if (!existsSync(out)) {
-    const packed = await Bun.zstdCompress(readFileSync(plainPath));
-    const tmp = `${out}.tmp`;
-    writeFileSync(tmp, packed);
-    renameSync(tmp, out);
-  }
-  try {
-    unlinkSync(plainPath);
-  } catch {
-    /* a reader that raced us still has the compressed copy */
-  }
-  return out;
 }

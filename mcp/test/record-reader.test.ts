@@ -10,8 +10,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SEGMENT_MS, SESSION_FILE, segmentFileName, type SessionFile, type TraceRow } from "../src/record/format";
 import { SessionReader, readSessionFile } from "../src/record/reader";
-import { compressSegment } from "../src/record/segments";
-import { DEFAULT_RETENTION_MS, SessionStore, ownGuidIndex } from "../src/record/store";
+import { compressSegment } from "../src/record/compress";
+import { ownGuidIndex } from "../src/record/gate";
+import { DEFAULT_RETENTION_MS, pruneSessions } from "../src/record/retention";
+import { SessionStore } from "../src/record/store";
 import { FIXTURE_T0 as T0, plantSession } from "./fixtures/sessions";
 
 const tmp: string[] = [];
@@ -150,7 +152,7 @@ describe("the store", () => {
     // The one the caller is about to write is never its own victim.
     session(root, "eeeeeeeeeeeeeeee", { opened: OLD, ended: OLD });
     const store = new SessionStore(root);
-    expect(store.prune(DEFAULT_RETENTION_MS, { now: NOW, except: "eeeeeeeeeeeeeeee" }).sort()).toEqual(["aaaaaaaaaaaaaaaa", "dddddddddddddddd"]);
+    expect(pruneSessions(store, DEFAULT_RETENTION_MS, { now: NOW, except: "eeeeeeeeeeeeeeee" }).sort()).toEqual(["aaaaaaaaaaaaaaaa", "dddddddddddddddd"]);
     expect(store.list().map((s) => s.id).sort()).toEqual(["bbbbbbbbbbbbbbbb", "cccccccccccccccc", "eeeeeeeeeeeeeeee"]);
   });
 
@@ -168,6 +170,6 @@ describe("the store", () => {
     expect(own("77")).toBe(false);
     now = 1500;
     expect(own("77")).toBe(true);
-    expect(new SessionStore(root).own()("6")).toBe(true);
+    expect(ownGuidIndex(() => new SessionStore(root).dirs())("6")).toBe(true);
   });
 });

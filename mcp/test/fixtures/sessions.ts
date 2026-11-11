@@ -18,7 +18,8 @@ import { createHash } from "node:crypto";
 import { cpSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CAPTURED_STREAMS, MANIFEST_FILE, SESSION_FILE, SESSION_FORMAT, type ManifestFile, type SessionFile } from "../../src/record/format";
-import { compressSegment, listSegments } from "../../src/record/segments";
+import { compressSegment } from "../../src/record/compress";
+import { listSegments } from "../../src/record/segments";
 
 export const FIXTURE_SESSIONS = ["closed", "live"] as const;
 export type FixtureSession = (typeof FIXTURE_SESSIONS)[number];

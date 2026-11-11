@@ -6,7 +6,7 @@
  * `createInspectorApi` in its own server instead and needs none of this.
  */
 
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, normalize, resolve, sep } from "node:path";
 import { createInspectorApi } from "./api";
 import { SESSION_COOKIE, bearerScope, bindRefusal, isLoopbackHost, isSecret } from "./auth";
@@ -28,6 +28,23 @@ export interface InspectorServerOptions {
    * `/tiles/`. Without one the map draws its grid.
    */
   tilesDir?: string;
+  /**
+   * Let the page load Wowhead's tooltip script for item, spell and quest
+   * icons and names, a third-party request from the reader's browser. Off
+   * unless asked for.
+   */
+  wowhead?: boolean;
+}
+
+/** The page's marker that the bin was started with `--wowhead`; `page/main.tsx` reads it. */
+export const WOWHEAD_META = '<meta name="wrath-inspector-wowhead" content="on" />';
+
+/** The built page's `index.html`, marked when the bin lets it load Wowhead's script. */
+function pageHtml(pageDir: string, wowhead: boolean): Response {
+  const file = join(pageDir, "index.html");
+  const headers = { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" };
+  if (!wowhead) return new Response(Bun.file(file), { headers });
+  return new Response(readFileSync(file, "utf8").replace("</head>", `  ${WOWHEAD_META}\n  </head>`), { headers });
 }
 
 const NOT_BUILT = "The inspector's page is not built: run `bun run --cwd inspector build`. The API answers under /api.\n";
@@ -88,10 +105,11 @@ export function inspectorHandler(o: Omit<InspectorServerOptions, "port">): (req:
     if (req.method !== "GET" && req.method !== "HEAD") return new Response("read-only", { status: 405, headers: { allow: "GET, HEAD" } });
 
     if (!existsSync(join(pageDir, "index.html"))) return new Response(NOT_BUILT, { status: 503, headers: { "content-type": "text/plain; charset=utf-8" } });
-    const hit = url.pathname === "/" ? null : staticFile(pageDir, decodeURIComponent(url.pathname));
+    const path = decodeURIComponent(url.pathname);
+    const hit = path === "/" || path === "/index.html" ? null : staticFile(pageDir, path);
     if (hit !== null) return hit;
     // Client-side routing: anything that is not a file is the page.
-    return new Response(Bun.file(join(pageDir, "index.html")), { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" } });
+    return pageHtml(pageDir, o.wowhead === true);
   };
 }
 

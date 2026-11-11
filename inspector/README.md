@@ -31,7 +31,9 @@ WRATH_INSPECTOR_SECRET=… bun inspector/src/bin.ts --store <dir> --host 0.0.0.0
 
 `--tiles <dir>` gives the map minimap tiles, `<map>/<row>_<col>.png` (the
 layout WrathBench's tile extraction writes its masters in); without it the
-map draws the tile grid. Without a build the page answers with how to make
+map draws the tile grid. `--wowhead` lets the page load Wowhead's tooltip
+script for item, spell and quest icons and names, a third-party request from
+the reader's browser; without it the page makes none. Without a build the page answers with how to make
 one, and the API still serves.
 
 `--store` is a session store, the directory `bun mcp/src/main.ts` records
@@ -78,10 +80,12 @@ minutes old.
 
 The views take what they show from the API and from the codecs' readings, and
 nothing else: names come from the record's dictionaries, never from game
-data. Item, spell and quest links point at Wowhead's Wrath database, and the
-inventory asks Wowhead's tooltip script for icons and names in the reader's
-browser, a third-party request; where the script is blocked the links show
-the record's names. Their classes and tokens are WrathBench's dashboard's,
+data. Item, spell and quest links point at Wowhead's Wrath database. Asking
+Wowhead's tooltip script for icons and names in the reader's browser is a
+third-party request, so it is opt-in: a page calls `enableWowhead()`
+(`@wrathbench/inspector/views/wowhead`) to allow it, the bin's page does when
+started with `--wowhead`, and otherwise, as where the script is blocked, the
+links show the record's names. Their classes and tokens are WrathBench's dashboard's,
 taken as they are (`src/views/inspector.css`, the bin's stylesheet).
 
 `bun run --cwd inspector dev` serves the page from source with the API
@@ -122,10 +126,13 @@ exported for a host that serves the same shapes under paths of its own.
 ## Boundaries
 
 From the stack the inspector imports `@wrathbench/mcp/record/read` (the store
-reader and the format's types) and nothing else, and `sdk/` and `mcp/` never
-import it or the UI's dependencies, which are this package's alone; its
-browser-side files (`src/wire.ts`, `src/codec/`, `src/views/`, `page/`) import
-no runtime built-in and nothing of its server side. `scripts/boundary.ts`
-holds all of it. The views also typecheck under the strictest flags an
-embedding page compiles them with (`tsconfig.views.json`). The session record's format is `docs/SESSION-FORMAT.md`; the
-inspector changes with it in the same pull request.
+reader and the format's types) and nothing else, and nothing that entry
+loads, nor anything of the inspector's own, writes or deletes a file. `sdk/`
+and `mcp/` never import it or the UI's dependencies, which are this
+package's alone. Its browser-side files (`src/wire.ts`, `src/codec/`,
+`src/views/`, `page/`) import no runtime built-in and nothing of its server
+side. `scripts/boundary.ts` holds all of it. The views also typecheck under
+the strictest flags an embedding page compiles them with
+(`tsconfig.views.json`). The session record's format is
+`docs/SESSION-FORMAT.md`; the inspector changes with it in the same pull
+request.

@@ -17,6 +17,12 @@
  *
  * `wotlk` in the link is Wowhead's Wrath dataset, which is the one our ids
  * belong to; the retail path would resolve the same numbers to different items.
+ *
+ * The script is a third-party request, so it is opt-in: until a page calls
+ * `enableWowhead()` no view asks for it, the status reads `failed` at once
+ * and the panels draw what the record names. The links are only links and
+ * cost nothing until followed. The inspector's bin turns it on with
+ * `--wowhead`; a harness's page decides for itself.
  */
 
 /** Where the script and the item, spell and quest pages live. One place spells each. */
@@ -142,8 +148,22 @@ function host(): ScriptHost | null {
   return typeof g.document === "object" && g.document !== null ? (g as ScriptHost) : null;
 }
 
+let enabled = false;
+
+/** Let the views ask Wowhead's tooltip script for icons and names in this page, or stop them asking. */
+export function enableWowhead(on = true): void {
+  enabled = on;
+}
+
+/** Whether this page lets the views load Wowhead's script. */
+export function wowheadEnabled(): boolean {
+  return enabled;
+}
+
 /**
- * Inject the config and the script tag, once.
+ * Inject the config and the script tag, once, if the page enabled it. Where
+ * it did not, the status is `failed` straight away, the state a blocked
+ * script ends in, so the panels draw the record's names without waiting.
  *
  * Idempotent by the tag already being in the document, not by a module-level
  * flag: the SPA mounts these panels on two pages and remounts them on every
@@ -156,6 +176,10 @@ function host(): ScriptHost | null {
 export function loadWowhead(target?: ScriptHost): boolean {
   const h = target ?? host();
   if (h === null) return false;
+  if (!enabled) {
+    setStatus("failed");
+    return false;
+  }
   // Globals first: the script reads them as it evaluates, so setting them
   // after the tag is a race we would lose on a warm cache.
   h.whTooltips = wowheadConfig();
