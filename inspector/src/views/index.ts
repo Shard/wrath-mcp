@@ -28,3 +28,4 @@ export { SessionView } from "./SessionView";
 export { UnitFrame, XpBar, type UnitFrameProps } from "./UnitFrame";
 export * from "./lib/sessions";
 export * from "./lib/world";
+export type * from "../wire";
