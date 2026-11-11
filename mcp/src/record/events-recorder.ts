@@ -109,7 +109,12 @@ export class EventsRecorder {
     this.unsubscribe = this.events.onAny((event) => {
       this.death.observe(event);
       this.flight.observe(event);
+      const mapKnown = this.party.map !== undefined;
       this.party.observe(event);
+      // The first reading of the map and its instance type is a baseline, not
+      // an `instance` row: stated in a key, so a recorder that starts inside
+      // a dungeon says so rather than leaving the type unknown until it leaves.
+      if (!mapKnown && this.party.map !== undefined) this.push({ ts: event.ts, seq: event.seq, kind: "key", state: this.read() });
       for (const s of this.party.drain()) {
         if (s.kind === "group") {
           const { kind, ts, seq, event: what, ...rest } = s;
@@ -153,6 +158,11 @@ export class EventsRecorder {
     if (self.area !== undefined) s.area = self.area.value.id;
     const pos = self.position?.value;
     if (pos !== undefined) s.map = pos.map;
+    const map = this.party.map;
+    if (map !== undefined) {
+      s.map = map.map;
+      s.instanceType = map.instanceType;
+    }
     const window = this.death.window;
     const health = self.fields.get("health")?.value;
     s.dead = window.dead || health === 0 || self.ghost?.value === true;

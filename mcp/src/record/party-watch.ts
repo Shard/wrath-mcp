@@ -129,6 +129,11 @@ export class PartyWatcher {
     else if (event.opcode === "SMSG_PARTYKILLLOG") this.kill(event);
   }
 
+  /** The map and instance type as last read off a `WB_AREA` or `WB_SESSION_STATE`; undefined before the first. */
+  get map(): { map: number; instanceType: number } | undefined {
+    return this.lastMap;
+  }
+
   /** Everything latched since the last drain, oldest first. */
   drain(): PartySignal[] {
     return this.signals.splice(0, this.signals.length);
