@@ -12,6 +12,7 @@ import { join } from "node:path";
 import {
   MANIFEST_FILE,
   NEARBY_RING_MS,
+  PLAYER_REF,
   SEGMENT_MS,
   SESSION_FILE,
   emptyEventsState,
@@ -55,8 +56,9 @@ function rig(extra: Partial<SessionWriterOptions> = {}): { dir: string; clock: {
   return { dir, clock, writer, reader: new SessionReader(dir), logs, reopen: make };
 }
 
-function drain(o: { trace?: TraceRow[]; dict?: RecordDrain["trace"]["dict"]; events?: EventRow[]; nearby?: NearbyRow[]; moves?: RecordDrain["moves"]; through?: number } = {}): RecordDrain {
+function drain(o: { trace?: TraceRow[]; dict?: RecordDrain["trace"]["dict"]; events?: EventRow[]; nearby?: NearbyRow[]; moves?: RecordDrain["moves"]; through?: number; players?: RecordDrain["players"] } = {}): RecordDrain {
   return {
+    ...(o.players !== undefined ? { players: o.players } : {}),
     trace: { rows: o.trace ?? [], dropped: 0, ...(o.dict !== undefined ? { dict: o.dict } : {}) },
     events: { rows: o.events ?? [], dropped: 0 },
     nearby: { rows: o.nearby ?? [], dropped: 0, through: o.through ?? 0 },
@@ -280,6 +282,39 @@ describe("the gate is on the write path", () => {
     expect(mirrored["trace"]).toEqual(reader.rows("trace"));
     valid(dir);
     await writer.close();
+  });
+});
+
+describe("the free-text scrub", () => {
+  test("a foreign player answered by name is scrubbed from the calls stream, a key row's open calls included, and the names are never written", async () => {
+    const { dir, writer, reader, clock } = rig({ own: (g) => g === OWN });
+    writer.ingest(
+      drain({
+        players: [
+          [SELF, "Quillon"],
+          [OWN, "Partner"],
+          [FOREIGN, "Bystander"],
+        ],
+      }),
+    );
+    const id = writer.call("run_snippet", { code: `whisper("Bystander"); whisper("Partner")` }, T0 + 2000);
+    writer.actions({ inCall: true, call: id }, [{ ts: T0 + 2001, action: "set_target", args: { guid: FOREIGN }, status: 200, ms: 1, names: { target: "Bystander" } }]);
+    writer.eventsServed(id, [{ seq: 3, ts: T0 + 2002, opcode: "SMSG_MESSAGECHAT", data: { senderGuid: FOREIGN, text: "hello Quillon" } }]);
+    // The call is still in flight when the next window opens: its key row restates it.
+    clock.now = T0 + SEGMENT_MS + 10;
+    writer.result(id, { text: `Bystander (guid ${FOREIGN}) and Partner (guid ${OWN}), ${FOREIGN} damage` });
+    const rows = reader.rows("calls");
+    expect(rows.filter((r) => r.kind === "call").map((r) => (r as Extract<CallRow, { kind: "call" }>).args)).toEqual([{ code: `whisper("player"); whisper("Partner")` }]);
+    expect(rows.find((r) => r.kind === "actions")).toMatchObject({ actions: [{ args: { guid: PLAYER_REF }, names: { target: PLAYER_REF } }] });
+    expect(rows.find((r) => r.kind === "events")).toMatchObject({ events: [{ data: { senderGuid: PLAYER_REF, text: "hello Quillon" } }] });
+    const key = reader.segment("calls", reader.segments("calls")[1]!)[0] as Extract<CallRow, { kind: "key" }>;
+    expect(key.open.map((c) => c.args)).toEqual([{ code: `whisper("player"); whisper("Partner")` }]);
+    expect(rows.find((r) => r.kind === "result")).toMatchObject({ text: `player (guid player) and Partner (guid ${OWN}), ${FOREIGN} damage` });
+    await writer.close();
+    const disk = JSON.stringify(reader.rows("calls")) + readdirSync(dir).filter((f) => f.endsWith(".json")).map((f) => readFileSync(join(dir, f), "utf8")).join("");
+    expect(disk).not.toContain("Bystander");
+    expect(disk).not.toContain(`"${FOREIGN}"`);
+    valid(dir);
   });
 });
 

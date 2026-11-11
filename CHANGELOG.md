@@ -289,7 +289,8 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   `--record-dir` (a `sessions` directory beside the state directory), prunes
   sessions closed more than `--record-retention-days` ago (default 3), and
   `--no-record` turns it off. Players who are not sessions of the same
-  deployment are never written (`mcp/src/record/gate.ts`). New entry point
+  deployment are never written (`mcp/src/record/gate.ts`), and free text is
+  scrubbed of their guids and names, best-effort. New entry point
   `@wrathbench/mcp/record`.
 - **wrath-inspector**, a third package, `@wrathbench/inspector`
   (`inspector/README.md`): read-only JSON and server-sent events over a

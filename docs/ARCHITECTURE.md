@@ -445,9 +445,12 @@ with a key row so it decodes alone. The code is `mcp/src/record/`.
   session.
 - **The gate** (`gate.ts`, `WriteGate`) is the one place the rules for other
   players are applied, to every row before it reaches a file: a player who is
-  not a session of the same deployment is never written. Which guids those
-  are it asks the host (`OwnGuid`; over a store's sessions, `ownGuidIndex`).
-  It governs storage only; what an agent observes live is `docs/CONTRACTS.md`.
+  not a session of the same deployment is never written in a structured
+  field, and the calls stream's free text is scrubbed of their guids and the
+  names the client was answered for them, best-effort. Which guids are own it
+  asks the host (`OwnGuid`; over a store's sessions, `ownGuidIndex`); the
+  names come with the recorder's drain and are never written. It governs
+  storage only; what an agent observes live is `docs/CONTRACTS.md`.
 - **The reader and the store** (`reader.ts`, `store.ts`): range reads and a
   tail by byte offset over one session, and over a directory of them the
   list. Retention (`retention.ts`) unlinks whole closed sessions only, and is

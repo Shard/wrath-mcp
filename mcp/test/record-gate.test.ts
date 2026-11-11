@@ -131,12 +131,116 @@ describe("calls", () => {
     }
   });
 
-  test("free text is written as it was: results, served batches and action arguments are not scrubbed", () => {
+  const freeText = (): CallRow[] => [
+    { ts: 1, kind: "call", id: 1, origin: { type: "tool" }, tool: "run_snippet", args: { code: `await sdk.whisper("Bystander", "hi"); await sdk.interact({ guid: "${FOREIGN}" })` } },
+    { ts: 1, kind: "result", id: 1, text: `saw Bystander (guid ${FOREIGN}) {"senderGuid":"${FOREIGN}","guids":["${OWN}","${FOREIGN}"]}`, error: false, durationMs: 1 },
+    { ts: 1, kind: "actions", origin: { type: "tool" }, actions: [{ ts: 1, action: "set_target", args: { guid: FOREIGN }, status: 200, ms: 1, names: { target: "Bystander" } }] },
+    { ts: 1, kind: "events", origin: { type: "tool" }, count: 1, events: [{ seq: 1, ts: 1, opcode: "SMSG_MESSAGECHAT", data: { senderGuid: FOREIGN, text: "Bystander waves" } }] },
+  ];
+
+  test("with no player names answered, free text is written as it was", () => {
+    for (const row of freeText()) expect(gate().gate("calls", row)).toBe(row);
+  });
+
+  test("a foreign player's guid and answered name are scrubbed from every kind of free text", () => {
+    const g = gate();
+    g.notePlayers([[FOREIGN, "Bystander"]]);
+    const out = freeText().map((row) => g.gate("calls", row));
+    expect(out).toEqual([
+      { ts: 1, kind: "call", id: 1, origin: { type: "tool" }, tool: "run_snippet", args: { code: `await sdk.whisper("player", "hi"); await sdk.interact({ guid: "player" })` } },
+      { ts: 1, kind: "result", id: 1, text: `saw player (guid player) {"senderGuid":"player","guids":["${OWN}","player"]}`, error: false, durationMs: 1 },
+      { ts: 1, kind: "actions", origin: { type: "tool" }, actions: [{ ts: 1, action: "set_target", args: { guid: PLAYER_REF }, status: 200, ms: 1, names: { target: PLAYER_REF } }] },
+      { ts: 1, kind: "events", origin: { type: "tool" }, count: 1, events: [{ seq: 1, ts: 1, opcode: "SMSG_MESSAGECHAT", data: { senderGuid: PLAYER_REF, text: "player waves" } }] },
+    ]);
+    // A key row restates the calls in flight, scrubbed the same way.
+    const key: CallRow = { ts: 2, kind: "key", open: [freeText()[0] as Extract<CallRow, { kind: "call" }>] };
+    expect((g.gate("calls", key) as Extract<CallRow, { kind: "key" }>).open[0]!.args).toEqual({ code: `await sdk.whisper("player", "hi"); await sdk.interact({ guid: "player" })` });
+  });
+
+  test("the character itself and the deployment's other sessions are never scrubbed", () => {
+    const g = gate();
+    g.notePlayers([
+      [SELF, "Quillon"],
+      [OWN, "Partner"],
+    ]);
+    for (const row of [...freeText(), { ts: 1, kind: "result", id: 1, text: `Quillon (guid ${SELF}) and Partner (guid ${OWN})`, error: false, durationMs: 1 } as CallRow]) {
+      expect(g.gate("calls", row)).toBe(row);
+    }
+  });
+
+  test("own or foreign is asked as the row is written, so a session the index learns of later is kept", () => {
+    const own = new Set<string>();
+    const g = new WriteGate((guid) => own.has(guid));
+    g.setSelf(SELF);
+    g.notePlayers([[OWN, "Partner"]]);
+    const row: CallRow = { ts: 1, kind: "result", id: 1, text: `Partner (guid ${OWN})`, error: false, durationMs: 1 };
+    expect(g.gate("calls", row)).toMatchObject({ text: "player (guid player)" });
+    own.add(OWN);
+    expect(g.gate("calls", row)).toBe(row);
+  });
+
+  test("a number equal to a foreign guid is kept wherever it is not a guid: damage, coordinates, counts, ids", () => {
+    const g = gate();
+    g.notePlayers([[FOREIGN, "Bystander"]]);
+    const text = `hit for ${FOREIGN} damage at (${FOREIGN}, ${FOREIGN}.5, -${FOREIGN}); looted ${FOREIGN}x Linen Cloth (item ${FOREIGN}); {"damage":${FOREIGN},"count":"${FOREIGN}","x":${FOREIGN}}; level: ${FOREIGN}`;
     const rows: CallRow[] = [
-      { ts: 1, kind: "result", id: 1, text: `saw player ${FOREIGN} called Bystander`, error: false, durationMs: 1 },
-      { ts: 1, kind: "actions", origin: { type: "tool" }, actions: [{ ts: 1, action: "set_target", args: { guid: FOREIGN }, status: 200, ms: 1 }] },
-      { ts: 1, kind: "events", origin: { type: "tool" }, count: 1, events: [{ seq: 1, ts: 1, opcode: "SMSG_MESSAGECHAT", data: { senderGuid: FOREIGN } }] },
+      { ts: 1, kind: "result", id: 1, text, error: false, durationMs: 1 },
+      { ts: 1, kind: "call", id: 1, origin: { type: "tool" }, tool: "run_snippet", args: { code: `await sdk.useItem(${FOREIGN}); await sdk.moveTo(${FOREIGN}, -${FOREIGN}, 0)`, count: FOREIGN } },
+      { ts: 1, kind: "actions", origin: { type: "tool" }, actions: [{ ts: 1, action: "move_to", args: { x: Number(FOREIGN), y: 1, z: 2, itemId: FOREIGN }, status: 200, ms: 1 }] },
+      {
+        ts: 1,
+        kind: "events",
+        origin: { type: "tool" },
+        count: 1,
+        events: [{ seq: 1, ts: 1, opcode: "SMSG_SPELLNONMELEEDAMAGELOG", data: { damage: Number(FOREIGN), amount: FOREIGN, spellId: FOREIGN, [FOREIGN]: "x", pos: { x: Number(FOREIGN) } } }],
+      },
     ];
-    for (const row of rows) expect(gate().gate("calls", row)).toBe(row);
+    for (const row of rows) expect(g.gate("calls", row)).toBe(row);
+  });
+
+  test("only whole words and whole guids match: a longer number or word that contains one is kept", () => {
+    const g = gate();
+    g.notePlayers([[FOREIGN, "Bystander"]]);
+    const row: CallRow = { ts: 1, kind: "result", id: 1, text: `guid ${FOREIGN}0 {"guid":"${FOREIGN}7"} Bystanders bystander`, error: false, durationMs: 1 };
+    expect(g.gate("calls", row)).toBe(row);
+    const quoted: CallRow = { ts: 1, kind: "result", id: 1, text: `{ guid: "${FOREIGN}", name: "Bystander's", hitGuids: [ "${FOREIGN}", "1" ] }`, error: false, durationMs: 1 };
+    expect(g.gate("calls", quoted)).toMatchObject({ text: `{ guid: "player", name: "player's", hitGuids: [ "player", "1" ] }` });
+    // A guid-named key's value, or a list under one, in structured data.
+    const keyed: CallRow = { ts: 1, kind: "events", origin: { type: "tool" }, count: 1, events: [{ seq: 1, ts: 1, opcode: "X", data: { casterGuid: FOREIGN, mover: FOREIGN, guids: [OWN, FOREIGN], Bystander: 3 } }] };
+    expect(g.gate("calls", keyed)).toMatchObject({ events: [{ data: { casterGuid: PLAYER_REF, mover: PLAYER_REF, guids: [OWN, PLAYER_REF], player: 3 } }] });
+  });
+
+  test("a name shorter than three characters is never scrubbed", () => {
+    const g = gate();
+    g.notePlayers([[FOREIGN, "Bo"]]);
+    const row: CallRow = { ts: 1, kind: "result", id: 1, text: "Bo said hi", error: false, durationMs: 1 };
+    expect(g.gate("calls", row)).toBe(row);
+  });
+
+  test("nothing is scrubbed before the session's own character is known, so it is never taken for a stranger", () => {
+    const g = new WriteGate(() => false);
+    g.notePlayers([[SELF, "Quillon"]]);
+    const row: CallRow = { ts: 1, kind: "result", id: 1, text: `logged in: Quillon (guid ${SELF})`, error: false, durationMs: 1 };
+    expect(g.gate("calls", row)).toBe(row);
+    g.setSelf(SELF);
+    expect(g.gate("calls", row)).toBe(row);
+  });
+
+  test("a guid the host says is own is kept before any index knows it", () => {
+    const g = new WriteGate(() => false);
+    g.setSelf(SELF);
+    g.notePlayers([[OWN, "Partner"]]);
+    const row: CallRow = { ts: 1, kind: "result", id: 1, text: "Partner", error: false, durationMs: 1 };
+    expect(g.gate("calls", row)).toMatchObject({ text: PLAYER_REF });
+    g.noteOwn(OWN);
+    expect(g.gate("calls", row)).toBe(row);
+  });
+
+  test("a renamed player is looked for by the name answered last", () => {
+    const g = gate();
+    g.notePlayers([[FOREIGN, "Bystander"]]);
+    g.notePlayers([[FOREIGN, "Passerby"]]);
+    const row: CallRow = { ts: 1, kind: "result", id: 1, text: "Bystander Passerby", error: false, durationMs: 1 };
+    expect(g.gate("calls", row)).toMatchObject({ text: "Bystander player" });
   });
 });

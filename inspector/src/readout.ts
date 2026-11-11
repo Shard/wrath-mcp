@@ -29,35 +29,21 @@ import {
   type TraceDictLookup,
   type TraceRow,
 } from "./codec/trace";
+import { SegmentMemo } from "./memo";
 import type { SegmentInfo, SessionHandle } from "./source";
 import type { MoveIntentView, NearbyWindow, PositionTrace, TraceChatKind, TraceIndexResponse, TraceSegment, TrackTrace } from "./wire";
 
 /** How many closed windows a session's recent trace names, newest last. */
 export const RECENT_WINDOWS = 3;
 
-/** What was derived from closed segments, by `ref`: bounded, the newest entries win. */
-class SegmentMemo<T> {
-  private readonly entries = new Map<string, T>();
-  constructor(private readonly max: number) {}
-
-  async get(seg: SegmentInfo, derive: () => Promise<T>): Promise<T> {
-    if (!seg.closed) return await derive();
-    const hit = this.entries.get(seg.ref);
-    if (hit !== undefined) {
-      this.entries.delete(seg.ref);
-      this.entries.set(seg.ref, hit);
-      return hit;
-    }
-    const value = await derive();
-    this.entries.set(seg.ref, value);
-    if (this.entries.size > this.max) this.entries.delete(this.entries.keys().next().value as string);
-    return value;
-  }
-}
-
-const traceMemo = new SegmentMemo<RecordedTraceRow[]>(64);
-const moveMemo = new SegmentMemo<MoveIntentView[]>(4096);
-const chatMemo = new SegmentMemo<{ ts: number; kind: TraceChatKind; text: string }[]>(4096);
+/**
+ * A trace segment's rows: a live session's map reads its last `CONTEXT_MS`
+ * of closed windows and the newest on every pass, and a player scrubbing
+ * back reads a window and its context, so eight a session holds both.
+ */
+const traceMemo = new SegmentMemo<RecordedTraceRow[]>({ perSession: 8, min: 128, max: 512 });
+const moveMemo = new SegmentMemo<MoveIntentView[]>({ max: 4096 });
+const chatMemo = new SegmentMemo<{ ts: number; kind: TraceChatKind; text: string }[]>({ max: 4096 });
 
 async function readOne<S extends StreamName>(h: SessionHandle, stream: S, seg: SegmentInfo, kinds?: readonly string[]): Promise<StreamRows[S][]> {
   const [rows] = await h.read(stream, [seg], kinds === undefined ? undefined : { kinds });
@@ -67,7 +53,7 @@ async function readOne<S extends StreamName>(h: SessionHandle, stream: S, seg: S
 // ---------------------------------------------------------------- trace
 
 async function traceRowsOf(h: SessionHandle, seg: SegmentInfo): Promise<RecordedTraceRow[]> {
-  return await traceMemo.get(seg, async () => await readOne(h, "trace", seg));
+  return await traceMemo.get(h.id, seg, async () => await readOne(h, "trace", seg));
 }
 
 /**
@@ -136,7 +122,7 @@ export async function traceLastTs(h: SessionHandle): Promise<number | null> {
 export async function traceChat(h: SessionHandle, kind: TraceChatKind): Promise<{ ts: number; text: string }[]> {
   const out: { ts: number; text: string }[] = [];
   for (const seg of await h.segments("trace")) {
-    const lines = await chatMemo.get(seg, async () => {
+    const lines = await chatMemo.get(h.id, seg, async () => {
       const found: { ts: number; kind: TraceChatKind; text: string }[] = [];
       for (const r of await readOne(h, "trace", seg, ["state"])) {
         if (r.kind !== "state" || typeof r.ts !== "number" || r.data === undefined || r.data === null || !("chat" in r.data)) continue;
@@ -293,7 +279,7 @@ function moveView(r: Extract<CallRow, { kind: "move" }>): MoveIntentView | null 
 }
 
 async function movesOf(h: SessionHandle, seg: SegmentInfo): Promise<MoveIntentView[]> {
-  return await moveMemo.get(seg, async () => {
+  return await moveMemo.get(h.id, seg, async () => {
     const out: MoveIntentView[] = [];
     for (const r of await readOne(h, "calls", seg, ["move"])) {
       if (r.kind !== "move") continue;

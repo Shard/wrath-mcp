@@ -209,6 +209,8 @@ export interface SeatView {
 
 interface HostSeat {
   character: string;
+  /** The character's guid, once it is in the world. */
+  guid?: string;
   token: string;
   secret: string | undefined;
   account: string | undefined;
@@ -588,9 +590,19 @@ export class SandboxHost {
       throw err;
     }
     seat.character = opened.character;
+    seat.guid = opened.guid;
     seat.attached = true;
     seat.writer = spec.writer?.(opened);
     this.seats.set(opened.character, seat);
+    // Each record's gate knows its own character and every other seat's at
+    // once, not a record tick and an index read later: one seat printing
+    // another's name is not a foreign player.
+    seat.writer?.noteSelf(opened.guid);
+    for (const other of this.seats.values()) {
+      if (other.guid === undefined || other === seat) continue;
+      other.writer?.noteOwn(opened.guid);
+      seat.writer?.noteOwn(other.guid);
+    }
     return opened;
   }
 
@@ -675,6 +687,7 @@ export class SandboxHost {
       }
       case "client_cache":
         this.opts.clientCache?.add(msg.frames);
+        this.notePlayers(msg.frames);
         return;
       case "result":
       case "pong":
@@ -743,6 +756,25 @@ export class SandboxHost {
     }
   }
 
+  /**
+   * Player names the child was just answered, handed to every record this
+   * host writes as they arrive, so the write gate's scrub (`gate.ts`) knows
+   * them before a result that prints one is written, not a record tick
+   * later. The drain still carries them all, for what a restarted child was
+   * seeded with. To every seat's record: a call can be written to each.
+   */
+  private notePlayers(frames: readonly unknown[]): void {
+    const players: [string, string][] = [];
+    for (const f of frames) {
+      const frame = f as { opcode?: unknown; data?: { guid?: unknown; found?: unknown; name?: unknown } | null } | null;
+      const d = frame?.opcode === "SMSG_NAME_QUERY_RESPONSE" ? frame.data : undefined;
+      if (d?.found === true && typeof d.guid === "string" && typeof d.name === "string") players.push([d.guid, d.name]);
+    }
+    if (players.length === 0) return;
+    this.opts.record?.writer?.notePlayers(players);
+    for (const seat of this.seats.values()) seat.writer?.notePlayers(players);
+  }
+
   /** Who dispatched something, for the session record: the call an eval was, when the host still knows. */
   private dispatchLink(evalId: number | null, routine: boolean): DispatchLink {
     if (evalId === null) return { inCall: false };
@@ -795,8 +827,12 @@ export class SandboxHost {
       } catch {
         return;
       }
+      // A call can be written to every seat's record (a roll-up), so each
+      // seat's scrub looks for the players any seat's client was answered for.
+      const players = Object.values(drained).flatMap((d) => d?.players ?? []);
       // A seat the child did not answer for (none running, or mid-reattach) still beats its heartbeat.
       for (const seat of this.seats.values()) {
+        if (players.length > 0) seat.writer?.notePlayers(players);
         seat.writer?.ingest(drained[seat.character] ?? null, (evalId, routine) => this.dispatchLink(evalId, routine));
       }
     })().finally(() => {

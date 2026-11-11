@@ -8,9 +8,15 @@
  * It governs storage only. The recorders read what the client observed, and
  * what an agent observes live is `docs/CONTRACTS.md`.
  *
- * Structured fields only. A tool result's text, a served event batch and an
- * action's arguments are written as they were: scrubbing free text is not
- * decided, and `gateCalls` below is where it would go.
+ * Structured fields are gated by rule. Free text (a tool call's arguments,
+ * its result, a served event batch, the action log) is scrubbed best-effort
+ * in `gateCalls`: a foreign player's guid where it is printed or keyed as a
+ * guid, never as a bare number, and the name the client was answered for it
+ * as a whole word, are replaced by `"player"`. The
+ * players it knows are the ones the session's client cache was answered for
+ * (`notePlayers`), held here and never written. It starts once the session's
+ * own character is known. On a world with no foreign players it changes
+ * nothing, and the record is what the agent saw.
  */
 
 import { PLAYER_REF, isPlayerGuid, type CallRow, type EventRow, type EventsState, type NearbyRow, type NearbyState, type NearbyUnit, type StreamName, type StreamRows, type TraceRow } from "./format";
@@ -49,6 +55,12 @@ export class WriteGate {
   private self: string | null = null;
   /** Units not written because a foreign player owns or charms them, until they leave view. */
   private readonly hidden = new Set<string>();
+  /** Player guids the host knows are the deployment's own before any record names them (`noteOwn`). */
+  private readonly ownKnown = new Set<string>();
+  /** Player guid -> the name the client cache was answered for it. Operational state: never written. */
+  private readonly playerNames = new Map<string, string>();
+  /** Name -> the guids answered with it, for the scrub's name lookup. */
+  private readonly playersByName = new Map<string, Set<string>>();
 
   constructor(private readonly ownSession: OwnGuid = () => false) {}
 
@@ -57,9 +69,41 @@ export class WriteGate {
     if (guid !== null && guid !== "" && guid !== "0") this.self = guid;
   }
 
+  /**
+   * Players the session's client was answered names for (`SMSG_NAME_QUERY_RESPONSE`),
+   * as guid and name: what the free-text scrub looks for. Own or foreign is
+   * asked when a row is written, not here, so a session of the deployment
+   * that the index learns of later is never scrubbed.
+   */
+  notePlayers(players: Iterable<readonly [string, string]>): void {
+    for (const [guid, name] of players) {
+      if (!isPlayerGuid(guid) || name === "") continue;
+      const before = this.playerNames.get(guid);
+      if (before === name) continue;
+      if (before !== undefined) this.playersByName.get(before)?.delete(guid);
+      this.playerNames.set(guid, name);
+      let guids = this.playersByName.get(name);
+      if (guids === undefined) this.playersByName.set(name, (guids = new Set()));
+      guids.add(guid);
+    }
+  }
+
+  /** A player guid the host knows is another session of the deployment (a seat of the same client), ahead of the index. */
+  noteOwn(guid: string): void {
+    if (isPlayerGuid(guid)) this.ownKnown.add(guid);
+  }
+
   /** Own: the session's character, or another session of the deployment. Anything else a player guid names is foreign. */
   private own(guid: string): boolean {
-    return guid === this.self || this.ownSession(guid);
+    return guid === this.self || this.ownKnown.has(guid) || this.ownSession(guid);
+  }
+
+  /**
+   * Whether the free-text scrub has anything to do: a player answered, and
+   * the session's own character known, so it is never taken for a stranger.
+   */
+  private scrubbing(): boolean {
+    return this.playerNames.size > 0 && this.self !== null;
   }
 
   /** The row as it may be written, or null when it may not be written at all. */
@@ -195,13 +239,144 @@ export class WriteGate {
 
   /**
    * A move aimed at a foreign player keeps its destination and loses its
-   * target. Every other calls row passes as it is: free text (a result, a
-   * served batch, an action's arguments) is not scrubbed, and if it ever is,
-   * this is where.
+   * target. The free text of every other row is scrubbed (`scrubValue`): a
+   * call's arguments, a result's text, the action log, a served batch, and
+   * the calls a key row restates.
    */
   private gateCalls(row: CallRow): CallRow {
-    if (row.kind !== "move" || row.target === null || !isPlayerGuid(row.target) || this.own(row.target)) return row;
-    const { name: _name, ...rest } = row;
-    return { ...rest, target: null };
+    switch (row.kind) {
+      case "move": {
+        if (row.target === null || !isPlayerGuid(row.target) || this.own(row.target)) return row;
+        const { name: _name, ...rest } = row;
+        return { ...rest, target: null };
+      }
+      case "key": {
+        const open = this.scrubValue(row.open);
+        return open === row.open ? row : { ...row, open };
+      }
+      case "call": {
+        const args = this.scrubValue(row.args);
+        return args === row.args ? row : { ...row, args };
+      }
+      case "result": {
+        const text = this.scrubText(row.text);
+        return text === row.text ? row : { ...row, text };
+      }
+      case "actions": {
+        const actions = this.scrubValue(row.actions);
+        return actions === row.actions ? row : { ...row, actions };
+      }
+      case "events": {
+        const events = this.scrubValue(row.events);
+        return events === row.events ? row : { ...row, events };
+      }
+      default:
+        return row;
+    }
+  }
+
+  /** Whether a guid, as a decimal string, is a player the client cache answered who is foreign. */
+  private foreignGuid(guid: string): boolean {
+    return this.playerNames.has(guid) && !this.own(guid);
+  }
+
+  /** Whether a word is the name the client cache answered for a foreign player, case as answered; never one under `MIN_NAME_CHARS`. */
+  private foreignName(word: string): boolean {
+    if (word.length < MIN_NAME_CHARS) return false;
+    const guids = this.playersByName.get(word);
+    if (guids === undefined) return false;
+    for (const g of guids) if (!this.own(g)) return true;
+    return false;
+  }
+
+  /** Every whole word in `text` that is a foreign player's name replaced by `"player"`; the same string when none was. */
+  private scrubNames(text: string): string {
+    let changed = false;
+    const out = text.replace(WORD_RE, (word) => {
+      if (!this.foreignName(word)) return word;
+      changed = true;
+      return PLAYER_REF;
+    });
+    return changed ? out : text;
+  }
+
+  /** The digit runs in a printed list of guids that are foreign players, replaced. */
+  private scrubGuidList(list: string): string {
+    return list.replace(/\d+/g, (d) => (this.foreignGuid(d) ? PLAYER_REF : d));
+  }
+
+  /**
+   * Free text with a foreign player's guid replaced by `"player"` where it is
+   * printed as a guid, and the name answered for it wherever it stands as a
+   * whole word (`scrubNames`). A guid is matched only in the forms the
+   * surface prints one in: after a `guid` label (`(guid 101)`), as the value
+   * of a guid-named key in printed JSON or an inspected object
+   * (`"senderGuid":"77"`, `guid: "77"`), or in a printed list under a
+   * `…guids` key. A bare number is never touched, whatever it equals: a
+   * damage value, a coordinate or a count stays as it was. The same string
+   * when nothing matched.
+   */
+  private scrubText(text: string): string {
+    if (!this.scrubbing()) return text;
+    const guids = text.replace(GUID_TEXT_RE, (whole, label: string | undefined, labelled: string | undefined, key: string | undefined, keyed: string | undefined, listOpen: string | undefined, list: string | undefined) => {
+      if (labelled !== undefined) return this.foreignGuid(labelled) ? `${label}${PLAYER_REF}` : whole;
+      if (keyed !== undefined) return this.foreignGuid(keyed) ? `${key}${PLAYER_REF}` : whole;
+      if (list !== undefined) return `${listOpen}${this.scrubGuidList(list)}]`;
+      return whole;
+    });
+    const out = this.scrubNames(guids);
+    return out === text ? text : out;
+  }
+
+  /**
+   * A JSON value scrubbed: a string under a guid-named key (`GUID_KEY_RE`), or
+   * in an array under one, is replaced whole when it is a foreign player's
+   * guid; every other string goes through `scrubText`, and keys through
+   * `scrubNames`. Numbers are never touched. The same value when nothing
+   * changed.
+   */
+  private scrubValue<T>(value: T, guidKeyed = false): T {
+    if (!this.scrubbing()) return value;
+    if (typeof value === "string") {
+      if (guidKeyed && this.foreignGuid(value)) return PLAYER_REF as T;
+      return this.scrubText(value) as T;
+    }
+    if (value === null || typeof value !== "object") return value;
+    if (Array.isArray(value)) {
+      let out: unknown[] | null = null;
+      for (let i = 0; i < value.length; i++) {
+        const v = this.scrubValue(value[i] as unknown, guidKeyed);
+        if (v !== value[i]) (out ??= [...value])[i] = v;
+      }
+      return (out ?? value) as T;
+    }
+    let changed = false;
+    const entries = Object.entries(value as Record<string, unknown>).map(([k, v]): [string, unknown] => {
+      const key = this.scrubNames(k);
+      const scrubbed = this.scrubValue(v, GUID_KEY_RE.test(k));
+      if (key !== k || scrubbed !== v) changed = true;
+      return [key, scrubbed];
+    });
+    return changed ? (Object.fromEntries(entries) as T) : value;
   }
 }
+
+/** A name shorter than this is never scrubbed: too likely to be an ordinary word. */
+export const MIN_NAME_CHARS = 3;
+
+/** A whole word, for the name scrub. */
+const WORD_RE = /\p{L}+/gu;
+
+/**
+ * A key whose value is a guid: the SDK's and the module's names for one all
+ * end in `guid` (`guid`, `senderGuid`, `targetGuid`, `packedGuid`, …) or
+ * `guids` for a list, and a movement's `mover`.
+ */
+const GUID_KEY_RE = /^(?:[A-Za-z_]*guids?|mover)$/i;
+
+/**
+ * The printed forms of a guid in free text: a `guid` label and its number;
+ * a guid-named key, quoted or not, and its value, quoted or not; a guid-named
+ * list key and its bracketed list.
+ */
+const GUID_TEXT_RE = /(\bguid\s+)(\d+)\b|(["']?\b(?:[A-Za-z_]*guid|mover)["']?\s*:\s*["']?)(\d+)\b|(["']?\b[A-Za-z_]*guids["']?\s*:\s*\[)([^\]]*)\]/gi;
