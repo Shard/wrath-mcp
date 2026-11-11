@@ -7,6 +7,7 @@
  * its own context rendering (`CoreToolRender`).
  *
  *   bun mcp/src/main.ts [--account <name>] [--dir <state-dir>] [--token-file <path> | --token <session-token>] [--allow-gm]
+ *                       [--record-dir <store> | --no-record] [--record-retention-days <n>]
  *
  * Environment: `WRATHBENCH_MODULE_URL` (default `http://127.0.0.1:8086`) and
  * `WRATHBENCH_MODULE_SECRET`, the module's port secret, which this process
@@ -19,6 +20,13 @@
  * so `--dir` alone resumes the session with both. The token is never printed:
  * stderr names the session by its tag and the state directory by its path.
  *
+ * The session is recorded by default (`docs/SESSION-FORMAT.md`): its trace,
+ * events, tool calls and a live ring of nearby units go to
+ * `<record-dir>/<fingerprint>/`, where `--record-dir` defaults to a `sessions`
+ * directory beside the state directory. Sessions that closed more than
+ * `--record-retention-days` ago (default 3) are removed at start; `--no-record`
+ * records nothing.
+ *
  * A clean exit — stdin closing, SIGINT or SIGTERM — logs the character out and
  * releases the lease. A killed process leaves the character in the world until
  * a create on its account reclaims it (module/PROTOCOL.md, "POST /session").
@@ -27,10 +35,12 @@
 import { randomBytes } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { EventSummary } from "./sandbox/ipc";
 import { compactJson } from "./jsonsafe";
-import { leaseRunSecret, logoutSession, releaseSessionSecret, tokenFingerprint, tokenTag } from "./module-auth";
+import { leaseRunSecret, logoutSession, moduleAuthHeaders, releaseSessionSecret, tokenFingerprint, tokenTag } from "./module-auth";
+import { DEFAULT_RETENTION_MS, SessionStore } from "./record/store";
+import { SessionWriter } from "./record/writer";
 import { SecretRedactor } from "./redact";
 import { CLIENT_CACHE_FILE, ClientCacheStore } from "./sandbox/client-cache";
 import { SandboxHost } from "./sandbox/host";
@@ -133,12 +143,47 @@ export function resolveSession(o: { token?: string; tokenFile?: string; dir?: st
 }
 
 /**
+ * Where the session is recorded and for how long, from argv: null with
+ * `--no-record`. The store is `--record-dir`, else `sessions` beside the
+ * state directory; retention is `--record-retention-days`, else three days.
+ */
+export function recordOption(argv: readonly string[], stateDir: string): { root: string; retentionMs: number } | null {
+  if (argv.includes("--no-record")) return null;
+  const flag = (name: string): string | undefined => {
+    const i = argv.indexOf(`--${name}`);
+    return i >= 0 ? argv[i + 1] : undefined;
+  };
+  const days = flag("record-retention-days");
+  let retentionMs = DEFAULT_RETENTION_MS;
+  if (days !== undefined) {
+    const n = Number(days);
+    if (!Number.isFinite(n) || n <= 0) throw new Error("--record-retention-days must be a number of days above 0");
+    retentionMs = n * 24 * 60 * 60_000;
+  }
+  return { root: flag("record-dir") ?? join(dirname(stateDir), "sessions"), retentionMs };
+}
+
+/** What the module says of itself on `GET /health`, for `session.json`; null when it does not answer. */
+export async function moduleIdentity(moduleUrl: string, headers: Record<string, string>, fetchImpl: typeof fetch = fetch): Promise<{ build: string | null; protocol: number | null } | null> {
+  try {
+    const res = await fetchImpl(new URL("/health", moduleUrl), { headers, signal: AbortSignal.timeout(3_000) });
+    if (!res.ok) return null;
+    const j = (await res.json()) as { build?: unknown; protocol?: unknown };
+    return { build: typeof j.build === "string" ? j.build : null, protocol: typeof j.protocol === "number" ? j.protocol : null };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * The clean exit, once however many ways it is asked for: stop the sandbox,
- * log the character out and release the lease, each bounded, with the port
- * secret, so a wedged child cannot hold the character in the world.
+ * close the session record, log the character out and release the lease,
+ * each bounded, with the port secret, so a wedged child cannot hold the
+ * character in the world.
  */
 export function sessionShutdown(o: {
   sandbox: Pick<SandboxHost, "stop">;
+  record?: Pick<SessionWriter, "close"> | undefined;
   moduleUrl: string;
   token: string;
   env?: Record<string, string | undefined>;
@@ -148,6 +193,7 @@ export function sessionShutdown(o: {
   return () =>
     (done ??= (async () => {
       await Promise.race([o.sandbox.stop().catch(() => {}), Bun.sleep(5_000)]);
+      if (o.record !== undefined) await Promise.race([o.record.close().catch(() => {}), Bun.sleep(5_000)]);
       const call = { moduleUrl: o.moduleUrl, token: o.token, ...(o.env !== undefined ? { env: o.env } : {}), ...(o.fetch !== undefined ? { fetch: o.fetch } : {}) };
       await logoutSession(call);
       await releaseSessionSecret(call);
@@ -184,6 +230,21 @@ async function main(): Promise<void> {
     console.error("[wrathbench-mcp] --allow-gm: the module did not confirm the GM opt-in (it predates it), so it serves player use only");
   } else if (allowGm) console.error("[wrathbench-mcp] GM opt-in on: the module serves a GM account and passes command chat for this session");
 
+  // The session record: on unless refused, in a store beside the state
+  // directory, named by the token's fingerprint and never by the token.
+  const recordAt = recordOption(argv, dir);
+  let record: SessionWriter | undefined;
+  if (recordAt !== null) {
+    const store = new SessionStore(recordAt.root);
+    const id = tokenFingerprint(token);
+    const pruned = store.prune(recordAt.retentionMs, { except: id });
+    if (pruned.length > 0) console.error(`[wrathbench-mcp] removed ${pruned.length} session record(s) past retention from ${recordAt.root}`);
+    record = new SessionWriter({ dir: store.sessionDir(id), id, stack: { version: MCP_PACKAGE_VERSION }, own: store.own(), scrub: (text) => secrets.scrub(text) });
+    record.open();
+    const writer = record;
+    void moduleIdentity(moduleUrl, moduleAuthHeaders()).then((m) => writer.setModule(m));
+  }
+
   const scratchpad = new Scratchpad(join(dir, "scratchpad.md"));
   const clientCache = new ClientCacheStore(join(dir, CLIENT_CACHE_FILE));
   process.on("exit", () => clientCache.flush());
@@ -196,6 +257,7 @@ async function main(): Promise<void> {
     snippetTimeoutMs: 30_000,
     pingGraceMs: 5_000,
     clientCache,
+    ...(record !== undefined ? { record: { writer: record } } : {}),
     // Scrubbed like everything else this process writes: a crash notice
     // quotes the child's stderr, and the child holds the lease secret.
     onNotice: (n) => console.error(secrets.scrub(`[wrathbench-mcp] ${n.kind}: ${n.text}`)),
@@ -206,6 +268,7 @@ async function main(): Promise<void> {
     sessionLive: () => true,
     turn: () => 0,
     secrets,
+    ...(record !== undefined ? { record } : {}),
   };
   const core = coreTools(PLAIN_RENDER);
   const tools = new ToolSet([core.run_snippet, core.recent_events, core.state_summary, core.write_scratchpad, core.edit_scratchpad]);
@@ -218,7 +281,7 @@ async function main(): Promise<void> {
     },
     { serverVersion: MCP_PACKAGE_VERSION },
   );
-  const shutdown = sessionShutdown({ sandbox, moduleUrl, token });
+  const shutdown = sessionShutdown({ sandbox, moduleUrl, token, record });
   let signalled = false;
   const onSignal = (code: number) => () => {
     // A second signal does not wait for the first one's logout.
@@ -229,7 +292,8 @@ async function main(): Promise<void> {
   process.on("SIGINT", onSignal(130));
   process.on("SIGTERM", onSignal(143));
   console.error(
-    `[wrathbench-mcp] session ${tokenTag(token)}, state in ${dir}; its token is in ${tokenPath} (mode 0600), and --dir ${dir} resumes it`,
+    `[wrathbench-mcp] session ${tokenTag(token)}, state in ${dir}; its token is in ${tokenPath} (mode 0600), and --dir ${dir} resumes it` +
+      (record !== undefined ? `; recorded in ${record.dir}` : "; not recorded"),
   );
   await serveStdio(server);
   await shutdown();

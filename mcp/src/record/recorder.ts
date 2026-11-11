@@ -1,0 +1,111 @@
+/**
+ * The session recorder: everything the stack records about a session from
+ * inside the process that holds its `WrathClient`, as one object.
+ *
+ * It is a library over a client, not something welded to the tool
+ * dispatcher: it reads the client's state cache and broadcast subscriptions
+ * and nothing else, so a long-running program that calls no tool is recorded
+ * exactly as a snippet loop is. The sandbox child builds one
+ * (`sandbox/child.ts`) and answers the host's `record_drain` with `drain()`;
+ * the host's session writer (`writer.ts`) gates and persists what comes back.
+ * Nothing here writes a file, and nothing here is reachable from a snippet.
+ */
+
+import type { EventStream, StateCache } from "@wrathbench/sdk";
+import { EventsRecorder, type EventsDrain } from "./events-recorder";
+import type { NearbyDrain, SessionCharacter, TraceDrain } from "./format";
+import { NearbyRecorder } from "./nearby-recorder";
+import { TraceRecorder } from "./trace-recorder";
+
+/** The slice of a `WrathClient` the recorders read. */
+export interface RecordedClient {
+  state: StateCache;
+  events: Pick<EventStream, "on" | "onAny" | "connected">;
+}
+
+/** A movement intention as the recorder is handed it by whatever watches the wire (`sandbox/child.ts`). */
+export interface RecordedMove {
+  /** When this row is about: the dispatch, or the verdict. */
+  ts: number;
+  /** When the move was dispatched. */
+  at: number;
+  /** The eval whose context dispatched it; null outside every eval. */
+  evalId: number | null;
+  /** True when that eval had already returned. */
+  routine?: true;
+  moveId: number | null;
+  map: number | null;
+  x: number;
+  y: number;
+  z: number;
+  /** The guid the move was aimed at, and its client-cache name. */
+  target: string | null;
+  name?: string;
+  status: string | null;
+}
+
+/** What one drain hands the host. */
+export interface RecordDrain {
+  trace: TraceDrain;
+  nearby: NearbyDrain;
+  events: EventsDrain;
+  moves: RecordedMove[];
+  /** The character as the cache holds it now; null before it is in the world. */
+  character: SessionCharacter | null;
+  /** The client's event stream: whether it is open, how many events it has folded and the last `seq`. */
+  stream: { connected: boolean; events: number; seq: number };
+}
+
+export class SessionRecorder {
+  readonly trace: TraceRecorder;
+  readonly nearby: NearbyRecorder;
+  readonly events: EventsRecorder;
+  private readonly moves: RecordedMove[] = [];
+
+  constructor(private readonly client: RecordedClient) {
+    this.trace = new TraceRecorder({ state: client.state, events: client.events });
+    this.nearby = new NearbyRecorder({ state: client.state, events: client.events });
+    this.events = new EventsRecorder({ state: client.state, events: client.events });
+  }
+
+  /** Start every recorder. Called once, after the client's own state fold is registered. */
+  start(): void {
+    this.events.start();
+    this.trace.start();
+    this.nearby.start();
+  }
+
+  stop(): void {
+    this.events.stop();
+    this.trace.stop();
+    this.nearby.stop();
+  }
+
+  /** Note a movement intention: at its dispatch, and again at its verdict. Bounded like the recorders. */
+  noteMove(move: RecordedMove): void {
+    this.moves.push(move);
+    if (this.moves.length > 256) this.moves.splice(0, this.moves.length - 256);
+  }
+
+  private character(): SessionCharacter | null {
+    const self = this.client.state.self;
+    if (self.guid === undefined) return null;
+    const field = (name: string): number | null => {
+      const v = self.fields.get(name)?.value;
+      return typeof v === "number" ? v : null;
+    };
+    return { guid: self.guid, name: self.name ?? null, race: field("race"), class: field("class") };
+  }
+
+  /** Everything latched since the last drain. Destructive: one caller, the host's writer, owns it. */
+  drain(): RecordDrain {
+    return {
+      trace: this.trace.drain(),
+      nearby: this.nearby.drain(),
+      events: this.events.drain(),
+      moves: this.moves.splice(0, this.moves.length),
+      character: this.character(),
+      stream: { connected: this.client.events.connected, events: this.client.state.eventCount, seq: this.client.state.lastSeq },
+    };
+  }
+}
