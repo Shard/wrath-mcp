@@ -3956,6 +3956,53 @@ describe("client: flight master window and activateTaxi", () => {
     expect(err).toBeInstanceOf(Error);
     expect((err as Error).message).toContain("no taxi option");
     expect((err as Error).message).toContain("Tell me about the city.");
+    // No node was discovered, so there was nothing to greet again for.
+    expect(stub.actions.filter((a) => a.action === "gossip_hello")).toHaveLength(1);
+    client.close();
+    await stub.stop();
+  });
+
+  test("showTaxiNodes: at a master not yet visited, the hello that discovers the node is followed by a second, which opens the window", async () => {
+    // Player::PrepareGossipMenu returns once SendLearnNewTaxiNode has taught
+    // the node: SMSG_NEW_TAXI_PATH, the node's status, then a menu cut short
+    // before its taxi option. A player clicks again.
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const pending = client.showTaxiNodes(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "gossip_hello");
+    stub.push(JSON.stringify({ seq: 350, opcode: "SMSG_NEW_TAXI_PATH", opcodeId: 0x1af, ts: TS + 350, data: {} }));
+    stub.push(JSON.stringify({ seq: 351, opcode: "SMSG_TAXINODE_STATUS", opcodeId: 0x1ab, ts: TS + 351, data: { guid: CREATURE_GUID, known: true } }));
+    stub.push(
+      JSON.stringify({ seq: 352, opcode: "SMSG_GOSSIP_MESSAGE", opcodeId: 0x17d, ts: TS + 352, data: { guid: CREATURE_GUID, menuId: 4360, textId: 100, options: [], quests: [] } }),
+    );
+    const hellos = () => stub.actions.filter((a) => a.action === "gossip_hello");
+    const deadline = Date.now() + 2000;
+    while (hellos().length < 2 && Date.now() < deadline) await Bun.sleep(5);
+    expect(hellos()).toHaveLength(2);
+    expect(hellos()[1]).toMatchObject({ guid: CREATURE_GUID });
+    stub.push(menu(353));
+    await untilAction(stub, "gossip_select");
+    stub.push(window(354));
+    const w = await pending;
+    expect(w.current.nodeId).toBe(6);
+    expect(hellos()).toHaveLength(2);
+    client.close();
+    await stub.stop();
+  });
+
+  test("showTaxiNodes: a second menu still without a taxi option throws; the master is greeted twice at most", async () => {
+    const stub = startStub({ onConnect: () => combatWorld() });
+    const client = await inWorld(stub);
+    const pending = client.showTaxiNodes(CREATURE_GUID, { timeout: 2000 });
+    await untilAction(stub, "gossip_hello");
+    stub.push(JSON.stringify({ seq: 360, opcode: "SMSG_NEW_TAXI_PATH", opcodeId: 0x1af, ts: TS + 360, data: {} }));
+    stub.push(menu(361, false));
+    const deadline = Date.now() + 2000;
+    while (stub.actions.filter((a) => a.action === "gossip_hello").length < 2 && Date.now() < deadline) await Bun.sleep(5);
+    stub.push(menu(362, false));
+    const err = await pending.catch((e: unknown) => e);
+    expect((err as Error).message).toContain("no taxi option");
+    expect(stub.actions.filter((a) => a.action === "gossip_hello")).toHaveLength(2);
     client.close();
     await stub.stop();
   });

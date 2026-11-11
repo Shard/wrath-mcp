@@ -9307,29 +9307,47 @@ export class WrathClient {
    * visited (the only destinations the server will accept, and only one flight path away). Nothing here
    * is a route or a fare; the way to learn whether two nodes connect is to
    * ask (`activateTaxi`).
+   *
+   * The first hello at a master whose node this character has not visited
+   * only discovers it: the server sends `SMSG_NEW_TAXI_PATH` and a menu cut
+   * short before its taxi option (`Player::PrepareGossipMenu` returns once
+   * `SendLearnNewTaxiNode` has taught the node). A player clicks the master
+   * again; so does this, once, when that discovery came with the menu.
    */
   async showTaxiNodes(npcGuid: GuidOrUnit, options: TaxiOptions = {}): Promise<WithResolved<TaxiWindow>> {
     return this.byName(npcGuid, "showTaxiNodes(npcGuid)", async (id) => {
       const timeout = options.timeout ?? 10_000;
-      const sinceSeq = this.events.recent(1)[0]?.seq;
+      let sinceSeq = this.events.recent(1)[0]?.seq;
       const after = (e: StreamEvent) => sinceSeq === undefined || e.seq > sinceSeq;
       const isWindow = (e: StreamEvent) =>
         isEvent(e, "SMSG_SHOWTAXINODES") && !isDecodeError(e.data) && guidKey((e.data as { guid: string }).guid) === id;
       const isMenu = (e: StreamEvent) =>
         isEvent(e, "SMSG_GOSSIP_MESSAGE") && !isDecodeError(e.data) && guidKey((e.data as GossipMessageData).guid) === id;
-      await this.gossipHello(id);
-      const first = await this.waitEvent((e) => after(e) && (isWindow(e) || isMenu(e)), {
-        timeout,
-        description: `the flight master's window (SMSG_SHOWTAXINODES) or menu (SMSG_GOSSIP_MESSAGE) for ${id}`,
-      });
-      if (isMenu(first)) {
+      for (let hello = 1; ; hello++) {
+        await this.gossipHello(id);
+        const first = await this.waitEvent((e) => after(e) && (isWindow(e) || isMenu(e)), {
+          timeout,
+          description: `the flight master's window (SMSG_SHOWTAXINODES) or menu (SMSG_GOSSIP_MESSAGE) for ${id}`,
+        });
+        if (!isMenu(first)) break;
         const menu = first.data as GossipMessageData;
         const taxi = menu.options.filter((o) => o.icon === 2);
+        if (taxi.length === 0 && hello === 1) {
+          // Only SMSG_NEW_TAXI_PATH says the node was just learned: a status
+          // packet saying known also answers a plain status query.
+          const from = sinceSeq;
+          const discovered = this.events
+            .recent()
+            .some((e) => e.opcode === "SMSG_NEW_TAXI_PATH" && (from === undefined || e.seq > from) && e.seq < first.seq);
+          if (discovered) {
+            sinceSeq = first.seq;
+            continue;
+          }
+        }
         if (taxi.length !== 1) {
           throw new Error(
             `showTaxiNodes(${id}): the menu that opened has ${taxi.length === 0 ? "no" : taxi.length} taxi option(s) ` +
-              `(gossip icon 2) — is this NPC a flight master (state.units({ role: "flightMaster" }))? A first hello ` +
-              `only discovers this master's node; call showTaxiNodes(guid) again to open the window. Options: ` +
+              `(gossip icon 2) — is this NPC a flight master (state.units({ role: "flightMaster" }))? Options: ` +
               menu.options.map((o) => `${o.optionId}:${JSON.stringify(o.text)} (icon ${o.icon})`).join(", "),
           );
         }
@@ -9338,6 +9356,7 @@ export class WrathClient {
           timeout,
           description: `the flight master's window (SMSG_SHOWTAXINODES) for ${id} after choosing its taxi option`,
         });
+        break;
       }
       const window = this.state.lastTaxiNodes(id);
       if (window === undefined) {
