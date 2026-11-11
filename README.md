@@ -6,13 +6,14 @@ on a live character, and nothing a client would not have. Every action goes in
 as the client opcode a real client would send, through the same server handler,
 and every observation is a packet the server would send that client.
 
-Three pieces:
+Four pieces:
 
 | Path | What it is |
 |---|---|
 | `module/` | `mod-wrathbench`, the C++ AzerothCore module. A thin packet bridge and event tap over HTTP and WebSocket inside the worldserver. Its wire is `module/PROTOCOL.md`. |
 | `sdk/` | `@wrathbench/sdk`, the typed Bun/TypeScript client over that wire: the event stream, the state cache, the helpers and their per-call hints. `sdk/API.md` is the generated per-method reference an agent reads. |
 | `mcp/` | `@wrathbench/mcp`, the agent surface over the SDK: a confined, persistent snippet sandbox holding one client, an MCP server, the core tools `run_snippet`, `recent_events`, `state_summary`, `write_scratchpad` and `edit_scratchpad`, and the session record every session leaves. |
+| `inspector/` | `@wrathbench/inspector`, wrath-inspector: a read-only server and SolidJS views over a session store (the live map, each session, its character, party and events), and the `wrath-inspector` bin that serves them. It reads records and nothing else. |
 
 What an agent may observe and do is `docs/CONTRACTS.md`; with
 `module/PROTOCOL.md` it is the stack's specification. The stack records what
@@ -26,7 +27,7 @@ evaluation harness, is one such harness and the stack's first consumer.
 flowchart TB
     agent["Agent<br/>(any MCP client)"]
     harness["Harness, optional<br/>(e.g. WrathBench)"]
-    reader["Readers<br/>(a viewer, a scorer, a collector)"]
+    reader["Readers<br/>(wrath-inspector, a harness's<br/>viewer, scorer, collector)"]
 
     subgraph mcp["mcp/"]
         server["MCP server + core tools<br/>holds the port secret"]
@@ -89,7 +90,8 @@ Every session leaves a record: a recorder beside the client reads its state
 cache, and the host writes that, the tool calls and the action log to one
 directory of append-only JSONL segments, the format `docs/SESSION-FORMAT.md`
 specifies. A player who is not one of the deployment's own sessions is never
-written.
+written. wrath-inspector reads a store back (`inspector/README.md`):
+`bun inspector/src/bin.ts --store <dir>` serves its API and page.
 
 Tested against AzerothCore
 [`3cafaf4a588fd1f287678fdb37438fdedd1ed85c`](https://github.com/azerothcore/azerothcore-wotlk/commit/3cafaf4a588fd1f287678fdb37438fdedd1ed85c).
@@ -170,8 +172,8 @@ using the SDK directly.
 ## Development
 
 ```bash
-bun test                 # sdk, mcp and the boundary check, against an in-process module stub
-bun run typecheck        # tsc over sdk, mcp and scripts; bun test does not check types
+bun test                 # sdk, mcp, the inspector and the boundary check, against an in-process module stub
+bun run typecheck        # tsc over sdk, mcp, the inspector and scripts; bun test does not check types
 bun run boundary         # the stack imports nothing but itself and declared dependencies
 bun run docs:api:check   # sdk/API.md matches the source it is generated from
 ```

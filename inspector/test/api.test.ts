@@ -5,7 +5,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInspectorApi, inspectorHandler, storeSource, type SessionScope } from "../src/index";
 import { decodeSegment } from "../src/codec/trace";
@@ -147,6 +147,20 @@ describe("the bin's handler", () => {
     const cookie = ok.headers.get("set-cookie")!.split(";")[0]!;
     expect(ok.headers.get("set-cookie")).toContain("HttpOnly");
     expect((await h(new Request("http://x/api/sessions", { headers: { cookie } }))).status).toBe(200);
+  });
+
+  test("tiles come from the directory it was given, by three integers, and are gated like the API", async () => {
+    const tiles = join(tmp, "tiles");
+    mkdirSync(join(tiles, "0"), { recursive: true });
+    writeFileSync(join(tiles, "0", "31_32.png"), "png");
+    const open = inspectorHandler({ source: storeSource(root), tilesDir: tiles });
+    const hit = await open(new Request("http://x/tiles/0/31_32.png"));
+    expect([hit.status, hit.headers.get("content-type"), await hit.text()]).toEqual([200, "image/png", "png"]);
+    expect((await open(new Request("http://x/tiles/0/31_33.png"))).status).toBe(404);
+    expect((await open(new Request("http://x/tiles/0/..%2F..%2Fsecret.png"))).status).toBe(404);
+    expect((await inspectorHandler({ source: storeSource(root) })(new Request("http://x/tiles/0/31_32.png"))).status).toBe(404);
+    const gated = inspectorHandler({ source: storeSource(root), tilesDir: tiles, host: "0.0.0.0", secret: "an-inspector-secret-of-length" });
+    expect((await gated(new Request("http://x/tiles/0/31_32.png"))).status).toBe(401);
   });
 
   test("an unbuilt page says so, and the API still answers", async () => {

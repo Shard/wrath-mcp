@@ -2,13 +2,15 @@
 /**
  * wrath-inspector: read a session store, serve its API and page.
  *
- *   wrath-inspector --store <dir> [--host 127.0.0.1] [--port 8091] [--secret-file <path>]
+ *   wrath-inspector --store <dir> [--host 127.0.0.1] [--port 8091] [--secret-file <path>] [--tiles <dir>]
  *
  * `--store` is a session store (`mcp/src/main.ts`'s `--record-dir`) or one
  * session directory. Bound to loopback, the default, it needs no credential.
  * Bound to anything else it refuses to start without a bearer secret, from
  * `WRATH_INSPECTOR_SECRET` or the first line of `--secret-file`; never from
- * the command line. It only ever reads the store.
+ * the command line. `--tiles` is a directory of minimap tiles,
+ * `<map>/<row>_<col>.png`, for the map to draw over its grid. It only ever
+ * reads the store.
  */
 
 import { existsSync, readFileSync, statSync } from "node:fs";
@@ -17,15 +19,15 @@ import { SECRET_ENV } from "./auth";
 import { serveInspector } from "./serve";
 import { storeSource } from "./store-source";
 
-const USAGE = "usage: wrath-inspector --store <dir> [--host 127.0.0.1] [--port 8091] [--secret-file <path>]";
+const USAGE = "usage: wrath-inspector --store <dir> [--host 127.0.0.1] [--port 8091] [--secret-file <path>] [--tiles <dir>]";
 
 /** The flags, parsed; throws with the usage on anything it does not know. */
-export function parseArgs(argv: readonly string[], env: Record<string, string | undefined> = process.env): { store: string; host: string; port: number; secret: string | undefined } {
+export function parseArgs(argv: readonly string[], env: Record<string, string | undefined> = process.env): { store: string; host: string; port: number; secret: string | undefined; tiles: string | undefined } {
   const flags = new Map<string, string>();
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "--help" || a === "-h") throw new Error(USAGE);
-    const m = /^--(store|host|port|secret-file)(?:=(.*))?$/.exec(a);
+    const m = /^--(store|host|port|secret-file|tiles)(?:=(.*))?$/.exec(a);
     if (m === null) throw new Error(`unknown argument ${a}\n${USAGE}`);
     const v = m[2] ?? argv[++i];
     if (v === undefined) throw new Error(`--${m[1]} needs a value\n${USAGE}`);
@@ -38,14 +40,21 @@ export function parseArgs(argv: readonly string[], env: Record<string, string | 
   let secret = env[SECRET_ENV];
   const file = flags.get("secret-file");
   if (file !== undefined) secret = readFileSync(file, "utf8").split("\n")[0]!.trim();
-  return { store: resolve(store), host: flags.get("host") ?? "127.0.0.1", port, secret: secret !== undefined && secret.length > 0 ? secret : undefined };
+  const tiles = flags.get("tiles");
+  return { store: resolve(store), host: flags.get("host") ?? "127.0.0.1", port, secret: secret !== undefined && secret.length > 0 ? secret : undefined, tiles: tiles === undefined ? undefined : resolve(tiles) };
 }
 
 if (import.meta.main) {
   try {
     const args = parseArgs(process.argv.slice(2));
     if (!existsSync(args.store) || !statSync(args.store).isDirectory()) throw new Error(`--store ${args.store} is not a directory`);
-    const server = serveInspector({ source: storeSource(args.store), host: args.host, port: args.port, ...(args.secret === undefined ? {} : { secret: args.secret }) });
+    const server = serveInspector({
+      source: storeSource(args.store),
+      host: args.host,
+      port: args.port,
+      ...(args.secret === undefined ? {} : { secret: args.secret }),
+      ...(args.tiles === undefined ? {} : { tilesDir: args.tiles }),
+    });
     console.log(`[wrath-inspector] ${args.store} on http://${server.hostname}:${server.port}${args.secret === undefined ? "" : " (bearer secret required)"}`);
   } catch (err) {
     console.error(`[wrath-inspector] ${(err as Error).message}`);

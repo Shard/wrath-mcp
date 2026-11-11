@@ -1,0 +1,502 @@
+/*
+ * wrath-inspector's page. The classes and the tokens are WrathBench's
+ * dashboard's (`dashboard/src/styles.css` there), taken as they are, so the
+ * views read the same wherever they are drawn: the palette and type scale, the
+ * shell, tables, cards, badges and buttons, the map stage and sidebar, and the
+ * unit frame, inventory, quest log and popover the views share. A page that
+ * embeds the views brings its own copy of these rules; this file is the bin's.
+ */
+
+:root {
+  color-scheme: dark light;
+  --bg: #14161a;
+  --fg: #d8dee6;
+  --dim: #8a94a3;
+  --line: #2b3038;
+  --panel: #1b1e24;
+  --accent: #7aa2f7;
+  --err: #f7768e;
+  --ok: #9ece6a;
+  /* A finished thing, not a live one: green enough to still mean "fine",
+     pulled back toward the background so it does not compete with --ok. */
+  --ok-muted: #7a9460;
+  --warn: #e0af68;
+  --grid: #1a1d22;
+  --gridline: #23272e;
+  /* A replayed route's flights. A run's own route colour is any hue at 60%
+     lightness, so this is set apart by lightness instead of hue: a pale sky
+     here, a deep blue on the light theme, and never one a run can draw in. */
+  --flight: #bfe6ff;
+  /* Claude's own orange, so the claude-code harness tag reads as itself rather
+     than as one more accent-coloured badge. */
+  --claude: #da7756;
+  /* The codex harness tag: OpenAI's green, for the same reason. */
+  --codex: #10a37f;
+  /* The pi harness tag: a violet no other tag or run line uses (pi has no house colour). */
+  --pi: #a78bfa;
+  /* A party's members by their place in it, the leader first (`lib/party.ts`):
+     five members of one model share one logo, so the colour is what tells them
+     apart on the map, in its legend and on the party page. Okabe–Ito hues. */
+  --member-1: #e69f00;
+  --member-2: #56b4e9;
+  --member-3: #cc79a7;
+  --member-4: #f0e442;
+  --member-5: #009e73;
+
+  /*
+   * The type scale. Seven steps, in rem against the browser's own root size,
+   * and every rule in this file that sets a size names one of them — nothing
+   * sets a pixel font-size any more. Two reasons it is tokens rather than
+   * literals: the page had eight different sizes doing the work of four, and a
+   * phone wants the whole thing a step smaller, which is one override of these
+   * seven values (below) instead of a media query per rule.
+   *
+   * SVG text is deliberately NOT on this scale (`.loop-label`, `.loop-sub`,
+   * and the `font-size` attributes the chart components write): those are
+   * viewBox user units that scale with the drawing, and a rem there would be
+   * an absolute size that stops scaling with it.
+   */
+  --fs-2xs: 0.5625rem;  /* 9px — the surface badge, sort marks, rail ticks */
+  --fs-xs: 0.6875rem;   /* 11px — table headers, key labels, badges */
+  --fs-sm: 0.75rem;     /* 12px — captions, controls, secondary lines */
+  --fs-md: 0.8125rem;   /* 13px — table body, section headings */
+  --fs-base: 0.875rem;  /* 14px — body copy */
+  --fs-lg: 0.9375rem;   /* 15px — the brand, card figures */
+  --fs-xl: 1.25rem;     /* 20px — the one page title per page */
+}
+
+/*
+ * A phone reads this dashboard one column at a time, and at desktop sizes the
+ * header alone took three lines of a 360px viewport. One step down across the
+ * board, defined in the one place the sizes are defined.
+ */
+@media (max-width: 720px) {
+  :root {
+    --fs-2xs: 0.5625rem;  /* 9px — already the floor; it does not step down */
+    --fs-xs: 0.625rem;    /* 10px */
+    --fs-sm: 0.6875rem;   /* 11px */
+    --fs-md: 0.75rem;     /* 12px */
+    --fs-base: 0.8125rem; /* 13px */
+    --fs-lg: 0.875rem;    /* 14px */
+    --fs-xl: 1.125rem;    /* 18px */
+  }
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #fbfbfc;
+    --fg: #1e2229;
+    --dim: #5d6673;
+    --line: #dde1e7;
+    --panel: #f2f3f6;
+    --accent: #2f5fd0;
+    --err: #b3283c;
+    --ok: #3f7a24;
+    /* Muted means "toward the page" in both schemes, so on white it lightens. */
+    --ok-muted: #6e8f57;
+    --warn: #8a5d00;
+    --grid: #e9ebef;
+    --gridline: #d5d9e0;
+    --flight: #0a4f8a;
+    /* Darkened for a light background: #da7756 is too pale for an 11px badge. */
+    --claude: #b4522f;
+    --codex: #0b7a5f;
+    --pi: #6d28d9;
+    --member-1: #a86f00;
+    --member-2: #1f6fa8;
+    --member-3: #a8487f;
+    --member-4: #857800;
+    --member-5: #00795a;
+  }
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: var(--fs-base)/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.app { display: flex; flex-direction: column; height: 100%; }
+
+header.top {
+  display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap;
+  padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--bg);
+  flex: none;
+}
+header.top .wordmark { font-size: var(--fs-lg); margin: 0; font-weight: 600; }
+
+main { flex: 1; min-height: 0; overflow: auto; }
+main.flush { overflow: hidden; }
+.page { padding: 16px; }
+
+.dim { color: var(--dim); }
+.err { color: var(--err); }
+.ok { color: var(--ok); }
+/* Done rather than going: a campaign that has finished its sweep. */
+.ok-muted { color: var(--ok-muted); }
+.warn { color: var(--warn); }
+.mono { font-variant-numeric: tabular-nums; }
+
+h1 { font-size: var(--fs-xl); margin: 4px 0 8px; font-weight: 700; }
+/* Section headings, a step up from where they were so the h1 is not alone in
+   being read as a heading — still plainly below it. A class rather than
+   `h2.section`, so the run page's breadcrumb h1 and the config page's h3s take
+   the same treatment without a copy of it. The `.section` after `h1` in source
+   order is what lets `h1.section` keep the breadcrumb's size. */
+.section { font-size: var(--fs-base); margin: 20px 0 8px; font-weight: 700;
+           text-transform: uppercase; letter-spacing: .08em; color: var(--dim); }
+.section:first-child { margin-top: 0; }
+/* Below h2, so the outline reads in the order it is written. */
+h3.section { font-size: var(--fs-md); }
+
+.cards { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; }
+.card .v { font-size: var(--fs-lg); font-weight: 600; }
+.card .sub { color: var(--dim); font-size: var(--fs-sm); }
+
+.scroller { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: var(--fs-md); }
+th, td { text-align: left; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--dim); font-weight: 600; font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .06em; }
+/* One highlight, two ways in: the pointer's own hover, and the shared
+   `hovered` key the ladder's chart and table agree on. */
+tbody tr:hover, tbody tr.hovered { background: var(--panel); }
+tbody tr.hovered { outline: 1px solid var(--accent); outline-offset: -1px; }
+
+.badge { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .05em; font-weight: 700;
+         border: 1px solid var(--line); border-radius: 3px; padding: 1px 5px; color: var(--dim); }
+.badge.running { color: var(--ok); border-color: var(--ok); }
+.badge.draining, .badge.paused-deploy { color: var(--warn); border-color: var(--warn); }
+/* `.combat` is the unit frame's flag (`unitFlags`): the same red as a run that exited. */
+.badge.exited, .badge.combat { color: var(--err); border-color: var(--err); }
+.badge.resuming { color: var(--accent); border-color: var(--accent); }
+
+.card .k, .side .k { color: var(--dim); text-transform: uppercase; letter-spacing: .06em; font-size: var(--fs-xs); }
+
+button, .btn {
+  font: inherit; background: var(--panel); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 4px; padding: 2px 8px; cursor: pointer;
+}
+button:hover, .btn:hover { border-color: var(--accent); text-decoration: none; }
+/* An anchor sitting in a row of buttons — the run page's "replay" and "open
+   run" links — has to read as a control beside them. */
+.btn { display: inline-block; color: var(--accent); line-height: 1.4; }
+button.on { border-color: var(--accent); font-weight: 700; }
+
+.map-wrap { display: flex; height: 100%; }
+.map-stage { position: relative; flex: 1; min-width: 0; }
+.map-stage canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
+.map-stage canvas.drag { cursor: grabbing; }
+/* The ground (lattice, tiles, art) under the canvas that takes the pointer and draws the marks. */
+.map-stage canvas.map-ground { position: absolute; inset: 0; pointer-events: none; }
+.map-stage canvas.map-ground + canvas { position: relative; }
+.map-chips { position: absolute; top: 10px; left: 10px; display: flex; gap: 6px; flex-wrap: wrap; }
+
+/*
+ * What a character said, over its pip (`lib/chatbubbles.ts`). The frame loop
+ * places each stack through four properties: its box (`--bx`, `--by`) and the
+ * leader down to its pip (`--lx`, `--lead`). The bubble itself is a `.card`.
+ * Only a bubble takes the pointer, for its title, and the layer hands a drag
+ * or a wheel that starts on one to the map's own handlers. A kind other than say is marked on the left
+ * edge; yell, raid and emote share the feed's error and notice rules.
+ */
+.map-bubbles { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
+.map-bubble-stack {
+  position: absolute; left: 0; top: 0; max-width: min(240px, 70%);
+  transform: translate(var(--bx, -9999px), var(--by, -9999px));
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+}
+.map-bubble-stack::after {
+  content: ""; position: absolute; top: 100%; left: var(--lx, 50%);
+  width: 1px; height: var(--lead, 0); background: var(--dim);
+}
+.card.map-bubble {
+  pointer-events: auto; touch-action: none; padding: 2px 6px; font-size: var(--fs-sm); line-height: 1.35;
+  overflow-wrap: anywhere; box-shadow: 0 2px 8px rgba(0, 0, 0, .25);
+}
+.map-bubble:not(:last-child) { opacity: .75; }
+.map-bubble.party { border-left: 3px solid var(--accent); }
+.map-bubble.whisper { border-left: 3px solid var(--pi); }
+
+.side { width: 300px; flex: none; border-left: 1px solid var(--line); background: var(--panel);
+        padding: 12px 14px; overflow-y: auto; }
+.side h3 { font-size: var(--fs-md); margin: 0 0 8px; font-weight: 700; }
+.side .v { margin-bottom: 8px; word-break: break-word; }
+.live-attempt { margin: 0 0 12px; max-width: 420px; }
+.live-attempt .unit-frame { margin: 8px 0; }
+
+/*
+ * The map is a fixed 300px sidebar beside a flex stage inside `main.flush`,
+ * which does not scroll. Under about a phone's width the stage has nothing
+ * left, so the two stack: the map takes what is above and the sidebar becomes
+ * a short scrolling panel under it. The canvas is measured by a ResizeObserver
+ * (`MapPage.tsx`), so it redraws at the new size on its own.
+ */
+@media (max-width: 720px) {
+  .map-wrap { flex-direction: column; }
+  .map-stage { flex: 1; min-height: 0; }
+  .side { width: auto; max-height: 45%; border-left: none; border-top: 1px solid var(--line); }
+  .map-bubble-stack { max-width: min(180px, 60%); }
+}
+
+/*
+ * Wide SVGs — the ladder scatter, the loop diagram — scale with their viewBox,
+
+/* --- the unit frame (components/UnitFrame.tsx) --- */
+/*
+ * The client's own bar colours — health 0/1/0, mana 0/0/1, rage 1/0/0, energy
+ * 1/1/0, focus 1/.5/.25, runic power 0/.82/1 — desaturated a step so they sit
+ * on the panel rather than glow off it, and darkened on white so 11px text
+ * stays legible over them. Experience is the client's purple. Tokens live here
+ * next to the palette so both schemes are defined in one place.
+ */
+:root {
+  --hp: #2fb34a;
+  --power-mana: #3a5fd9;
+  --power-rage: #c8352f;
+  --power-energy: #d9c227;
+  --power-focus: #d9772f;
+  --power-runic: #29b4e0;
+  --xp: #7b3fd6;
+  --bar-track: #0e1013;
+  --bar-border: #000000;
+  --bar-text: #f4f6f8;
+  /* The two states that opt out of `--bar-text` and its shadow: unobserved and
+     dead. They sit on the same dark track, so they are tokens rather than
+     `--dim`/`--err` directly — the light theme's versions of those are chosen
+     for the page's white ground and vanish here. */
+  --bar-text-dim: #8a94a3;
+  --bar-text-err: #f7768e;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --hp: #2a9a42;
+    --power-mana: #2d4fc4;
+    --power-rage: #b52d28;
+    --power-energy: #c4ad10;
+    --power-focus: #c46520;
+    --power-runic: #1f9dc7;
+    --xp: #6b32c2;
+    /*
+     * The track is dark in both themes, and the bar text stays white.
+     * It used to be #d9dce2 here, which put white 11px text on a near-white
+     * ground at about 1.3:1 — the depleted half of every bar was unreadable in
+     * the light theme, and no value of `--bar-text` fixes it alone: dark text
+     * legible on that track fails against the saturated fills (mana, xp) the
+     * same text has to cross. Darkening the track is what makes one colour
+     * work over both halves, and it is what the dark theme already does.
+     */
+    --bar-track: #59606c;
+    --bar-border: #454b55;
+    --bar-text: #ffffff;
+    /* Light versions, because the track above is dark here too: the page's
+       `--dim` (#5d6673) is the track's own value and `--err` (#b3283c) is
+       barely off it. */
+    --bar-text-dim: #ced4de;
+    --bar-text-err: #ff9aa8;
+  }
+}
+.unit-frame { display: flex; flex-direction: column; gap: 3px; margin: 2px 0 4px; }
+.bar { position: relative; height: 16px; border-radius: 2px; overflow: hidden;
+       background: var(--bar-track); border: 1px solid var(--bar-border); }
+.bar-fill { position: absolute; inset: 0 auto 0 0; transition: width .3s ease;
+            /* A faint bevel: lighter at the top, darker toward the bottom. */
+            background-image: linear-gradient(to bottom, rgba(255,255,255,.28), rgba(255,255,255,0) 45%, rgba(0,0,0,.22)); }
+.bar.hp .bar-fill { background-color: var(--hp); }
+.bar.xp .bar-fill { background-color: var(--xp); }
+/* The power tint is an inline background-color from the component, chosen by type. */
+.bar.pw .bar-fill { background-color: var(--power-mana); }
+.bar-text { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+            font-size: var(--fs-xs); line-height: 1; font-variant-numeric: tabular-nums; color: var(--bar-text);
+            text-shadow: 0 1px 1px rgba(0,0,0,.7); pointer-events: none; }
+.bar.unobserved .bar-text { color: var(--bar-text-dim); text-shadow: none; }
+.bar.dead { border-color: var(--err); }
+.bar.dead .bar-text { color: var(--bar-text-err); text-shadow: none; }
+.xp-row { display: flex; align-items: center; gap: 5px; }
+/* The same row inside a line of text: it shrinks with the line rather than
+   taking the column, and never grows past a readable width. */
+.xp-inline { display: inline-flex; flex: 1 1 120px; min-width: 60px; max-width: 200px; vertical-align: middle; }
+.xp-inline .bar { height: 14px; }
+.xp-inline .level-badge { min-width: 18px; height: 18px; }
+/* The table form: a fixed narrow bar with no numbers inside it, because a
+   column is not wide enough for "1,234 / 5,400" and a squeezed bar that prints
+   half a figure is worse than one that prints none. The exact reading is the
+   cell's title (`xpCellTitle`). The heights are the inline bar's, so a row
+   carrying one is no taller than a row carrying text. */
+.xp-cell { display: inline-flex; vertical-align: middle; }
+.xp-cell .xp-inline { flex: 0 0 auto; width: 74px; min-width: 0; max-width: none; }
+.xp-cell .bar-text { display: none; }
+@media (max-width: 560px) {
+  .xp-cell .xp-inline { width: 52px; }
+}
+.xp-row .bar { flex: 1; min-width: 0; }
+.level-badge { flex: none; min-width: 20px; height: 20px; padding: 0 4px; border-radius: 50%;
+               display: inline-flex; align-items: center; justify-content: center;
+               font-size: var(--fs-xs); font-weight: 700; color: var(--bar-text); background: var(--xp);
+               border: 1px solid var(--bar-border); box-shadow: inset 0 1px 0 rgba(255,255,255,.3); }
+/*
+ * What a trace adds to the frame: the cast bar (the client's yellow), the
+ * target's health, the states as badges, and the buffs row. The squares are
+ * the inventory's `.inv-cell` over a spell link, smaller; the time left under
+ * each is `.inv-note`. A debuff is told by its border, which only a private
+ * segment carries the flag for.
+ */
+.bar.cast .bar-fill { background-color: var(--warn); }
+.cast-row .inv-cell { width: 18px; height: 18px; }
+.unit-flags { display: flex; flex-wrap: wrap; gap: 4px; }
+.auras { display: flex; flex-wrap: wrap; gap: 4px 3px; margin-top: 2px; }
+.auras > span { display: inline-flex; flex-direction: column; align-items: center; min-width: 26px; }
+.auras .inv-cell { width: 26px; height: 26px; }
+.inv-cell.debuff { border-color: var(--err); }
+
+/*
+ * Inventory (item icons). A cell is a fixed square that holds
+ * either Wowhead's icon or our own fallback text, so the grid does not reflow
+ * when the script lands — or when it never does. `.decorated` is written by the
+ * panel's MutationObserver: before it, the name shows; after it, the icon does.
+ */
+.inventory { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.inv-note, .bag-label { color: var(--dim); font-size: var(--fs-xs); }
+
+.inv-cell {
+  position: relative; width: 40px; height: 40px; flex: 0 0 auto;
+  border: 1px solid var(--line); border-radius: 4px; background: var(--grid);
+  overflow: hidden;
+}
+.inv-cell.empty { background: transparent; border-style: dashed; opacity: 0.55; }
+.inv-cell .inv-slot-label {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  color: var(--dim); font-size: var(--fs-2xs); text-align: center; line-height: 1.05; padding: 1px;
+  white-space: nowrap;
+}
+.inv-link {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  text-decoration: none; overflow: hidden;
+}
+/* The fallback: as much of the name as fits, in its quality colour. It is the
+   readable state, not a placeholder — a blocked reader never leaves it. */
+.inv-link .inv-name {
+  font-size: var(--fs-2xs); line-height: 1.05; text-align: center; padding: 1px 1px 8px;
+  overflow: hidden; word-break: break-word; max-height: 100%;
+}
+.inv-link.decorated .inv-name { display: none; }
+.inv-link img, .inv-link ins, .inv-link del { display: block; width: 100%; height: 100%; }
+.inv-count {
+  position: absolute; right: 1px; bottom: 0; z-index: 1;
+  font-size: var(--fs-2xs); font-weight: 700; color: var(--fg);
+  background: var(--bg); border-radius: 2px; padding: 0 2px; line-height: 1.3;
+  pointer-events: none;
+}
+.inv-grid { display: flex; flex-wrap: wrap; gap: 3px; }
+
+/* Bounded, so the two columns sit either side of a character-sized gap rather
+   than being flung to the edges of whatever card holds them. */
+.paperdoll-grid { display: flex; gap: 6px; align-items: flex-start; max-width: 230px; }
+.paperdoll-col { display: flex; flex-direction: column; gap: 3px; }
+.paperdoll-mid { flex: 1 1 auto; min-width: 0; }
+/* The weapon row sits centred under the two columns, as the sheet draws it. */
+.paperdoll-row { display: flex; gap: 3px; margin-top: 3px; max-width: 230px; justify-content: center; }
+.inv-unplaced { margin-top: 8px; display: flex; flex-direction: column; gap: 3px;
+                border-top: 1px solid var(--line); padding-top: 6px; }
+
+/*
+ * The readable shape. A row with no entry can never carry an icon, so it is
+ * never given a square to be truncated inside: name in quality colour, count
+ * to the right. The same list is the whole panel once the script has failed.
+ */
+/* One column, wide enough for a real item name and wrapping rather than
+   clipping past it. */
+.inv-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 1px;
+            font-size: var(--fs-sm);
+            min-width: min(240px, calc(100vw - 48px)); max-width: min(320px, calc(100vw - 32px)); }
+/* A name and its count share a line only where both fit whole; otherwise the
+   count drops to its own line under the name, at the right, and wraps there.
+   So a wrapped name's tail never sits beside a wrapped count's tail, which
+   read as a row of its own ("Fur Cloak … 10 / 10" for a four-objective quest). */
+.inv-list li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 8px; justify-content: space-between; }
+.inv-list-name { overflow-wrap: anywhere; }
+.inv-list-link { text-decoration: none; }
+.inv-list-link:hover .inv-list-name { text-decoration: underline; }
+.inv-list-count { color: var(--dim); font-variant-numeric: tabular-nums; margin-left: auto; }
+.inv-grid + .inv-list { margin-top: 6px; border-top: 1px solid var(--line); padding-top: 6px; }
+/* The map sidebar's live list (`LiveList.tsx`): `.inv-list` rows, the whole
+   sidebar wide, a row a line high. The model gives way first when a row is
+   crowded, then the name; the level never does. */
+.live-list { max-width: none; }
+.live-row { padding: 3px 6px; align-items: center; }
+.live-name { flex: 0 1 auto; font-weight: 700; }
+.live-model { flex: 1 1 0; }
+
+/* The bag button, and the popover it opens. Hover on a desktop, tap anywhere. */
+/* The anchor a popover hangs off, and the button that opens one. Shared by the
+   bag, the paperdoll and the ladder's filters (one class,
+   not one per caller) — `lib/popover.ts` is the arithmetic half of the same
+   consolidation. */
+.popover-anchor { position: relative; display: inline-flex; }
+.popover-button {
+  display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+  font: inherit; font-size: var(--fs-sm); color: var(--fg);
+  background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 2px 8px;
+}
+.popover-button:hover, .popover-button.on { border-color: var(--accent); }
+/* A bag drawn in CSS, because we ship no art: a body and a flap. */
+.bag-icon.worn::before { left: 0; right: 0; top: -3px; border-radius: 2px 2px 0 0; }
+.bag-icon.worn { border-radius: 3px; }
+.bag-icon {
+  width: 11px; height: 12px; border: 1px solid currentColor; border-radius: 2px 2px 3px 3px;
+  position: relative; opacity: 0.85;
+}
+.bag-icon::before {
+  content: ""; position: absolute; left: 2px; right: 2px; top: -3px; height: 3px;
+  border: 1px solid currentColor; border-bottom: 0; border-radius: 3px 3px 0 0;
+}
+.bag-count { font-weight: 700; }
+/* Every hover panel on the site. Portalled to the body and placed against the
+   viewport (`popoverPlacement`), because as a child of its card the sidebar's
+   scroll area clipped it; `.floating` is that placement and the un-suffixed
+   rule is the fallback position. It scrolls rather than being clipped — a full
+   doll is taller than the room under a button near the foot of a card. */
+.popover {
+  position: absolute; left: 0; top: calc(100% + 6px); z-index: 20;
+  width: max-content; max-width: min(320px, calc(100vw - 32px));
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, .25);
+  overflow-y: auto;
+}
+.popover.floating { position: fixed; z-index: 60; }
+
+@media (max-width: 400px) {
+  .inv-cell { width: 36px; height: 36px; }
+  .popover { max-width: calc(100vw - 24px); }
+}
+
+/*
+ * The character card's fact line: the xp bar the frame
+ * already draws, money as coins, quests behind a marker. The coins and the
+ * marker are drawn here — three circles and a question mark — because the
+ * repository serves no game art and a coin is not worth the exception.
+ */
+:root { --coin-gold: #e8b923; --coin-silver: #c7c7cf; --coin-copper: #c87533; --quest-mark: #ffd100; }
+@media (prefers-color-scheme: light) {
+  :root { --coin-gold: #b8860b; --coin-silver: #8b8b96; --coin-copper: #a75d22; --quest-mark: #b8860b; }
+}
+.charline { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; }
+.charline .fact { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; }
+.coins { gap: 6px; }
+.coin-pair { display: inline-flex; align-items: center; gap: 2px; }
+.coin-value { font-variant-numeric: tabular-nums; }
+.coin {
+  width: 8px; height: 8px; border-radius: 50%; display: inline-block;
+  /* A coin, not a dot: lit from the top left the way the bars are. */
+  background-image: linear-gradient(to bottom right, rgba(255,255,255,.55), rgba(0,0,0,.25));
+  border: 1px solid rgba(0, 0, 0, .35);
+}
+.coin.gold { background-color: var(--coin-gold); }
+.coin.silver { background-color: var(--coin-silver); }
+.coin.copper { background-color: var(--coin-copper); }
+.quest-mark { color: var(--quest-mark); font-weight: 700; font-size: var(--fs-base); line-height: 1; }

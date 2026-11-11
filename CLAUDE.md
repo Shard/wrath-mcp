@@ -9,7 +9,8 @@ and the MCP server and snippet sandbox `mcp/`. An agent gets what a game client
 would see and do, and nothing more. It records what its own sessions did and
 knows nothing of what drove them. The session record (the trace and character
 sheet, game events, tool calls and their results) is the stack's: `mcp/` writes
-it to the session store, in the format `docs/SESSION-FORMAT.md` specifies.
+it to the session store, in the format `docs/SESSION-FORMAT.md` specifies, and
+`inspector/` reads it.
 Episodes, scores, model trajectories (requests, responses, tokens, cost, turns,
 compaction) and anything that compares one run with another are a harness's,
 plugged in through its hooks. The stack never reads them, and no record of its
@@ -60,6 +61,8 @@ module/        C++ AzerothCore module: HTTP/WS bridge into WorldSession
 sdk/           Bun/TypeScript SDK over the module
 mcp/           Snippet sandbox, MCP server and core tools over the SDK, and
                the session record (mcp/src/record/)
+inspector/     wrath-inspector: read-only server, SolidJS views and bin over a
+               session store; the UI's dependencies live here and nowhere else
 docs/          CONTRACTS.md, the stack's specification with module/PROTOCOL.md;
                SESSION-FORMAT.md, the format of what a session records;
                ARCHITECTURE.md, how the pieces fit and the harness hooks
@@ -81,14 +84,17 @@ scripts/       Repository checks (the stack boundary)
   structure and the harness hooks, `module/README.md` and `module/PROTOCOL.md`
   for the wire, `sdk/README.md` for the SDK, `mcp/README.md` for the sandbox
   and tools, `docs/CONTRACTS.md` for what an agent may see and do,
-  `docs/SESSION-FORMAT.md` for what is recorded.
+  `docs/SESSION-FORMAT.md` for what is recorded, `inspector/README.md` for
+  reading it back.
 - Checks, all fixture-based and green from a bare clone after
   `bun install --frozen-lockfile`: `bun test`, `bun run typecheck`,
   `bun run boundary`, `bun run docs:api:check`. Bun strips types without
   checking them, so a green `bun test` says nothing about types; run both.
 - The stack imports nothing outside itself but declared dependencies
   (`scripts/boundary.ts`). sdk/ never imports mcp/, and mcp/ reaches the SDK
-  through `@wrathbench/sdk` at an exported entry point.
+  through `@wrathbench/sdk` at an exported entry point. inspector/ takes only
+  `@wrathbench/mcp/record/read` from the stack, sdk/ and mcp/ never import it,
+  and the UI's dependencies are declared in inspector/ alone.
 - A `module/` change cannot be verified here: it ships through a WrathBench
   pin bump and is proven by WrathBench's smoke suite
   ([`infra/smoke/`](https://github.com/Shard/WrathBench/tree/master/infra/smoke))

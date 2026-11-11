@@ -1,6 +1,7 @@
 /**
  * The inspector as a process: the API (`api.ts`) at `/api` over a source, a
- * sign-in for a browser off loopback, and the built page. What the bin
+ * sign-in for a browser off loopback, minimap tiles when it was given a
+ * directory of them, and the built page. What the bin
  * (`bin.ts`) starts; a harness that embeds the inspector mounts
  * `createInspectorApi` in its own server instead and needs none of this.
  */
@@ -22,6 +23,11 @@ export interface InspectorServerOptions {
   secret?: string;
   /** The built page; defaults to `PAGE_DIR`. */
   pageDir?: string;
+  /**
+   * Minimap tiles, `<dir>/<map>/<row>_<col>.png`, served at the same path under
+   * `/tiles/`. Without one the map draws its grid.
+   */
+  tilesDir?: string;
 }
 
 const NOT_BUILT = "The inspector's page is not built: run `bun run --cwd inspector build`. The API answers under /api.\n";
@@ -37,7 +43,9 @@ function staticFile(root: string, path: string): Response | null {
 /** The request handler, without a socket: what `serveInspector` binds, and what a test calls. */
 export function inspectorHandler(o: Omit<InspectorServerOptions, "port">): (req: Request) => Promise<Response> {
   const secure = o.host !== undefined && !isLoopbackHost(o.host);
-  const api = createInspectorApi(o.source, { base: "/api", scope: bearerScope(o.secret) });
+  const scope = bearerScope(o.secret);
+  const api = createInspectorApi(o.source, { base: "/api", scope });
+  const tilesDir = o.tilesDir === undefined ? undefined : resolve(o.tilesDir);
   const pageDir = resolve(o.pageDir ?? PAGE_DIR);
 
   return async (req) => {
@@ -67,6 +75,16 @@ export function inspectorHandler(o: Omit<InspectorServerOptions, "port">): (req:
     const answered = await api(req);
     if (answered !== null) return answered;
     if (url.pathname === "/api" || url.pathname.startsWith("/api/")) return Response.json({ error: "no such path" }, { status: 404 });
+
+    // A tile is a whole file named by three integers, so nothing a request says reaches outside the directory.
+    const tile = /^\/tiles\/(\d{1,4})\/(\d{1,2})_(\d{1,2})\.png$/.exec(url.pathname);
+    if (tile !== null || url.pathname.startsWith("/tiles/")) {
+      if (scope(req) === null) return new Response("a bearer credential is required", { status: 401 });
+      if (tile === null || tilesDir === undefined) return new Response("no such tile", { status: 404 });
+      const file = join(tilesDir, String(Number(tile[1])), `${Number(tile[2])}_${Number(tile[3])}.png`);
+      if (!existsSync(file)) return new Response("no such tile", { status: 404 });
+      return new Response(Bun.file(file), { headers: { "content-type": "image/png", "cache-control": "private, max-age=3600" } });
+    }
     if (req.method !== "GET" && req.method !== "HEAD") return new Response("read-only", { status: 405, headers: { allow: "GET, HEAD" } });
 
     if (!existsSync(join(pageDir, "index.html"))) return new Response(NOT_BUILT, { status: 503, headers: { "content-type": "text/plain; charset=utf-8" } });

@@ -45,7 +45,7 @@ describe("binds", () => {
 describe("flags", () => {
   test("the store is required; host and port default to loopback and 8091", () => {
     expect(() => parseArgs([], {})).toThrow("usage");
-    expect(parseArgs(["--store", tmp], {})).toEqual({ store: tmp, host: "127.0.0.1", port: 8091, secret: undefined });
+    expect(parseArgs(["--store", tmp], {})).toEqual({ store: tmp, host: "127.0.0.1", port: 8091, secret: undefined, tiles: undefined });
     expect(parseArgs([`--store=${tmp}`, "--host", "0.0.0.0", "--port=9000"], {}).port).toBe(9000);
     expect(() => parseArgs(["--store", tmp, "--secret", SECRET], {})).toThrow("unknown argument");
   });

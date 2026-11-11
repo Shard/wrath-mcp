@@ -1,0 +1,10 @@
+{
+  "//": "What a browser bundles, under the strictest flags a page that embeds the views compiles with (WrathBench's dashboard's), so an embedder's typecheck never fails on a file of ours.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "exactOptionalPropertyTypes": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true
+  },
+  "include": ["src/wire.ts", "src/codec", "src/views", "page"]
+}
