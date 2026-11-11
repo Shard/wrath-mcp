@@ -1,15 +1,24 @@
 #!/usr/bin/env bun
 /**
- * The stack boundary, inside half: module/, sdk/ and mcp/ are meant to bolt
- * onto a stock AzerothCore and into any harness, so they depend on nothing but
- * themselves and what they declare. This check keeps that true as the code
- * changes:
+ * The stack boundary, inside half: module/, sdk/, mcp/ and inspector/ are
+ * meant to bolt onto a stock AzerothCore and into any harness, so they depend
+ * on nothing but themselves and what they declare. This check keeps that true
+ * as the code changes:
  *
- *  - A TypeScript file in sdk/ or mcp/ imports only its own package (by
- *    relative path), Bun and Node built-ins, and the dependencies its
- *    package.json declares, at a subpath that dependency exports. sdk/ declares
- *    no stack dependency, so it can never import mcp/; mcp/ reaches the SDK
- *    through `@wrathbench/sdk` alone, at an exported entry point.
+ *  - A TypeScript file in sdk/, mcp/ or inspector/ imports only its own
+ *    package (by relative path), Bun and Node built-ins, and the dependencies
+ *    its package.json declares, at a subpath that dependency exports. sdk/
+ *    declares no stack dependency, so it can never import mcp/; mcp/ reaches
+ *    the SDK through `@wrathbench/sdk` alone, at an exported entry point.
+ *  - The inspector reads records and nothing else: from the stack it imports
+ *    `@wrathbench/mcp/record/read` (the store reader and the format's types)
+ *    and no other entry point, and never the SDK, so it can never reach a
+ *    module, a sandbox or a writer. sdk/ and mcp/ never import it.
+ *  - The UI's dependency graph (Solid, Vite and their kin) is declared by
+ *    inspector/ alone; sdk/ and mcp/ never take one on.
+ *  - The inspector's browser-side files (`src/wire.ts`, `src/codec/`,
+ *    `src/views/`) import no runtime built-in and nothing of the inspector's
+ *    server side, because a browser bundles them.
  *  - The C++ module's quoted includes name a header by its bare file name —
  *    its own or the core's — never a path out of module/.
  *
@@ -24,7 +33,21 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { builtinModules } from "node:module";
 import { dirname, join, relative, resolve, sep } from "node:path";
 
-export const STACK_PACKAGES = ["sdk", "mcp"] as const;
+export const STACK_PACKAGES = ["sdk", "mcp", "inspector"] as const;
+
+/** The only entry point of the stack the inspector may import: the read side of the session record. */
+export const INSPECTOR_STACK_IMPORTS: ReadonlySet<string> = new Set(["@wrathbench/mcp/record/read"]);
+
+/** The UI's dependencies: declared by inspector/ and by no other stack package. */
+export const UI_DEPENDENCIES = ["solid-js", "@solidjs/router", "vite", "vite-plugin-solid", "happy-dom"] as const;
+
+/** The inspector's files a browser bundles, relative to inspector/: a file, or a directory with a trailing slash. */
+export const INSPECTOR_BROWSER = ["src/wire.ts", "src/codec/", "src/views/"] as const;
+
+function isBrowserFile(relToInspector: string): boolean {
+  const p = relToInspector.split(sep).join("/");
+  return INSPECTOR_BROWSER.some((b) => (b.endsWith("/") ? p.startsWith(b) : p === b));
+}
 
 interface Manifest {
   name: string;
@@ -142,25 +165,44 @@ export function checkStackBoundary(root: string): string[] {
     return Object.hasOwn(stack.exports ?? { ".": "" }, sub);
   };
 
+  const inspectorName = manifest(join(root, "inspector")).name;
   for (const pkg of STACK_PACKAGES) {
     const dir = join(root, pkg);
     const m = manifest(dir);
     const declared = new Set([...Object.keys(m.dependencies ?? {}), ...Object.keys(m.devDependencies ?? {})]);
+    if (pkg !== "inspector") {
+      for (const dep of [inspectorName, ...UI_DEPENDENCIES]) {
+        if (declared.has(dep)) problems.push(`${pkg}/package.json: declares ${dep}, which only inspector/ may`);
+      }
+    }
     for (const file of walk(dir, [".ts", ".tsx"])) {
       const rel = relative(root, file);
+      const browser = pkg === "inspector" && isBrowserFile(relative(dir, file));
       for (const spec of importsOf(file)) {
         if (spec.startsWith(".")) {
           const target = resolve(dirname(file), spec);
           if (target !== dir && !target.startsWith(dir + sep)) problems.push(`${rel}: imports ${spec}, outside ${pkg}/`);
+          else if (browser && !isBrowserFile(relative(dir, target)) && !isBrowserFile(relative(dir, `${target}.ts`)) && !isBrowserFile(relative(dir, `${target}.tsx`))) {
+            problems.push(`${rel}: imports ${spec}, the inspector's server side, from a file a browser bundles`);
+          }
           continue;
         }
-        if (isBuiltin(spec)) continue;
+        if (isBuiltin(spec)) {
+          if (browser) problems.push(`${rel}: imports ${spec}, a runtime built-in, from a file a browser bundles`);
+          continue;
+        }
         const [name, sub] = splitPackage(spec);
         if (!declared.has(name)) {
           problems.push(`${rel}: imports ${spec}, which ${pkg}/package.json does not declare`);
           continue;
         }
-        if (!exportedSubpath(name, sub)) problems.push(`${rel}: imports ${spec}, which ${name} does not export`);
+        if (!exportedSubpath(name, sub)) {
+          problems.push(`${rel}: imports ${spec}, which ${name} does not export`);
+          continue;
+        }
+        if (pkg === "inspector" && stackManifests.has(name) && !INSPECTOR_STACK_IMPORTS.has(spec)) {
+          problems.push(`${rel}: imports ${spec}; the inspector takes only ${[...INSPECTOR_STACK_IMPORTS].join(", ")} from the stack`);
+        }
       }
     }
   }
@@ -179,5 +221,5 @@ if (import.meta.main) {
   const problems = checkStackBoundary(resolve(import.meta.dir, ".."));
   for (const p of problems) console.error(p);
   if (problems.length > 0) process.exit(1);
-  console.log("stack boundary holds: module/, sdk/ and mcp/ import nothing outside themselves but declared dependencies");
+  console.log("stack boundary holds: module/, sdk/, mcp/ and inspector/ import nothing outside themselves but declared dependencies, and the inspector only the record's read side");
 }

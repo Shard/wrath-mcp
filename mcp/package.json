@@ -16,6 +16,7 @@
     "./paths": "./src/paths.ts",
     "./tools": "./src/tools.ts",
     "./record": "./src/record/index.ts",
+    "./record/read": "./src/record/read.ts",
     "./record/recorder": "./src/record/recorder.ts"
   },
   "scripts": {
