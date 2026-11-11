@@ -1,0 +1,5 @@
+# The inspector's suite run from here (`bun run --cwd inspector test`): bun
+# reads its config from the working directory, so the root's preload is
+# repeated. `test/preload-solid.ts` says why it is there.
+[test]
+preload = ["./test/preload-solid.ts"]
