@@ -5,7 +5,7 @@
 
 import { For, Show } from "solid-js";
 import type { SessionSummary } from "../wire";
-import { fmtAgo, isLive, sessionName, sessionOrder } from "./lib/sessions";
+import { fmtAgo, isLive, sessionBlocks, sessionName } from "./lib/sessions";
 
 export function SessionList(props: {
   sessions: readonly SessionSummary[];
@@ -16,9 +16,9 @@ export function SessionList(props: {
   onSelect?: (id: string) => void;
   mapName?: (map: number) => string | null;
 }) {
-  const rows = () => sessionOrder(props.sessions, props.now);
+  const blocks = () => sessionBlocks(props.sessions, props.now);
   return (
-    <Show when={rows().length > 0} fallback={<p class="dim">no sessions</p>}>
+    <Show when={blocks().length > 0} fallback={<p class="dim">no sessions</p>}>
       <div class="scroller">
         <table>
           <thead>
@@ -30,7 +30,18 @@ export function SessionList(props: {
             </tr>
           </thead>
           <tbody>
-            <For each={rows()}>
+            <For each={blocks()}>
+              {(b) => (
+                <>
+                  {/* The sessions one client drove together are listed as one block under its group. */}
+                  <Show when={b.sessions.length > 1}>
+                    <tr>
+                      <td colSpan={4} class="mono dim" title={b.group ?? ""}>
+                        {b.group} · {b.sessions.length}
+                      </td>
+                    </tr>
+                  </Show>
+                  <For each={b.sessions}>
               {(s) => {
                 const live = () => isLive(s, props.now);
                 const where = () => {
@@ -57,6 +68,9 @@ export function SessionList(props: {
                   </tr>
                 );
               }}
+                  </For>
+                </>
+              )}
             </For>
           </tbody>
         </table>

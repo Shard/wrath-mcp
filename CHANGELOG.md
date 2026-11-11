@@ -28,6 +28,16 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Added
 
+- **Several characters for one client (fan-out).** Off unless the operator
+  grants it: `--max-characters <n> --accounts <a,b,…>` on the standalone
+  server, `SandboxHostOptions.fanout` with a `CharacterRoster` and
+  `fanoutTools` (`@wrathbench/mcp/fanout`) for a harness. A granted client is
+  served the core tools with an optional `character` on `run_snippet`,
+  `recent_events` and `state_summary`, plus `login_character`,
+  `logout_character` and `list_characters`; a snippet sees `chars`; each
+  character has its own token, lease and session record, and the inspector
+  lists one client's sessions together. Ungranted, nothing a model is served
+  changes (`mcp/README.md`, "Several characters").
 - **Jump.** `sdk.jump()` (in place) and `sdk.jump({ forward: true })` (at the
   run speed along the facing), the `jump` action: `MSG_MOVE_JUMP` with the
   stock client's launch, the arc flown as a client's physics fly it, and

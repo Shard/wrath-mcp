@@ -115,6 +115,12 @@ own over its own layout (WrathBench maps its runs to their `session/`
 directories and reads runs from before the format through an adapter), and
 everything the inspector derives is built on those reads in `src/readout.ts`.
 
+A listing may say which sessions belong together: an entry's `group` is the
+same for the sessions one client drove (a fan-out client's characters; a
+harness's own unit, as WrathBench's run). `storeSource` takes it from the
+record's `group` label. The session list shows a group as one block, and a
+session's page links its siblings.
+
 Every read is scoped (wrath-mcp#29, decision 11): the operator sees every
 session, a user only the sessions whose `owner` is theirs. A source filters by
 the scope it is handed, on the listing and on every open, and the API asks a

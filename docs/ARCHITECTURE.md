@@ -129,6 +129,16 @@ A harness plugs in through hooks, each a narrow interface:
   confined child read access to where it lives (`readDirs`). Nothing an
   extension holds is reachable from a snippet. A harness may also subclass
   `SandboxHost` to drain what its extension collects.
+- **Fan-out** (`mcp/src/fanout.ts`). One client driving several characters is
+  a grant only the holder of the port secret can give, as the GM opt-in is:
+  `SandboxHostOptions.fanout` makes the child hold a client per character,
+  `CharacterRoster` takes a lease per character on the accounts the grant
+  names and remembers where each lives, and `fanoutTools` is the tool list a
+  granted client is served. The roll-up and merged feed a model reads when it
+  names no character are rendered through `FanoutRender`, the harness's
+  context policy like `CoreToolRender`; `PLAIN_FANOUT_RENDER` is the bare
+  stack's. A harness that grants nothing builds `coreTools` and none of this
+  is loaded into what a model sees ("Several characters", below).
 - **Records and secrets.** Every tool context carries a secret registry
   (`CoreToolContext.secrets`) that every result passes through, and an
   optional `onEventsServed` callback for each event batch the agent was shown.
@@ -321,6 +331,48 @@ socket families are outside Landlock. Closing those is the deployment's network
 policy; the child's only legitimate destinations are the module's port on the
 module's host, and DNS.
 
+### Several characters
+
+A client granted more than one character (`fanout: { maxCharacters }`) gets
+one confined child holding one `WrathClient` per logged-in character, a
+*seat*, rather than a child or a connection per character. One runtime is the
+point: a snippet, or a routine it leaves running, can act for several
+characters at once (`chars`), which forty separate sandboxes could not, and
+forty servers would put forty copies of the tool list in a model's context.
+
+- **Seats.** The host opens a seat with `seat_open`: the character's own
+  token and lease secret, over IPC and never in the environment, around which
+  the child builds a client, its recorder and the harness's extensions, opens
+  its stream and enters the world. The seat is keyed by the name the server
+  gave the character, which is the handle every tool takes, exact match only,
+  checked against the roster on every call. Everything the child kept once
+  per process (the movement intention, the action log, the hint tally) it
+  keeps per seat; a snippet run for a character has that seat's `sdk`,
+  `state` and `events` through the same `AsyncLocalStorage` that carries its
+  abort signal, so a routine keeps its character.
+- **The tool list is a function of the grant**, fixed for its life, as MCP's
+  stateless revision asks: nothing appears after a login. At fan-out 1 it is
+  the five core tools with no `character` anywhere, and the child's
+  environment, ambient names and every served output are held byte for byte
+  to a golden written before fan-out existed
+  (`mcp/test/fanout1-identity.test.ts`).
+- **One event loop.** Forty clients fold forty streams on one loop, and a
+  snippet that blocks it costs every seat: the child is killed, and the host
+  reopens each seat in the new one with the module's reattach replay, four at
+  a time (`REATTACH_CONCURRENCY`) so the replay bursts do not starve the
+  pings, before the next call is answered. Measured against a stub module
+  with the recorders running (`mcp/test/fixtures/fanout-load.ts`, one room of
+  60 units seen by every character at 200 frames a second each): at 5
+  characters the loop runs under a millisecond late at p99 on a tenth of a
+  core; at 40, 8,000 frames a second, 26 ms late at p99 on four tenths of a
+  core, and a killed child has all forty seats back a quarter of a second
+  after it starts. A worker per client would isolate a blocked loop at the
+  cost of the shared runtime; these numbers do not ask for it.
+- **Cost grows with what differs.** With no `character`, `state_summary` is a
+  roll-up (counts, where the group is, one line per exception) and
+  `recent_events` one merged feed in which an event several characters
+  received is one line; hints are tallied per character and grouped.
+
 ### Harness-delivered hints
 
 The SDK attaches a per-status recovery hint to a failed action result
@@ -394,6 +446,11 @@ with a key row so it decodes alone. The code is `mcp/src/record/`.
   the writing side's: the read entry, `@wrathbench/mcp/record/read`, loads no
   module that writes or deletes a file, and `bun run boundary` checks that
   over everything it imports.
+
+At fan-out each seat has its own recorder and its own writer, so a client's
+characters leave one session each; the host drains them all in one ask a
+tick, and a tool call is written to every record it concerns
+(`FanoutCalls`). The standalone server labels them with one `group`.
 
 `ToolSet.call` writes each tool call and its scrubbed result through
 `CoreToolContext.record`. Every line passes the host's secret scrub, and no

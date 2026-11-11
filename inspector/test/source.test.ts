@@ -23,6 +23,15 @@ describe("listing and scope", () => {
     expect(list[1]!.live).toBeNull();
   });
 
+  test("sessions one client drove carry its group; a session that stands alone carries none", async () => {
+    const store = join(tmp, "grouped");
+    mkdirSync(store, { recursive: true });
+    plant("closed", join(store, CLOSED_ID), { group: "0123456789abcdef" });
+    plant("live", join(store, LIVE_ID), { group: "0123456789abcdef" });
+    expect((await storeSource(store).list(OPERATOR)).map((e) => e.group)).toEqual(["0123456789abcdef", "0123456789abcdef"]);
+    expect((await storeSource(root).list(OPERATOR)).map((e) => "group" in e)).toEqual([false, false]);
+  });
+
   test("a lone session directory is a source of one", async () => {
     const one = plant("closed", join(tmp, "one"));
     const src = storeSource(one);

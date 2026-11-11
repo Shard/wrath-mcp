@@ -35,6 +35,49 @@ export function sessionOrder<T extends Pick<SessionSummary, "id" | "session" | "
   return [...list].sort((a, b) => Number(isLive(b, now)) - Number(isLive(a, now)) || (b.session?.opened ?? 0) - (a.session?.opened ?? 0) || a.id.localeCompare(b.id));
 }
 
+/** The group a session belongs to: its source's, else its record's own label; null when it stands alone. */
+export function sessionGroup(s: Pick<SessionSummary, "session" | "group">): string | null {
+  return s.group ?? s.session?.group ?? null;
+}
+
+/** Sessions that are listed together: one client's characters, or one session on its own. */
+export interface SessionBlock<T> {
+  /** The group they share; null for a session that stands alone. */
+  group: string | null;
+  sessions: T[];
+}
+
+/**
+ * Listed sessions as blocks: the sessions of one group together, in name
+ * order, and the blocks in the order `sessionOrder` gives their first
+ * member, so a group with one live character lists with the live ones. A
+ * group of one is still a block of its own.
+ */
+export function sessionBlocks<T extends Pick<SessionSummary, "id" | "session" | "live" | "group">>(list: readonly T[], now: number): SessionBlock<T>[] {
+  const blocks: SessionBlock<T>[] = [];
+  const byGroup = new Map<string, SessionBlock<T>>();
+  for (const s of sessionOrder(list, now)) {
+    const group = sessionGroup(s);
+    const block = group === null ? undefined : byGroup.get(group);
+    if (block !== undefined) {
+      block.sessions.push(s);
+      continue;
+    }
+    const made: SessionBlock<T> = { group, sessions: [s] };
+    if (group !== null) byGroup.set(group, made);
+    blocks.push(made);
+  }
+  for (const b of blocks) if (b.sessions.length > 1) b.sessions.sort((a, c) => sessionName(a).localeCompare(sessionName(c)) || a.id.localeCompare(c.id));
+  return blocks;
+}
+
+/** The other sessions of this one's group, in name order; none when it stands alone. */
+export function groupSiblings<T extends Pick<SessionSummary, "id" | "session" | "group">>(list: readonly T[], s: Pick<SessionSummary, "id" | "session" | "group">): T[] {
+  const group = sessionGroup(s);
+  if (group === null) return [];
+  return list.filter((o) => o.id !== s.id && sessionGroup(o) === group).sort((a, b) => sessionName(a).localeCompare(sessionName(b)) || a.id.localeCompare(b.id));
+}
+
 /** A duration as the views print it: `45s`, `12m`, `3h 05m`, `2d 4h`. */
 export function fmtAgo(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000));

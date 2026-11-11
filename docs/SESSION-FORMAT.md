@@ -59,6 +59,11 @@ A harness that keeps its own evidence per run points the writer at a
 directory inside the run instead of at a store. The session directory is the
 same either way.
 
+A session is one character's. A client that drives several characters
+(fan-out) leaves one session per character, each with its own token and so
+its own id, each written from its own client's stream and decodable alone;
+nothing in one refers to another.
+
 `session.json`, `live.json` and `manifest.json` are each rewritten whole by
 writing a temporary file beside them and renaming it into place, so a reader
 never sees half of one.
@@ -115,7 +120,7 @@ exhausted.
 | `character` | object or null | `guid` (string), `name`, `race`, `class`, each of the last three null until observed. Null until the character is in the world. |
 | `stack` | object | `version`, the stack's release, and `commit` when the host knew which commit it ran. |
 | `module` | object or null | `build` and `protocol` from the module's `GET /health`; null when it did not answer. |
-| `owner`, `group` | string, optional | Deployment labels the operator's host sets. Never a harness's ids or configuration. |
+| `owner`, `group` | string, optional | Deployment labels the operator's host sets. Never a harness's ids or configuration. The standalone server sets `group` on every session of a client granted several characters, to one value for that client: the first 16 hex characters of the SHA-256 of the client's own state token, which is no session's. |
 | `started` | integer | When the session was first opened. |
 | `opened` | integer | When the process now (or last) writing it opened it. |
 | `ended` | integer or null | When it closed. Null while a writer holds it, and left null by a writer that died. |
@@ -260,6 +265,16 @@ know; `program` is reserved.
 
 A `result` always has its `call` in the same segment or restated in that
 segment's key. A call whose process died has no result.
+
+At fan-out a tool call is written to the record of every character it
+concerns, under one `id`: the character it named, or, when it named none (a
+roll-up, the scratchpad, a snippet that reaches several), every character
+logged in at the time. So each session's `calls` holds every call its
+character could have acted under, and an `actions` or `move` row's `call` is
+always a `call` row of the same session. A `call` whose `args` name another
+character is never in this session; one whose `args` name none may be in
+several. An `events` row holds what was served from this character's own
+stream.
 
 The stack never learns what drove it, so no row carries a turn number, a run
 id or anything else of a harness's. A harness joins its own records to these

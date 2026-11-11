@@ -115,6 +115,18 @@ The floor that closes that (`module/PROTOCOL.md`
   this narrowing closes ([Shard/WrathBench#74](https://github.com/Shard/WrathBench/issues/74)). The kernel's per-port TCP rule still lets
   `node:net`/`Bun.connect` open the module's port, but with no credential to
   read such a connection authenticates nothing.
+- **One lease per character, at fan-out.** A client the operator granted
+  several characters (`mcp/README.md`, "Several characters") holds one token
+  and one lease per character it has logged in, each on its own account: the
+  sandbox host takes each lease with the port secret, hands the child that
+  secret over the host's own IPC channel, never in its environment, and the
+  child builds one client per character around it, each keeping its secret
+  in the same private field. A snippet reaches each of those clients and no
+  credential, as with one; what the child holds reaches the client's own
+  characters and nothing else. Each client folds only its own session's
+  stream, so the observation contract holds per character: one runtime
+  reading several of them is what one player at several clients is
+  (operator, 2026-11-11, wrath-mcp#29).
 - **Token-to-account and token-to-character binding.** A leased token lands on
   its lease's account, with its lease's GM opt-in, whatever the body says, and the first create that
   succeeds under it binds the character; a later same-token create for another

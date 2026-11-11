@@ -132,10 +132,12 @@ export function storeSource(dir: string): SessionSource {
   const store = new SessionStore(dir);
 
   const entries = (): SessionEntry[] => {
-    if (!single) return store.list().map((s) => ({ id: s.id, session: s.session, live: s.live }));
+    // A fan-out client's sessions carry one `group` label (`mcp/src/main.ts`), which is what lists them together.
+    const grouped = (session: NonNullable<ReturnType<SessionReader["session"]>>): { group?: string } => (session.group !== undefined ? { group: session.group } : {});
+    if (!single) return store.list().map((s) => ({ id: s.id, session: s.session, live: s.live, ...grouped(s.session) }));
     const reader = new SessionReader(dir);
     const session = reader.session();
-    return session === null ? [] : [{ id: session.id, session, live: reader.live() }];
+    return session === null ? [] : [{ id: session.id, session, live: reader.live(), ...grouped(session) }];
   };
 
   return {

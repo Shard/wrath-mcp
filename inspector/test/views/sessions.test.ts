@@ -8,7 +8,7 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { OPERATOR, storeSource, traceSegment } from "../../src/index";
-import { characterAt, decoded, eventLine, fmtAgo, fmtMoney, isLive, partyOf, segmentEnd, sessionOrder } from "../../src/views/lib/sessions";
+import { characterAt, decoded, eventLine, fmtAgo, fmtMoney, groupSiblings, isLive, partyOf, segmentEnd, sessionBlocks, sessionGroup, sessionOrder } from "../../src/views/lib/sessions";
 import { fit, fromScreen, toScreen, visibleTiles, worldToPixel } from "../../src/views/lib/world";
 import type { SessionSummary } from "../../src/wire";
 import { CLOSED_ID, FIXTURE_T0, LIVE_ID, plantStore, tempDir } from "../fixtures";
@@ -29,6 +29,25 @@ describe("sessions", () => {
     expect(isLive(summary("a", { liveTs: NOW, ended: NOW }), NOW)).toBe(false);
     const order = sessionOrder([summary("old", { opened: 1 }), summary("new", { opened: 5 }), summary("live", { opened: 0, liveTs: NOW })], NOW);
     expect(order.map((s) => s.id)).toEqual(["live", "new", "old"]);
+  });
+
+  test("the sessions one client drove are one block, listed where its first member would be; a lone session is its own", () => {
+    const grouped = (id: string, group: string | undefined, o: Parameters<typeof summary>[1] = {}): SessionSummary => ({ ...summary(id, { guid: id, ...o }), ...(group !== undefined ? { group } : {}) });
+    const list = [grouped("solo", undefined, { opened: 9 }), grouped("b", "run-1", { opened: 3 }), grouped("a", "run-1", { opened: 2, liveTs: NOW }), grouped("z", "run-2", { opened: 5 })];
+    const blocks = sessionBlocks(list, NOW);
+    expect(blocks.map((b) => [b.group, b.sessions.map((s) => s.id)])).toEqual([
+      ["run-1", ["a", "b"]],
+      [null, ["solo"]],
+      ["run-2", ["z"]],
+    ]);
+    expect(groupSiblings(list, list[1]!).map((s) => s.id)).toEqual(["a"]);
+    expect(groupSiblings(list, list[0]!)).toEqual([]);
+    // A source's own grouping wins; the record's label stands in when it gives none.
+    const labelled = summary("l");
+    labelled.session!.group = "0123456789abcdef";
+    expect(sessionGroup(labelled)).toBe("0123456789abcdef");
+    expect(sessionGroup({ ...labelled, group: "run-9" })).toBe("run-9");
+    expect(sessionGroup(summary("n"))).toBeNull();
   });
 
   test("durations and money", () => {
