@@ -6,13 +6,20 @@ Working instructions for agents developing this repository.
 wrath-mcp is a client-equivalent agent surface over a stock AzerothCore
 (World of Warcraft 3.3.5a): the C++ module `module/`, the TypeScript SDK `sdk/`
 and the MCP server and snippet sandbox `mcp/`. An agent gets what a game client
-would see and do, and nothing more. It knows nothing of episodes, scores or
-trajectories; a harness such as WrathBench plugs those in through its hooks.
+would see and do, and nothing more. It records what its own sessions did and
+knows nothing of what drove them. The session record (the trace and character
+sheet, game events, tool calls and their results) is the stack's: `mcp/` writes
+it to the session store, in the format `docs/SESSION-FORMAT.md` specifies.
+Episodes, scores, model trajectories (requests, responses, tokens, cost, turns,
+compaction) and anything that compares one run with another are a harness's,
+plugged in through its hooks. The stack never reads them, and no record of its
+own carries a harness's ids or configuration.
 
 ## Hard constraints
 
 - Nothing Blizzard-derived ever enters git: no client files, no MPQ/DBC, no
-  extracted maps/vmaps/mmaps, no game text, no audit or trajectory logs.
+  extracted maps/vmaps/mmaps, no game text, no audit logs, session stores or
+  trajectory logs. A fixture session is synthetic, with invented names.
 - The agent observes only what a real game client could observe, and the action
   path goes through the same server opcode handlers a client would hit. See
   `docs/CONTRACTS.md`. If you find yourself reaching for a server-side shortcut
@@ -22,7 +29,16 @@ trajectories; a harness such as WrathBench plugs those in through its hooks.
   agent never widens or narrows a contract on its own initiative. Wording fixes
   that change no meaning are fine; when in doubt, ask.
 - The C++ module stays thin: packet bridge and event tap only. Game semantics
-  live in TypeScript.
+  and all recording live in TypeScript.
+- The session store holds NPCs, objects and the deployment's own sessions, each
+  from its own session. A player who is not one of them is never written; the
+  rules are applied at one place, `mcp/src/record/gate.ts`. This governs
+  storage only; what an agent observes live is `docs/CONTRACTS.md`.
+- The session record is what a harness's scorer may read. A recorder or format
+  change is judged as a change to a model-visible surface is: read WrathBench's
+  [`docs/METHODOLOGY.md`](https://github.com/Shard/WrathBench/blob/master/docs/METHODOLOGY.md)
+  ("Scoring") first, and change `docs/SESSION-FORMAT.md` in the same pull
+  request.
 - What the SDK and the core tools show a model is governed by WrathBench's
   [`docs/METHODOLOGY.md`](https://github.com/Shard/WrathBench/blob/master/docs/METHODOLOGY.md)
   ("The model surface") alone; this repository carries no
@@ -42,8 +58,10 @@ trajectories; a harness such as WrathBench plugs those in through its hooks.
 ```
 module/        C++ AzerothCore module: HTTP/WS bridge into WorldSession
 sdk/           Bun/TypeScript SDK over the module
-mcp/           Snippet sandbox, MCP server and core tools over the SDK
+mcp/           Snippet sandbox, MCP server and core tools over the SDK, and
+               the session record (mcp/src/record/)
 docs/          CONTRACTS.md, the stack's specification with module/PROTOCOL.md;
+               SESSION-FORMAT.md, the format of what a session records;
                ARCHITECTURE.md, how the pieces fit and the harness hooks
 scripts/       Repository checks (the stack boundary)
 ```
@@ -62,7 +80,8 @@ scripts/       Repository checks (the stack boundary)
 - Read the relevant doc before touching a component: `docs/ARCHITECTURE.md` for
   structure and the harness hooks, `module/README.md` and `module/PROTOCOL.md`
   for the wire, `sdk/README.md` for the SDK, `mcp/README.md` for the sandbox
-  and tools, `docs/CONTRACTS.md` for what an agent may see and do.
+  and tools, `docs/CONTRACTS.md` for what an agent may see and do,
+  `docs/SESSION-FORMAT.md` for what is recorded.
 - Checks, all fixture-based and green from a bare clone after
   `bun install --frozen-lockfile`: `bun test`, `bun run typecheck`,
   `bun run boundary`, `bun run docs:api:check`. Bun strips types without

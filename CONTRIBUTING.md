@@ -15,7 +15,9 @@ down, and a patch that has not met the reason tends to undo it.
   the authoritative text, and a change to what it means needs the operator's
   explicit approval. Propose one in an issue first.
 - The C++ module stays thin: packet bridge and event tap only. Game semantics
-  live in TypeScript.
+  and all recording live in TypeScript.
+- A session's record never holds a player who is not one of the deployment's
+  own sessions (`docs/SESSION-FORMAT.md`, "Other players").
 - The model surface — what the SDK and the core tools show a model — is
   governed by one text only, WrathBench's
   [`docs/METHODOLOGY.md`](https://github.com/Shard/WrathBench/blob/master/docs/METHODOLOGY.md)

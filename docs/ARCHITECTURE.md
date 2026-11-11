@@ -2,18 +2,74 @@
 
 ## Components
 
-```
- agent  <--MCP-->  mcp (Bun)  <--SDK calls-->  sdk (Bun)  <--HTTP/WS-->  module (C++ in worldserver)
-                    ^  sandbox, MCP server,                                     |
-                    |  core tools                                               v
-                 harness (optional): its own tools,                 AzerothCore worldserver + DBs
-                 context rendering, records
+```mermaid
+flowchart TB
+    agent["Agent<br/>(any MCP client)"]
+    harness["Harness, optional<br/>(e.g. WrathBench)"]
+    reader["Readers<br/>(a viewer, a scorer, a collector)"]
+
+    subgraph mcp["mcp/"]
+        server["MCP server + core tools<br/>holds the port secret"]
+        host["Sandbox host"]
+        child["Confined sandbox child<br/>(Landlock) runs snippets"]
+        recorder["Session recorder<br/>in the child"]
+        writer["Session writer<br/>write gate"]
+    end
+
+    store[("Session record<br/>wrath-session/1<br/>trace, events, calls, nearby")]
+
+    subgraph sdk["sdk/"]
+        client["WrathClient<br/>actions, events, state cache"]
+    end
+
+    subgraph ws["AzerothCore worldserver"]
+        subgraph module["module/"]
+            http["HTTP/WS bridge<br/>bearer: port or lease secret"]
+            sessions["Sessions and leases"]
+            pbridge["Packet bridge"]
+            tap["Event tap<br/>whitelist"]
+            audit[("Audit log")]
+        end
+        session["WorldSession<br/>stock opcode handlers"]
+        world(("Game world"))
+    end
+
+    agent <-->|"MCP over stdio"| server
+    harness -. "hooks: tools, rendering,<br/>child extension, records" .-> mcp
+    server --> host
+    host <-->|"IPC"| child
+    server -->|"POST /lease"| http
+    child -->|"in-process"| client
+    client -->|"POST /action<br/>lease secret only"| http
+    http --> sessions
+    http --> pbridge
+    sessions -->|"login, logout"| session
+    pbridge -->|"client opcodes CMSG_*"| session
+    session <--> world
+    session ==>|"outbound SMSG_*"| tap
+    tap ==>|"whitelisted events<br/>WS /events"| client
+    pbridge -.-> audit
+    tap -.-> audit
+    client ==>|"state cache"| recorder
+    recorder ==>|"drained on the host's tick"| writer
+    server -->|"tool calls and results"| writer
+    host -->|"action log"| writer
+    writer ==>|"append-only segments"| store
+    store ==> reader
 ```
 
-The stack is three pieces, a client-equivalent agent surface over a stock
-AzerothCore: packets, not pixels. It knows what a client knows and does what a
-client does, serves it to any MCP-capable agent, and knows nothing of episodes,
-scores or trajectories.
+Thin arrows carry calls and actions, thick arrows carry observations and what
+is recorded of them. The stack is three pieces, a client-equivalent agent
+surface over a stock AzerothCore: packets, not pixels. It knows what a client
+knows and does what a client does, and serves it to any MCP-capable agent.
+
+It records what its own sessions did and knows nothing of what drove them. The
+session record (the trace and character sheet, game events, tool calls and
+their results) is the stack's: `mcp/` writes it to the session store. Episodes,
+scores, model trajectories (requests, responses, tokens, cost, turns,
+compaction) and anything that compares one run with another are a harness's,
+plugged in through its hooks. The stack never reads them, and no record of its
+own carries a harness's ids or configuration.
 
 - `module/` is the worldserver module. It takes actions as the client opcodes a
   client would send and serves the packets a client would receive.
@@ -21,8 +77,9 @@ scores or trajectories.
 - `mcp/` is the agent surface over the SDK.
 
 What an agent may observe and do is `docs/CONTRACTS.md`; the wire is
-`module/PROTOCOL.md`. Together they are the stack's specification, and the rest
-of this document is how the code meets them.
+`module/PROTOCOL.md`. Together they are the stack's specification, and
+`docs/SESSION-FORMAT.md` is the format of what it records. The rest of this
+document is how the code meets them.
 
 ## The stack and a harness
 
@@ -69,6 +126,12 @@ A harness plugs in through hooks, each a narrow interface:
   (the action log, below) and a `clientCache` that survives a restart. Run
   configuration, ids and anything a harness stamps on its records never enter
   the stack.
+- **The session record** (`SandboxHostOptions.record`, `CoreToolContext.record`,
+  below). A harness that keeps its evidence per run builds a `SessionWriter`
+  on a directory of its own and hands it to both, so the record is written in
+  place. `SessionWriterOptions.onRows` hands it the rows as they were written,
+  for a harness that also acts on them; `own` tells the write gate which
+  player guids are the deployment's own sessions.
 
 ## Versions
 
@@ -192,8 +255,8 @@ The agent surface over the SDK, and the part of the stack an agent actually
 touches: the snippet sandbox (`mcp/src/sandbox/`), the MCP server
 (`mcp/src/server.ts`, and the stdio-to-TCP bridge a CLI agent is handed,
 `mcp/src/bridge.ts`), the tool dispatcher and the core tools
-(`mcp/src/tools.ts`), the scratchpad, the secret redactor and the module's auth
-and lease helpers. `mcp/src/main.ts` serves the core tools on their own; a
+(`mcp/src/tools.ts`), the session record (`mcp/src/record/`), the scratchpad,
+the secret redactor and the module's auth and lease helpers. `mcp/src/main.ts` serves the core tools on their own; a
 harness serves its own set through the same pieces (above).
 
 ### The sandbox
@@ -269,12 +332,55 @@ A snippet's code says what the agent asked for; it does not say what went on
 the wire (a helper's inner `set_target`, a routine's fortieth re-cast, a
 refusal the snippet swallowed). So the sandbox watches its own client's
 `POST /action` requests and pushes each dispatch, with the module's HTTP
-answer, to the host, which hands it to `onActions` already linked to the tool
-call that caused it. Nothing in it reaches the agent. A harness that keeps
-records writes it; WrathBench's is the `actions` record in its trajectory
-([`docs/ARCHITECTURE.md`](https://github.com/Shard/WrathBench/blob/master/docs/ARCHITECTURE.md),
-"The action log"). The module's audit log is the ground truth for the wire
-while it is kept (`docs/CONTRACTS.md`, "Audit").
+answer, to the host, linked to the tool call that caused it. Nothing in it
+reaches the agent. The host writes it to the session record's `calls` stream
+and hands it to `onActions` for a harness that keeps its own copy. The
+module's audit log is the ground truth for the wire while it is kept
+(`docs/CONTRACTS.md`, "Audit").
+
+### The session record
+
+Any session that goes through `mcp/` leaves a record in one versioned format,
+`wrath-session/1` (`docs/SESSION-FORMAT.md`): a directory of append-only,
+five-minute JSONL segments per stream, compressed once closed, each opening
+with a key row so it decodes alone. The code is `mcp/src/record/`.
+
+- **The recorder** (`recorder.ts`, `SessionRecorder`) is a library over a
+  `WrathClient`, not something welded to the tool dispatcher: it reads the
+  client's state cache and broadcast subscriptions, sends nothing, and is not
+  reachable from a snippet, so a program that calls no tool is recorded
+  exactly as a snippet loop is. It holds the trace recorder (position at
+  observation cadence, unit state and the character sheet as deltas), the
+  nearby recorder (the units in view) and the events recorder (zone, level,
+  deaths, flights, the party records, turn-ins, achievements, spells, talents,
+  trades). Transitions a periodic reading would lose are latched off the event
+  that carried them (`watchers.ts`, `party-watch.ts`). The sandbox child runs
+  one when its host keeps a record.
+- **The host** owns the tick: `SandboxHost` drains the child's recorder every
+  two seconds (`recordDrain`, which never spawns a child), writes the action
+  log, and takes a last drain as it stops.
+- **The writer** (`writer.ts`, `SessionWriter`) is the one writer of a session
+  directory. It keeps a fold per stream so every segment opens with a key row,
+  rotates lazily, compresses a segment when it closes, rewrites `live.json`
+  on every tick and writes the manifest when the session closes. It never
+  throws into its caller: a disk it cannot write costs the record, never the
+  session.
+- **The gate** (`gate.ts`, `WriteGate`) is the one place the rules for other
+  players are applied, to every row before it reaches a file: a player who is
+  not a session of the same deployment is never written. It governs storage
+  only; what an agent observes live is `docs/CONTRACTS.md`.
+- **The reader and the store** (`reader.ts`, `store.ts`): range reads and a
+  tail by byte offset over one session, and over a directory of them the
+  list, the own-guid index the gate asks, and retention, which unlinks whole
+  closed sessions only.
+
+`ToolSet.call` writes each tool call and its scrubbed result through
+`CoreToolContext.record`. Every line passes the host's secret scrub, and no
+file holds a token: a session is named by the fingerprint its audit files
+carry. `main.ts` records by default into a store beside its state directory;
+a harness points the writer at a directory inside its own run. The record is
+what a harness's scorer may read, so a recorder or format change is judged as
+a change to a model-visible surface is.
 
 ## Data flow for one action
 
@@ -290,5 +396,6 @@ while it is kept (`docs/CONTRACTS.md`, "Audit").
 7. The SDK surfaces it as a typed event and folds it into the state cache; the
    snippet or the agent reacts, and a refusal is tallied on the hint channel.
 8. The result goes back to the agent with any pending hint block at its foot.
-   A harness records the snippet, the result, the dispatched actions and the
-   events served through its hooks.
+   The session record holds the call, the result, the dispatched actions and
+   what the cast changed on the character; a harness records the model's side
+   through its hooks.
