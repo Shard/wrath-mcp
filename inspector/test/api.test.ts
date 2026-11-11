@@ -8,6 +8,7 @@ import { describe, expect, test } from "bun:test";
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInspectorApi, inspectorHandler, storeSource, type SessionScope } from "../src/index";
+import { WOWHEAD_META } from "../src/serve";
 import { decodeSegment } from "../src/codec/trace";
 import { decodeNearby as decodeNearbyCodec } from "../src/codec/nearby";
 import type { NearbyWindow, TraceSegment } from "../src/wire";
@@ -161,6 +162,18 @@ describe("the bin's handler", () => {
     expect((await inspectorHandler({ source: storeSource(root) })(new Request("http://x/tiles/0/31_32.png"))).status).toBe(404);
     const gated = inspectorHandler({ source: storeSource(root), tilesDir: tiles, host: "0.0.0.0", secret: "an-inspector-secret-of-length" });
     expect((await gated(new Request("http://x/tiles/0/31_32.png"))).status).toBe(401);
+  });
+
+  test("the page loads Wowhead's script only when the bin was asked to", async () => {
+    const page = join(tmp, "page");
+    mkdirSync(page, { recursive: true });
+    writeFileSync(join(page, "index.html"), "<html><head><title>t</title></head><body></body></html>");
+    const off = inspectorHandler({ source: storeSource(root), pageDir: page });
+    const on = inspectorHandler({ source: storeSource(root), pageDir: page, wowhead: true });
+    for (const path of ["/", "/index.html", "/session/x"]) {
+      expect(await (await off(new Request(`http://x${path}`))).text()).not.toContain("wrath-inspector-wowhead");
+      expect(await (await on(new Request(`http://x${path}`))).text()).toContain(`${WOWHEAD_META}\n  </head>`);
+    }
   });
 
   test("an unbuilt page says so, and the API still answers", async () => {

@@ -102,7 +102,9 @@ exported subpath, or when a module include names a path out of `module/`.
 `sdk/` declares no stack dependency, so it never imports `mcp/`; `mcp/`
 reaches the SDK through `@wrathbench/sdk` alone. The inspector takes
 `@wrathbench/mcp/record/read` (the store reader and the format's types) and
-nothing else of the stack, its browser-side files import no runtime built-in
+nothing else of the stack; neither that entry, through everything it loads,
+nor the inspector's own sources calls anything that writes or deletes a
+file; its browser-side files import no runtime built-in
 and nothing of its server half, and the UI's dependencies (Solid, Vite) are
 its alone: `sdk/` and `mcp/` never declare them. The other half, that a consumer reaches the stack only
 through package names and exported entry points, is each consumer's to check.
@@ -377,18 +379,21 @@ with a key row so it decodes alone. The code is `mcp/src/record/`.
   log, and takes a last drain as it stops.
 - **The writer** (`writer.ts`, `SessionWriter`) is the one writer of a session
   directory. It keeps a fold per stream so every segment opens with a key row,
-  rotates lazily, compresses a segment when it closes, rewrites `live.json`
+  rotates lazily, compresses a segment when it closes (`compress.ts`), rewrites `live.json`
   on every tick and writes the manifest when the session closes. It never
   throws into its caller: a disk it cannot write costs the record, never the
   session.
 - **The gate** (`gate.ts`, `WriteGate`) is the one place the rules for other
   players are applied, to every row before it reaches a file: a player who is
-  not a session of the same deployment is never written. It governs storage
-  only; what an agent observes live is `docs/CONTRACTS.md`.
+  not a session of the same deployment is never written. Which guids those
+  are it asks the host (`OwnGuid`; over a store's sessions, `ownGuidIndex`).
+  It governs storage only; what an agent observes live is `docs/CONTRACTS.md`.
 - **The reader and the store** (`reader.ts`, `store.ts`): range reads and a
   tail by byte offset over one session, and over a directory of them the
-  list, the own-guid index the gate asks, and retention, which unlinks whole
-  closed sessions only.
+  list. Retention (`retention.ts`) unlinks whole closed sessions only, and is
+  the writing side's: the read entry, `@wrathbench/mcp/record/read`, loads no
+  module that writes or deletes a file, and `bun run boundary` checks that
+  over everything it imports.
 
 `ToolSet.call` writes each tool call and its scrubbed result through
 `CoreToolContext.record`. Every line passes the host's secret scrub, and no

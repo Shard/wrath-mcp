@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { recordOption, resolveSession, sessionShutdown, TOKEN_FILE } from "../src/main";
-import { DEFAULT_RETENTION_MS } from "../src/record/store";
+import { DEFAULT_RETENTION_MS } from "../src/record/retention";
 import { logoutSession, moduleIdentity, tokenFingerprint, tokenTag } from "../src/module-auth";
 
 const dirs: string[] = [];

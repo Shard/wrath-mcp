@@ -132,4 +132,24 @@ describe("the stack boundary", () => {
       "inspector/src/views/Bad.tsx: imports ../store-source, the inspector's server side, from a file a browser bundles",
     ]);
   });
+
+  test("the record's read side writes nothing, through every module it loads, and neither does the inspector", () => {
+    const root = tree({
+      "mcp/src/record/read.ts": 'export * from "./format";\nexport { SessionStore } from "./store";\nimport type { SessionWriter } from "./writer";\n',
+      "mcp/src/record/format.ts": "export const SESSION_FORMAT = 1;\n",
+      // Two hops down: the delete is pulled in by an import, not named by the entry.
+      "mcp/src/record/store.ts": 'import { readdirSync } from "node:fs";\nimport { prune } from "./retention";\nexport class SessionStore { list() { return readdirSync("."); } prune() { prune(); } }\n',
+      "mcp/src/record/retention.ts": 'import { rmSync as rm, statSync } from "node:fs";\nexport function prune() { rm("x"); statSync("y"); }\n',
+      // A type-only import loads nothing, so the writer it names is not on the read side.
+      "mcp/src/record/writer.ts": 'import { writeFileSync } from "node:fs";\nexport class SessionWriter { w() { writeFileSync("x", ""); } }\n',
+      "inspector/src/cache.ts": 'import * as fs from "node:fs/promises";\nimport fsSync from "fs";\nexport async function keep() { await fs.writeFile("x", ""); await fs.readFile("y"); fsSync.unlinkSync("z"); await Bun.write("w", ""); }\n',
+      "inspector/test/fixtures.ts": 'import { writeFileSync } from "node:fs";\nwriteFileSync("x", "");\n',
+    });
+    expect(checkStackBoundary(root).sort()).toEqual([
+      "inspector/src/cache.ts: calls Bun.write, on the record's read side",
+      "inspector/src/cache.ts: calls fs.writeFile, on the record's read side",
+      "inspector/src/cache.ts: calls fsSync.unlinkSync, on the record's read side",
+      "mcp/src/record/retention.ts: calls rmSync, on the record's read side",
+    ]);
+  });
 });

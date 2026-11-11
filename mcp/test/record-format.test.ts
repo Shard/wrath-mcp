@@ -9,7 +9,8 @@ import { appendFileSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFil
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MANIFEST_FILE, SEGMENT_MS, SESSION_FILE, parseSegmentName, segmentFileName, segmentStart, type ManifestFile } from "../src/record/format";
-import { compressSegment, listSegments, parseLines, readSegment } from "../src/record/segments";
+import { compressSegment } from "../src/record/compress";
+import { listSegments, parseLines, readSegment } from "../src/record/segments";
 import { validateRow, validateSession } from "../src/record/validate";
 import { FIXTURE_SESSIONS, FIXTURE_T0, fixtureSessionDir, plantSession, type FixtureSession } from "./fixtures/sessions";
 

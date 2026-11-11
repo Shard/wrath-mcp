@@ -62,7 +62,8 @@ import {
 } from "./format";
 import { WriteGate, type OwnGuid } from "./gate";
 import type { RecordDrain, RecordedMove } from "./recorder";
-import { compressSegment, listSegments } from "./segments";
+import { compressSegment } from "./compress";
+import { listSegments } from "./segments";
 
 export interface SessionWriterOptions {
   /** The session directory itself: `<store>/<session-id>`, or a directory a harness keeps inside its run. */

@@ -7,7 +7,11 @@
 import { Match, Show, Switch, createMemo, createSignal, onCleanup } from "solid-js";
 import { render } from "solid-js/web";
 import { LiveMap, SessionList, SessionView, Unauthorized, createInspectorClient, poll } from "../src/views";
+import { enableWowhead } from "../src/views/lib/wowhead";
 import "../src/views/inspector.css";
+
+// Wowhead's tooltip script only when the bin was started with `--wowhead` (`src/serve.ts`).
+if (document.querySelector('meta[name="wrath-inspector-wowhead"]') !== null) enableWowhead();
 
 const client = createInspectorClient("/api");
 const href = (id: string): string => `#/session/${encodeURIComponent(id)}`;

@@ -39,7 +39,9 @@ import { dirname, join } from "node:path";
 import type { EventSummary } from "./sandbox/ipc";
 import { compactJson } from "./jsonsafe";
 import { leaseRunSecret, logoutSession, moduleAuthHeaders, moduleIdentity, releaseSessionSecret, tokenFingerprint, tokenTag } from "./module-auth";
-import { DEFAULT_RETENTION_MS, SessionStore } from "./record/store";
+import { ownGuidIndex } from "./record/gate";
+import { DEFAULT_RETENTION_MS, pruneSessions } from "./record/retention";
+import { SessionStore } from "./record/store";
 import { SessionWriter } from "./record/writer";
 import { SecretRedactor } from "./redact";
 import { CLIENT_CACHE_FILE, ClientCacheStore } from "./sandbox/client-cache";
@@ -225,9 +227,9 @@ async function main(): Promise<void> {
   if (recordAt !== null) {
     const store = new SessionStore(recordAt.root);
     const id = tokenFingerprint(token);
-    const pruned = store.prune(recordAt.retentionMs, { except: id });
+    const pruned = pruneSessions(store, recordAt.retentionMs, { except: id });
     if (pruned.length > 0) console.error(`[wrathbench-mcp] removed ${pruned.length} session record(s) past retention from ${recordAt.root}`);
-    record = new SessionWriter({ dir: store.sessionDir(id), id, stack: { version: MCP_PACKAGE_VERSION }, own: store.own(), scrub: (text) => secrets.scrub(text), token });
+    record = new SessionWriter({ dir: store.sessionDir(id), id, stack: { version: MCP_PACKAGE_VERSION }, own: ownGuidIndex(() => store.dirs()), scrub: (text) => secrets.scrub(text), token });
     record.open();
     const writer = record;
     void moduleIdentity(moduleUrl, moduleAuthHeaders()).then((m) => writer.setModule(m));

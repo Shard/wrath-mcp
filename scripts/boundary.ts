@@ -13,7 +13,10 @@
  *  - The inspector reads records and nothing else: from the stack it imports
  *    `@wrathbench/mcp/record/read` (the store reader and the format's types)
  *    and no other entry point, and never the SDK, so it can never reach a
- *    module, a sandbox or a writer. sdk/ and mcp/ never import it.
+ *    module, a sandbox or a writer. sdk/ and mcp/ never import it. In
+ *    substance as well as by name: no module that entry loads, followed
+ *    through every import, and no source of the inspector's own calls a
+ *    filesystem function that writes or deletes.
  *  - The UI's dependency graph (Solid, Vite and their kin) is declared by
  *    inspector/ alone; sdk/ and mcp/ never take one on.
  *  - The inspector's browser-side files (`src/wire.ts`, `src/codec/`,
@@ -154,6 +157,62 @@ export function importsOf(file: string): string[] {
   return [...new Set([...scanner.scanImports(code).map((i) => i.path).filter(named), ...typeOnlyImports(code)])];
 }
 
+/** The filesystem functions that write, move or delete, in `node:fs` and `node:fs/promises` alike. */
+export const FS_WRITES: ReadonlySet<string> = new Set([
+  "appendFile", "appendFileSync", "chmod", "chmodSync", "chown", "chownSync", "copyFile", "copyFileSync", "cp", "cpSync",
+  "createWriteStream", "link", "linkSync", "mkdir", "mkdirSync", "mkdtemp", "mkdtempSync", "rename", "renameSync",
+  "rm", "rmSync", "rmdir", "rmdirSync", "symlink", "symlinkSync", "truncate", "truncateSync", "unlink", "unlinkSync",
+  "utimes", "utimesSync", "write", "writeFile", "writeFileSync", "writeSync", "writev", "writevSync",
+]);
+
+const FS_MODULE = /^(?:node:)?fs(?:\/promises)?$/;
+
+/**
+ * What in a file's code writes or deletes a file: a write function named in
+ * an import from `node:fs` (or `fs/promises`), one reached through a default
+ * or namespace import of it, and `Bun.write`. Read from the text with
+ * comments blanked.
+ */
+export function fsWritesOf(code: string): string[] {
+  const text = stripComments(code);
+  const out = new Set<string>();
+  for (const m of text.matchAll(/\bimport\s+([^;'"`]*?)\s+from\s*(["'])([^"'\n]+)\2/g)) {
+    if (!FS_MODULE.test(m[3]!)) continue;
+    const clause = m[1]!;
+    const named = /\{([^}]*)\}/.exec(clause);
+    for (const part of named?.[1]?.split(",") ?? []) {
+      const name = part.trim().replace(/^type\s+/, "").split(/\s+as\s+/)[0]!;
+      if (FS_WRITES.has(name)) out.add(name);
+    }
+    const whole = clause.replace(/\{[^}]*\}/, "").replace(/\*\s*as\s+/, "").split(",").map((x) => x.trim()).filter((x) => /^[A-Za-z_$][\w$]*$/.test(x));
+    for (const ns of whole) {
+      for (const use of text.matchAll(new RegExp(`\\b${ns}\\.([A-Za-z]+)\\b`, "g"))) if (FS_WRITES.has(use[1]!)) out.add(`${ns}.${use[1]}`);
+    }
+  }
+  if (/\bBun\s*\.\s*write\b/.test(text)) out.add("Bun.write");
+  return [...out];
+}
+
+/** A package's relative value imports, followed from `entry` to every module they load. */
+function valueClosure(entry: string): string[] {
+  const seen = new Set<string>();
+  const queue = [entry];
+  while (queue.length > 0) {
+    const file = queue.pop()!;
+    if (seen.has(file)) continue;
+    seen.add(file);
+    const loader = file.endsWith(".tsx") ? "tsx" : "ts";
+    const code = readFileSync(file, "utf8").replace(/^#!.*/, "");
+    for (const i of new Bun.Transpiler({ loader }).scanImports(code)) {
+      if (!i.path.startsWith(".")) continue;
+      const base = resolve(dirname(file), i.path);
+      const hit = [base, `${base}.ts`, `${base}.tsx`, join(base, "index.ts")].find((c) => existsSync(c) && statSync(c).isFile());
+      if (hit !== undefined) queue.push(hit);
+    }
+  }
+  return [...seen];
+}
+
 /** One line per violation; empty when the boundary holds. */
 export function checkStackBoundary(root: string): string[] {
   const problems: string[] = [];
@@ -211,6 +270,25 @@ export function checkStackBoundary(root: string): string[] {
     }
   }
 
+  // The read side reads: what the inspector may import from the stack, through
+  // everything it loads, and the inspector's own sources, write nothing.
+  const readOnly = new Set<string>();
+  const mcp = stackManifests.get(manifest(join(root, "mcp")).name);
+  for (const spec of INSPECTOR_STACK_IMPORTS) {
+    const [, sub] = splitPackage(spec);
+    const target = mcp?.exports?.[sub];
+    if (target !== undefined && existsSync(join(root, "mcp", target))) for (const f of valueClosure(join(root, "mcp", target))) readOnly.add(f);
+  }
+  const inspectorDir = join(root, "inspector");
+  for (const file of walk(inspectorDir, [".ts", ".tsx"])) {
+    const rel = relative(inspectorDir, file).split(sep).join("/");
+    if (rel.startsWith("test/") || /\.test\.tsx?$/.test(rel)) continue;
+    readOnly.add(file);
+  }
+  for (const file of [...readOnly].sort()) {
+    for (const w of fsWritesOf(readFileSync(file, "utf8"))) problems.push(`${relative(root, file)}: calls ${w}, on the record's read side`);
+  }
+
   // The module: quoted includes by bare name only.
   for (const file of walk(join(root, "module"), [".cpp", ".h", ".hpp"])) {
     const rel = relative(root, file);
@@ -225,5 +303,5 @@ if (import.meta.main) {
   const problems = checkStackBoundary(resolve(import.meta.dir, ".."));
   for (const p of problems) console.error(p);
   if (problems.length > 0) process.exit(1);
-  console.log("stack boundary holds: module/, sdk/, mcp/ and inspector/ import nothing outside themselves but declared dependencies, and the inspector only the record's read side");
+  console.log("stack boundary holds: module/, sdk/, mcp/ and inspector/ import nothing outside themselves but declared dependencies, and the inspector only the record's read side, which writes nothing");
 }

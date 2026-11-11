@@ -5,19 +5,17 @@
  * evidence per run points a `SessionWriter` at a directory of its own
  * instead and needs none of this.
  *
- * What the store adds to a writer and a reader: the list of sessions, the
- * index of the deployment's own characters the write gate asks, and
- * retention, which unlinks whole sessions and only ones nobody is writing.
+ * This is the store read: its sessions and a reader for each. What the
+ * writing side adds over it, the index of the deployment's own characters the
+ * write gate asks (`ownGuidIndex`, `gate.ts`) and retention, which unlinks
+ * whole sessions (`retention.ts`), lives with the writer, so the record's read
+ * side (`read.ts`) carries nothing that writes or deletes.
  */
 
-import { readdirSync, rmSync, statSync } from "node:fs";
+import { readdirSync } from "node:fs";
 import { join } from "node:path";
-import { LIVE_FILE, isPlayerGuid, type LiveFile, type SessionFile } from "./format";
-import type { OwnGuid } from "./gate";
-import { SessionReader, readSessionFile } from "./reader";
-
-/** How long a closed session is kept unless the operator says otherwise: three days, the audit log's default. */
-export const DEFAULT_RETENTION_MS = 3 * 24 * 60 * 60_000;
+import type { LiveFile, SessionFile } from "./format";
+import { SessionReader } from "./reader";
 
 /** A session id is the 16 hex characters of a token fingerprint. */
 const SESSION_ID_RE = /^[0-9a-f]{16}$/;
@@ -29,31 +27,6 @@ export interface StoredSession {
   live: LiveFile | null;
 }
 
-/**
- * The guids that are sessions of one deployment, read from a set of session
- * directories and refreshed when a guid it does not know is asked for, at
- * most once every `refreshMs`. A guid it cannot place is foreign.
- */
-export function ownGuidIndex(sessionDirs: () => string[], o: { refreshMs?: number; now?: () => number } = {}): OwnGuid {
-  const refreshMs = o.refreshMs ?? 5_000;
-  const now = o.now ?? Date.now;
-  let known = new Set<string>();
-  let readAt = -Infinity;
-  return (guid) => {
-    if (!isPlayerGuid(guid)) return false;
-    if (known.has(guid)) return true;
-    if (now() - readAt < refreshMs) return false;
-    readAt = now();
-    const next = new Set<string>();
-    for (const dir of sessionDirs()) {
-      const g = readSessionFile(dir)?.character?.guid;
-      if (typeof g === "string") next.add(g);
-    }
-    known = next;
-    return known.has(guid);
-  };
-}
-
 export class SessionStore {
   constructor(readonly root: string) {}
 
@@ -63,7 +36,8 @@ export class SessionStore {
     return join(this.root, id);
   }
 
-  private dirs(): string[] {
+  /** The directories named as sessions, whether or not they hold a record yet. */
+  dirs(): string[] {
     try {
       return readdirSync(this.root).filter((n) => SESSION_ID_RE.test(n)).map((n) => join(this.root, n));
     } catch {
@@ -84,35 +58,5 @@ export class SessionStore {
 
   reader(id: string): SessionReader {
     return new SessionReader(this.sessionDir(id));
-  }
-
-  /** The write gate's question for sessions of this store: is this guid one of ours. */
-  own(): OwnGuid {
-    return ownGuidIndex(() => this.dirs());
-  }
-
-  /**
-   * Unlink every closed session older than `retentionMs`, and return their
-   * ids. Closed means `ended` is that old, or the writer died: `ended` is
-   * null and its heartbeat (`live.json`, else `opened`) is. A session being
-   * written beats every tick, so it is never one of these. `except` is the
-   * session the caller is about to write.
-   */
-  prune(retentionMs: number, o: { now?: number; except?: string } = {}): string[] {
-    const now = o.now ?? Date.now();
-    const pruned: string[] = [];
-    for (const s of this.list()) {
-      if (s.id === o.except) continue;
-      const beat = Math.max(s.live?.ts ?? 0, statSync(join(s.dir, LIVE_FILE), { throwIfNoEntry: false })?.mtimeMs ?? 0, s.session.opened);
-      const last = s.session.ended ?? beat;
-      if (now - last < retentionMs) continue;
-      try {
-        rmSync(s.dir, { recursive: true, force: true });
-        pruned.push(s.id);
-      } catch {
-        /* the next start tries again */
-      }
-    }
-    return pruned;
   }
 }
