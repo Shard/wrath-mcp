@@ -16,4 +16,4 @@ export { liveFileSchema, manifestFileSchema, sessionFileSchema, validateRow, val
 export type { RecordDrain, RecordedMove } from "./recorder";
 export type { EventsDrain } from "./events-recorder";
 export type { DeathSignal, FlightSignal } from "./watchers";
-export type { PartySignal } from "./party-watch";
+export { groupKeyOf, type PartySignal } from "./party-watch";
