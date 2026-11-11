@@ -1,0 +1,177 @@
+{
+  "defs": [
+    {
+      "name": "run_snippet",
+      "description": "Execute a TypeScript snippet in the persistent game sandbox. Top-level bindings persist across snippets; `sdk`, `state`, `events`, `connect()`, `sleep(ms)`, `scratchpad` and `signal` (aborted if this snippet is abandoned) are ambient. A single expression returns its value. This is the only way to act in the world. With `character`, `sdk`, `state` and `events` are that character's for this snippet and for anything it leaves running. `chars` holds every logged-in character by name, each with its own `sdk`, `state` and `events`, so one snippet can act for several.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "TypeScript source to evaluate."
+          },
+          "character": {
+            "type": "string",
+            "description": "A logged-in character's name, exactly as list_characters shows it."
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "recent_events",
+      "description": "Return the most recent game events (server packets as JSON), oldest first. Use after acting to see what the server said. Ambient movement packets (SMSG_MONSTER_MOVE, MSG_MOVE_*) are folded out by default — they fold into cached state instead, and a trailing note says how many were dropped. Pass includeMovement: true for the raw stream. With `character`, that character's events. Without, one feed merged from every logged-in character's: an event several of them received is one line ending with how many saw it, and an event one of them received ends with its name.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200,
+            "description": "How many events to return, counted AFTER the movement fold. Default 50."
+          },
+          "includeMovement": {
+            "type": "boolean",
+            "description": "Include ambient movement packets (SMSG_MONSTER_MOVE, MSG_MOVE_*). Default false."
+          },
+          "character": {
+            "type": "string",
+            "description": "A logged-in character's name, exactly as list_characters shows it."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "state_summary",
+      "description": "A summary of the cached game state. With `character`, that character's: character, level, position, recent chat and notifications, whether any events were missed. Without, a roll-up of every logged-in character: how many are alive, in combat, casting and out of mana, where the group is, and one line for each character that is an exception (dead, low on health, disconnected, far from the group, its last move refused).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "character": {
+            "type": "string",
+            "description": "A logged-in character's name, exactly as list_characters shows it."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "write_scratchpad",
+      "description": "Replace the entire scratchpad with new markdown. Keep it current: plan, progress, durable facts. It survives restarts; conversation history does not.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "The full new scratchpad content (markdown)."
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "edit_scratchpad",
+      "description": "Change part of the scratchpad in place: replace the exact text `old` with `new`. Use this for ordinary upkeep — striking a done item, correcting a coordinate, adding a line under a heading — and write_scratchpad only to start the pad or rewrite it wholesale. `old` must match the pad byte for byte, whitespace included, and must appear exactly once unless replaceAll is set.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "old": {
+            "type": "string",
+            "description": "The exact existing text to replace, copied from the scratchpad."
+          },
+          "new": {
+            "type": "string",
+            "description": "What to put in its place. Empty string deletes the text."
+          },
+          "replaceAll": {
+            "type": "boolean",
+            "description": "Replace every occurrence instead of requiring a unique one. Default false."
+          }
+        },
+        "required": [
+          "old",
+          "new"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "login_character",
+      "description": "Log a character into the world. A character of that name is logged in if one exists; otherwise it is created, and race and class are then required. The name the result gives is the handle every `character` argument takes. Only so many characters may be logged in at once; list_characters says how many.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The character's name: 2-12 letters, no spaces."
+          },
+          "race": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 11,
+            "description": "Race id, 1-11. Needed only to create the character."
+          },
+          "class": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 11,
+            "description": "Class id, 1-11. Needed only to create the character."
+          },
+          "gender": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "0 or 1. Default 0. Used only to create the character."
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "logout_character",
+      "description": "Log a character out of the world, which frees its place for another. The character is saved and can be logged in again by name.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "character": {
+            "type": "string",
+            "description": "A logged-in character's name, exactly as list_characters shows it."
+          }
+        },
+        "required": [
+          "character"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "list_characters",
+      "description": "The characters logged in now, one line each with level, health and where it is, how many may be logged in at once, and the characters known but not logged in.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    }
+  ],
+  "help": [
+    "run_snippet expects { code: string, character?: string } — the TypeScript source to evaluate, and the logged-in character whose sdk, state and events it gets.",
+    "recent_events expects { limit?: number, includeMovement?: boolean, character?: string } — how many events to return (1-200, default 50, counted after ambient movement is folded out), whether to include ambient movement packets (SMSG_MONSTER_MOVE, MSG_MOVE_*; default false), and the logged-in character whose events to return (default: one feed merged from all of them).",
+    "state_summary expects { character?: string } — the logged-in character to summarise (default: a roll-up of all of them).",
+    "write_scratchpad expects { content: string } — the full new scratchpad markdown.",
+    "edit_scratchpad expects { old: string, new: string, replaceAll?: boolean } — the exact existing text to replace, what to put there, and whether to replace every occurrence (default false, which requires old to appear exactly once).",
+    "login_character expects { name: string, race?: number, class?: number, gender?: number } — the character's name, and the numeric race and class ids (1-11) to create it with when no character of that name exists.",
+    "logout_character expects { character: string } — a logged-in character's name.",
+    "list_characters takes no parameters ({})."
+  ]
+}

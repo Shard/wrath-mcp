@@ -19,7 +19,7 @@ import type { Subprocess } from "bun";
 import { ScrubbedStream, SecretRedactor } from "../redact";
 import { overCapText, type Scratchpad } from "../scratchpad";
 import type { ClientCacheStore } from "./client-cache";
-import type { ActionHintNote, ActionNote, ChildToHost, EventSummary, EvalResultMsg, HostToChild, HostcallResult, LogEntry } from "./ipc";
+import type { ActionHintNote, ActionNote, ChildToHost, EventSummary, EvalResultMsg, HostToChild, HostcallResult, LogEntry, SeatClosed, SeatOpened } from "./ipc";
 import { RepeatFolder } from "./log-fold";
 import type { RecordDrain } from "../record/recorder";
 import type { DispatchLink, SessionWriter } from "../record/writer";
@@ -65,6 +65,8 @@ export interface EvalLink {
 export interface ActionsFlush {
   turn?: number;
   callTs?: number;
+  /** Whose client dispatched them, at fan-out above 1: the character's name. */
+  character?: string;
   routine?: true;
   actions: ActionNote[];
   dropped?: Record<string, number>;
@@ -87,6 +89,7 @@ export interface HarnessNotice<K extends string = SandboxNoticeKind> {
 
 export interface SandboxHostOptions {
   moduleUrl: string;
+  /** The session token of the one character, at fan-out 1. Unused above it, where each seat brings its own (`SeatSpec`). */
   token: string;
   /**
    * The session secret leased for `token` (module/PROTOCOL.md,
@@ -155,12 +158,75 @@ export interface SandboxHostOptions {
    * Undefined records nothing, and the child runs no recorder.
    */
   record?: {
-    writer: SessionWriter;
+    /** The one character's record, at fan-out 1. Above it there is none here: each seat brings its own (`SeatSpec.writer`). */
+    writer?: SessionWriter;
     /** How often the child's recorder is drained. Default `RECORD_TICK_MS`. */
     tickMs?: number;
   };
+  /**
+   * Fan-out: how many characters this sandbox may hold at once, when that is
+   * more than one. The grant is the operator's, as the GM opt-in is
+   * (`fanout.ts`); the host only holds the seats it is handed (`openSeat`).
+   * The child then builds no client from its environment: `token`, `secret`
+   * and `account` above are unused, and every client is a seat's, on that
+   * seat's own token and lease secret, sent over IPC. Absent, or 1, is the
+   * single-character sandbox, unchanged.
+   */
+  fanout?: { maxCharacters: number };
   now?: () => number;
 }
+
+/**
+ * One more character for a fan-out sandbox (`SandboxHost.openSeat`): the name
+ * to enter the world as, and the token, lease secret and account the host's
+ * owner took for it.
+ */
+export interface SeatSpec {
+  character: string;
+  token: string;
+  secret?: string | undefined;
+  account?: string | undefined;
+  /** What to create the character with when the account has none by that name. */
+  create?: { race?: number; class?: number; gender?: number } | undefined;
+  /** The session may already be in the world (a resumed server): ask for the reattach replay. */
+  reattach?: boolean | undefined;
+  /**
+   * The seat's session record, asked for once the character is in the world
+   * and its name is the server's. The host drains the seat's recorder into
+   * it; whoever built it opens and closes it.
+   */
+  writer?: ((opened: SeatOpened) => SessionWriter | undefined) | undefined;
+}
+
+/** A seat as the host knows it. */
+export interface SeatView {
+  character: string;
+  account: string | undefined;
+  /** False after a restart it could not be reattached from; `error` says why. */
+  attached: boolean;
+  error?: string;
+}
+
+interface HostSeat {
+  character: string;
+  token: string;
+  secret: string | undefined;
+  account: string | undefined;
+  writer: SessionWriter | undefined;
+  attached: boolean;
+  error: string | undefined;
+}
+
+/** How long a seat may take to reach the world: the module's own 20s login and a reclaim before it. */
+export const SEAT_OPEN_TIMEOUT_MS = 45_000;
+
+/**
+ * How many seats reattach at once after a restart. Each reattach is a replay
+ * burst (a create block per object in view) folded on the child's one event
+ * loop, so forty at once would starve the pings that decide whether the
+ * child is alive; a few at a time keeps it answering.
+ */
+export const REATTACH_CONCURRENCY = 4;
 
 /** How often the host drains the child's recorder into the session record. */
 export const RECORD_TICK_MS = 2_000;
@@ -236,6 +302,12 @@ export const STATE_LOSS_RECOVERY =
   "once that replay has landed, so `state` and `sdk` are whole again. Call `await sdk.createSession({...})` " +
   "only if `connect()` fails because the session is gone.";
 
+/** `STATE_LOSS_RECOVERY` for a fan-out sandbox: the host reattaches every seat itself, so there is nothing for a snippet to reconnect. */
+export const STATE_LOSS_RECOVERY_FANOUT =
+  "All top-level bindings and routines were lost; the game sessions were not, and each character is where it was. " +
+  "Every character that was logged in is reattached and its state replayed before the next call is answered; " +
+  "`list_characters` shows them, and one that could not be reattached is named in a notice.";
+
 /** The runner's own stream of the same name: the job log, or the pod log on the cluster. */
 function defaultLogSink(stream: "stdout" | "stderr", text: string): void {
   (stream === "stdout" ? process.stdout : process.stderr).write(text);
@@ -279,9 +351,28 @@ export class SandboxHost {
   /** The record tick, running from the first start until `stop`. */
   private recordTimer: ReturnType<typeof setInterval> | undefined;
   private recordDraining: Promise<void> | null = null;
+  /** The seats of a fan-out sandbox, by character name, in the order they were opened. */
+  private readonly seats = new Map<string, HostSeat>();
+  /** The current child's seats reattached, after its ready; resolved at once at fan-out 1. */
+  private reattached: Promise<void> = Promise.resolve();
 
   constructor(private readonly opts: SandboxHostOptions) {
     this.redactor.redact(opts.secret);
+  }
+
+  /** How many characters this sandbox may hold: above 1 only for a fan-out sandbox. */
+  get maxCharacters(): number {
+    const n = this.opts.fanout?.maxCharacters ?? 1;
+    return Number.isInteger(n) && n > 1 ? n : 1;
+  }
+
+  private get fanout(): boolean {
+    return this.maxCharacters > 1;
+  }
+
+  /** What a state-loss notice ends with: how to get the session back, or that the host already did. */
+  private get stateLoss(): string {
+    return this.fanout ? STATE_LOSS_RECOVERY_FANOUT : STATE_LOSS_RECOVERY;
   }
 
   get entryPath(): string {
@@ -312,6 +403,7 @@ export class SandboxHost {
     // fold events into a cache that is not seeded yet.
     if (this.proc !== null) {
       await this.ready;
+      await this.reattached;
       return;
     }
     this.startRecordTick();
@@ -360,6 +452,9 @@ export class SandboxHost {
         // Whether this child runs the session recorder: set here and nowhere
         // else, so a stray value in the operator's shell decides nothing.
         WRATHBENCH_RECORD: this.opts.record !== undefined ? "1" : "",
+        // Fan-out only, and absent at 1: the child of a single-character
+        // sandbox is spawned with exactly the environment it always had.
+        ...(this.fanout ? { WRATHBENCH_MAX_CHARACTERS: String(this.maxCharacters) } : {}),
       }),
       stdio: ["ignore", "pipe", "pipe"],
       serialization: "json",
@@ -385,7 +480,7 @@ export class SandboxHost {
               "sandbox_restarted",
               `sandbox process exited unexpectedly (${cause}).` +
                 (tail ? ` Last stderr: ${tail}\n` : " ") +
-                STATE_LOSS_RECOVERY,
+                this.stateLoss,
             );
             // Never leave a start() awaiting a dead child — this child's
             // start(), by its own resolver: the field may already belong to
@@ -406,7 +501,124 @@ export class SandboxHost {
       stderr.tail = this.redactor.scrub(stderr.tail + text).slice(-4_000);
     });
     this.drained = Promise.all([stderr.done, this.pump(this.proc.stdout, "stdout")]).then(() => undefined);
+    // A fan-out child starts with no client: every seat this host holds is
+    // opened in it again before anything else is asked of it.
+    const proc = this.proc;
+    this.reattached = this.fanout ? this.ready.then(() => this.reattachSeats(proc)) : Promise.resolve();
     await this.ready;
+    await this.reattached;
+  }
+
+  // ---------------------------------------------------------------- seats
+
+  private async sendSeatOpen(seat: HostSeat, o: { reattach: boolean; create?: SeatSpec["create"] }): Promise<SeatOpened> {
+    const id = this.nextId++;
+    const res = await this.request<{ t: "rpc_result"; id: number; ok: boolean; value?: unknown; error?: string }>(
+      {
+        t: "seat_open",
+        id,
+        character: seat.character,
+        token: seat.token,
+        ...(seat.secret !== undefined ? { secret: seat.secret } : {}),
+        ...(seat.account !== undefined ? { account: seat.account } : {}),
+        ...(o.create !== undefined ? { create: o.create } : {}),
+        reattach: o.reattach,
+        frames: this.opts.clientCache?.snapshot() ?? [],
+      },
+      SEAT_OPEN_TIMEOUT_MS,
+    );
+    if (!res.ok) throw new Error(res.error ?? "the character did not reach the world");
+    return res.value as SeatOpened;
+  }
+
+  /**
+   * Open every seat this host holds in a child that has just started, a few
+   * at a time (`REATTACH_CONCURRENCY`). A seat that does not come back stays
+   * in the table, marked, and is named in a notice; nothing here throws.
+   * Abandoned without a word when the child it was for is no longer the
+   * current one: the next start reattaches from the top.
+   */
+  private async reattachSeats(proc: Subprocess | null): Promise<void> {
+    const pending = [...this.seats.values()];
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (next < pending.length) {
+        const seat = pending[next++]!;
+        if (this.proc !== proc || proc === null) return;
+        try {
+          await this.sendSeatOpen(seat, { reattach: true });
+          seat.attached = true;
+          seat.error = undefined;
+        } catch (err) {
+          if (this.proc !== proc) return;
+          seat.attached = false;
+          seat.error = err instanceof Error ? err.message : String(err);
+          this.notice("session_note", `${seat.character} could not be reattached after the sandbox restarted: ${seat.error}`);
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(REATTACH_CONCURRENCY, pending.length) }, worker));
+  }
+
+  /**
+   * Open a seat: one more character in a fan-out sandbox, on the token and
+   * lease secret its owner took for it. Resolves with the character as the
+   * server named it, which is the seat's key from then on; rejects with why
+   * it did not reach the world, and then nothing is held. The secret is
+   * scrubbed from everything the child writes, as the single character's is.
+   */
+  async openSeat(spec: SeatSpec): Promise<SeatOpened> {
+    if (!this.fanout) throw new Error("this sandbox holds one character");
+    this.redactor.redact(spec.secret);
+    await this.start();
+    const seat: HostSeat = { character: spec.character, token: spec.token, secret: spec.secret, account: spec.account, writer: undefined, attached: false, error: undefined };
+    let opened: SeatOpened;
+    try {
+      opened = await this.sendSeatOpen(seat, { reattach: spec.reattach === true, create: spec.create });
+    } catch (err) {
+      // A create that outlived the wait may still land: have the child drop whatever it built.
+      if (err instanceof SandboxTimeoutError) {
+        try {
+          this.send({ t: "seat_close", id: this.nextId++, seat: spec.character, logout: false });
+        } catch {
+          // no child to tell
+        }
+        throw new Error(`${spec.character} did not reach the world within ${SEAT_OPEN_TIMEOUT_MS / 1000}s`);
+      }
+      throw err;
+    }
+    seat.character = opened.character;
+    seat.attached = true;
+    seat.writer = spec.writer?.(opened);
+    this.seats.set(opened.character, seat);
+    return opened;
+  }
+
+  /**
+   * Close a seat: with `logout`, the child logs the character out first.
+   * What its recorder still held is written before the seat is forgotten.
+   * A seat this host does not hold is a no-op. Never throws.
+   */
+  async closeSeat(character: string, o: { logout: boolean }): Promise<void> {
+    const seat = this.seats.get(character);
+    if (seat === undefined) return;
+    this.seats.delete(character);
+    if (this.proc === null || !seat.attached) return;
+    try {
+      const res = await this.request<{ t: "rpc_result"; id: number; ok: boolean; value?: unknown }>(
+        { t: "seat_close", id: this.nextId++, seat: character, logout: o.logout },
+        this.opts.pingGraceMs + (o.logout ? 6_000 : 0),
+      );
+      const drain = (res.value as SeatClosed | undefined)?.drain ?? null;
+      if (drain !== null) seat.writer?.ingest(drain as RecordDrain, (evalId, routine) => this.dispatchLink(evalId, routine));
+    } catch {
+      // A child that cannot answer loses the last tick of this seat's record, no more.
+    }
+  }
+
+  /** The seats this host holds, in the order they were opened. */
+  seatViews(): SeatView[] {
+    return [...this.seats.values()].map((s) => ({ character: s.character, account: s.account, attached: s.attached, ...(s.error !== undefined ? { error: s.error } : {}) }));
   }
 
   /**
@@ -449,7 +661,8 @@ export class SandboxHost {
       case "ready": {
         // Seed first, ready second: the seed is then the first message this
         // child handles, ahead of every eval and rpc that waited for ready.
-        const frames = this.opts.clientCache?.snapshot() ?? [];
+        // A fan-out child has no client yet: each seat is seeded as it opens.
+        const frames = this.fanout ? [] : (this.opts.clientCache?.snapshot() ?? []);
         if (frames.length > 0) {
           try {
             this.proc?.send({ t: "client_cache_seed", frames } satisfies HostToChild);
@@ -507,13 +720,14 @@ export class SandboxHost {
         return;
       case "actions": {
         const sink = this.opts.onActions;
-        const writer = this.opts.record?.writer;
-        if (sink === undefined && writer === undefined) return;
         for (const b of msg.batches) {
+          // The dispatching client's own record: the seat's at fan-out above 1.
+          const writer = b.seat !== undefined ? this.seats.get(b.seat)?.writer : this.opts.record?.writer;
           writer?.actions(this.dispatchLink(b.evalId, b.routine === true), b.actions, b.dropped);
           if (sink === undefined) continue;
           const link = b.evalId === null ? undefined : this.evalLinks.get(b.evalId);
           const flush: ActionsFlush = { actions: b.actions };
+          if (b.seat !== undefined) flush.character = b.seat;
           if (link?.turn !== undefined) flush.turn = link.turn;
           if (link?.callTs !== undefined) flush.callTs = link.callTs;
           if (b.routine === true) flush.routine = true;
@@ -550,6 +764,7 @@ export class SandboxHost {
    * this rather than waiting for the timer. Never throws.
    */
   recordDrain(): Promise<void> {
+    if (this.fanout) return this.recordDrainSeats();
     const writer = this.opts.record?.writer;
     if (writer === undefined) return Promise.resolve();
     if (this.recordDraining !== null) return this.recordDraining;
@@ -562,6 +777,28 @@ export class SandboxHost {
         return;
       }
       writer.ingest(drained, (evalId, routine) => this.dispatchLink(evalId, routine));
+    })().finally(() => {
+      if (this.recordDraining === p) this.recordDraining = null;
+    });
+    this.recordDraining = p;
+    return p;
+  }
+
+  /** The record tick at fan-out above 1: one ask for every seat's recorder, each drained into its own writer. */
+  private recordDrainSeats(): Promise<void> {
+    if (this.opts.record === undefined) return Promise.resolve();
+    if (this.recordDraining !== null) return this.recordDraining;
+    const p = (async () => {
+      let drained: Record<string, RecordDrain | null> = {};
+      try {
+        drained = ((await this.drain("record_drain_all"))?.value ?? {}) as Record<string, RecordDrain | null>;
+      } catch {
+        return;
+      }
+      // A seat the child did not answer for (none running, or mid-reattach) still beats its heartbeat.
+      for (const seat of this.seats.values()) {
+        seat.writer?.ingest(drained[seat.character] ?? null, (evalId, routine) => this.dispatchLink(evalId, routine));
+      }
     })().finally(() => {
       if (this.recordDraining === p) this.recordDraining = null;
     });
@@ -605,7 +842,7 @@ export class SandboxHost {
    * tool call it is, for the action log (`EvalLink`); it changes nothing about
    * the evaluation.
    */
-  async evalSnippet(code: string, link?: EvalLink): Promise<SnippetResult> {
+  async evalSnippet(code: string, link?: EvalLink, character?: string): Promise<SnippetResult> {
     await this.start();
     const id = this.nextId++;
     if (link !== undefined) {
@@ -628,6 +865,8 @@ export class SandboxHost {
           code,
           deadline: Date.now() + this.opts.snippetTimeoutMs,
           timeoutMs: this.opts.snippetTimeoutMs,
+          // At fan-out above 1, the character whose `sdk`, `state` and `events` the snippet gets.
+          ...(character !== undefined ? { seat: character } : {}),
         },
         this.opts.snippetTimeoutMs,
       );
@@ -646,7 +885,7 @@ export class SandboxHost {
         return {
           ok: false,
           restarted: true,
-          error: `the sandbox process exited while this snippet was running — ${STATE_LOSS_RECOVERY}`,
+          error: `the sandbox process exited while this snippet was running — ${this.stateLoss}`,
           logs: [],
           durationMs: 0,
         };
@@ -707,7 +946,7 @@ export class SandboxHost {
         restarted: true,
         error:
           `snippet blocked the sandbox event loop past ${this.opts.snippetTimeoutMs}ms; ` +
-          `the sandbox process was killed and restarted — ${STATE_LOSS_RECOVERY}`,
+          `the sandbox process was killed and restarted — ${this.stateLoss}`,
         logs: [],
         durationMs: this.opts.snippetTimeoutMs,
       };
@@ -746,7 +985,7 @@ export class SandboxHost {
       }
     }
     await this.start();
-    this.notice("sandbox_restarted", `sandbox restarted (${reason}). ${STATE_LOSS_RECOVERY}`);
+    this.notice("sandbox_restarted", `sandbox restarted (${reason}). ${this.stateLoss}`);
   }
 
   /**
@@ -755,9 +994,9 @@ export class SandboxHost {
    * `state_summary`; any other is an extension's (`SandboxChildExtension.rpc`
    * in `child.ts`), which is how a harness drains what its extension latched.
    */
-  async rpc(method: string, params: { limit?: number } = {}): Promise<unknown> {
+  async rpc(method: string, params: { limit?: number } = {}, character?: string): Promise<unknown> {
     await this.start();
-    return this.ask(method, params, 5_000);
+    return this.ask(method, params, 5_000, character);
   }
 
   /**
@@ -767,17 +1006,17 @@ export class SandboxHost {
    * `pingGraceMs`, the host's measure of how long a live child takes to
    * answer, so a child whose event loop is blocked costs that long and no more.
    */
-  async drain(method: string, params: { limit?: number } = {}): Promise<{ value: unknown } | null> {
+  async drain(method: string, params: { limit?: number } = {}, character?: string): Promise<{ value: unknown } | null> {
     if (this.proc === null) return null;
     await this.ready;
     if (this.proc === null) return null;
-    return { value: await this.ask(method, params, this.opts.pingGraceMs) };
+    return { value: await this.ask(method, params, this.opts.pingGraceMs, character) };
   }
 
-  private async ask(method: string, params: { limit?: number }, timeoutMs: number): Promise<unknown> {
+  private async ask(method: string, params: { limit?: number }, timeoutMs: number, character?: string): Promise<unknown> {
     const id = this.nextId++;
     const res = await this.request<{ t: "rpc_result"; id: number; ok: boolean; value?: unknown; error?: string }>(
-      { t: "rpc", id, method, params },
+      { t: "rpc", id, method, params, ...(character !== undefined ? { seat: character } : {}) },
       timeoutMs,
     );
     if (!res.ok) throw new Error(res.error ?? `${method} rpc failed`);
@@ -785,8 +1024,18 @@ export class SandboxHost {
   }
 
   /** Recent events as JSON-safe summaries, via the child's SDK event buffer. */
-  async recentEvents(limit: number): Promise<EventSummary[]> {
-    return ((await this.rpc("recent_events", { limit })) ?? []) as EventSummary[];
+  async recentEvents(limit: number, character?: string): Promise<EventSummary[]> {
+    return ((await this.rpc("recent_events", { limit }, character)) ?? []) as EventSummary[];
+  }
+
+  /** Fan-out above 1: every seat's recent events, by character name. */
+  async recentEventsAll(limit: number): Promise<Record<string, EventSummary[]>> {
+    return ((await this.rpc("recent_events_all", { limit })) ?? {}) as Record<string, EventSummary[]>;
+  }
+
+  /** Fan-out above 1: every seat's state snapshot, by character name. */
+  async stateSnapshots(): Promise<Record<string, Record<string, unknown>>> {
+    return ((await this.rpc("state_summary_all")) ?? {}) as Record<string, Record<string, unknown>>;
   }
 
   /**
@@ -805,8 +1054,8 @@ export class SandboxHost {
   }
 
   /** JSON-safe snapshot of the child's StateCache, plus what its extensions add. */
-  async stateSnapshot(): Promise<Record<string, unknown>> {
-    return ((await this.rpc("state_summary")) ?? {}) as Record<string, unknown>;
+  async stateSnapshot(character?: string): Promise<Record<string, unknown>> {
+    return ((await this.rpc("state_summary", {}, character)) ?? {}) as Record<string, unknown>;
   }
 
   async stop(): Promise<void> {

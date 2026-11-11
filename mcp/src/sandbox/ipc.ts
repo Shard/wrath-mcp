@@ -28,6 +28,11 @@ export interface ActionHintNote {
    * Absent for the current snippet's own hints and for world events.
    */
   from?: string;
+  /**
+   * Whose client tallied it, at fan-out above 1 (`fanout.ts`): the character's
+   * name. Absent at fan-out 1, where there is one client and nothing to tell apart.
+   */
+  character?: string;
 }
 
 /**
@@ -115,6 +120,8 @@ export interface ActionNote {
  */
 export interface ActionBatch {
   evalId: number | null;
+  /** Whose client dispatched them, at fan-out above 1: the character's name. Absent at fan-out 1. */
+  seat?: string;
   /** True when the launching snippet had already returned: a background routine's actions. */
   routine?: true;
   actions: ActionNote[];
@@ -142,7 +149,7 @@ export type HostToChild =
    * its snippet had left names the ceiling in the abandon note. Explanation
    * only; the sleep still runs for what it was asked.
    */
-  | { t: "eval"; id: number; code: string; deadline?: number; timeoutMs?: number }
+  | { t: "eval"; id: number; code: string; deadline?: number; timeoutMs?: number; seat?: string }
   | { t: "ping"; id: number }
   /** Abort the eval with this id: fires its `signal`, so SDK waits it left behind settle. */
   | { t: "abort"; id: number }
@@ -161,7 +168,39 @@ export type HostToChild =
       id: number;
       method: string;
       params: { limit?: number };
+      /**
+       * At fan-out above 1, the character whose client answers. Without one
+       * the core's per-character methods have an `_all` form
+       * (`recent_events_all`, `state_summary_all`, `record_drain_all`) that
+       * answers for every seat, keyed by name.
+       */
+      seat?: string;
     }
+  /**
+   * Fan-out above 1 (`fanout.ts`): build a client for one more character, on
+   * the token and lease secret the host took for it, open its stream and
+   * enter the world as `character` (created with `create` when the account
+   * has none by that name). `reattach` asks the module for the reattach
+   * replay first: the session may already be in the world (a restarted
+   * child, a resumed server). `frames` seeds its client cache. Answered with
+   * an `rpc_result` whose value is `SeatOpened`.
+   */
+  | {
+      t: "seat_open";
+      id: number;
+      character: string;
+      token: string;
+      secret?: string;
+      account?: string;
+      create?: { race?: number; class?: number; gender?: number };
+      reattach: boolean;
+      frames: ClientCacheFrame[];
+    }
+  /**
+   * Drop a character's client: with `logout`, log it out first. Answered with
+   * an `rpc_result` whose value is `SeatClosed`, the last of its record.
+   */
+  | { t: "seat_close"; id: number; seat: string; logout: boolean }
   /**
    * The client cache a starting child is seeded with (`client-cache.ts`): the
    * query answers this run's client was given before this child existed,
@@ -170,6 +209,17 @@ export type HostToChild =
    */
   | { t: "client_cache_seed"; frames: ClientCacheFrame[] }
   | { t: "shutdown" };
+
+/** What `seat_open` answers: the character as the server named it. */
+export interface SeatOpened {
+  character: string;
+  guid: string;
+}
+
+/** What `seat_close` answers: what its recorder still held (a `RecordDrain`), or null with no recorder. */
+export interface SeatClosed {
+  drain: unknown;
+}
 
 export interface EvalResultMsg {
   t: "result";

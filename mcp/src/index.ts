@@ -19,11 +19,14 @@
 export { MCP_BRIDGE_PATH, SANDBOX_CONFINE_PATH, SANDBOX_ENTRY_PATH } from "./paths";
 
 export {
+  REATTACH_CONCURRENCY,
   RECORD_TICK_MS,
   SANDBOX_FORWARDED_ENV,
   SandboxHost,
   sandboxChildEnv,
+  SEAT_OPEN_TIMEOUT_MS,
   STATE_LOSS_RECOVERY,
+  STATE_LOSS_RECOVERY_FANOUT,
 } from "./sandbox/host";
 export type {
   ActionsFlush,
@@ -31,8 +34,40 @@ export type {
   HarnessNotice,
   SandboxHostOptions,
   SandboxNoticeKind,
+  SeatSpec,
+  SeatView,
   SnippetResult,
 } from "./sandbox/host";
+export {
+  CharacterRoster,
+  digestCharacter,
+  exceptionsOf,
+  FANOUT_TOOL_ORDER,
+  FanoutCalls,
+  fanoutGrantProblem,
+  fanoutTools,
+  groupCentre,
+  MAX_CHARACTERS_LIMIT,
+  MERGE_WINDOW_MS,
+  mergeEvents,
+  PLAIN_FANOUT_RENDER,
+  ROLLUP,
+} from "./fanout";
+export type {
+  CharacterDigest,
+  CharacterRosterOptions,
+  CharacterView,
+  FanoutGrant,
+  FanoutRender,
+  FanoutSandbox,
+  FanoutSurface,
+  FanoutToolContext,
+  FanoutToolName,
+  LoginOutcome,
+  LoginRequest,
+  MergedEvent,
+  RosterEntry,
+} from "./fanout";
 // Types only: importing the child runtime itself is what makes a process a
 // sandbox child (it replaces fetch, WebSocket and console), so its values are
 // reached through `@wrathbench/mcp/sandbox-child` and nowhere else.
@@ -100,6 +135,8 @@ export type {
   HostToChild,
   LogEntry,
   MoveIntentNote,
+  SeatClosed,
+  SeatOpened,
 } from "./sandbox/ipc";
 
 export {
@@ -107,8 +144,12 @@ export {
   appendPendingActionHints,
   booleanish,
   coreTools,
+  foldedNote,
   parseToolArgsText,
+  recentEventsScan,
   renderActionHints,
+  serveEvents,
+  snippetToolResult,
   stripTrailingCommas,
   toolCallCount,
   ToolSet,

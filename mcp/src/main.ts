@@ -8,6 +8,7 @@
  *
  *   bun mcp/src/main.ts [--account <name>] [--dir <state-dir>] [--token-file <path> | --token <session-token>] [--allow-gm]
  *                       [--record-dir <store> | --no-record] [--record-retention-days <n>]
+ *                       [--max-characters <n> --accounts <a,b,…>]
  *
  * Environment: `WRATHBENCH_MODULE_URL` (default `http://127.0.0.1:8086`) and
  * `WRATHBENCH_MODULE_SECRET`, the module's port secret, which this process
@@ -27,17 +28,29 @@
  * `--record-retention-days` ago (default 3) are removed at start; `--no-record`
  * records nothing.
  *
+ * `--max-characters <n>` above 1 is fan-out, the operator's grant as
+ * `--allow-gm` is (`fanout.ts`): this one client may have up to `n` characters
+ * in the world at once, on the accounts `--accounts` lists (one live session
+ * per account, so at least `n` of them). The tool list is then the fan-out one
+ * (`fanoutTools`): the same five, `character` on the three that act on one,
+ * and `login_character`, `logout_character`, `list_characters`. Each
+ * character has its own token, lease and session record; the state directory
+ * keeps which account and token each lives on (`roster.json`, mode 0600), so
+ * `--dir` brings back the ones that were logged in. Absent, or 1, everything
+ * here is the single-character server, byte for byte.
+ *
  * A clean exit — stdin closing, SIGINT or SIGTERM — logs the character out and
  * releases the lease. A killed process leaves the character in the world until
  * a create on its account reclaims it (module/PROTOCOL.md, "POST /session").
  */
 
 import { randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { EventSummary } from "./sandbox/ipc";
 import { compactJson } from "./jsonsafe";
+import { CharacterRoster, FANOUT_TOOL_ORDER, fanoutGrantProblem, fanoutTools, MAX_CHARACTERS_LIMIT, type FanoutGrant, type FanoutToolContext, type RosterEntry } from "./fanout";
 import { leaseRunSecret, logoutSession, moduleAuthHeaders, moduleIdentity, releaseSessionSecret, tokenFingerprint, tokenTag } from "./module-auth";
 import { ownGuidIndex } from "./record/gate";
 import { DEFAULT_RETENTION_MS, pruneSessions } from "./record/retention";
@@ -109,6 +122,63 @@ export function allowGmOption(argv: readonly string[], env: Record<string, strin
   if (v === undefined || v === "" || v === "0" || v === "false") return false;
   if (v === "1" || v === "true") return true;
   throw new Error(`${ALLOW_GM_ENV} must be 1 or true to allow GM use, or 0, false or unset for the default (off)`);
+}
+
+/**
+ * The fan-out grant from argv, or null for the single-character server:
+ * `--max-characters <n>` above 1 with `--accounts <a,b,…>`. Refused rather
+ * than guessed at: a count that is no whole number from 1 to the limit, a
+ * count above 1 with no accounts or fewer than it needs, and `--account`
+ * beside `--accounts`, which would be two answers to where a character lives.
+ */
+export function fanoutOption(argv: readonly string[], allowGm = false): FanoutGrant | null {
+  const flag = (name: string): string | undefined => {
+    const i = argv.indexOf(`--${name}`);
+    return i >= 0 ? argv[i + 1] : undefined;
+  };
+  const raw = flag("max-characters");
+  const accountsRaw = flag("accounts");
+  if (raw === undefined) {
+    if (accountsRaw !== undefined) throw new Error("--accounts is the fan-out grant's and needs --max-characters above 1; a single character takes --account");
+    return null;
+  }
+  const n = Number(raw);
+  if (!/^\d+$/.test(raw) || n < 1 || n > MAX_CHARACTERS_LIMIT) throw new Error(`--max-characters must be a whole number from 1 to ${MAX_CHARACTERS_LIMIT}`);
+  if (n === 1) {
+    if (accountsRaw !== undefined) throw new Error("--accounts is the fan-out grant's and needs --max-characters above 1; a single character takes --account");
+    return null;
+  }
+  if (flag("account") !== undefined) throw new Error("--account names one character's account; with --max-characters above 1 the accounts are --accounts <a,b,…>");
+  const accounts = (accountsRaw ?? "").split(",").map((a) => a.trim()).filter((a) => a.length > 0);
+  const grant: FanoutGrant = { maxCharacters: n, accounts, ...(allowGm ? { allowGm: true } : {}) };
+  const problem = fanoutGrantProblem(grant);
+  if (problem !== null) throw new Error(`--max-characters ${n}: ${problem} (--accounts <a,b,…>)`);
+  return grant;
+}
+
+/** The file in the state directory that keeps where each character lives, at fan-out above 1. Mode 0600: it holds tokens. */
+export const ROSTER_FILE = "roster.json";
+
+/** The entries a state directory's roster file holds; none when it has no file or one that does not read. */
+export function readRoster(path: string): RosterEntry[] {
+  try {
+    const raw: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (!Array.isArray(raw)) return [];
+    return raw.filter(
+      (e): e is RosterEntry =>
+        e !== null && typeof e === "object" && typeof (e as RosterEntry).character === "string" && typeof (e as RosterEntry).account === "string" && typeof (e as RosterEntry).token === "string",
+    ).map((e) => ({ character: e.character, account: e.account, token: e.token, in: e.in === true }));
+  } catch {
+    return [];
+  }
+}
+
+/** Write the roster file whole, 0600, by rename, so a reader never sees half and never a looser mode. */
+export function writeRoster(path: string, entries: readonly RosterEntry[]): void {
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(entries, null, 2)}\n`, { mode: 0o600 });
+  chmodSync(tmp, 0o600);
+  renameSync(tmp, path);
 }
 
 /** The file in the state directory that holds the session token. */
@@ -207,6 +277,8 @@ async function main(): Promise<void> {
   const account = flag("account");
   const moduleUrl = process.env["WRATHBENCH_MODULE_URL"] ?? "http://127.0.0.1:8086";
   const allowGm = allowGmOption(argv, process.env);
+  const grant = fanoutOption(argv, allowGm);
+  if (grant !== null) return mainFanout({ argv, grant, token, dir, tokenPath, moduleUrl });
 
   const secrets = new SecretRedactor();
   // The opt-in rides the lease, which only this process can take: the child's
@@ -251,6 +323,8 @@ async function main(): Promise<void> {
     // Scrubbed like everything else this process writes: a crash notice
     // quotes the child's stderr, and the child holds the lease secret.
     onNotice: (n) => console.error(secrets.scrub(`[wrathbench-mcp] ${n.kind}: ${n.text}`)),
+    // stdout is the MCP transport: what a snippet prints goes to stderr with the rest of this process's log.
+    logSink: (_stream, text) => void process.stderr.write(text),
   });
   const ctx: CoreToolContext = {
     sandbox,
@@ -285,6 +359,98 @@ async function main(): Promise<void> {
     `[wrathbench-mcp] session ${tokenTag(token)}, state in ${dir}; its token is in ${tokenPath} (mode 0600), and --dir ${dir} resumes it` +
       (record !== undefined ? `; recorded in ${record.dir}` : "; not recorded"),
   );
+  await serveStdio(server);
+  await shutdown();
+  process.exit(0);
+}
+
+/**
+ * The server for a client granted more than one character. The state
+ * directory's token names the client, not a session: it is never leased, and
+ * its fingerprint is the `group` every one of the client's session records
+ * carries, which is how a reader finds the sessions one client drove.
+ */
+async function mainFanout(o: { argv: readonly string[]; grant: FanoutGrant; token: string; dir: string; tokenPath: string; moduleUrl: string }): Promise<void> {
+  const { grant, dir, moduleUrl } = o;
+  const secrets = new SecretRedactor();
+  const group = tokenFingerprint(o.token);
+  const rosterPath = join(dir, ROSTER_FILE);
+  const known = readRoster(rosterPath);
+
+  const recordAt = recordOption(o.argv, dir);
+  const store = recordAt !== null ? new SessionStore(recordAt.root) : null;
+  if (store !== null && recordAt !== null) {
+    const pruned = pruneSessions(store, recordAt.retentionMs);
+    if (pruned.length > 0) console.error(`[wrathbench-mcp] removed ${pruned.length} session record(s) past retention from ${recordAt.root}`);
+  }
+  const module = store !== null ? moduleIdentity(moduleUrl, moduleAuthHeaders()) : null;
+
+  const scratchpad = new Scratchpad(join(dir, "scratchpad.md"));
+  const clientCache = new ClientCacheStore(join(dir, CLIENT_CACHE_FILE));
+  process.on("exit", () => clientCache.flush());
+  const sandbox = new SandboxHost({
+    moduleUrl,
+    token: "",
+    scratchpad,
+    snippetTimeoutMs: 30_000,
+    pingGraceMs: 5_000,
+    clientCache,
+    fanout: { maxCharacters: grant.maxCharacters },
+    ...(store !== null ? { record: {} } : {}),
+    onNotice: (n) => console.error(secrets.scrub(`[wrathbench-mcp] ${n.kind}: ${n.text}`)),
+    logSink: (_stream, text) => void process.stderr.write(text),
+  });
+  const roster = new CharacterRoster({
+    grant,
+    moduleUrl,
+    sandbox,
+    secrets,
+    known,
+    onChange: (entries) => writeRoster(rosterPath, entries),
+    ...(store !== null
+      ? {
+          record: (seat) => {
+            const id = tokenFingerprint(seat.token);
+            const writer = new SessionWriter({ dir: store.sessionDir(id), id, stack: { version: MCP_PACKAGE_VERSION }, group, own: ownGuidIndex(() => store.dirs()), scrub: (text) => secrets.scrub(text), token: seat.token });
+            writer.open();
+            void module?.then((m) => writer.setModule(m));
+            return writer;
+          },
+        }
+      : {}),
+  });
+  const ctx: FanoutToolContext = { sandbox, scratchpad, sessionLive: () => true, turn: () => 0, secrets, fanout: roster, ...(store !== null ? { record: roster.calls } : {}) };
+  const specs = fanoutTools<FanoutToolContext>(PLAIN_RENDER);
+  const tools = new ToolSet(FANOUT_TOOL_ORDER.map((name) => specs[name]));
+  const server = new McpServer(
+    {
+      list: () => tools.defs,
+      coerce: (name, raw) => tools.coerce(name, raw),
+      call: async (name, args, origin) => withNotices(sandbox, secrets, await tools.call(ctx, name, args, origin)),
+      appendPending: async (result) => withNotices(sandbox, secrets, await tools.appendPending(ctx, result)),
+    },
+    { serverVersion: MCP_PACKAGE_VERSION },
+  );
+  let done: Promise<void> | undefined;
+  const shutdown = (): Promise<void> =>
+    (done ??= (async () => {
+      await Promise.race([sandbox.stop().catch(() => {}), Bun.sleep(5_000)]);
+      await Promise.race([roster.shutdown({ logout: true }).catch(() => {}), Bun.sleep(5_000 + 1_000 * grant.maxCharacters)]);
+    })());
+  let signalled = false;
+  const onSignal = (code: number) => () => {
+    if (signalled) process.exit(code);
+    signalled = true;
+    void shutdown().finally(() => process.exit(code));
+  };
+  process.on("SIGINT", onSignal(130));
+  process.on("SIGTERM", onSignal(143));
+  console.error(
+    `[wrathbench-mcp] up to ${grant.maxCharacters} characters on ${grant.accounts.length} accounts, state in ${dir} (--dir ${dir} resumes it)` +
+      (recordAt !== null ? `; each recorded in ${recordAt.root}, group ${group}` : "; not recorded"),
+  );
+  // The characters that were logged in when this state directory was last used.
+  for (const f of await roster.resume()) console.error(secrets.scrub(`[wrathbench-mcp] ${f.character} was not brought back: ${f.error}`));
   await serveStdio(server);
   await shutdown();
   process.exit(0);

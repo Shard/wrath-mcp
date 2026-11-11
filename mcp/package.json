@@ -15,6 +15,7 @@
     "./client-cache": "./src/sandbox/client-cache.ts",
     "./paths": "./src/paths.ts",
     "./tools": "./src/tools.ts",
+    "./fanout": "./src/fanout.ts",
     "./record": "./src/record/index.ts",
     "./record/read": "./src/record/read.ts",
     "./record/recorder": "./src/record/recorder.ts"

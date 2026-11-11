@@ -257,6 +257,8 @@ export const ACTION_HINT_RENDER = {
  */
 export function renderActionHints(hints: readonly ActionHintNote[]): string | undefined {
   if (hints.length === 0) return undefined;
+  // Fan-out above 1: each client tallied its own, and a line says whose it is.
+  if (hints.some((h) => h.character !== undefined)) return renderActionHints(groupHintsByCharacter(hints));
   // Most recent first. Nothing here reacts to how often a status failed — the
   // count is only the collapse marker for repeats of one hint, and no rendering
   // or ordering decision reads it.
@@ -273,6 +275,37 @@ export function renderActionHints(hints: readonly ActionHintNote[]): string | un
   const rest = ordered.length - shown.length;
   if (rest > 0) lines.push(`(+${rest} other failure ${rest === 1 ? "status" : "statuses"} since the last result)`);
   return lines.join("\n");
+}
+
+/** How many names a grouped hint line lists before it counts the rest. */
+const HINT_CHARACTERS_SHOWN = 4;
+
+/**
+ * Hints tallied per character (fan-out above 1), grouped: the same failure
+ * with the same hint from several characters is one line whose head names
+ * them, with the count summed, so the block grows with what differs between
+ * characters and not with how many there are. The names ride the `from`
+ * label's place on the line's head, where the hint cap never cuts them.
+ */
+function groupHintsByCharacter(hints: readonly ActionHintNote[]): ActionHintNote[] {
+  const groups = new Map<string, { note: ActionHintNote; names: string[] }>();
+  for (const h of hints) {
+    const key = `${h.action}\n${h.status}\n${h.hint}\n${h.from ?? "\u0000"}`;
+    const g = groups.get(key);
+    const name = h.character ?? "?";
+    if (g === undefined) {
+      groups.set(key, { note: { ...h }, names: [name] });
+      continue;
+    }
+    g.note.count += h.count;
+    if (h.ts > g.note.ts) g.note.ts = h.ts;
+    if (!g.names.includes(name)) g.names.push(name);
+  }
+  return [...groups.values()].map(({ note, names }) => {
+    const { character: _c, ...rest } = note;
+    const shown = names.slice(0, HINT_CHARACTERS_SHOWN).join(", ") + (names.length > HINT_CHARACTERS_SHOWN ? ` +${names.length - HINT_CHARACTERS_SHOWN}` : "");
+    return { ...rest, status: `${note.status} [${shown}]` };
+  });
 }
 
 /**
@@ -503,6 +536,84 @@ const EDIT_SCRATCHPAD_HINTS: Record<"empty_old" | "identical" | "not_found" | "a
 };
 
 /**
+ * A snippet's result as the model reads it: the verdict, its value, the note
+ * about it, the error, the console, the hint block and whatever the harness
+ * ends a snippet result with. Marked as evaluated, so the dispatcher does not
+ * append the hints a second time.
+ */
+export async function snippetToolResult<C extends CoreToolContext>(ctx: C, res: SnippetResult, render: Pick<CoreToolRender<C>, "afterSnippet">): Promise<ToolResult> {
+  const lines: string[] = [];
+  lines.push(res.ok ? `ok (${res.durationMs}ms)` : `error (${res.durationMs}ms)`);
+  if (res.value !== undefined) lines.push(`=> ${res.value}`);
+  if (res.hint !== undefined) lines.push(res.hint);
+  if (res.error !== undefined) lines.push(res.error);
+  if (res.logs.length > 0) {
+    lines.push("--- console ---");
+    for (const l of res.logs) lines.push(`[${l.level}] ${l.text}`);
+  }
+  // Last, and on a successful snippet too: a11's snippets returned `ok`
+  // while swallowing 41 hints, so this is the main case, not the edge.
+  const hints = renderActionHints(res.actionHints ?? []);
+  if (hints !== undefined) lines.push(hints);
+  // After the hint block and carrying no action outcome, so nothing a
+  // background routine did is said twice; before the result is marked,
+  // so it is still the one `EVALUATED` holds.
+  if (render.afterSnippet !== undefined) {
+    const after = await render.afterSnippet(ctx);
+    if (after !== undefined) lines.push(after);
+  }
+  const result = { text: lines.join("\n"), isError: !res.ok };
+  EVALUATED.add(result);
+  return result;
+}
+
+/** How many events `recent_events` asks the sandbox for: `limit` of the raw stream, or a wider span to fold within. */
+export function recentEventsScan(limit: number, includeMovement: boolean): number {
+  return includeMovement ? limit : Math.min(RECENT_EVENTS_SCAN_MAX, limit * RECENT_EVENTS_SCAN_FACTOR);
+}
+
+/** The note a folded reply ends with, or undefined when nothing was folded. */
+export function foldedNote(folded: number): string | undefined {
+  return folded === 0
+    ? undefined
+    : `(+${folded} ambient movement and party-frame events folded into state — pass {includeMovement: true} for the raw stream)`;
+}
+
+/**
+ * What `recent_events` serves of a scanned span: the events shown, how many
+ * ambient ones were folded out of the span they cover, and the reply's text.
+ */
+export function serveEvents<C extends CoreToolContext>(
+  scanned: EventSummary[],
+  limit: number,
+  includeMovement: boolean,
+  render: Pick<CoreToolRender<C>, "eventLine" | "isAmbient">,
+): { visible: EventSummary[]; folded: number; text: string } {
+  if (includeMovement) {
+    return { visible: scanned, folded: 0, text: scanned.length === 0 ? "no events yet" : scanned.map((e) => render.eventLine(e)).join("\n") };
+  }
+  const ambient = (e: EventSummary): boolean => render.isAmbient(e.opcode);
+  // An event a child extension marked as a bystander's (a harness's
+  // spell combat-log line nobody of ours is in) is left out as the
+  // harness's own event window leaves it out; it is not movement, so it
+  // is not counted below.
+  const visible = scanned.filter((e) => !ambient(e) && e.bystander !== true).slice(-limit);
+  // The span the reply covers. When `limit` truncated the signal events,
+  // it starts at the oldest visible one — reporting ambient events from
+  // before it would credit the note with a span the reply never showed.
+  // When it did not, the reply is everything there was, so the span is
+  // the whole scan and leading ambient events still get counted (an
+  // all-movement buffer must say so, not silently look empty).
+  const spanStart = visible.length < limit ? 0 : scanned.indexOf(visible[0]!);
+  const folded = scanned.slice(spanStart).filter(ambient).length;
+  const note = foldedNote(folded);
+  if (visible.length === 0) return { visible, folded, text: note === undefined ? "no events yet" : `no non-ambient events yet\n${note}` };
+  const lines = visible.map((e) => render.eventLine(e));
+  if (note !== undefined) lines.push(note);
+  return { visible, folded, text: lines.join("\n") };
+}
+
+/**
  * How a harness shows the core tools' answers: the event line and the state
  * summary are its context rendering, and which opcodes are ambient is its
  * context policy. `afterSnippet` is what a snippet result ends with after its
@@ -540,29 +651,7 @@ export function coreTools<C extends CoreToolContext>(render: CoreToolRender<C>):
       run: async (ctx, args, origin) => {
         const { code } = args as { code: string };
         const res = await ctx.sandbox.evalSnippet(code, { callTs: origin.dispatchTs, turn: ctx.turn() });
-        const lines: string[] = [];
-        lines.push(res.ok ? `ok (${res.durationMs}ms)` : `error (${res.durationMs}ms)`);
-        if (res.value !== undefined) lines.push(`=> ${res.value}`);
-        if (res.hint !== undefined) lines.push(res.hint);
-        if (res.error !== undefined) lines.push(res.error);
-        if (res.logs.length > 0) {
-          lines.push("--- console ---");
-          for (const l of res.logs) lines.push(`[${l.level}] ${l.text}`);
-        }
-        // Last, and on a successful snippet too: a11's snippets returned `ok`
-        // while swallowing 41 hints, so this is the main case, not the edge.
-        const hints = renderActionHints(res.actionHints ?? []);
-        if (hints !== undefined) lines.push(hints);
-        // After the hint block and carrying no action outcome, so nothing a
-        // background routine did is said twice; before the result is marked,
-        // so it is still the one `EVALUATED` holds.
-        if (render.afterSnippet !== undefined) {
-          const after = await render.afterSnippet(ctx);
-          if (after !== undefined) lines.push(after);
-        }
-        const result = { text: lines.join("\n"), isError: !res.ok };
-        EVALUATED.add(result);
-        return result;
+        return snippetToolResult(ctx, res, render);
       },
     },
     recent_events: {
@@ -610,43 +699,12 @@ export function coreTools<C extends CoreToolContext>(render: CoreToolRender<C>):
       aliases: { include_movement: "includeMovement", includemovement: "includeMovement" },
       run: async (ctx, args, origin) => {
         const { limit, includeMovement } = args as { limit: number; includeMovement: boolean };
-        if (includeMovement) {
-          const events = await ctx.sandbox.recentEvents(limit);
-          ctx.onEventsServed?.(events, 0);
-          ctx.record?.eventsServed(origin.dispatchTs, events, 0);
-          if (events.length === 0) return { text: "no events yet" };
-          return { text: events.map((e) => render.eventLine(e)).join("\n") };
-        }
-        // `limit` counts SIGNAL events, so scan a wider span and fold within it.
-        const scan = Math.min(RECENT_EVENTS_SCAN_MAX, limit * RECENT_EVENTS_SCAN_FACTOR);
-        const scanned = await ctx.sandbox.recentEvents(scan);
-        const ambient = (e: EventSummary): boolean => render.isAmbient(e.opcode);
-        // An event a child extension marked as a bystander's (a harness's
-        // spell combat-log line nobody of ours is in) is left out as the
-        // harness's own event window leaves it out; it is not movement, so it
-        // is not counted below.
-        const visible = scanned.filter((e) => !ambient(e) && e.bystander !== true).slice(-limit);
-        // The span the reply covers. When `limit` truncated the signal events,
-        // it starts at the oldest visible one — reporting ambient events from
-        // before it would credit the note with a span the reply never showed.
-        // When it did not, the reply is everything there was, so the span is
-        // the whole scan and leading ambient events still get counted (an
-        // all-movement buffer must say so, not silently look empty).
-        const spanStart =
-          visible.length < limit ? 0 : scanned.indexOf(visible[0]!);
-        const folded = scanned.slice(spanStart).filter(ambient).length;
-        ctx.onEventsServed?.(visible, folded);
-        ctx.record?.eventsServed(origin.dispatchTs, visible, folded);
-        const note =
-          folded === 0
-            ? undefined
-            : `(+${folded} ambient movement and party-frame events folded into state — pass {includeMovement: true} for the raw stream)`;
-        if (visible.length === 0) {
-          return { text: note === undefined ? "no events yet" : `no non-ambient events yet\n${note}` };
-        }
-        const lines = visible.map((e) => render.eventLine(e));
-        if (note !== undefined) lines.push(note);
-        return { text: lines.join("\n") };
+        // `limit` counts SIGNAL events, so without the raw stream a wider span is scanned and folded within.
+        const scanned = await ctx.sandbox.recentEvents(recentEventsScan(limit, includeMovement));
+        const served = serveEvents(scanned, limit, includeMovement, render);
+        ctx.onEventsServed?.(served.visible, served.folded);
+        ctx.record?.eventsServed(origin.dispatchTs, served.visible, served.folded);
+        return { text: served.text };
       },
     },
     state_summary: {
