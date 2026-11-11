@@ -3,7 +3,8 @@
  * The format's types, the writer a host holds, the reader and the store, and
  * the validator. Nothing here spawns or confines anything, so a process that
  * only reads records (a viewer, a collector) imports this and loads no
- * sandbox. The recorders that run beside a `WrathClient` are `./recorder`.
+ * sandbox. The recorders that run beside a `WrathClient` are
+ * `@wrathbench/mcp/record/recorder`.
  */
 
 export * from "./format";

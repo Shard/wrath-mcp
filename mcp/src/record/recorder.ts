@@ -17,6 +17,12 @@ import type { NearbyDrain, SessionCharacter, TraceDrain } from "./format";
 import { NearbyRecorder } from "./nearby-recorder";
 import { TraceRecorder } from "./trace-recorder";
 
+export { EventsRecorder, type EventsDrain, type EventsRecorderOptions } from "./events-recorder";
+export { NearbyRecorder, type NearbyRecorderOptions } from "./nearby-recorder";
+export { TraceRecorder, type TraceRecorderOptions } from "./trace-recorder";
+export { PartyWatcher, type PartyWatchEvent, type PartyWatchState } from "./party-watch";
+export { DeathWatcher, FlightWatcher } from "./watchers";
+
 /** The slice of a `WrathClient` the recorders read. */
 export interface RecordedClient {
   state: StateCache;
