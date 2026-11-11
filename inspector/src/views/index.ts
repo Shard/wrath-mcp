@@ -13,7 +13,8 @@
  *   `…/nearbyplayer`, `…/chatbubbles`, `…/popover`, `…/wowhead`), so a test
  *   or a page that wants only the arithmetic loads no component.
  *
- * The class names are the stylesheet's (`@wrathbench/inspector/views/inspector.css`).
+ * Their own rules are `@wrathbench/inspector/views/views.css`, imported after
+ * the host page's shell (its tokens, cards, tables, badges and buttons).
  */
 
 export { CharacterPanel } from "./CharacterPanel";

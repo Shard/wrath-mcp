@@ -14,11 +14,17 @@ It is released with the stack as `@wrathbench/inspector`, in three parts:
   the live map, the session list, a session's page, its character (unit
   frame, money, inventory and quest log), its party and its event feed. The
   bin's page (`page/`) is built from them, and a harness's own pages import
-  them.
+  them. Beside them, the pure logic a map plays a session with, each its own
+  entry point: the trace player and its live and replay clocks
+  (`…/traceplayer`), a track's cursor maths and route (`…/replay`), the
+  transport's arithmetic (`…/playback`), movement intentions
+  (`…/mapintent`), a feed's clock (`…/feedclock`) and the camera's fit
+  (`…/mapfit`). The shapes a map's feeds carry are `SessionPosition` and
+  `SessionTrack` in the wire types, which a harness's own feed extends.
 - **The codecs.** The trace and the ring of nearby units, packed per window
   for a map (`src/codec/trace.ts`, `src/codec/nearby.ts`, where each format is
-  specified), and their wire types (`src/wire.ts`). Browser-safe, so a page
-  bundles them.
+  specified), a replay track's inventory as patches (`src/codec/inventory.ts`),
+  and their wire types (`src/wire.ts`). Browser-safe, so a page bundles them.
 
 ## Running it on a bare store
 
@@ -85,8 +91,15 @@ Wowhead's tooltip script for icons and names in the reader's browser is a
 third-party request, so it is opt-in: a page calls `enableWowhead()`
 (`@wrathbench/inspector/views/wowhead`) to allow it, the bin's page does when
 started with `--wowhead`, and otherwise, as where the script is blocked, the
-links show the record's names. Their classes and tokens are WrathBench's dashboard's,
-taken as they are (`src/views/inspector.css`, the bin's stylesheet).
+links show the record's names.
+
+The views' own rules are one stylesheet, `@wrathbench/inspector/views/views.css`
+(`src/views/views.css`): the classes only they draw. The shell they sit in,
+the palette and type-scale tokens and the card, table, badge and button
+classes, is the host page's, and the views' stylesheet is imported after it.
+The bin's shell is `page/page.css`, WrathBench's dashboard's tokens and
+classes taken as they are; the dashboard imports the views' stylesheet and
+carries no copy of it.
 
 `bun run --cwd inspector dev` serves the page from source with the API
 proxied to a bin on 8091 (`WRATH_INSPECTOR_ORIGIN` points it elsewhere).

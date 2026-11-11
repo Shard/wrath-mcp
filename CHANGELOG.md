@@ -283,16 +283,21 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   `@wrathbench/mcp/record`.
 - **wrath-inspector**, a third package, `@wrathbench/inspector`
   (`inspector/README.md`): read-only JSON and server-sent events over a
-  session store (`createInspectorApi(source)`), the trace and nearby codecs
-  that pack a session's windows for a map, and the `wrath-inspector --store
+  session store (`createInspectorApi(source)`), the trace, nearby and
+  track-inventory codecs that pack a session for a map, and the `wrath-inspector --store
   <dir>` bin, which needs a bearer secret to bind anywhere but loopback. It
   reads records through the new `@wrathbench/mcp/record/read` entry point and
   nothing else of the stack, and neither that entry, through everything it
   loads, nor the inspector writes or deletes a file (`scripts/boundary.ts`).
   Its SolidJS views (the live map, the session list and page, the
   character's unit frame, inventory and quest log, the party and the event
-  feed) are `@wrathbench/inspector/views`, and the bin serves a page built
-  from them, with minimap tiles from `--tiles <dir>` when it has them.
+  feed) are `@wrathbench/inspector/views`, styled by one stylesheet
+  (`@wrathbench/inspector/views/views.css`) over the host page's shell, with
+  the pure logic a map plays a session with (the trace player and its clocks,
+  a track's cursor maths and route, the transport's arithmetic, movement
+  intentions, the camera's fit) and the base shapes of a map's position and
+  track feeds; the bin serves a page built from them, with minimap tiles
+  from `--tiles <dir>` when it has them.
   Wowhead's tooltip script, a third-party request, is opt-in: the views ask
   for it only on a page that calls `enableWowhead()`, which the bin's page
   does with `--wowhead`.

@@ -8,7 +8,8 @@ import { Match, Show, Switch, createMemo, createSignal, onCleanup } from "solid-
 import { render } from "solid-js/web";
 import { LiveMap, SessionList, SessionView, Unauthorized, createInspectorClient, poll } from "../src/views";
 import { enableWowhead } from "../src/views/lib/wowhead";
-import "../src/views/inspector.css";
+import "./page.css";
+import "../src/views/views.css";
 
 // Wowhead's tooltip script only when the bin was started with `--wowhead` (`src/serve.ts`).
 if (document.querySelector('meta[name="wrath-inspector-wowhead"]') !== null) enableWowhead();

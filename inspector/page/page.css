@@ -1,0 +1,207 @@
+/*
+ * The bin's page: the palette and type-scale tokens, the base, the shell its
+ * views sit in (cards, tables, badges, buttons) and the map's layout beside
+ * its session list. The views' own rules are `src/views/views.css`, which the
+ * page imports after this. The tokens and the shell are WrathBench's
+ * dashboard's, taken as they are, so the views read the same in either.
+ */
+
+:root {
+  color-scheme: dark light;
+  --bg: #14161a;
+  --fg: #d8dee6;
+  --dim: #8a94a3;
+  --line: #2b3038;
+  --panel: #1b1e24;
+  --accent: #7aa2f7;
+  --err: #f7768e;
+  --ok: #9ece6a;
+  /* A finished thing, not a live one: green enough to still mean "fine",
+     pulled back toward the background so it does not compete with --ok. */
+  --ok-muted: #7a9460;
+  --warn: #e0af68;
+  --grid: #1a1d22;
+  --gridline: #23272e;
+  /* A replayed route's flights. A run's own route colour is any hue at 60%
+     lightness, so this is set apart by lightness instead of hue: a pale sky
+     here, a deep blue on the light theme, and never one a run can draw in. */
+  --flight: #bfe6ff;
+  /* Claude's own orange, so the claude-code harness tag reads as itself rather
+     than as one more accent-coloured badge. */
+  --claude: #da7756;
+  /* The codex harness tag: OpenAI's green, for the same reason. */
+  --codex: #10a37f;
+  /* The pi harness tag: a violet no other tag or run line uses (pi has no house colour). */
+  --pi: #a78bfa;
+  /* A party's members by their place in it, the leader first (`lib/party.ts`):
+     five members of one model share one logo, so the colour is what tells them
+     apart on the map, in its legend and on the party page. Okabe–Ito hues. */
+  --member-1: #e69f00;
+  --member-2: #56b4e9;
+  --member-3: #cc79a7;
+  --member-4: #f0e442;
+  --member-5: #009e73;
+
+  /*
+   * The type scale. Seven steps, in rem against the browser's own root size,
+   * and every rule in this file that sets a size names one of them — nothing
+   * sets a pixel font-size any more. Two reasons it is tokens rather than
+   * literals: the page had eight different sizes doing the work of four, and a
+   * phone wants the whole thing a step smaller, which is one override of these
+   * seven values (below) instead of a media query per rule.
+   *
+   * SVG text is deliberately NOT on this scale (`.loop-label`, `.loop-sub`,
+   * and the `font-size` attributes the chart components write): those are
+   * viewBox user units that scale with the drawing, and a rem there would be
+   * an absolute size that stops scaling with it.
+   */
+  --fs-2xs: 0.5625rem;  /* 9px — the surface badge, sort marks, rail ticks */
+  --fs-xs: 0.6875rem;   /* 11px — table headers, key labels, badges */
+  --fs-sm: 0.75rem;     /* 12px — captions, controls, secondary lines */
+  --fs-md: 0.8125rem;   /* 13px — table body, section headings */
+  --fs-base: 0.875rem;  /* 14px — body copy */
+  --fs-lg: 0.9375rem;   /* 15px — the brand, card figures */
+  --fs-xl: 1.25rem;     /* 20px — the one page title per page */
+}
+
+/*
+ * A phone reads this dashboard one column at a time, and at desktop sizes the
+ * header alone took three lines of a 360px viewport. One step down across the
+ * board, defined in the one place the sizes are defined.
+ */
+@media (max-width: 720px) {
+  :root {
+    --fs-2xs: 0.5625rem;  /* 9px — already the floor; it does not step down */
+    --fs-xs: 0.625rem;    /* 10px */
+    --fs-sm: 0.6875rem;   /* 11px */
+    --fs-md: 0.75rem;     /* 12px */
+    --fs-base: 0.8125rem; /* 13px */
+    --fs-lg: 0.875rem;    /* 14px */
+    --fs-xl: 1.125rem;    /* 18px */
+  }
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #fbfbfc;
+    --fg: #1e2229;
+    --dim: #5d6673;
+    --line: #dde1e7;
+    --panel: #f2f3f6;
+    --accent: #2f5fd0;
+    --err: #b3283c;
+    --ok: #3f7a24;
+    /* Muted means "toward the page" in both schemes, so on white it lightens. */
+    --ok-muted: #6e8f57;
+    --warn: #8a5d00;
+    --grid: #e9ebef;
+    --gridline: #d5d9e0;
+    --flight: #0a4f8a;
+    /* Darkened for a light background: #da7756 is too pale for an 11px badge. */
+    --claude: #b4522f;
+    --codex: #0b7a5f;
+    --pi: #6d28d9;
+    --member-1: #a86f00;
+    --member-2: #1f6fa8;
+    --member-3: #a8487f;
+    --member-4: #857800;
+    --member-5: #00795a;
+  }
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: var(--fs-base)/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.app { display: flex; flex-direction: column; height: 100%; }
+
+header.top {
+  display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap;
+  padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--bg);
+  flex: none;
+}
+header.top .wordmark { font-size: var(--fs-lg); margin: 0; font-weight: 600; }
+
+main { flex: 1; min-height: 0; overflow: auto; }
+main.flush { overflow: hidden; }
+.page { padding: 16px; }
+
+.dim { color: var(--dim); }
+.err { color: var(--err); }
+.ok { color: var(--ok); }
+/* Done rather than going: a campaign that has finished its sweep. */
+.ok-muted { color: var(--ok-muted); }
+.warn { color: var(--warn); }
+.mono { font-variant-numeric: tabular-nums; }
+
+h1 { font-size: var(--fs-xl); margin: 4px 0 8px; font-weight: 700; }
+/* Section headings, a step up from where they were so the h1 is not alone in
+   being read as a heading — still plainly below it. A class rather than
+   `h2.section`, so the run page's breadcrumb h1 and the config page's h3s take
+   the same treatment without a copy of it. The `.section` after `h1` in source
+   order is what lets `h1.section` keep the breadcrumb's size. */
+.section { font-size: var(--fs-base); margin: 20px 0 8px; font-weight: 700;
+           text-transform: uppercase; letter-spacing: .08em; color: var(--dim); }
+.section:first-child { margin-top: 0; }
+/* Below h2, so the outline reads in the order it is written. */
+h3.section { font-size: var(--fs-md); }
+
+.cards { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; }
+.card .v { font-size: var(--fs-lg); font-weight: 600; }
+.card .sub { color: var(--dim); font-size: var(--fs-sm); }
+
+.scroller { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: var(--fs-md); }
+th, td { text-align: left; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--dim); font-weight: 600; font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .06em; }
+/* One highlight, two ways in: the pointer's own hover, and the shared
+   `hovered` key the ladder's chart and table agree on. */
+tbody tr:hover, tbody tr.hovered { background: var(--panel); }
+tbody tr.hovered { outline: 1px solid var(--accent); outline-offset: -1px; }
+
+.badge { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .05em; font-weight: 700;
+         border: 1px solid var(--line); border-radius: 3px; padding: 1px 5px; color: var(--dim); }
+.badge.running { color: var(--ok); border-color: var(--ok); }
+.badge.draining, .badge.paused-deploy { color: var(--warn); border-color: var(--warn); }
+/* `.combat` is the unit frame's flag (`unitFlags`): the same red as a run that exited. */
+.badge.exited, .badge.combat { color: var(--err); border-color: var(--err); }
+.badge.resuming { color: var(--accent); border-color: var(--accent); }
+
+.card .k, .side .k { color: var(--dim); text-transform: uppercase; letter-spacing: .06em; font-size: var(--fs-xs); }
+
+button, .btn {
+  font: inherit; background: var(--panel); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 4px; padding: 2px 8px; cursor: pointer;
+}
+button:hover, .btn:hover { border-color: var(--accent); text-decoration: none; }
+/* An anchor sitting in a row of buttons — the run page's "replay" and "open
+   run" links — has to read as a control beside them. */
+.btn { display: inline-block; color: var(--accent); line-height: 1.4; }
+button.on { border-color: var(--accent); font-weight: 700; }
+
+.map-wrap { display: flex; height: 100%; }
+
+.side { width: 300px; flex: none; border-left: 1px solid var(--line); background: var(--panel);
+        padding: 12px 14px; overflow-y: auto; }
+.side h3 { font-size: var(--fs-md); margin: 0 0 8px; font-weight: 700; }
+.side .v { margin-bottom: 8px; word-break: break-word; }
+
+/*
+ * The map is a fixed 300px sidebar beside a flex stage inside `main.flush`,
+ * which does not scroll. Under about a phone's width the stage has nothing
+ * left, so the two stack: the map takes what is above and the sidebar becomes
+ * a short scrolling panel under it. The canvas is measured by a ResizeObserver
+ * (`LiveMap.tsx`), so it redraws at the new size on its own.
+ */
+@media (max-width: 720px) {
+  .map-wrap { flex-direction: column; }
+  .side { width: auto; max-height: 45%; border-left: none; border-top: 1px solid var(--line); }
+}
