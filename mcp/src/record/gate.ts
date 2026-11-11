@@ -10,8 +10,9 @@
  *
  * Structured fields are gated by rule. Free text (a tool call's arguments,
  * its result, a served event batch, the action log) is scrubbed best-effort
- * in `gateCalls`: a foreign player's guid, and the name the client was
- * answered for it, are replaced wherever they stand as a whole token. The
+ * in `gateCalls`: a foreign player's guid where it is printed or keyed as a
+ * guid, never as a bare number, and the name the client was answered for it
+ * as a whole word, are replaced by `"player"`. The
  * players it knows are the ones the session's client cache was answered for
  * (`notePlayers`), held here and never written. It starts once the session's
  * own character is known. On a world with no foreign players it changes
@@ -274,51 +275,85 @@ export class WriteGate {
     }
   }
 
-  /** Whether a token of free text names a foreign player: a guid the client cache answered, or the name it answered. */
-  private foreignToken(token: string): boolean {
-    const first = token.charCodeAt(0);
-    if (first >= 0x30 && first <= 0x39) return this.playerNames.has(token) && !this.own(token);
-    const guids = this.playersByName.get(token);
+  /** Whether a guid, as a decimal string, is a player the client cache answered who is foreign. */
+  private foreignGuid(guid: string): boolean {
+    return this.playerNames.has(guid) && !this.own(guid);
+  }
+
+  /** Whether a word is the name the client cache answered for a foreign player, case as answered; never one under `MIN_NAME_CHARS`. */
+  private foreignName(word: string): boolean {
+    if (word.length < MIN_NAME_CHARS) return false;
+    const guids = this.playersByName.get(word);
     if (guids === undefined) return false;
     for (const g of guids) if (!this.own(g)) return true;
     return false;
   }
 
-  /**
-   * Free text with each whole token that names a foreign player replaced by
-   * `"player"`: a run of digits that is such a guid, a run of letters that is
-   * such a name (case as the server answered it). Best-effort over prose: a
-   * number or a word that happens to equal one is replaced too, and a name
-   * spelled any other way is missed. The same string when nothing matched.
-   */
-  private scrubText(text: string): string {
-    if (!this.scrubbing()) return text;
+  /** Every whole word in `text` that is a foreign player's name replaced by `"player"`; the same string when none was. */
+  private scrubNames(text: string): string {
     let changed = false;
-    const out = text.replace(TOKEN_RE, (token) => {
-      if (!this.foreignToken(token)) return token;
+    const out = text.replace(WORD_RE, (word) => {
+      if (!this.foreignName(word)) return word;
       changed = true;
       return PLAYER_REF;
     });
     return changed ? out : text;
   }
 
-  /** A JSON value with every string in it, keys included, through `scrubText`; the same value when nothing changed. */
-  private scrubValue<T>(value: T): T {
+  /** The digit runs in a printed list of guids that are foreign players, replaced. */
+  private scrubGuidList(list: string): string {
+    return list.replace(/\d+/g, (d) => (this.foreignGuid(d) ? PLAYER_REF : d));
+  }
+
+  /**
+   * Free text with a foreign player's guid replaced by `"player"` where it is
+   * printed as a guid, and the name answered for it wherever it stands as a
+   * whole word (`scrubNames`). A guid is matched only in the forms the
+   * surface prints one in: after a `guid` label (`(guid 101)`), as the value
+   * of a guid-named key in printed JSON or an inspected object
+   * (`"senderGuid":"77"`, `guid: "77"`), or in a printed list under a
+   * `…guids` key. A bare number is never touched, whatever it equals: a
+   * damage value, a coordinate or a count stays as it was. The same string
+   * when nothing matched.
+   */
+  private scrubText(text: string): string {
+    if (!this.scrubbing()) return text;
+    const guids = text.replace(GUID_TEXT_RE, (whole, label: string | undefined, labelled: string | undefined, key: string | undefined, keyed: string | undefined, listOpen: string | undefined, list: string | undefined) => {
+      if (labelled !== undefined) return this.foreignGuid(labelled) ? `${label}${PLAYER_REF}` : whole;
+      if (keyed !== undefined) return this.foreignGuid(keyed) ? `${key}${PLAYER_REF}` : whole;
+      if (list !== undefined) return `${listOpen}${this.scrubGuidList(list)}]`;
+      return whole;
+    });
+    const out = this.scrubNames(guids);
+    return out === text ? text : out;
+  }
+
+  /**
+   * A JSON value scrubbed: a string under a guid-named key (`GUID_KEY_RE`), or
+   * in an array under one, is replaced whole when it is a foreign player's
+   * guid; every other string goes through `scrubText`, and keys through
+   * `scrubNames`. Numbers are never touched. The same value when nothing
+   * changed.
+   */
+  private scrubValue<T>(value: T, guidKeyed = false): T {
     if (!this.scrubbing()) return value;
-    if (typeof value === "string") return this.scrubText(value) as T;
+    if (typeof value === "string") {
+      if (guidKeyed && this.foreignGuid(value)) return PLAYER_REF as T;
+      return this.scrubText(value) as T;
+    }
     if (value === null || typeof value !== "object") return value;
     if (Array.isArray(value)) {
       let out: unknown[] | null = null;
       for (let i = 0; i < value.length; i++) {
-        const v = this.scrubValue(value[i] as unknown);
+        const v = this.scrubValue(value[i] as unknown, guidKeyed);
         if (v !== value[i]) (out ??= [...value])[i] = v;
       }
       return (out ?? value) as T;
     }
     let changed = false;
     const entries = Object.entries(value as Record<string, unknown>).map(([k, v]): [string, unknown] => {
-      const key = this.scrubText(k);
-      const scrubbed = this.scrubValue(v);
+      const key = this.scrubNames(k);
+      const scrubbed = this.scrubValue(v, GUID_KEY_RE.test(k));
       if (key !== k || scrubbed !== v) changed = true;
       return [key, scrubbed];
     });
@@ -326,5 +361,22 @@ export class WriteGate {
   }
 }
 
-/** The tokens free text is scrubbed by: a run of ASCII digits (a guid as the surface prints it) or of letters (a name). */
-const TOKEN_RE = /[0-9]+|\p{L}+/gu;
+/** A name shorter than this is never scrubbed: too likely to be an ordinary word. */
+export const MIN_NAME_CHARS = 3;
+
+/** A whole word, for the name scrub. */
+const WORD_RE = /\p{L}+/gu;
+
+/**
+ * A key whose value is a guid: the SDK's and the module's names for one all
+ * end in `guid` (`guid`, `senderGuid`, `targetGuid`, `packedGuid`, …) or
+ * `guids` for a list, and a movement's `mover`.
+ */
+const GUID_KEY_RE = /^(?:[A-Za-z_]*guids?|mover)$/i;
+
+/**
+ * The printed forms of a guid in free text: a `guid` label and its number;
+ * a guid-named key, quoted or not, and its value, quoted or not; a guid-named
+ * list key and its bracketed list.
+ */
+const GUID_TEXT_RE = /(\bguid\s+)(\d+)\b|(["']?\b(?:[A-Za-z_]*guid|mover)["']?\s*:\s*["']?)(\d+)\b|(["']?\b[A-Za-z_]*guids["']?\s*:\s*\[)([^\]]*)\]/gi;

@@ -339,17 +339,29 @@ row restates. The gate knows the players the session's client was answered
 names for (`SMSG_NAME_QUERY_RESPONSE`, which a client asks for every player
 it sees), and at fan-out those of every character of the same client; it
 holds them in memory and never writes them. Once the session's own character
-is known, in every string of those rows, object keys included, a whole token
-that names one of them who is foreign is replaced by `"player"`: a run of
-digits equal to the guid, or a run of letters equal to the name as the
-server answered it. Own or foreign is asked as each row is written.
+is known, a foreign one's guid and name are replaced by `"player"`:
 
-It is best-effort over prose, and says so. A number or a word that happens
-to equal a foreign player's guid or name is replaced too; a name spelled
-another way, a player the client was never answered for, or a guid in a JSON
-number is missed. On a world with no foreign players it changes nothing, and
-the record is what the agent saw. Keeping an evaluation apart from other
-players is done by giving it a world of its own, not by this scrub.
+- The guid only where it is a guid: the value of a guid-named key (one
+  ending in `guid` or `guids`, as every guid field of the SDK and the module
+  does, and a movement's `mover`), in structured data or printed as JSON or
+  an inspected object (`"senderGuid":"77"`, `guid: "77"`), a printed list
+  under a `…guids` key, and the `guid 77` label the surface prints. A bare
+  number is never replaced, whatever it equals, so a damage value, a
+  coordinate, an item id or a count is written as it was.
+- The name as a whole word, case as the server answered it, in every string
+  and object key of those rows; never a name shorter than three characters.
+
+Own or foreign is asked as each row is written.
+
+It is best-effort over prose, and says so. It misses a guid printed bare
+(`sdk.interact("77")`, an error that names a guid without a label), under a
+key not named as a guid, as a JSON number or as a map key; a name spelled
+or cased another way, or shorter than three characters; and any player the
+client was never answered for. It over-matches a word of three or more
+letters that happens to be a foreign player's name. On a world with no
+foreign players it changes nothing, and the record is what the agent saw.
+Keeping an evaluation apart from other players is done by giving it a world
+of its own, not by this scrub.
 
 **The module's audit log** records every event served, other players
 included, and is not part of this format.

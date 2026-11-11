@@ -411,11 +411,11 @@ describe("a fan-out sandbox", () => {
     await r.call("run_snippet", { code: "await sleep(100, { wake: false })" });
     // No record tick in between: the answers reached the writers with the cache
     // forward, and the other seat is own from the moment it opened.
-    await r.call("run_snippet", { code: `'Stranger 88 and Bravo ${bravo}'`, character: "Alfa" });
+    await r.call("run_snippet", { code: `'Stranger (guid 88) and Bravo (guid ${bravo})'`, character: "Alfa" });
     await r.host.recordDrain();
     const byName = new Map(r.store.list().map((s) => [s.session.character?.name, s]));
     const results = (new SessionReader(byName.get("Alfa")!.dir).rows("calls") as CallRow[]).flatMap((x) => (x.kind === "result" ? [x.text] : []));
-    expect(results.at(-1)).toContain(`player player and Bravo ${bravo}`);
+    expect(results.at(-1)).toContain(`player (guid player) and Bravo (guid ${bravo})`);
     expect(JSON.stringify(results)).not.toContain("Stranger");
     await r.host.stop();
     await r.roster.shutdown({ logout: true });

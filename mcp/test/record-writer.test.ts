@@ -302,14 +302,14 @@ describe("the free-text scrub", () => {
     writer.eventsServed(id, [{ seq: 3, ts: T0 + 2002, opcode: "SMSG_MESSAGECHAT", data: { senderGuid: FOREIGN, text: "hello Quillon" } }]);
     // The call is still in flight when the next window opens: its key row restates it.
     clock.now = T0 + SEGMENT_MS + 10;
-    writer.result(id, { text: `Bystander (${FOREIGN}) and Partner (${OWN})` });
+    writer.result(id, { text: `Bystander (guid ${FOREIGN}) and Partner (guid ${OWN}), ${FOREIGN} damage` });
     const rows = reader.rows("calls");
     expect(rows.filter((r) => r.kind === "call").map((r) => (r as Extract<CallRow, { kind: "call" }>).args)).toEqual([{ code: `whisper("player"); whisper("Partner")` }]);
     expect(rows.find((r) => r.kind === "actions")).toMatchObject({ actions: [{ args: { guid: PLAYER_REF }, names: { target: PLAYER_REF } }] });
     expect(rows.find((r) => r.kind === "events")).toMatchObject({ events: [{ data: { senderGuid: PLAYER_REF, text: "hello Quillon" } }] });
     const key = reader.segment("calls", reader.segments("calls")[1]!)[0] as Extract<CallRow, { kind: "key" }>;
     expect(key.open.map((c) => c.args)).toEqual([{ code: `whisper("player"); whisper("Partner")` }]);
-    expect(rows.find((r) => r.kind === "result")).toMatchObject({ text: `player (player) and Partner (${OWN})` });
+    expect(rows.find((r) => r.kind === "result")).toMatchObject({ text: `player (guid player) and Partner (guid ${OWN}), ${FOREIGN} damage` });
     await writer.close();
     const disk = JSON.stringify(reader.rows("calls")) + readdirSync(dir).filter((f) => f.endsWith(".json")).map((f) => readFileSync(join(dir, f), "utf8")).join("");
     expect(disk).not.toContain("Bystander");
