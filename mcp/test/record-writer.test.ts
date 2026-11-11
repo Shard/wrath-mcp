@@ -130,6 +130,17 @@ describe("a session on disk", () => {
       expect(text).toContain("[redacted]");
     }
   });
+
+  test("nor the session's own token, which an agent can print", () => {
+    const token = "a3f1c9d2e4b56789a3f1c9d2e4b56789";
+    const { dir, writer } = rig({ token });
+    const id = writer.call("run_snippet", { code: "sdk.token" }, T0 + 2000);
+    writer.result(id, { text: `=> "${token}"` });
+    writer.eventsServed(id, [{ seq: 1, ts: T0, opcode: "X", data: { said: token } }]);
+    const text = readFileSync(join(dir, "calls", segmentFileName(T0)), "utf8");
+    expect(text).not.toContain(token);
+    expect(text.match(/\[redacted\]/g)).toHaveLength(2);
+  });
 });
 
 describe("segments", () => {

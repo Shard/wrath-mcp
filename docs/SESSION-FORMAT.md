@@ -49,8 +49,11 @@ here. This document governs what is written down.
 A session store is a directory of these, one per session, each named by its
 **session id**: the first 16 hex characters of the SHA-256 of the session
 token. That is the stem the module's audit files already use
-(`module/PROTOCOL.md`, "Audit log"), so the two join by name. No file of the
-record holds a token, a secret or an account name.
+(`module/PROTOCOL.md`, "Audit log"), so the two join by name. No field of the
+record is a token, a secret or an account name, and the writer strikes the
+session's own token and the host's registered secrets from every line of
+`trace`, `events` and `calls` before it is written, so text an agent printed
+cannot put one there either.
 
 A harness that keeps its own evidence per run points the writer at a
 directory inside the run instead of at a store. The session directory is the
