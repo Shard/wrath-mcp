@@ -1,6 +1,9 @@
-# `bun test` from the root runs the sdk and mcp suites and the boundary check's
-# own tests. None of them needs a preload: every test runs against an
-# in-process stub of the module (`sdk/test/server.ts`) or a planted temp tree,
-# with no game stack and no config store. This file is also one of the root
-# manifests the confined snippet child may read (`mcp/src/sandbox/confine.ts`).
+# `bun test` from the root runs the sdk, mcp and inspector suites and the
+# boundary check's own tests, every one against an in-process stub of the
+# module (`sdk/test/server.ts`) or a planted temp tree, with no game stack and
+# no config store. The one preload points `solid-js` at its reactive build for
+# the inspector's view logic; `inspector/test/preload-solid.ts` says why. This
+# file is also one of the root manifests the confined snippet child may read
+# (`mcp/src/sandbox/confine.ts`).
 [test]
+preload = ["./inspector/test/preload-solid.ts"]
