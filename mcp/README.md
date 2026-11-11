@@ -22,7 +22,8 @@ repo root:
 WRATHBENCH_MODULE_URL=http://127.0.0.1:8086 \
 WRATHBENCH_MODULE_SECRET=<the module's port secret> \
   bun mcp/src/main.ts --account <an allowed account> [--dir <state-dir>] [--token-file <path> | --token <t>] [--allow-gm] \
-    [--record-dir <store> | --no-record] [--record-retention-days <n>]
+    [--record-dir <store> | --no-record] [--record-retention-days <n>] \
+    [--max-characters <n> --accounts <a,b,…>]
 ```
 
 That is an MCP server over stdio serving the core tools: point an MCP-capable
@@ -78,6 +79,38 @@ store: it points a `SessionWriter` at a directory inside the run and hands it
 to `SandboxHost` and to its tool contexts (`docs/ARCHITECTURE.md`, "The
 session record").
 
+## Several characters
+
+Off by default, and the operator's to grant, as GM use is: with
+`--max-characters <n>` above 1 and `--accounts <a,b,…>` (at least `n` allowed
+accounts, because the module holds one live session per account), one client
+may have up to `n` characters in the world at once.
+
+- The tool list is then the five core tools, with an optional `character` on
+  `run_snippet`, `recent_events` and `state_summary`, and three more:
+  `login_character { name, race?, class?, gender? }`,
+  `logout_character { character }` and `list_characters {}`. It is fixed for
+  the server's life. A character's name, as the server spells it, is its
+  handle, matched exactly.
+- With `character`, a snippet's `sdk`, `state` and `events` are that
+  character's. Every snippet also sees `chars`, each logged-in character by
+  name with its own `sdk`, `state` and `events`. Without `character`,
+  `state_summary` is a roll-up of all of them with one line per exception and
+  `recent_events` one merged feed.
+- Each character has its own token, lease and session record; the records of
+  one client carry the same `group`. The scratchpad is one per client.
+- The state directory keeps which account and token each character lives on
+  (`roster.json`, mode 0600), so a name logs the same character back in and
+  `--dir` brings back the ones that were logged in when the server last
+  stopped uncleanly. A clean exit logs every one out.
+- Without the flag, or with `--max-characters 1`, none of this exists and the
+  server is the single-character one, byte for byte.
+
+A harness grants it through `SandboxHostOptions.fanout`, a `CharacterRoster`
+and `fanoutTools` (`src/fanout.ts`; `docs/ARCHITECTURE.md`, "Several
+characters"), and words the roll-up and the merged feed its own way through
+`FanoutRender`.
+
 ## GM accounts
 
 Off by default: the module then refuses a GM account (`gm_account`) and any
@@ -116,6 +149,8 @@ the module confirmed it. The SDK's equivalent is
   (`confine.ts`), the IPC shapes, the snippet rewrite and the client cache.
 - `src/tools.ts` — `ToolSet`, the core tools, and the hooks a harness renders
   them with (`CoreToolRender`).
+- `src/fanout.ts` — several characters for one client: the grant, the roster
+  of seats, the fan-out tool list and the summaries it serves.
 - `src/record/` — the session record: the format's types, the recorders the
   child runs, the writer, the reader, the store and the validator.
 - `src/server.ts`, `src/bridge.ts` — the MCP transport, and the stdio-to-TCP
@@ -125,6 +160,6 @@ the module confirmed it. The SDK's equivalent is
 Entry points: the root, `./sandbox-child` (the child runtime, for a harness's
 own child entry), and leaves that load nothing else — `./module-auth`,
 `./redact`, `./jsonsafe`, `./scratchpad`, `./client-cache`, `./paths`,
-`./tools`, `./record` (the format, writer, reader, store and validator) and
+`./tools`, `./fanout`, `./record` (the format, writer, reader, store and validator) and
 `./record/recorder` (the recorders) — for processes that run no sandbox. The package releases with the
 SDK at the same version.
