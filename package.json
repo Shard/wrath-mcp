@@ -4,14 +4,15 @@
   "license": "MIT",
   "workspaces": [
     "sdk",
-    "mcp"
+    "mcp",
+    "inspector"
   ],
   "engines": {
     "bun": "1.4.4"
   },
   "scripts": {
     "test": "bun test",
-    "typecheck": "for p in sdk mcp scripts; do tsc --noEmit -p $p || exit 1; done",
+    "typecheck": "for p in sdk mcp inspector scripts; do tsc --noEmit -p $p || exit 1; done",
     "boundary": "bun scripts/boundary.ts",
     "docs:api": "bun run sdk/generate-api-docs.ts",
     "docs:api:check": "bun run sdk/generate-api-docs.ts && git diff --exit-code -- sdk/API.md",

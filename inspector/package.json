@@ -1,0 +1,25 @@
+{
+  "name": "@wrathbench/inspector",
+  "version": "0.2.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "module": "src/index.ts",
+  "bin": {
+    "wrath-inspector": "./src/bin.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./wire": "./src/wire.ts",
+    "./codec/trace": "./src/codec/trace.ts",
+    "./codec/nearby": "./src/codec/nearby.ts"
+  },
+  "scripts": {
+    "start": "bun src/bin.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "dependencies": {
+    "@wrathbench/mcp": "workspace:*"
+  }
+}

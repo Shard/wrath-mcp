@@ -21,8 +21,17 @@ function tree(files: Record<string, string>): string {
     "mcp/package.json": JSON.stringify({
       name: "@wrathbench/mcp",
       dependencies: { "@wrathbench/sdk": "workspace:*", zod: "4.4.3" },
-      exports: { ".": "./src/index.ts", "./sandbox-child": "./src/sandbox/child.ts" },
+      exports: { ".": "./src/index.ts", "./sandbox-child": "./src/sandbox/child.ts", "./record": "./src/record/index.ts", "./record/read": "./src/record/read.ts" },
     }),
+    "inspector/package.json": JSON.stringify({
+      name: "@wrathbench/inspector",
+      dependencies: { "@wrathbench/mcp": "workspace:*", "solid-js": "1.9.19" },
+      exports: { ".": "./src/index.ts", "./wire": "./src/wire.ts" },
+    }),
+    "inspector/src/index.ts": 'import type { SessionFile } from "@wrathbench/mcp/record/read";\nimport { readFileSync } from "node:fs";\nimport type { TraceSegment } from "./wire";\n',
+    "inspector/src/wire.ts": "export interface TraceSegment { v: number }\n",
+    "inspector/src/codec/trace.ts": 'import type { TraceSegment } from "../wire";\n',
+    "inspector/src/views/Map.tsx": 'import { createSignal } from "solid-js";\nimport { decode } from "../codec/trace";\n',
     "sdk/src/index.ts": 'import { z } from "zod";\nimport { join } from "node:path";\nexport const x = 1;\n',
     "mcp/src/index.ts": 'import { connect } from "@wrathbench/sdk";\nimport { readFileSync } from "node:fs";\n',
     "module/src/WbManager.cpp": '#include "WbManager.h"\n#include "Player.h"\n#include <string>\n',
@@ -85,5 +94,42 @@ describe("the stack boundary", () => {
   test("strings and comments that look like imports are not imports", () => {
     const root = tree({ "mcp/src/prose.ts": '// import x from "../../runner/src/tools";\nexport const s = \'from "../../runner"\';\n' });
     expect(checkStackBoundary(root)).toEqual([]);
+  });
+
+  test("the inspector takes only the record's read side from the stack, and never the SDK", () => {
+    const root = tree({
+      "inspector/src/bad.ts": 'import { SessionWriter } from "@wrathbench/mcp/record";\nimport { McpServer } from "@wrathbench/mcp";\nimport { connect } from "@wrathbench/sdk";\n',
+    });
+    expect(checkStackBoundary(root).sort()).toEqual([
+      "inspector/src/bad.ts: imports @wrathbench/mcp/record; the inspector takes only @wrathbench/mcp/record/read from the stack",
+      "inspector/src/bad.ts: imports @wrathbench/mcp; the inspector takes only @wrathbench/mcp/record/read from the stack",
+      "inspector/src/bad.ts: imports @wrathbench/sdk, which inspector/package.json does not declare",
+    ]);
+  });
+
+  test("sdk/ and mcp/ never import the inspector, nor take on the UI's dependencies", () => {
+    const root = tree({
+      "mcp/package.json": JSON.stringify({ name: "@wrathbench/mcp", dependencies: { "@wrathbench/sdk": "workspace:*", "@wrathbench/inspector": "workspace:*", vite: "8.3.7" }, exports: { ".": "./src/index.ts", "./record/read": "./src/record/read.ts" } }),
+      "sdk/src/ui.ts": 'import { render } from "solid-js/web";\nimport { createInspectorApi } from "@wrathbench/inspector";\n',
+    });
+    expect(checkStackBoundary(root).sort()).toEqual([
+      "mcp/package.json: declares @wrathbench/inspector, which only inspector/ may",
+      "mcp/package.json: declares vite, which only inspector/ may",
+      "sdk/src/ui.ts: imports @wrathbench/inspector, which sdk/package.json does not declare",
+      "sdk/src/ui.ts: imports solid-js/web, which sdk/package.json does not declare",
+    ]);
+  });
+
+  test("what a browser bundles imports no built-in and nothing of the server side", () => {
+    const root = tree({
+      "inspector/src/codec/bad.ts": 'import { readFileSync } from "node:fs";\nimport { serve } from "bun";\nimport { createInspectorApi } from "../index";\nimport type { TraceSegment } from "../wire";\n',
+      "inspector/src/views/Bad.tsx": 'import { storeSource } from "../store-source";\nimport { decode } from "../codec/trace";\n',
+    });
+    expect(checkStackBoundary(root).sort()).toEqual([
+      "inspector/src/codec/bad.ts: imports ../index, the inspector's server side, from a file a browser bundles",
+      "inspector/src/codec/bad.ts: imports bun, a runtime built-in, from a file a browser bundles",
+      "inspector/src/codec/bad.ts: imports node:fs, a runtime built-in, from a file a browser bundles",
+      "inspector/src/views/Bad.tsx: imports ../store-source, the inspector's server side, from a file a browser bundles",
+    ]);
   });
 });

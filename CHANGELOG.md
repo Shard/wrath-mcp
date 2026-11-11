@@ -1,7 +1,8 @@
 # Changelog
 
-What each release of the stack changed: the module, `@wrathbench/sdk` and
-`@wrathbench/mcp`, which release together at one version. Versions follow
+What each release of the stack changed: the module, `@wrathbench/sdk`,
+`@wrathbench/mcp` and `@wrathbench/inspector`, which release together at one
+version. Versions follow
 semantic versioning (`CONTRIBUTING.md`, "Versioning"); before 1.0 any release
 may break, and its entry says how. The module's wire
 version, `protocol` on `GET /health`, is separate and named where it moves.
@@ -280,6 +281,13 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   `--no-record` turns it off. Players who are not sessions of the same
   deployment are never written (`mcp/src/record/gate.ts`). New entry point
   `@wrathbench/mcp/record`.
+- **wrath-inspector**, a third package, `@wrathbench/inspector`
+  (`inspector/README.md`): read-only JSON and server-sent events over a
+  session store (`createInspectorApi(source)`), the trace and nearby codecs
+  that pack a session's windows for a map, and the `wrath-inspector --store
+  <dir>` bin, which needs a bearer secret to bind anywhere but loopback. It
+  reads records through the new `@wrathbench/mcp/record/read` entry point and
+  nothing else of the stack (`scripts/boundary.ts`).
 
 ### Changed
 
