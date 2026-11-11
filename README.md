@@ -12,14 +12,84 @@ Three pieces:
 |---|---|
 | `module/` | `mod-wrathbench`, the C++ AzerothCore module. A thin packet bridge and event tap over HTTP and WebSocket inside the worldserver. Its wire is `module/PROTOCOL.md`. |
 | `sdk/` | `@wrathbench/sdk`, the typed Bun/TypeScript client over that wire: the event stream, the state cache, the helpers and their per-call hints. `sdk/API.md` is the generated per-method reference an agent reads. |
-| `mcp/` | `@wrathbench/mcp`, the agent surface over the SDK: a confined, persistent snippet sandbox holding one client, an MCP server, and the core tools `run_snippet`, `recent_events`, `state_summary`, `write_scratchpad` and `edit_scratchpad`. |
+| `mcp/` | `@wrathbench/mcp`, the agent surface over the SDK: a confined, persistent snippet sandbox holding one client, an MCP server, the core tools `run_snippet`, `recent_events`, `state_summary`, `write_scratchpad` and `edit_scratchpad`, and the session record every session leaves. |
 
 What an agent may observe and do is `docs/CONTRACTS.md`; with
-`module/PROTOCOL.md` it is the stack's specification. The stack knows nothing
-of episodes, scores or trajectories. A harness plugs those in through the hooks
-`mcp/` exposes; `docs/ARCHITECTURE.md` is how the pieces fit and what those
-hooks are. [WrathBench](https://github.com/Shard/WrathBench), an LLM
+`module/PROTOCOL.md` it is the stack's specification. The stack records what
+its own sessions did (`docs/SESSION-FORMAT.md`) and knows nothing of what
+drove them: episodes, scores and model trajectories are a harness's, plugged
+in through the hooks `mcp/` exposes. `docs/ARCHITECTURE.md` is how the pieces
+fit and what those hooks are. [WrathBench](https://github.com/Shard/WrathBench), an LLM
 evaluation harness, is one such harness and the stack's first consumer.
+
+```mermaid
+flowchart TB
+    agent["Agent<br/>(any MCP client)"]
+    harness["Harness, optional<br/>(e.g. WrathBench)"]
+    reader["Readers<br/>(a viewer, a scorer, a collector)"]
+
+    subgraph mcp["mcp/"]
+        server["MCP server + core tools<br/>holds the port secret"]
+        host["Sandbox host"]
+        child["Confined sandbox child<br/>(Landlock) runs snippets"]
+        recorder["Session recorder<br/>in the child"]
+        writer["Session writer<br/>write gate"]
+    end
+
+    store[("Session record<br/>wrath-session/1<br/>trace, events, calls, nearby")]
+
+    subgraph sdk["sdk/"]
+        client["WrathClient<br/>actions, events, state cache"]
+    end
+
+    subgraph ws["AzerothCore worldserver"]
+        subgraph module["module/"]
+            http["HTTP/WS bridge<br/>bearer: port or lease secret"]
+            sessions["Sessions and leases"]
+            pbridge["Packet bridge"]
+            tap["Event tap<br/>whitelist"]
+            audit[("Audit log")]
+        end
+        session["WorldSession<br/>stock opcode handlers"]
+        world(("Game world"))
+    end
+
+    agent <-->|"MCP over stdio"| server
+    harness -. "hooks: tools, rendering,<br/>child extension, records" .-> mcp
+    server --> host
+    host <-->|"IPC"| child
+    server -->|"POST /lease"| http
+    child -->|"in-process"| client
+    client -->|"POST /action<br/>lease secret only"| http
+    http --> sessions
+    http --> pbridge
+    sessions -->|"login, logout"| session
+    pbridge -->|"client opcodes CMSG_*"| session
+    session <--> world
+    session ==>|"outbound SMSG_*"| tap
+    tap ==>|"whitelisted events<br/>WS /events"| client
+    pbridge -.-> audit
+    tap -.-> audit
+    client ==>|"state cache"| recorder
+    recorder ==>|"drained on the host's tick"| writer
+    server -->|"tool calls and results"| writer
+    host -->|"action log"| writer
+    writer ==>|"append-only segments"| store
+    store ==> reader
+```
+
+Thin arrows carry calls and actions, thick arrows carry observations. An
+action reaches the world only as the opcode a real client would send, through
+the same stock handler; what comes back is the session's outbound packets, cut
+down to what a client would see (`docs/CONTRACTS.md`). The port secret stays in
+the MCP process, which leases a per-session secret for the sandbox child, so a
+snippet can drive its own character and nothing else.
+
+Every session leaves a record: a recorder beside the client reads its state
+cache, and the host writes that, the tool calls and the action log to one
+directory of append-only JSONL segments, the format `docs/SESSION-FORMAT.md`
+specifies. A player who is not one of the deployment's own sessions is never
+written.
 
 Tested against AzerothCore
 [`3cafaf4a588fd1f287678fdb37438fdedd1ed85c`](https://github.com/azerothcore/azerothcore-wotlk/commit/3cafaf4a588fd1f287678fdb37438fdedd1ed85c).
@@ -91,6 +161,8 @@ WRATHBENCH_MODULE_SECRET=<the port secret> \
 It speaks MCP over stdio, so the agent launches it as its server command. It
 leases a session secret with the port secret and hands the sandbox only that,
 and when it exits cleanly it logs the character out and releases the lease.
+The session is recorded by default, into a `sessions` directory beside its
+state directory (`--record-dir`, `--no-record`).
 The sandbox needs Linux 6.7 or later (Landlock with TCP rules) and refuses to
 start without it. `mcp/README.md` has the options; `sdk/README.md` covers
 using the SDK directly.
