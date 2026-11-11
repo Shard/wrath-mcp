@@ -320,6 +320,12 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   "unknown_target", hint }` with nothing sent, as `moveTo` answers a target it
   cannot place; they threw. A malformed point and an unresolvable `targetItem`
   still throw.
+- `zod` 4.4.3 to 4.6.7, for GHSA-mrhx-c7xc-m3w5: before 4.6.6 a schema over a
+  large array, set or map built an issue for every failing element, so one
+  oversized payload could exhaust memory; 4.6.6 checks the size bounds first,
+  and an oversized array now reports the one bound issue where it reported one
+  per element as well. The 4.5 release also tightened what a schema accepts:
+  string lengths count code points, and `z.iso.datetime()` needs seconds.
 
 ## 0.2.0
 

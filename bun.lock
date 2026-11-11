@@ -14,14 +14,14 @@
       "version": "0.2.0",
       "dependencies": {
         "@wrathbench/sdk": "workspace:*",
-        "zod": "4.4.3",
+        "zod": "4.6.7",
       },
     },
     "sdk": {
       "name": "@wrathbench/sdk",
       "version": "0.2.0",
       "dependencies": {
-        "zod": "4.4.3",
+        "zod": "4.6.7",
       },
     },
   },
@@ -80,6 +80,6 @@
 
     "undici-types": ["undici-types@8.3.0", "", {}, "sha512-j375ScV60dom+YkPFIfTLcOiPxkN/buHz5GobjLhixFuANaNs3C9l4GmrWqejgXWJ7BbJcFYpTEUkS1Ge8bpZQ=="],
 
-    "zod": ["zod@4.4.3", "", {}, "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ=="],
+    "zod": ["zod@4.6.7", "", {}, "sha512-g8W2D2kU6a8untc053fX1uVBKzM7yqAxW/3zwk83+6RyF2+SKOuV+c0wBDhUwzV1PaGapmZH+rmcUzPf+3CGwg=="],
   }
 }
