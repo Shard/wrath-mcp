@@ -1,8 +1,9 @@
 /**
  * The wire shapes the inspector serves and its views decode: the API's
  * bodies, the trace and nearby codecs' packed windows (`codec/trace.ts`,
- * `codec/nearby.ts`, where each format is specified), the trace index, and a
- * movement intention.
+ * `codec/nearby.ts`, where each format is specified), the trace index, a
+ * movement intention, and the base shapes a map's position and track feeds
+ * carry (`SessionPosition`, `SessionTrack`).
  *
  * Types only, with no imports, so a browser bundle and a server can both
  * take them and neither pulls the other in. A harness that serves the
@@ -388,3 +389,210 @@ export interface NearbyWindow {
   ev: NearbyEventWire[];
 }
 
+/* -------------------------------------------------------------- the map --- */
+
+/*
+ * What a map draws a session from: a position near now, and a track to
+ * replay (its points, what it wore and carried along it, its movement
+ * intentions and travel, its closed trace windows). A harness's feed carries
+ * these fields and adds its own (WrathBench's adds its run, model and turn),
+ * so these are the base shapes it extends.
+ */
+
+/**
+ * One item on a state sample: a client-cache name, its stack count, worn or
+ * carried, and where it sits.
+ *
+ * Everything past `name`, `count` and `equipped` is optional and arrived later
+ * (the paperdoll/bag UI). Every row written before it carries those three and
+ * nothing else, so a reader treats an absent field as **unobserved** — never as
+ * zero, and never as slot 0. A live sample can be missing them too: a slot whose
+ * item create block or item query has not arrived yet is a real observation of
+ * an occupied slot with no id, name or quality behind it.
+ *
+ * `slot` and `bag` are the SDK's own addressing pair, unchanged, so a row is
+ * what `equipItem`/`useItem`/`destroyItem` take:
+ * - worn (`equipped: true`): `bag` absent, `slot` the equipment slot 0-18.
+ * - carried (`equipped: false`): `bag` 255 for the backpack (slots 23-38) or a
+ *   worn bag's own equipment slot 19-22 (slots 0..numSlots-1), `slot` the slot
+ *   within it.
+ *
+ * So `bag !== undefined` is the carried discriminator and `slot` means the same
+ * kind of thing on both sides of it. There is no separate `bagSlot`.
+ */
+export interface ItemSample {
+  name: string;
+  count: number;
+  equipped: boolean;
+  /** The item template id, once the item's own create block has been seen. */
+  itemId?: number;
+  /** Item quality (0 poor .. 7 heirloom), from the item query, once answered. */
+  quality?: number;
+  /** The equipment slot when worn, the slot within `bag` when carried. */
+  slot?: number;
+  /** The container, when carried: 255 the backpack, 19-22 a worn bag. Absent when worn. */
+  bag?: number;
+}
+
+/**
+ * One point of a session's track, for a map's replay: the character's
+ * position and readings at a state sample. A harness's track point carries
+ * these and whatever it adds (WrathBench's, the driver turn).
+ */
+export interface SessionTrackPoint {
+  ts: number;
+  map: number;
+  x: number;
+  y: number;
+  level: number | null;
+  xp: number | null;
+  money: number | null;
+  /**
+   * The session's quest count up to this point, summed across the counter's
+   * restarts, so the last point's is the session's whole figure.
+   * Null before any sample carried one, and on every point of a track
+   * published before it was filled.
+   */
+  questsCompleted: number | null;
+  /**
+   * The player frame's numbers, from the newest state sample that carried a
+   * position. Optional: a session
+   * recorded before the columns existed, and a snapshot published before this
+   * shipped, carry none, and every reader must draw those as unobserved rather
+   * than as zero. A health/maxHealth pair is whole or absent — the SDK
+   * withholds a gauge until both halves are seen.
+   */
+  health?: number | null;
+  maxHealth?: number | null;
+  power?: number | null;
+  maxPower?: number | null;
+  /** The raw `powerType` field the client picks a power bar with. */
+  powerType?: number | null;
+  /** The XP bar's denominator, as the client shows it. */
+  nextLevelXp?: number | null;
+  /**
+   * The inventory as a track served and published before `SessionTrack.inv`
+   * carried it, read only from a track that old: the whole inventory on each
+   * point where the stored sample changed, a point without the field meaning
+   * "unchanged" and one before the first reading "not yet observed". The
+   * viewer no longer writes it.
+   */
+  items?: ItemSample[];
+}
+
+/**
+ * One item a track's inventory names: `[name, itemId, quality]`, null where
+ * the stored row carried none. Keyed by the whole triple, not the id: a
+ * random suffix is stored in the name, so one id can carry two names at once.
+ */
+export type TrackInvItem = [name: string, itemId: number | null, quality: number | null];
+
+/**
+ * A slot filled, in a patch: `item` indexes `TrackInventory.items`, and
+ * `count` is there only when the stack is not 1. `bag` is -1 for a worn item
+ * (`slot` the equipment slot 0-18), else the carried pair `ItemSample` names.
+ */
+export type TrackInvRow = [bag: number, slot: number, item: number] | [bag: number, slot: number, item: number, count: number];
+
+/** A slot emptied, in a patch. */
+export type TrackInvGone = [bag: number, slot: number];
+
+/**
+ * One reading, on the index of the point it surfaces at: a patch onto the
+ * reading before it (onto empty bags for the first), or `null` and the reading
+ * whole, as stored, where a patch cannot say it.
+ */
+export type TrackInvEntry = [point: number, patch: (TrackInvRow | TrackInvGone)[]] | [point: number, patch: null, whole: ItemSample[]];
+
+/**
+ * What the character wore and carried along a track, as changes
+ * (`codec/inventory.ts` is the codec and the format; `inventoryAt`
+ * reads it). Built at read time from the same stored samples the points come
+ * from, so nothing about what is recorded changed.
+ */
+export interface TrackInventory {
+  items: TrackInvItem[];
+  /** The readings, oldest first; a point before the first has none yet observed. */
+  at: TrackInvEntry[];
+}
+
+/**
+ * One recorded fact about how the character crossed the gap between two track
+ * points, which is what the replay's route is drawn by: a flight path's
+ * takeoff and landing, a hearthstone used, a spirit released to a graveyard.
+ *
+ * Derived at read time from the record (the session's flight, release and
+ * death events and the action log's hearthstone) and never stored. `ts` is the record's own: a milestone's is
+ * the state sample that observed it, so the change it names happened since the
+ * sample before; a hearth's is the dispatch, about ten seconds before the
+ * teleport lands.
+ */
+export interface TrackTravelMark {
+  kind: "taxi" | "taxi_landed" | "hearth" | "release";
+  ts: number;
+}
+
+/**
+ * A session's track, for replay. The field set a map reads; a harness's
+ * track response extends it with its own (WrathBench's, the run's identity).
+ */
+export interface SessionTrack<P extends SessionTrackPoint = SessionTrackPoint> {
+  points: P[];
+  /**
+   * What the character wore and carried, as a patch onto the reading before
+   * wherever the stored sample changed (`TrackInventory`). Absent where no
+   * sample recorded an inventory, and on a track from before it existed,
+   * whose points carry `items` instead.
+   */
+  inv?: TrackInventory;
+  /** Every movement intention, oldest first; optional, as on `SessionPosition.move`. */
+  moves?: MoveIntentView[];
+  /** The flight, hearth and graveyard marks, oldest first (`TrackTravelMark`); optional. */
+  travel?: TrackTravelMark[];
+  /** The closed trace windows; absent, not empty, where the session recorded no trace. */
+  trace?: TrackTrace;
+}
+
+/**
+ * Where a session's character is now, as a live map's feed carries it. A
+ * harness's position extends it with its own identity (WrathBench's, the run
+ * and its model).
+ */
+export interface SessionPosition {
+  map: number;
+  x: number;
+  y: number;
+  /** Epoch ms of the state sample this position came from. */
+  ts: number;
+  level: number | null;
+  xp: number | null;
+  money: number | null;
+  /** Quests turned in over the whole session, summed across the counter's restarts; on a replay, up to the point. */
+  questsCompleted: number | null;
+  /**
+   * The newest recorded movement intention, when there is one. Optional: a
+   * feed from before it existed carries none, and reads as a session that
+   * never moved.
+   */
+  move?: MoveIntentView | null;
+  /**
+   * The player frame's numbers, from the newest state sample that carried a
+   * position. Optional, and unobserved rather than zero where absent. A
+   * health/maxHealth pair is whole or absent: the SDK withholds a gauge until
+   * both halves are seen.
+   */
+  health?: number | null;
+  maxHealth?: number | null;
+  power?: number | null;
+  maxPower?: number | null;
+  /** The raw `powerType` field the client picks a power bar with. */
+  powerType?: number | null;
+  /** The XP bar's denominator, as the client shows it. */
+  nextLevelXp?: number | null;
+  /** The character's class, so a power bar is tinted by class where no `powerType` was read. */
+  class?: number | null;
+  /** The fine-grained trace near now (`PositionTrace`); absent where none was recorded. */
+  trace?: PositionTrace;
+  /** True while the session's nearby ring is being written; absent otherwise. */
+  nearby?: true;
+}

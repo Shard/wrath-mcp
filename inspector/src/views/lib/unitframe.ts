@@ -164,7 +164,7 @@ export function xpCellTitle(
   return `${head} — ${fmtInt(xp)} / ${fmtInt(next)} xp into the level (${Math.round(percentOf(xp, next))}%)`;
 }
 
-/* --- the trace's half of the frame (`lib/traceplayer.ts` reads the state) --- */
+/* --- the trace's half of the frame (`traceplayer.ts` reads the state) --- */
 
 /** The numbers the bars draw, wherever they came from. */
 export interface Gauges {
