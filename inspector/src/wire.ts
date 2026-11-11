@@ -71,6 +71,8 @@ export interface SessionSummary {
   id: string;
   session: SessionFileWire | null;
   live: LiveFileWire | null;
+  /** The sessions one client drove together share one (`SessionEntry.group`); absent for a session that stands alone. */
+  group?: string;
 }
 
 /** `GET <base>/sessions`. */

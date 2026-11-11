@@ -3,12 +3,12 @@
  * what happened to it.
  */
 
-import { Show, createSignal } from "solid-js";
+import { For, Show, createSignal } from "solid-js";
 import type { RowWire, SessionSummary } from "../wire";
 import { CharacterPanel } from "./CharacterPanel";
 import type { InspectorClient } from "./client";
 import { EventFeed } from "./EventFeed";
-import { fmtAgo, isLive, sessionName } from "./lib/sessions";
+import { fmtAgo, groupSiblings, isLive, sessionName } from "./lib/sessions";
 import { PartyView } from "./PartyView";
 
 export function SessionView(props: { client: InspectorClient; summary: SessionSummary; sessions: readonly SessionSummary[]; now: number; href: (id: string) => string }) {
@@ -51,6 +51,19 @@ export function SessionView(props: { client: InspectorClient; summary: SessionSu
           </div>
         </Show>
       </div>
+      {/* The other characters the same client drives, each a link to its own session. */}
+      <Show when={groupSiblings(props.sessions, props.summary).length > 0}>
+        <p>
+          <For each={groupSiblings(props.sessions, props.summary)}>
+            {(o) => (
+              <>
+                <a href={props.href(o.id)}>{sessionName(o)}</a>{" "}
+                <span class={`badge${isLive(o, props.now) ? " running" : ""}`}>{isLive(o, props.now) ? "live" : o.session?.ended != null ? "ended" : "quiet"}</span>{" "}
+              </>
+            )}
+          </For>
+        </p>
+      </Show>
       <h2 class="section">character</h2>
       <CharacterPanel client={props.client} id={props.summary.id} live={live()} klass={s()?.character?.class ?? null} />
       <h2 class="section">party</h2>

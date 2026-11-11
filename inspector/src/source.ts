@@ -42,6 +42,14 @@ export interface SessionEntry {
   id: string;
   session: SessionFile;
   live: LiveFile | null;
+  /**
+   * The sessions one client drove together: a fan-out client's characters, or
+   * whatever a harness keeps as one unit (WrathBench's runs source gives a
+   * run's id). Opaque, and only compared: a listing shows the sessions of one
+   * group together. The store's is the record's own `group` label; absent
+   * for a session that stands alone.
+   */
+  group?: string;
 }
 
 /** One segment of a stream: a window of time and how to recognise it again. */
