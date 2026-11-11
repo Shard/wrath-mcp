@@ -1,0 +1,8 @@
+{"ts":1767225900000,"kind":"key","state":{"level":3,"zone":9001,"area":9005,"map":0,"instanceType":0,"dead":false,"released":false,"taxi":false,"group":{"groupGuid":"2251799813685249","members":["6"],"foreign":1,"count":3}}}
+{"ts":1767225909000,"seq":1200,"kind":"quest","id":8101}
+{"ts":1767225911000,"seq":1300,"kind":"kill","victimGuid":"17379391030842884174","entry":4102,"rank":1,"self":false,"member":true,"killerGuid":"6"}
+{"ts":1767225911500,"seq":1310,"kind":"kill","victimGuid":"17379391030826106957","entry":4101,"rank":1,"self":false,"member":true}
+{"ts":1767225912000,"seq":1400,"kind":"death","position":{"map":0,"x":401.0,"y":-221.0,"z":35.0,"source":"death_spot"},"zone":9001,"area":9005,"released":false}
+{"ts":1767225920000,"seq":1500,"kind":"release","graveyard":{"map":0,"x":380.0,"y":-200.0,"z":33.0}}
+{"ts":1767225950000,"seq":1700,"kind":"resurrect"}
+{"ts":1767225960000,"seq":1800,"kind":"group","event":"left","members":[],"foreign":0,"count":0}

@@ -1,0 +1,12 @@
+{"ts":1767225601000,"kind":"key","open":[]}
+{"ts":1767225602500,"kind":"call","id":1767225602500,"origin":{"type":"tool"},"tool":"run_snippet","args":{"code":"await sdk.killTarget(nearest)"}}
+{"ts":1767225602600,"kind":"move","origin":{"type":"tool","call":1767225602500},"at":1767225602600,"moveId":null,"map":0,"x":-98.5,"y":51.0,"z":10.1,"target":"17379391030826106957","name":"Mire Skulker","status":null}
+{"ts":1767225602950,"kind":"move","origin":{"type":"tool","call":1767225602500},"at":1767225602600,"moveId":11,"map":0,"x":-98.5,"y":51.0,"z":10.1,"target":"17379391030826106957","name":"Mire Skulker","status":"arrived"}
+{"ts":1767225606100,"kind":"actions","origin":{"type":"tool","call":1767225602500},"actions":[{"ts":1767225602600,"action":"move_to","args":{"x":-98.5,"y":51.0,"z":10.1},"status":200,"ms":4,"moveId":11},{"ts":1767225603000,"action":"attack_start","status":200,"ms":3,"names":{"target":"Mire Skulker"}}]}
+{"ts":1767225606150,"kind":"result","id":1767225602500,"text":"{ status: 'killed' }","error":false,"durationMs":3650}
+{"ts":1767225608000,"kind":"call","id":1767225608000,"origin":{"type":"tool"},"tool":"recent_events","args":{"limit":5}}
+{"ts":1767225608010,"kind":"events","origin":{"type":"tool","call":1767225608000},"count":1,"folded":14,"events":[{"seq":120,"ts":1767225605700,"opcode":"SMSG_LOG_XPGAIN","data":{"amount":60}}]}
+{"ts":1767225608012,"kind":"result","id":1767225608000,"text":"#120 SMSG_LOG_XPGAIN {\"amount\":60}","error":false,"durationMs":12}
+{"ts":1767225690000,"kind":"actions","origin":{"type":"routine","call":1767225602500},"actions":[{"ts":1767225688000,"action":"cast_spell","args":{"spellId":5002},"status":200,"ms":5,"count":3,"lastTs":1767225689500}]}
+{"ts":1767225691000,"kind":"actions","origin":{"type":"client"},"actions":[{"ts":1767225690500,"action":"quest_query","args":{"questId":8101},"status":200,"ms":2,"auto":true}]}
+{"ts":1767225896000,"kind":"call","id":1767225896000,"origin":{"type":"tool"},"tool":"run_snippet","args":{"code":"await sleep(8000)"}}

@@ -263,6 +263,12 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   `state.self.speeds` reads them.
 - Dispel logs: `SMSG_SPELLDISPELLOG`, `SMSG_SPELLSTEALLOG` and
   `SMSG_DISPEL_FAILED`, with the dispel and each aura named.
+- **The session record format, `wrath-session/1`** (`docs/SESSION-FORMAT.md`):
+  one directory per session of append-only JSONL segments (`trace`, `events`,
+  `calls` and a live-only `nearby` ring), `session.json`, `live.json` and a
+  manifest, with a validator (`mcp/src/record/validate.ts`) and fixture
+  sessions. Unstable until v1 ships. The format only; the writer and the
+  recorders follow.
 
 ### Changed
 

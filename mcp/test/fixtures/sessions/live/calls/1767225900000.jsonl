@@ -1,0 +1,2 @@
+{"ts":1767225901000,"kind":"key","open":[]}
+{"ts":1767225929000,"kind":"call","id":1767225929000,"origin":{"type":"tool"},"tool":"run_snippet","args":{"code":"await sdk.killTarget(nearest)"}}
