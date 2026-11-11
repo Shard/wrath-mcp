@@ -1,0 +1,12 @@
+{"ts":1767225601000,"kind":"key","map":0,"x":-100.0,"y":50.0,"z":10.0,"o":1.5,"data":{"hp":120,"hpMax":120,"pw":80,"pwMax":100,"pwType":0,"level":3,"xp":410,"xpMax":1400,"auras":[],"combat":false,"mounted":false,"taxi":false,"dead":false,"ghost":false,"resting":false,"zone":9001,"area":9002,"target":null,"cast":null,"money":1250,"equip":[[4,70001],[15,70002,-12]],"bags":[[19,70010,6]],"inv":[[255,23,70020,5],[19,0,70021]],"dur":[[4,30,35]],"quests":[[0,8101,0,2]],"rep":[[801,150]],"skills":[[95,12,15]]},"dict":{"items":[[70001,1,"Wayfarer's Tunic"],[70002,2,"Brindle Hatchet"],[70010,1,"Burlap Satchel"],[70020,1,"Marsh Reed"],[70021,0,"Bent Nail"]],"quests":[[8101,[6,0,0,0,[70020,8]]]]}}
+{"ts":1767225601250,"kind":"pos","map":0,"x":-100.0,"y":50.0,"z":10.0,"o":1.5,"data":{"jump":1}}
+{"ts":1767225602000,"kind":"pos","map":0,"x":-98.5,"y":51.0,"z":10.1,"o":1.4}
+{"ts":1767225603000,"kind":"state","data":{"target":{"kind":"creature","entry":4101,"hpPct":100},"combat":true}}
+{"ts":1767225604200,"kind":"state","data":{"hp":96,"cast":{"spellId":5001,"endsAt":1767225605700}}}
+{"ts":1767225605700,"kind":"state","data":{"cast":null,"target":{"kind":"creature","entry":4101,"hpPct":0},"xp":470}}
+{"ts":1767225606000,"kind":"state","data":{"combat":false,"target":null,"money":1262,"inv":[[255,23,70020,6]],"quests":[[0,8101,0,3]]}}
+{"ts":1767225607000,"kind":"state","data":{"chat":[["say","Any reeds left by the weir?"]]}}
+{"ts":1767225609000,"kind":"dict","dict":{"items":[[70030,2,"Ferryman's Token"]]}}
+{"ts":1767225609000,"kind":"state","data":{"inv":[[255,24,70030]],"target":{"kind":"player"}}}
+{"ts":1767225660000,"kind":"flight","map":0,"x":-90.0,"y":60.0,"z":12.0,"o":0.2,"data":{"to":{"map":0,"x":400.0,"y":-220.0,"z":35.0},"durationMs":95000}}
+{"ts":1767225660000,"kind":"state","data":{"taxi":true,"target":null}}

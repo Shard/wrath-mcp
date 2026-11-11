@@ -1,0 +1,21 @@
+{
+  "format": "wrath-session/1",
+  "id": "3f9a1c0b7e2d4a61",
+  "character": {
+    "guid": "5",
+    "name": "Quillon",
+    "race": 1,
+    "class": 1
+  },
+  "stack": {
+    "version": "0.2.0",
+    "commit": "0000000000000000000000000000000000000000"
+  },
+  "module": {
+    "build": "fixture-build",
+    "protocol": 1
+  },
+  "started": 1767225601000,
+  "opened": 1767225601000,
+  "ended": 1767226180000
+}

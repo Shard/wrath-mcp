@@ -1,0 +1,2 @@
+{"ts":1767225900000,"kind":"key","open":[{"ts":1767225896000,"kind":"call","id":1767225896000,"origin":{"type":"tool"},"tool":"run_snippet","args":{"code":"await sleep(8000)"}}]}
+{"ts":1767225904010,"kind":"result","id":1767225896000,"text":"snippet evaluation exceeded 8000ms","error":true,"durationMs":8010}

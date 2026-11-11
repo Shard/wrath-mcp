@@ -1,0 +1,22 @@
+{
+  "ts": 1767225931000,
+  "observed": 1767225930500,
+  "map": 1,
+  "x": 10.0,
+  "y": 20.0,
+  "z": 3.0,
+  "o": 0.0,
+  "level": 1,
+  "hp": 55,
+  "hpMax": 55,
+  "zone": 9100,
+  "area": 9100,
+  "flags": [
+    "combat"
+  ],
+  "stream": {
+    "connected": true,
+    "events": 220,
+    "seq": 219
+  }
+}

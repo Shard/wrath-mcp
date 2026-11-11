@@ -1,0 +1,10 @@
+{"ts":1767225601000,"kind":"key","state":{"level":3,"zone":9001,"area":9002,"map":0,"instanceType":0,"dead":false,"released":false,"taxi":false,"group":null}}
+{"ts":1767225601000,"kind":"zone","to":9001}
+{"ts":1767225601000,"kind":"area","to":9002}
+{"ts":1767225601000,"kind":"level","to":3,"xp":410}
+{"ts":1767225601100,"kind":"achievements_at_login","ids":[],"points":0}
+{"ts":1767225601100,"kind":"spells_at_login","ids":[5001,5002]}
+{"ts":1767225630000,"seq":412,"kind":"group","event":"joined","groupGuid":"2251799813685249","members":["6"],"foreign":1,"count":3}
+{"ts":1767225660000,"seq":530,"kind":"taxi","position":{"map":0,"x":-90.0,"y":60.0,"z":12.0},"zone":9001,"area":9002}
+{"ts":1767225755000,"seq":801,"kind":"taxi_landed","position":{"map":0,"x":400.0,"y":-220.0,"z":35.0},"zone":9001,"area":9005}
+{"ts":1767225755000,"seq":801,"kind":"area","from":9002,"to":9005}
