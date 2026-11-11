@@ -287,7 +287,11 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   that pack a session's windows for a map, and the `wrath-inspector --store
   <dir>` bin, which needs a bearer secret to bind anywhere but loopback. It
   reads records through the new `@wrathbench/mcp/record/read` entry point and
-  nothing else of the stack (`scripts/boundary.ts`).
+  nothing else of the stack (`scripts/boundary.ts`). Its SolidJS views (the
+  live map, the session list and page, the character's unit frame, inventory
+  and quest log, the party and the event feed) are
+  `@wrathbench/inspector/views`, and the bin serves a page built from them,
+  with minimap tiles from `--tiles <dir>` when it has them.
 
 ### Changed
 

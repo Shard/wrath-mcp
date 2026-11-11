@@ -31,7 +31,7 @@ function tree(files: Record<string, string>): string {
     "inspector/src/index.ts": 'import type { SessionFile } from "@wrathbench/mcp/record/read";\nimport { readFileSync } from "node:fs";\nimport type { TraceSegment } from "./wire";\n',
     "inspector/src/wire.ts": "export interface TraceSegment { v: number }\n",
     "inspector/src/codec/trace.ts": 'import type { TraceSegment } from "../wire";\n',
-    "inspector/src/views/Map.tsx": 'import { createSignal } from "solid-js";\nimport { decode } from "../codec/trace";\n',
+    "inspector/src/views/Map.tsx": 'import { createSignal } from "solid-js";\nimport { decode } from "../codec/trace";\nexport const Map = () => <div class="map">{String(createSignal(decode)[0]())}</div>;\n',
     "sdk/src/index.ts": 'import { z } from "zod";\nimport { join } from "node:path";\nexport const x = 1;\n',
     "mcp/src/index.ts": 'import { connect } from "@wrathbench/sdk";\nimport { readFileSync } from "node:fs";\n',
     "module/src/WbManager.cpp": '#include "WbManager.h"\n#include "Player.h"\n#include <string>\n',

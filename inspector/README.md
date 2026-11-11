@@ -5,11 +5,16 @@ What a session did, read back: a read-only server over a session store
 nothing else. It never calls the module and never holds the port secret, so it
 can run anywhere the store can be read, beside a live stack or long after.
 
-It has two halves, released with the stack as `@wrathbench/inspector`:
+It is released with the stack as `@wrathbench/inspector`, in three parts:
 
 - **The server library.** `createInspectorApi(source)` answers read-only JSON
   and server-sent events over a `SessionSource`, and `wrath-inspector` is a bin
   that serves it over a store directory with its own page.
+- **The views.** SolidJS components (`src/views/`, `@wrathbench/inspector/views`):
+  the live map, the session list, a session's page, its character (unit
+  frame, money, inventory and quest log), its party and its event feed. The
+  bin's page (`page/`) is built from them, and a harness's own pages import
+  them.
 - **The codecs.** The trace and the ring of nearby units, packed per window
   for a map (`src/codec/trace.ts`, `src/codec/nearby.ts`, where each format is
   specified), and their wire types (`src/wire.ts`). Browser-safe, so a page
@@ -18,10 +23,16 @@ It has two halves, released with the stack as `@wrathbench/inspector`:
 ## Running it on a bare store
 
 ```
+bun run --cwd inspector build                              # the page, once, into inspector/dist
 bun inspector/src/bin.ts --store <dir>                     # http://127.0.0.1:8091
 bun inspector/src/bin.ts --store <dir> --port 9000
 WRATH_INSPECTOR_SECRET=… bun inspector/src/bin.ts --store <dir> --host 0.0.0.0
 ```
+
+`--tiles <dir>` gives the map minimap tiles, `<map>/<row>_<col>.png` (the
+layout WrathBench's tile extraction writes its masters in); without it the
+map draws the tile grid. Without a build the page answers with how to make
+one, and the API still serves.
 
 `--store` is a session store, the directory `bun mcp/src/main.ts` records
 into (`--record-dir`, by default `sessions` beside its state directory), or a
@@ -55,6 +66,26 @@ Under `/api` in the bin; wherever a host mounts it otherwise.
 The streams are `trace`, `events`, `calls` and `nearby`. Nothing takes a
 body and nothing writes. A session the caller may not see is a 404 on every
 path, the same as one that does not exist.
+
+## The page and the views
+
+The page is the live map with every session beside it, and a page per
+session (`#/session/<id>`): what it is, its character now, its party and what
+happened to it, the feed following the `events` stream while the session is
+live. Drag the map to pan, wheel to zoom, click a pip to see the units around
+that character. A session is live while its writer's heartbeat is under two
+minutes old.
+
+The views take what they show from the API and from the codecs' readings, and
+nothing else: names come from the record's dictionaries, never from game
+data. Item, spell and quest links point at Wowhead's Wrath database, and the
+inventory asks Wowhead's tooltip script for icons and names in the reader's
+browser, a third-party request; where the script is blocked the links show
+the record's names. Their classes and tokens are WrathBench's dashboard's,
+taken as they are (`src/views/inspector.css`, the bin's stylesheet).
+
+`bun run --cwd inspector dev` serves the page from source with the API
+proxied to a bin on 8091 (`WRATH_INSPECTOR_ORIGIN` points it elsewhere).
 
 ## Sources and scope
 
@@ -92,7 +123,9 @@ exported for a host that serves the same shapes under paths of its own.
 
 From the stack the inspector imports `@wrathbench/mcp/record/read` (the store
 reader and the format's types) and nothing else, and `sdk/` and `mcp/` never
-import it; its browser-side files (`src/wire.ts`, `src/codec/`) import no
-runtime built-in and nothing of its server side. `scripts/boundary.ts` holds
-all three. The session record's format is `docs/SESSION-FORMAT.md`; the
+import it or the UI's dependencies, which are this package's alone; its
+browser-side files (`src/wire.ts`, `src/codec/`, `src/views/`, `page/`) import
+no runtime built-in and nothing of its server side. `scripts/boundary.ts`
+holds all of it. The views also typecheck under the strictest flags an
+embedding page compiles them with (`tsconfig.views.json`). The session record's format is `docs/SESSION-FORMAT.md`; the
 inspector changes with it in the same pull request.

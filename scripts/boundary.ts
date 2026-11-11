@@ -17,8 +17,9 @@
  *  - The UI's dependency graph (Solid, Vite and their kin) is declared by
  *    inspector/ alone; sdk/ and mcp/ never take one on.
  *  - The inspector's browser-side files (`src/wire.ts`, `src/codec/`,
- *    `src/views/`) import no runtime built-in and nothing of the inspector's
- *    server side, because a browser bundles them.
+ *    `src/views/`, and the bin's page in `page/`) import no runtime built-in
+ *    and nothing of the inspector's server side, because a browser bundles
+ *    them.
  *  - The C++ module's quoted includes name a header by its bare file name —
  *    its own or the core's — never a path out of module/.
  *
@@ -42,7 +43,7 @@ export const INSPECTOR_STACK_IMPORTS: ReadonlySet<string> = new Set(["@wrathbenc
 export const UI_DEPENDENCIES = ["solid-js", "@solidjs/router", "vite", "vite-plugin-solid", "happy-dom"] as const;
 
 /** The inspector's files a browser bundles, relative to inspector/: a file, or a directory with a trailing slash. */
-export const INSPECTOR_BROWSER = ["src/wire.ts", "src/codec/", "src/views/"] as const;
+export const INSPECTOR_BROWSER = ["src/wire.ts", "src/codec/", "src/views/", "page/"] as const;
 
 function isBrowserFile(relToInspector: string): boolean {
   const p = relToInspector.split(sep).join("/");
@@ -147,7 +148,10 @@ export function importsOf(file: string): string[] {
   const scanner = new Bun.Transpiler({ loader });
   // The scanner refuses a shebang line; it is a comment to everything else.
   const code = readFileSync(file, "utf8").replace(/^#!.*/, "");
-  return [...new Set([...scanner.scanImports(code).map((i) => i.path), ...typeOnlyImports(code)])];
+  // A TSX file's scan also names the JSX runtime the transpiler would import
+  // (React's, whatever the file says); only what the text itself names counts.
+  const named = (spec: string): boolean => loader !== "tsx" || code.includes(`"${spec}"`) || code.includes(`'${spec}'`);
+  return [...new Set([...scanner.scanImports(code).map((i) => i.path).filter(named), ...typeOnlyImports(code)])];
 }
 
 /** One line per violation; empty when the boundary holds. */
@@ -182,7 +186,7 @@ export function checkStackBoundary(root: string): string[] {
         if (spec.startsWith(".")) {
           const target = resolve(dirname(file), spec);
           if (target !== dir && !target.startsWith(dir + sep)) problems.push(`${rel}: imports ${spec}, outside ${pkg}/`);
-          else if (browser && !isBrowserFile(relative(dir, target)) && !isBrowserFile(relative(dir, `${target}.ts`)) && !isBrowserFile(relative(dir, `${target}.tsx`))) {
+          else if (browser && ![target, `${target}.ts`, `${target}.tsx`, `${target}/`].some((t) => isBrowserFile(relative(dir, t) + (t.endsWith("/") ? "/" : "")))) {
             problems.push(`${rel}: imports ${spec}, the inspector's server side, from a file a browser bundles`);
           }
           continue;

@@ -1,17 +1,89 @@
 /**
- * The wire shapes the inspector serves and its views decode: the trace and
- * nearby codecs' packed windows (`codec/trace.ts`, `codec/nearby.ts`, where
- * each format is specified), the trace index, and a movement intention.
+ * The wire shapes the inspector serves and its views decode: the API's
+ * bodies, the trace and nearby codecs' packed windows (`codec/trace.ts`,
+ * `codec/nearby.ts`, where each format is specified), the trace index, and a
+ * movement intention.
  *
  * Types only, with no imports, so a browser bundle and a server can both
- * take them and neither pulls the other in. A harness that serves the same
- * shapes (WrathBench's viewer and its public snapshot) re-exports them from
- * here rather than declaring its own.
+ * take them and neither pulls the other in. A harness that serves the
+ * same shapes (WrathBench's viewer and its public snapshot) re-exports them
+ * from here rather than declaring its own.
  *
  * One field is named for a harness: a packed window's `run` is the id of the
  * session it was read from. It is published bytes in WrathBench's public
  * site, so it keeps its name.
  */
+
+/* ----------------------------------------------------------------- API --- */
+
+/*
+ * The record's own files as the API hands them on (`docs/SESSION-FORMAT.md`;
+ * the types are `mcp/src/record/format.ts`, mirrored here so a browser bundle
+ * takes nothing of the stack's, and held to them by `test/wire.test.ts`).
+ */
+
+/** `session.json`. */
+export interface SessionFileWire {
+  format: string;
+  id: string;
+  character: { guid: string; name: string | null; race: number | null; class: number | null } | null;
+  stack: { version: string; commit?: string };
+  module: { build: string | null; protocol: number | null } | null;
+  owner?: string;
+  group?: string;
+  started: number;
+  opened: number;
+  ended: number | null;
+}
+
+/** `live.json`. */
+export interface LiveFileWire {
+  ts: number;
+  observed: number | null;
+  map: number | null;
+  x: number | null;
+  y: number | null;
+  z: number | null;
+  o: number | null;
+  level: number | null;
+  hp: number | null;
+  hpMax: number | null;
+  zone: number | null;
+  area: number | null;
+  flags: string[];
+  stream: { connected: boolean; events: number; seq: number | null } | null;
+}
+
+/** The streams a session records. */
+export type StreamNameWire = "trace" | "events" | "calls" | "nearby";
+
+/** Any row of any stream: a `ts`, a `kind`, and the kind's own fields. */
+export interface RowWire {
+  ts: number;
+  kind: string;
+  [field: string]: unknown;
+}
+
+/** One session as the API lists it: `GET <base>/sessions`, `GET <base>/sessions/<id>`. */
+export interface SessionSummary {
+  /** What the source opens it by; not always `session.id` (a harness may key its sessions its own way). */
+  id: string;
+  session: SessionFileWire | null;
+  live: LiveFileWire | null;
+}
+
+/** `GET <base>/sessions`. */
+export interface SessionListResponse {
+  sessions: (SessionSummary & { session: SessionFileWire })[];
+}
+
+/** `GET <base>/sessions/<id>/rows/<stream>`. */
+export interface RowsResponse {
+  stream: StreamNameWire;
+  from: number;
+  to: number;
+  rows: RowWire[];
+}
 
 /**
  * Where a character was trying to get to: one recorded movement intention.
