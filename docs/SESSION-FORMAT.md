@@ -313,7 +313,9 @@ is `k` (`pos` or `mv`), `t` (the packet's own time), `p` (`[x, y, z]` or
 
 The store holds NPCs, objects and the deployment's own sessions, each from
 its own session's record. A player who is not one of those sessions is never
-written. "Own" means the session's own character, or a character guid in the
+written in a field the format defines, and free text is scrubbed of them,
+best-effort (below). "Own" means the session's own character, another
+character of the same client (a fan-out seat), or a character guid in the
 `session.json` of another session of the same deployment; a player guid the
 writer cannot place is foreign.
 
@@ -329,15 +331,28 @@ These rules are applied at one place, the writer's gate
 | `events` `group` | Own member guids are kept in `members`; the rest are counted in `foreign`. A foreign `leaderGuid` is left out. |
 | `events` `kill` | A foreign `killerGuid` is left out; `self` and `member` still say whose kill it was. |
 | `calls` `move` | `target` is null, and `name` absent, for a foreign player. |
+| `calls` free text | Scrubbed, best-effort; below. |
 
-Two places are outside these rules, and both are stated rather than hidden:
+**Free text** is scrubbed rather than ruled: a `call`'s `args`, a `result`'s
+`text`, an `actions` row's notes, an `events` batch, and the calls a `key`
+row restates. The gate knows the players the session's client was answered
+names for (`SMSG_NAME_QUERY_RESPONSE`, which a client asks for every player
+it sees), and at fan-out those of every character of the same client; it
+holds them in memory and never writes them. Once the session's own character
+is known, in every string of those rows, object keys included, a whole token
+that names one of them who is foreign is replaced by `"player"`: a run of
+digits equal to the guid, or a run of letters equal to the name as the
+server answered it. Own or foreign is asked as each row is written.
 
-- **Free text.** A `result`'s text is whatever the agent printed, an `events`
-  batch is what it was shown, and an action's arguments are what it sent.
-  They are written as they were. Whether the gate should also scrub them is
-  not decided; the gate is where it would be done.
-- **The module's audit log** records every event served and is not part of
-  this format.
+It is best-effort over prose, and says so. A number or a word that happens
+to equal a foreign player's guid or name is replaced too; a name spelled
+another way, a player the client was never answered for, or a guid in a JSON
+number is missed. On a world with no foreign players it changes nothing, and
+the record is what the agent saw. Keeping an evaluation apart from other
+players is done by giving it a world of its own, not by this scrub.
+
+**The module's audit log** records every event served, other players
+included, and is not part of this format.
 
 ## The manifest
 

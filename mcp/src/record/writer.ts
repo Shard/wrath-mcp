@@ -422,6 +422,7 @@ export class SessionWriter {
       if (drain !== null) {
         this.stream = drain.stream;
         this.noteCharacter(drain.character);
+        if (drain.players !== undefined) this.notePlayers(drain.players);
         this.writeTrace(drain.trace.rows, drain.trace.dict);
         for (const row of drain.events.rows) this.writeEvent(row);
         for (const move of drain.moves) this.writeMove(move, link(move.evalId, move.routine === true));
@@ -436,6 +437,30 @@ export class SessionWriter {
     } catch (err) {
       this.log(`[record] a record tick failed: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  /**
+   * Player names a client was answered, as `[guid, name]`: what the gate's
+   * free-text scrub looks for (`gate.ts`). Held in memory, never written.
+   * `ingest` takes a drain's own; a host driving several characters also
+   * hands each writer the others'.
+   */
+  notePlayers(players: Iterable<readonly [string, string]>): void {
+    this.gate.notePlayers(players);
+  }
+
+  /**
+   * The session's own character's guid, when the host learns it before a
+   * drain names the character (a seat as it opens). Held by the gate only;
+   * `session.json` still names the character from the drain.
+   */
+  noteSelf(guid: string): void {
+    this.gate.setSelf(guid);
+  }
+
+  /** Another session of the deployment that the host knows of ahead of the store's index: a seat of the same client. */
+  noteOwn(guid: string): void {
+    this.gate.noteOwn(guid);
   }
 
   private noteCharacter(c: SessionCharacter | null): void {
@@ -642,7 +667,8 @@ export class SessionWriter {
 
   // ---------------------------------------------------------------- calls
 
-  private callsKey = (ts: number): CallRow => ({ ts, kind: "key", open: [...this.openCalls.values()] });
+  /** The calls still in flight, as written: through the gate like the rows they restate. */
+  private callsKey = (ts: number): CallRow => this.gate.gate("calls", { ts, kind: "key", open: [...this.openCalls.values()] }) as CallRow;
 
   private writeCall(row: CallRow): void {
     if (this.closed || this.session === null) return;

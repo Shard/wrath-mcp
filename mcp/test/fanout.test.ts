@@ -399,6 +399,28 @@ describe("a fan-out sandbox", () => {
     expect(r.stub.sessions.size).toBe(0);
   }, 30_000);
 
+  test("a player one character's client was answered for is scrubbed from every record, as soon as the answer lands", async () => {
+    const r = rig();
+    await r.call("login_character", { name: "alfa", race: 1, class: 1 });
+    const bravo = /\(guid (\d+)\)/.exec((await r.call("login_character", { name: "bravo", race: 1, class: 1 })).text)![1]!;
+    await r.call("run_snippet", { code: "await sleep(50, { wake: false })" });
+    const [alfaToken, bravoToken] = [...r.stub.sessions.keys()];
+    const at = Date.now() + 60_000;
+    r.stub.push(bravoToken!, { opcode: "SMSG_NAME_QUERY_RESPONSE", opcodeId: 0x051, ts: at, data: { guid: "88", found: true, name: "Stranger" } });
+    r.stub.push(alfaToken!, { opcode: "SMSG_NAME_QUERY_RESPONSE", opcodeId: 0x051, ts: at + 1, data: { guid: bravo, found: true, name: "Bravo" } });
+    await r.call("run_snippet", { code: "await sleep(100, { wake: false })" });
+    // No record tick in between: the answers reached the writers with the cache
+    // forward, and the other seat is own from the moment it opened.
+    await r.call("run_snippet", { code: `'Stranger 88 and Bravo ${bravo}'`, character: "Alfa" });
+    await r.host.recordDrain();
+    const byName = new Map(r.store.list().map((s) => [s.session.character?.name, s]));
+    const results = (new SessionReader(byName.get("Alfa")!.dir).rows("calls") as CallRow[]).flatMap((x) => (x.kind === "result" ? [x.text] : []));
+    expect(results.at(-1)).toContain(`player player and Bravo ${bravo}`);
+    expect(JSON.stringify(results)).not.toContain("Stranger");
+    await r.host.stop();
+    await r.roster.shutdown({ logout: true });
+  }, 30_000);
+
   test("a resumed roster brings back the characters that were logged in", async () => {
     const first = rig();
     await first.call("login_character", { name: "alfa", race: 1, class: 1 });

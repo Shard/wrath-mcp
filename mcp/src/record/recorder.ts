@@ -60,6 +60,13 @@ export interface RecordDrain {
   character: SessionCharacter | null;
   /** The client's event stream: whether it is open, how many events it has folded and the last `seq`. */
   stream: { connected: boolean; events: number; seq: number };
+  /**
+   * Player names the client cache was answered (`SMSG_NAME_QUERY_RESPONSE`)
+   * since the last drain, as `[guid, name]`; every one it holds on a
+   * recorder's first drain. For the write gate's scrub (`gate.ts`): held by
+   * the writer, never written.
+   */
+  players?: [string, string][];
 }
 
 export class SessionRecorder {
@@ -67,6 +74,8 @@ export class SessionRecorder {
   readonly nearby: NearbyRecorder;
   readonly events: EventsRecorder;
   private readonly moves: RecordedMove[] = [];
+  /** The player names already handed to the host, by guid. */
+  private readonly playersSent = new Map<string, string>();
 
   constructor(private readonly client: RecordedClient) {
     this.trace = new TraceRecorder({ state: client.state, events: client.events });
@@ -103,9 +112,22 @@ export class SessionRecorder {
     return { guid: self.guid, name: self.name ?? null, race: field("race"), class: field("class") };
   }
 
+  /** The client cache's player names it has not handed over yet, or changed since. */
+  private players(): [string, string][] {
+    const out: [string, string][] = [];
+    for (const [guid, observed] of this.client.state.names) {
+      if (this.playersSent.get(guid) === observed.value) continue;
+      this.playersSent.set(guid, observed.value);
+      out.push([guid, observed.value]);
+    }
+    return out;
+  }
+
   /** Everything latched since the last drain. Destructive: one caller, the host's writer, owns it. */
   drain(): RecordDrain {
+    const players = this.players();
     return {
+      ...(players.length > 0 ? { players } : {}),
       trace: this.trace.drain(),
       nearby: this.nearby.drain(),
       events: this.events.drain(),
