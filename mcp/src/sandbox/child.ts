@@ -1800,14 +1800,18 @@ function answerForEverySeat(method: string, params: { limit?: number }): unknown
  */
 async function openSeat(msg: Extract<HostToChild, { t: "seat_open" }>): Promise<SeatOpened> {
   if (!MULTI) throw new Error("this sandbox holds one character");
-  if (seats.size >= MAX_CHARACTERS) throw new Error(`${seats.size} of ${MAX_CHARACTERS} characters are logged in`);
+  if (seats.size + opening.size >= MAX_CHARACTERS) throw new Error(`${seats.size + opening.size} of ${MAX_CHARACTERS} characters are logged in`);
   const seat = makeSeat({ name: msg.character, token: msg.token, secret: msg.secret, account: msg.account });
   installSeat(seat);
   seedClientCache(seat.client, msg.frames);
+  const mine = { abandoned: false };
+  opening.set(msg.character, mine);
   try {
     if (msg.reattach) await connectSeat(seat.client);
     else await seat.client.events.connect();
     const res = await seat.client.createSession({ character: msg.character, ...(msg.create ?? {}) } as Parameters<WrathClient["createSession"]>[0]);
+    // The host gave up waiting and holds no seat for this: keeping one here would hold the name for good.
+    if (mine.abandoned) throw new Error(`${res.character} reached the world after the host stopped waiting`);
     if (seats.has(res.character)) throw new Error(`${res.character} is already logged in`);
     seat.name = res.character;
     seats.set(seat.name, seat);
@@ -1816,8 +1820,13 @@ async function openSeat(msg: Extract<HostToChild, { t: "seat_open" }>): Promise<
   } catch (err) {
     disposeSeat(seat);
     throw err;
+  } finally {
+    if (opening.get(msg.character) === mine) opening.delete(msg.character);
   }
 }
+
+/** The opens in flight, by the name they were asked for, so a host that stopped waiting for one can say so (`closeSeat`). */
+const opening = new Map<string, { abandoned: boolean }>();
 
 function disposeSeat(seat: Seat): void {
   seat.recorder?.stop();
@@ -1830,6 +1839,8 @@ function disposeSeat(seat: Seat): void {
 
 /** Close a seat (`seat_close`): log its character out when asked, hand back the last of its record, drop its client. */
 async function closeSeat(name: string, logout: boolean): Promise<SeatClosed> {
+  const pending = opening.get(name);
+  if (pending !== undefined) pending.abandoned = true;
   const seat = seats.get(name);
   if (seat === undefined) return { drain: null };
   if (logout) {

@@ -29,6 +29,7 @@
 import { randomBytes } from "node:crypto";
 import { z } from "zod";
 import { leaseRunSecret, logoutSession, releaseSessionSecret } from "./module-auth";
+import { SecretRedactor } from "./redact";
 import type { SessionWriter } from "./record/writer";
 import type { EvalLink, SeatSpec, SeatView, SnippetResult } from "./sandbox/host";
 import type { EventSummary, SeatOpened } from "./sandbox/ipc";
@@ -163,14 +164,30 @@ export class CharacterRoster implements FanoutSurface {
   private readonly entries = new Map<string, RosterEntry>();
   private readonly writers = new Map<string, SessionWriter>();
   private queue: Promise<unknown> = Promise.resolve();
+  /** Every token this roster has put on a seat, to strike from what is recorded. */
+  private readonly tokens = new SecretRedactor();
 
   constructor(private readonly o: CharacterRosterOptions) {
     const problem = fanoutGrantProblem(o.grant);
     if (problem !== null) throw new Error(problem);
     this.maxCharacters = o.grant.maxCharacters;
     this.sandbox = o.sandbox;
-    for (const e of o.known ?? []) this.entries.set(e.character, { ...e });
+    for (const e of o.known ?? []) {
+      this.entries.set(e.character, { ...e });
+      this.tokens.redact(e.token);
+    }
     this.calls = new FanoutCalls(this.writers);
+  }
+
+  /**
+   * `text` with every seat's session token struck. A record's own writer
+   * strikes its own token; a call recorded in several records can print
+   * another character's (`chars.Other.sdk.token`), so the scrub a seat's
+   * writer is built with passes through this too. Not applied to what a
+   * model is served: a token names a session and authenticates nothing.
+   */
+  scrubTokens(text: string): string {
+    return this.tokens.scrub(text);
   }
 
   private serial<T>(fn: () => Promise<T>): Promise<T> {
@@ -244,6 +261,7 @@ export class CharacterRoster implements FanoutSurface {
     }
     if (account === undefined) return { ok: false, error: "every granted account has a character logged in; log one out first (logout_character)" };
     const token = known?.token ?? (this.o.newToken ?? (() => randomBytes(16).toString("hex")))();
+    this.tokens.redact(token);
     const call = { moduleUrl: this.o.moduleUrl, token, ...(this.o.env !== undefined ? { env: this.o.env } : {}), ...(this.o.fetch !== undefined ? { fetch: this.o.fetch } : {}) };
     let opened: SeatOpened;
     try {

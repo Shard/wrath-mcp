@@ -400,7 +400,7 @@ async function mainFanout(o: { argv: readonly string[]; grant: FanoutGrant; toke
     onNotice: (n) => console.error(secrets.scrub(`[wrathbench-mcp] ${n.kind}: ${n.text}`)),
     logSink: (_stream, text) => void process.stderr.write(text),
   });
-  const roster = new CharacterRoster({
+  const roster: CharacterRoster = new CharacterRoster({
     grant,
     moduleUrl,
     sandbox,
@@ -411,7 +411,7 @@ async function mainFanout(o: { argv: readonly string[]; grant: FanoutGrant; toke
       ? {
           record: (seat) => {
             const id = tokenFingerprint(seat.token);
-            const writer = new SessionWriter({ dir: store.sessionDir(id), id, stack: { version: MCP_PACKAGE_VERSION }, group, own: ownGuidIndex(() => store.dirs()), scrub: (text) => secrets.scrub(text), token: seat.token });
+            const writer = new SessionWriter({ dir: store.sessionDir(id), id, stack: { version: MCP_PACKAGE_VERSION }, group, own: ownGuidIndex(() => store.dirs()), scrub: (text) => roster.scrubTokens(secrets.scrub(text)), token: seat.token });
             writer.open();
             void module?.then((m) => writer.setModule(m));
             return writer;

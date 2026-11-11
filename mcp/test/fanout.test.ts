@@ -226,7 +226,7 @@ function rig(o: { max?: number; accounts?: string[]; timeoutMs?: number; known?:
   const store = new SessionStore(join(root, "sessions"));
   const secrets = new SecretRedactor();
   let entries: RosterEntry[] = [];
-  const roster = new CharacterRoster({
+  const roster: CharacterRoster = new CharacterRoster({
     grant: { maxCharacters: max, accounts: o.accounts ?? ["ACCA", "ACCB", "ACCC"] },
     moduleUrl: stub.baseUrl,
     sandbox: host,
@@ -236,7 +236,7 @@ function rig(o: { max?: number; accounts?: string[]; timeoutMs?: number; known?:
     onChange: (e) => (entries = e),
     record: (seat) => {
       const id = tokenFingerprint(seat.token);
-      const w = new SessionWriter({ dir: store.sessionDir(id), id, stack: { version: "0.0.0-test" }, group: "0123456789abcdef", token: seat.token, log: () => {} });
+      const w = new SessionWriter({ dir: store.sessionDir(id), id, stack: { version: "0.0.0-test" }, group: "0123456789abcdef", token: seat.token, scrub: (text) => roster.scrubTokens(text), log: () => {} });
       w.open();
       return w;
     },
@@ -356,6 +356,8 @@ describe("a fan-out sandbox", () => {
     await r.call("run_snippet", { code: "(await sdk.say('from alfa')).ok", character: "Alfa" });
     await r.call("run_snippet", { code: "(await chars.Bravo.sdk.say('from bravo')).ok" });
     await r.call("write_scratchpad", { content: "notes" });
+    // A call recorded in both records prints one character's token: neither record may hold it.
+    expect((await r.call("run_snippet", { code: "chars.Bravo.sdk.token" })).text).toContain(r.entries().find((e) => e.character === "Bravo")!.token);
     await r.call("recent_events", { character: "Bravo" });
     await r.host.recordDrain();
     const byName = new Map(r.store.list().map((s) => [s.session.character?.name, s]));
@@ -364,8 +366,13 @@ describe("a fan-out sandbox", () => {
     const rows = (name: string): CallRow[] => (new SessionReader(byName.get(name)!.dir).rows("calls") as CallRow[]).filter((x) => x.kind !== "key");
     const tools = (name: string): string[] => rows(name).flatMap((x) => (x.kind === "call" ? [`${x.tool}${(x.args as { character?: string } | null)?.character !== undefined ? `@${(x.args as { character: string }).character}` : ""}`] : []));
     // Alfa's record: its own login, Bravo's login (it was open), its snippet, the two that name nobody.
-    expect(tools("Alfa")).toEqual(["login_character", "login_character", "run_snippet@Alfa", "run_snippet", "write_scratchpad"]);
-    expect(tools("Bravo")).toEqual(["login_character", "run_snippet", "write_scratchpad", "recent_events@Bravo"]);
+    expect(tools("Alfa")).toEqual(["login_character", "login_character", "run_snippet@Alfa", "run_snippet", "write_scratchpad", "run_snippet"]);
+    expect(tools("Bravo")).toEqual(["login_character", "run_snippet", "write_scratchpad", "run_snippet", "recent_events@Bravo"]);
+    for (const name of ["Alfa", "Bravo"]) {
+      const text = JSON.stringify(rows(name));
+      for (const e of r.entries()) expect(text).not.toContain(e.token);
+      expect(text).toContain("[redacted]");
+    }
     // Each character's dispatches are in its own record, linked to the call that sent them.
     const said = (name: string): string[] => rows(name).flatMap((x) => (x.kind === "actions" ? x.actions.filter((a) => a.action === "say").map((a) => String(a.args?.["text"])) : []));
     expect(said("Alfa")).toEqual(["from alfa"]);
