@@ -21,6 +21,58 @@ of episodes, scores or trajectories. A harness plugs those in through the hooks
 hooks are. [WrathBench](https://github.com/Shard/WrathBench), an LLM
 evaluation harness, is one such harness and the stack's first consumer.
 
+```mermaid
+flowchart TB
+    agent["Agent<br/>(any MCP client)"]
+    harness["Harness, optional<br/>(e.g. WrathBench)"]
+
+    subgraph mcp["mcp/"]
+        server["MCP server + core tools<br/>holds the port secret"]
+        host["Sandbox host"]
+        child["Confined sandbox child<br/>(Landlock) runs snippets"]
+    end
+
+    subgraph sdk["sdk/"]
+        client["WrathClient<br/>actions, events, state cache"]
+    end
+
+    subgraph ws["AzerothCore worldserver"]
+        subgraph module["module/"]
+            http["HTTP/WS bridge<br/>bearer: port or lease secret"]
+            sessions["Sessions and leases"]
+            pbridge["Packet bridge"]
+            tap["Event tap<br/>whitelist"]
+            audit[("Audit log")]
+        end
+        session["WorldSession<br/>stock opcode handlers"]
+        world(("Game world"))
+    end
+
+    agent <-->|"MCP over stdio"| server
+    harness -. "hooks: tools, rendering,<br/>child extension, records" .-> mcp
+    server --> host
+    host <-->|"IPC"| child
+    server -->|"POST /lease"| http
+    child -->|"in-process"| client
+    client -->|"POST /action<br/>lease secret only"| http
+    http --> sessions
+    http --> pbridge
+    sessions -->|"login, logout"| session
+    pbridge -->|"client opcodes CMSG_*"| session
+    session <--> world
+    session ==>|"outbound SMSG_*"| tap
+    tap ==>|"whitelisted events<br/>WS /events"| client
+    pbridge -.-> audit
+    tap -.-> audit
+```
+
+Thin arrows carry calls and actions, thick arrows carry observations. An
+action reaches the world only as the opcode a real client would send, through
+the same stock handler; what comes back is the session's outbound packets, cut
+down to what a client would see (`docs/CONTRACTS.md`). The port secret stays in
+the MCP process, which leases a per-session secret for the sandbox child, so a
+snippet can drive its own character and nothing else.
+
 Tested against AzerothCore
 [`3cafaf4a588fd1f287678fdb37438fdedd1ed85c`](https://github.com/azerothcore/azerothcore-wotlk/commit/3cafaf4a588fd1f287678fdb37438fdedd1ed85c).
 
