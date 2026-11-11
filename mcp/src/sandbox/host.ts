@@ -1033,7 +1033,18 @@ export class SandboxHost {
     return ((await this.rpc("recent_events_all", { limit })) ?? {}) as Record<string, EventSummary[]>;
   }
 
-  /** Fan-out above 1: every seat's state snapshot, by character name. */
+  /**
+   * Fan-out above 1: every seat's state reduced to what a roll-up reads
+   * (`child.ts`, `stateBrief`), by character name: the snapshot's own fields
+   * for identity, level, bars, flags, position, stream and last move, and
+   * nothing else. What a roll-up of many characters asks for; one
+   * character's whole state is `stateSnapshot(character)`.
+   */
+  async stateBriefs(): Promise<Record<string, Record<string, unknown>>> {
+    return ((await this.rpc("state_brief_all")) ?? {}) as Record<string, Record<string, unknown>>;
+  }
+
+  /** Fan-out above 1: every seat's whole state snapshot, by character name. A roll-up wants `stateBriefs`. */
   async stateSnapshots(): Promise<Record<string, Record<string, unknown>>> {
     return ((await this.rpc("state_summary_all")) ?? {}) as Record<string, Record<string, unknown>>;
   }
