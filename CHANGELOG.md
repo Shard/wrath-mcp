@@ -375,6 +375,19 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   and an oversized array now reports the one bound issue where it reported one
   per element as well. The 4.5 release also tightened what a schema accepts:
   string lengths count code points, and `z.iso.datetime()` needs seconds.
+- A sandbox killed because its event loop stopped answering no longer blames
+  the snippet whose timeout noticed. That snippet was often a bystander parked
+  in `sleep` while a routine or the client's own work held the loop; its
+  error and the `sandbox_restarted` notice now say the loop was blocked and
+  that what blocked it is not known. Every snippet in flight on the killed
+  child is told the same (one waiting beside it was told the process
+  exited), one stall is one restart (a second snippet timing out during the
+  first one's ping could kill the fresh child), and a child's exit fails only
+  the requests sent to it.
+- `showTaxiNodes` at a flight master not yet visited threw on the first call.
+  The server answers that hello by teaching the node (`SMSG_NEW_TAXI_PATH`)
+  and sends a menu cut short before its taxi option; the call now greets the
+  master once more, as a player clicks again, and returns the window.
 
 ## 0.2.0
 

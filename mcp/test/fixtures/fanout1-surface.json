@@ -1141,13 +1141,13 @@
           "code": "for (;;) {}"
         },
         "result": {
-          "text": "error (<n>ms)\nsnippet blocked the sandbox event loop past 2000ms; the sandbox process was killed and restarted — All top-level bindings and routines were lost; the game session was not, and your character is where it was. Run `await connect()`: resubscribing replays your own state (health, power, xp, money, bags, quest log, spells, skills, factions, bind point) and everything in view, and `connect()` returns once that replay has landed, so `state` and `sdk` are whole again. Call `await sdk.createSession({...})` only if `connect()` fails because the session is gone.",
+          "text": "error (<n>ms)\nthe sandbox event loop was blocked past 2000ms while this snippet was running, so the sandbox process was killed and restarted; what blocked it is not known (this snippet, a background routine, another snippet or the client's own work) — All top-level bindings and routines were lost; the game session was not, and your character is where it was. Run `await connect()`: resubscribing replays your own state (health, power, xp, money, bags, quest log, spells, skills, factions, bind point) and everything in view, and `connect()` returns once that replay has landed, so `state` and `sdk` are whole again. Call `await sdk.createSession({...})` only if `connect()` fails because the session is gone.",
           "isError": true
         },
         "notices": [
           {
             "kind": "sandbox_restarted",
-            "text": "sandbox restarted (a snippet blocked the event loop past the timeout). All top-level bindings and routines were lost; the game session was not, and your character is where it was. Run `await connect()`: resubscribing replays your own state (health, power, xp, money, bags, quest log, spells, skills, factions, bind point) and everything in view, and `connect()` returns once that replay has landed, so `state` and `sdk` are whole again. Call `await sdk.createSession({...})` only if `connect()` fails because the session is gone."
+            "text": "sandbox restarted (its event loop was blocked past the timeout; what blocked it is not known). All top-level bindings and routines were lost; the game session was not, and your character is where it was. Run `await connect()`: resubscribing replays your own state (health, power, xp, money, bags, quest log, spells, skills, factions, bind point) and everything in view, and `connect()` returns once that replay has landed, so `state` and `sdk` are whole again. Call `await sdk.createSession({...})` only if `connect()` fails because the session is gone."
           }
         ]
       },
