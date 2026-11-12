@@ -312,6 +312,12 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   Wowhead's tooltip script, a third-party request, is opt-in: the views ask
   for it only on a page that calls `enableWowhead()`, which the bin's page
   does with `--wowhead`.
+- **An item's random suffix is named in the record.** The trace's dictionary
+  gains `rands`, `[rand, suffix]` for each random property id the sheet's
+  `equip` and `inv` rows carry, once per segment like an item's name, so a
+  reader shows "Sentry's Leggings of the Bear" where it showed the template's
+  name; no row grows. The inspector's trace segments carry it as `rands` and
+  its inventory views put it on the item's name.
 
 ### Changed
 

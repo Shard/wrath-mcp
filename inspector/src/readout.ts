@@ -24,6 +24,7 @@ import {
   itemNameOf,
   packSegs,
   questReqOf,
+  suffixOf,
   tailStart,
   windowOf,
   type TraceDictLookup,
@@ -73,6 +74,7 @@ export async function withTrace<T>(h: SessionHandle, from: number, to: number, n
   const rows: TraceRow[] = [];
   const items = new Map<number, unknown>();
   const quests = new Map<number, unknown>();
+  const rands = new Map<number, unknown>();
   try {
     // A trace row's window is its segment's, so the range's segments hold all of it.
     for (const seg of segs) {
@@ -80,6 +82,7 @@ export async function withTrace<T>(h: SessionHandle, from: number, to: number, n
       for (const r of await traceRowsOf(h, seg)) {
         for (const e of r.dict?.items ?? []) items.set(e[0], [e[1], e[2]]);
         for (const e of r.dict?.quests ?? []) quests.set(e[0], e[1]);
+        for (const e of r.dict?.rands ?? []) rands.set(e[0], e[1]);
         if (r.kind === "dict" || r.ts < from || r.ts >= to) continue;
         rows.push({
           ts: r.ts,
@@ -93,7 +96,7 @@ export async function withTrace<T>(h: SessionHandle, from: number, to: number, n
         });
       }
     }
-    return fn(rows, { item: (id) => itemNameOf(items.get(id)), quest: (id) => questReqOf(quests.get(id)) });
+    return fn(rows, { item: (id) => itemNameOf(items.get(id)), quest: (id) => questReqOf(quests.get(id)), rand: (id) => suffixOf(rands.get(id)) });
   } catch {
     return failed;
   }

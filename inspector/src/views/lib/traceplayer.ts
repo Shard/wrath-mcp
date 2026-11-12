@@ -136,6 +136,8 @@ export interface TraceSheetView {
   sheet: TraceSheetAt;
   items: ReadonlyMap<number, TraceItemName>;
   qreq: ReadonlyMap<number, TraceQuestReq>;
+  /** The random properties' name suffixes, by signed id. */
+  rands: ReadonlyMap<number, string>;
 }
 
 /** One unbroken stretch of a trail, on one map, all walked or all flown. */
@@ -472,7 +474,7 @@ export function createTraceStore(opts: TraceStoreOptions = {}): TraceStore {
       if (entry === undefined) return null;
       const at = locate(entry, t);
       if (at === null) return null;
-      return { sheet: foldSheet(at.piece.seg, t), items: at.piece.seg.items, qreq: at.piece.seg.qreq };
+      return { sheet: foldSheet(at.piece.seg, t), items: at.piece.seg.items, qreq: at.piece.seg.qreq, rands: at.piece.seg.rands };
     },
 
     trail(id, from, to) {

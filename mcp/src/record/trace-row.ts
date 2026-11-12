@@ -64,7 +64,8 @@ export interface TraceState {
  * only its key fields for one that went. A list after `null` is whole.
  *
  * - `equip` `[slot, itemId, rand?]`: equipment slots 0-18. `rand` is the
- *   item's signed random property id, present only when it has one.
+ *   item's signed random property id, present only when it has one; its
+ *   name suffix is the dictionary's (`TraceDict.rands`).
  * - `bags` `[slot, itemId, numSlots]`: the worn bags, slots 19-22.
  * - `inv` `[bag, slot, itemId, count?, rand?]`: what is carried, addressed as
  *   the item actions take it (the backpack is bag 255, slots 23-38; a worn
@@ -176,12 +177,21 @@ export type TraceQuestReq = [number, number, number, number, ...[itemId: number,
 
 /**
  * What a drain names, each id once per process: an item's quality and its
- * template's name (never the instance's random suffix, its text or its
- * description), and a quest's required counts. The session writer keeps them
- * for the session and restates in each segment the ones its rows reference.
+ * template's name (never its description), a random property's name suffix
+ * by its signed id, and a quest's required counts. The session writer keeps
+ * them for the session and restates in each segment the ones its rows
+ * reference.
+ *
+ * `rands` is keyed by the id the sheet's rows already carry (`equip`'s and
+ * `inv`'s `rand`), so an instance's suffixed name costs no row anything: a
+ * reader shows "<template> <suffix>" ("Sentry's Leggings of the Bear"). The
+ * suffix is the property's `ItemRandomProperties.dbc` or
+ * `ItemRandomSuffix.dbc` row's, the client-cache text the module serves
+ * beside the public field (`suffixName`), and one id always has the same one.
  */
 export interface TraceDict {
   items?: [itemId: number, quality: number | null, name: string][];
+  rands?: [rand: number, suffix: string][];
   quests?: [questId: number, req: TraceQuestReq][];
 }
 

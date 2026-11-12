@@ -233,25 +233,35 @@ function sheetOf(data: unknown): TraceSheet {
   return s;
 }
 
-/** The item and quest ids a key or state row's sheet lists reference. */
-function sheetRefs(data: unknown): { items: number[]; quests: number[] } {
+/** The item, random property and quest ids a key or state row's sheet lists reference. */
+function sheetRefs(data: unknown): { items: number[]; rands: number[]; quests: number[] } {
   const items: number[] = [];
+  const rands: number[] = [];
   const quests: number[] = [];
-  if (data === null || typeof data !== "object") return { items, quests };
+  if (data === null || typeof data !== "object") return { items, rands, quests };
   const d = data as Record<string, unknown>;
-  const at = (key: string, index: number, out: number[]): void => {
+  const at = (key: string, index: number, out: number[], signed = false): void => {
     const list = d[key];
     if (!Array.isArray(list)) return;
     for (const r of list as unknown[]) {
       const id = Array.isArray(r) ? (r[index] as unknown) : undefined;
-      if (typeof id === "number" && id > 0) out.push(id);
+      if (typeof id === "number" && (signed ? id !== 0 : id > 0)) out.push(id);
     }
   };
   at("equip", 1, items);
   at("bags", 1, items);
   at("inv", 2, items);
+  // A random property id is signed: negative is a random suffix.
+  at("equip", 2, rands, true);
+  at("inv", 4, rands, true);
   at("quests", 1, quests);
-  return { items, quests };
+  return { items, rands, quests };
+}
+
+/** A dictionary of the entries given, without the empty lists; `undefined` when all are empty. */
+function dictOf(items: NonNullable<TraceDict["items"]>, rands: NonNullable<TraceDict["rands"]>, quests: NonNullable<TraceDict["quests"]>): TraceDict | undefined {
+  if (items.length === 0 && rands.length === 0 && quests.length === 0) return undefined;
+  return { ...(items.length > 0 ? { items } : {}), ...(rands.length > 0 ? { rands } : {}), ...(quests.length > 0 ? { quests } : {}) };
 }
 
 const FLAG_KEYS = ["combat", "mounted", "taxi", "dead", "ghost", "resting"] as const;
@@ -276,9 +286,10 @@ export class SessionWriter {
   };
   private traceLast = 0;
   private readonly dictItems = new Map<number, NonNullable<TraceDict["items"]>[number]>();
+  private readonly dictRands = new Map<number, string>();
   private readonly dictQuests = new Map<number, TraceQuestReq>();
   /** The ids the live trace segment has already named. */
-  private named = { items: new Set<number>(), quests: new Set<number>() };
+  private named = { items: new Set<number>(), rands: new Set<number>(), quests: new Set<number>() };
 
   // events
   private eventsFold: EventsState = emptyEventsState();
@@ -496,6 +507,7 @@ export class SessionWriter {
   private unnamed(data: unknown): TraceDict | undefined {
     const refs = sheetRefs(data);
     const items: NonNullable<TraceDict["items"]> = [];
+    const rands: NonNullable<TraceDict["rands"]> = [];
     const quests: NonNullable<TraceDict["quests"]> = [];
     const item = (id: number): void => {
       const e = this.dictItems.get(id);
@@ -512,8 +524,13 @@ export class SessionWriter {
       for (let i = 4; i < req.length; i++) item((req[i] as [number, number])[0]);
     }
     for (const id of refs.items) item(id);
-    if (items.length === 0 && quests.length === 0) return undefined;
-    return { ...(items.length > 0 ? { items } : {}), ...(quests.length > 0 ? { quests } : {}) };
+    for (const id of refs.rands) {
+      const suffix = this.dictRands.get(id);
+      if (suffix === undefined || this.named.rands.has(id)) continue;
+      this.named.rands.add(id);
+      rands.push([id, suffix]);
+    }
+    return dictOf(items, rands, quests);
   }
 
   private writeTrace(rows: TraceRow[], dict: TraceDict | undefined): void {
@@ -523,6 +540,10 @@ export class SessionWriter {
     for (const e of dict?.items ?? []) {
       this.dictItems.set(e[0], e);
       (fresh.items ??= []).push(e);
+    }
+    for (const [id, suffix] of dict?.rands ?? []) {
+      this.dictRands.set(id, suffix);
+      (fresh.rands ??= []).push([id, suffix]);
     }
     for (const [id, req] of dict?.quests ?? []) {
       this.dictQuests.set(id, req);
@@ -535,7 +556,7 @@ export class SessionWriter {
     const at = Math.max(this.traceLast, first?.ts ?? this.now());
     // Into the segment that is open, ahead of the rows that may need them. When
     // the first row opens a new segment instead, its key names what it references.
-    if ((fresh.items !== undefined || fresh.quests !== undefined) && live !== null && segmentStart(at) <= live) {
+    if ((fresh.items !== undefined || fresh.rands !== undefined || fresh.quests !== undefined) && live !== null && segmentStart(at) <= live) {
       this.putTrace({ ts: at, kind: "dict", dict: fresh });
     }
     for (const latched of sorted) this.putTrace(latched);
@@ -549,16 +570,19 @@ export class SessionWriter {
     if (live === null || segmentStart(row.ts) > live) {
       // A new segment names everything again. It opens with this row when the
       // row is a key, else with the fold's, which names what the fold references.
-      this.named = { items: new Set(), quests: new Set() };
+      this.named = { items: new Set(), rands: new Set(), quests: new Set() };
       if (row.kind !== "key") this.writeTraceRow(this.traceKey(row.ts), key);
     }
     if (row.kind === "dict") {
       const items = (row.dict?.items ?? []).filter((e) => !this.named.items.has(e[0]));
+      const rands = (row.dict?.rands ?? []).filter((e) => !this.named.rands.has(e[0]));
       const quests = (row.dict?.quests ?? []).filter((e) => !this.named.quests.has(e[0]));
-      if (items.length === 0 && quests.length === 0) return;
+      const dict = dictOf(items, rands, quests);
+      if (dict === undefined) return;
       for (const e of items) this.named.items.add(e[0]);
+      for (const e of rands) this.named.rands.add(e[0]);
       for (const e of quests) this.named.quests.add(e[0]);
-      row = { ts: row.ts, kind: "dict", dict: { ...(items.length > 0 ? { items } : {}), ...(quests.length > 0 ? { quests } : {}) } };
+      row = { ts: row.ts, kind: "dict", dict };
     } else if (row.kind === "key" || row.kind === "state") {
       const dict = this.unnamed(row.data);
       if (dict !== undefined) {
