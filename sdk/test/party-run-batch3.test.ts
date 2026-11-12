@@ -196,6 +196,10 @@ const spellStart = (seq: number) =>
 const interrupted = (seq: number) =>
   frame(seq, "SMSG_SPELL_FAILURE", { casterGuid: SELF_GUID, castCount: 1, spellId: 2050, result: 40, reason: "interrupted" });
 
+/** An interrupt nothing this client saw explains: the server names none, and the hint says so. */
+const NO_CAUSE =
+  "the cast was interrupted, and the server names no cause: no move, loot or cancel of yours, no stun and no hit on you came with it";
+
 describe("castSpell interrupted: what interrupted it, when the client can tell", () => {
   test("a move this client sent during the cast", async () => {
     const stub = startStub({ onConnect: () => world() });
@@ -231,7 +235,7 @@ describe("castSpell interrupted: what interrupted it, when the client can tell",
     push(stub, interrupted(43));
     await folded(client, "SMSG_SPELL_FAILURE", 43);
     await Bun.sleep(5);
-    expect(client.drainActionHints()[0]?.hint).toBe("Lesser Heal (2050): the cast was interrupted (moving or acting during it)");
+    expect(client.drainActionHints()[0]?.hint).toBe(`Lesser Heal (2050): ${NO_CAUSE}`);
     client.close();
     await stub.stop();
   });
@@ -262,9 +266,7 @@ describe("castSpell interrupted: a move refused at planning moved nothing", () =
     await folded(client, "WB_MOVE_RESULT", 40);
     push(stub, interrupted(41));
     await folded(client, "SMSG_SPELL_FAILURE", 41);
-    expect(client.drainActionHints().find((h) => h.action === "castSpell")?.hint).toBe(
-      "Lesser Heal (2050): the cast was interrupted (moving or acting during it)",
-    );
+    expect(client.drainActionHints().find((h) => h.action === "castSpell")?.hint).toBe(`Lesser Heal (2050): ${NO_CAUSE}`);
     client.close();
     await stub.stop();
   });

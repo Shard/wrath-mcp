@@ -14,7 +14,7 @@ import { SecretRedactor } from "../src/redact";
 import type { ActionHintNote, EventSummary } from "../src/sandbox/ipc";
 import { Scratchpad } from "../src/scratchpad";
 import { McpServer } from "../src/server";
-import { coreTools, toolCallCount, ToolSet, type CoreToolContext, type ToolSpec } from "../src/tools";
+import { coreTools, serveEvents, toolCallCount, ToolSet, type CoreToolContext, type ToolSpec } from "../src/tools";
 import { MCP_PACKAGE_VERSION } from "../src/version";
 
 const dirs: string[] = [];
@@ -93,6 +93,16 @@ describe("ToolSet", () => {
       '#2 SMSG_ATTACKSTART {"victimGuid":"1"}',
       "(+1 ambient movement and party-frame events folded into state — pass {includeMovement: true} for the raw stream)",
     ]);
+  });
+
+  test("a render may call an event ambient by its data, not its opcode alone", () => {
+    const ev = (seq: number, data: unknown) => ({ seq, ts: seq, opcode: "SMSG_UPDATE_OBJECT", data });
+    const served = serveEvents([ev(1, { noise: true }), ev(2, { noise: false }), ev(3, { noise: true })], 10, false, {
+      eventLine: (e) => `#${e.seq}`,
+      isAmbient: (_opcode, data) => (data as { noise?: boolean }).noise === true,
+    });
+    expect(served.visible.map((e) => e.seq)).toEqual([2]);
+    expect(served.folded).toBe(2);
   });
 
   test("the bare render folds threat list updates and world state changes, not their removal, clear or init", () => {

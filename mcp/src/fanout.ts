@@ -771,7 +771,7 @@ export function fanoutTools<C extends FanoutToolContext>(render: CoreToolRender<
         if (!ctx.fanout.views().some((v) => v.state === "in")) return { text: NO_CHARACTERS };
         const scanned = await ctx.fanout.sandbox.recentEventsAll(scan);
         // Each character's own fold first, uncut, so the merge sees every signal event of the span.
-        const ambient = (e: EventSummary): boolean => render.isAmbient(e.opcode);
+        const ambient = (e: EventSummary): boolean => render.isAmbient(e.opcode, e.data);
         const shown = (e: EventSummary): boolean => includeMovement || (!ambient(e) && e.bystander !== true);
         const kept: Record<string, EventSummary[]> = {};
         for (const [name, events] of Object.entries(scanned)) kept[name] = events.filter(shown);

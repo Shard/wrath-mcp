@@ -253,12 +253,61 @@ export const ACTION_HINT_RENDER = {
  * held back for the next snippet.
  *
  * Nothing is added to the hint strings. Grouping is the SDK's (action, status)
- * tally, so a status that failed 21 times costs one line and a count.
+ * tally, so a status that failed 21 times costs one line and a count. The
+ * tally is kept per routine, so one result could carry the same sentence once
+ * for each routine that earned it; those are one line here, naming the
+ * routines (`collapseOrigins`).
  */
 export function renderActionHints(hints: readonly ActionHintNote[]): string | undefined {
   if (hints.length === 0) return undefined;
+  let rows = collapseOrigins(hints);
   // Fan-out above 1: each client tallied its own, and a line says whose it is.
-  if (hints.some((h) => h.character !== undefined)) return renderActionHints(groupHintsByCharacter(hints));
+  if (rows.some((h) => h.character !== undefined)) rows = groupHintsByCharacter(rows);
+  return renderHintRows(rows);
+}
+
+/** One line of the block: a tallied hint, with every routine it came from when several earned the same one. */
+interface HintRow extends ActionHintNote {
+  /** The `from` labels of the notes folded into this row, each once, in arrival order. */
+  froms?: string[];
+}
+
+/** How many routines a collapsed line names before it counts the rest. */
+const HINT_ORIGINS_SHOWN = 3;
+
+/**
+ * The same failure with the same hint raised by several earlier snippets'
+ * routines, as one row: the SDK tallies each routine apart so a line can say
+ * whose code it was, and a sentence with nothing of the call in it (a
+ * `superseded`, a cooldown) then came once per routine in one result. The row
+ * keeps the hint once, names each routine and sums the repeats; nothing is
+ * remembered between results. The current snippet's own line stays apart from
+ * a routine's, and so do lines whose hints differ in any character.
+ */
+function collapseOrigins(hints: readonly ActionHintNote[]): HintRow[] {
+  const rows: HintRow[] = [];
+  const byKey = new Map<string, HintRow & { froms: string[] }>();
+  for (const h of hints) {
+    if (h.from === undefined) {
+      rows.push({ ...h });
+      continue;
+    }
+    const key = `${h.character ?? ""}\n${h.action}\n${h.status}\n${h.hint}`;
+    const row = byKey.get(key);
+    if (row === undefined) {
+      const first = { ...h, froms: [h.from] };
+      byKey.set(key, first);
+      rows.push(first);
+      continue;
+    }
+    row.count += h.count;
+    if (h.ts > row.ts) row.ts = h.ts;
+    if (!row.froms.includes(h.from)) row.froms.push(h.from);
+  }
+  return rows;
+}
+
+function renderHintRows(hints: readonly HintRow[]): string {
   // Most recent first. Nothing here reacts to how often a status failed — the
   // count is only the collapse marker for repeats of one hint, and no rendering
   // or ordering decision reads it.
@@ -270,7 +319,7 @@ export function renderActionHints(hints: readonly ActionHintNote[]): string | un
       h.hint.length > ACTION_HINT_RENDER.MAX_HINT_CHARS
         ? `${h.hint.slice(0, ACTION_HINT_RENDER.MAX_HINT_CHARS - 1).trimEnd()}…`
         : h.hint;
-    lines.push(`${h.action} ${h.status}${h.count > 1 ? ` ×${h.count}` : ""}${fromLabel(h.from)}: ${hint}`);
+    lines.push(`${h.action} ${h.status}${h.count > 1 ? ` ×${h.count}` : ""}${fromLabel(h)}: ${hint}`);
   }
   const rest = ordered.length - shown.length;
   if (rest > 0) lines.push(`(+${rest} other failure ${rest === 1 ? "status" : "statuses"} since the last result)`);
@@ -287,10 +336,10 @@ const HINT_CHARACTERS_SHOWN = 4;
  * characters and not with how many there are. The names ride the `from`
  * label's place on the line's head, where the hint cap never cuts them.
  */
-function groupHintsByCharacter(hints: readonly ActionHintNote[]): ActionHintNote[] {
-  const groups = new Map<string, { note: ActionHintNote; names: string[] }>();
+function groupHintsByCharacter(hints: readonly HintRow[]): HintRow[] {
+  const groups = new Map<string, { note: HintRow; names: string[] }>();
   for (const h of hints) {
-    const key = `${h.action}\n${h.status}\n${h.hint}\n${h.from ?? "\u0000"}`;
+    const key = `${h.action}\n${h.status}\n${h.hint}\n${h.froms === undefined ? "\u0000" : h.froms.join("\u0001")}`;
     const g = groups.get(key);
     const name = h.character ?? "?";
     if (g === undefined) {
@@ -315,9 +364,16 @@ function groupHintsByCharacter(hints: readonly ActionHintNote[]): ActionHintNote
  * the model wrote and can recognise (`sandbox/call-site.ts`). Nothing for the
  * current snippet's own hints.
  */
-function fromLabel(from: string | undefined): string {
-  if (from === undefined) return "";
-  return from === "" ? " (from an earlier snippet)" : ` (from an earlier snippet: ${from})`;
+function fromLabel(row: HintRow): string {
+  const froms = row.froms ?? (row.from === undefined ? undefined : [row.from]);
+  if (froms === undefined) return "";
+  // `""` is a routine nothing names any more: counted, never listed.
+  const named = froms.filter((f) => f !== "");
+  if (froms.length === 1) return named.length === 0 ? " (from an earlier snippet)" : ` (from an earlier snippet: ${named[0]})`;
+  if (named.length === 0) return " (from earlier snippets)";
+  const shown = named.slice(0, HINT_ORIGINS_SHOWN);
+  const rest = froms.length - shown.length;
+  return ` (from earlier snippets: ${shown.join("; ")}${rest > 0 ? `; +${rest}` : ""})`;
 }
 
 /**
@@ -592,7 +648,7 @@ export function serveEvents<C extends CoreToolContext>(
   if (includeMovement) {
     return { visible: scanned, folded: 0, text: scanned.length === 0 ? "no events yet" : scanned.map((e) => render.eventLine(e)).join("\n") };
   }
-  const ambient = (e: EventSummary): boolean => render.isAmbient(e.opcode);
+  const ambient = (e: EventSummary): boolean => render.isAmbient(e.opcode, e.data);
   // An event a child extension marked as a bystander's (a harness's
   // spell combat-log line nobody of ours is in) is left out as the
   // harness's own event window leaves it out; it is not movement, so it
@@ -615,13 +671,14 @@ export function serveEvents<C extends CoreToolContext>(
 
 /**
  * How a harness shows the core tools' answers: the event line and the state
- * summary are its context rendering, and which opcodes are ambient is its
- * context policy. `afterSnippet` is what a snippet result ends with after its
+ * summary are its context rendering, and which events are ambient is its
+ * context policy: by opcode, and by the event's data where an opcode carries
+ * both signal and noise. `afterSnippet` is what a snippet result ends with after its
  * hint block, if anything (a harness's "what changed since the last snippet").
  */
 export interface CoreToolRender<C extends CoreToolContext> {
   eventLine(e: EventSummary): string;
-  isAmbient(opcode: string): boolean;
+  isAmbient(opcode: string, data?: unknown): boolean;
   stateSummary(snapshot: Record<string, unknown>, o: { sessionLive: boolean }): string;
   afterSnippet?(ctx: C): Promise<string | undefined>;
 }
@@ -635,7 +692,7 @@ export function coreTools<C extends CoreToolContext>(render: CoreToolRender<C>):
       def: {
         name: "run_snippet",
         description:
-          "Execute a TypeScript snippet in the persistent game sandbox. Top-level bindings persist across snippets; `sdk`, `state`, `events`, `connect()`, `sleep(ms)`, `scratchpad` and `signal` (aborted if this snippet is abandoned) are ambient. A single expression returns its value. This is the only way to act in the world.",
+          "Execute a TypeScript snippet in the persistent game sandbox. Top-level bindings persist across snippets; `sdk`, `state`, `events`, `connect()`, `sleep(ms)`, `scratchpad` (its read(), write() and append() each return a Promise: `await scratchpad.read()`) and `signal` (aborted if this snippet is abandoned) are ambient. A single expression returns its value. This is the only way to act in the world.",
         inputSchema: {
           type: "object",
           properties: {

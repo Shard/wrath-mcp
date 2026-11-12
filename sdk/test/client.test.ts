@@ -775,7 +775,9 @@ describe("client: movement", () => {
     if (r2.ok) throw new Error("unreachable");
     expect(r2.status).toBe("path_incomplete");
     expect(r2.reachedPos).toEqual({ x: 5, y: 6, z: 7 });
-    expect(r2.hint).toContain("ends at (5.0, 6.0, z 7.0), 23y below the point asked for. ");
+    expect(r2.hint).toContain("ends at reachedPos (5.0, 6.0, z 7.0), 23y below the point asked for. ");
+    // The way out a stranded character has, named last.
+    expect(r2.hint).toEndWith('With no way out, unstuck() is the game\'s "I\'m stuck".');
 
     const p3 = client.moveTo({ x: 12, y: 20, z: 30 }, { timeout: 2000 });
     stub.push(JSON.stringify(moveResult("no_mesh", 3, 32)));
@@ -5733,13 +5735,15 @@ describe("client: a name in view is a referent", () => {
   test("sellItem's itemGuid stays strict — an item guid is not a unit in view", async () => {
     const stub = startStub({ onConnect: () => namedWorld() });
     const client = await inWorld(stub);
-    // The vendor resolves by name; the item does not, because there is no
-    // name-to-item-guid namespace to resolve it against — so a name there
-    // goes to the module as typed (and is refused there), never rewritten
-    // into the guid of a unit standing nearby.
-    // Nothing answers in the stub, so the sale times out; what matters is the wire.
-    await client.sellItem("thistle", "thistle", undefined, { timeout: 20 });
-    expect(stub.actions.at(-1)).toMatchObject({ action: "sell_item", guid: CREATURE_GUID, itemGuid: "thistle" });
+    // The vendor resolves by name; the item does not: a name there is never
+    // rewritten into the guid of a unit standing nearby, and never sent. It
+    // used to reach the module and come back as `invalid_guid`, worded for a
+    // unit ("pass unit.guid"); now the call says what the argument is.
+    expect(() => client.sellItem("thistle", "thistle", undefined, { timeout: 20 })).toThrow(
+      'sellItem(vendor, itemGuid): "thistle" is not an item guid. sellItem takes the item\'s own guid, ' +
+        "the .guid of its row in state.bag().items; no row there is named that",
+    );
+    expect(stub.actions.some((a) => a.action === "sell_item")).toBe(false);
     expect(() => client.sellItem("thistle", undefined as never)).toThrow(/sellItem\(\.\.\., itemGuid\)/);
     client.close();
     await stub.stop();

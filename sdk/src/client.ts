@@ -61,6 +61,8 @@ import {
   type ShowFrameData,
   type SpellFailureData,
   type SpellGoData,
+  type SpellNonMeleeDamageLogData,
+  type AttackerStateUpdateData,
   type SpellStartData,
   type InventoryChangeFailureData,
   type CastFailedData,
@@ -411,6 +413,22 @@ function aimFields(aim: CastAim): { itemTargetGuid?: string; destX?: number; des
     ...(aim.targetItem === undefined ? {} : { itemTargetGuid: aim.targetItem.guid }),
     ...(aim.targetPoint === undefined ? {} : { destX: aim.targetPoint.x, destY: aim.targetPoint.y, destZ: aim.targetPoint.z }),
   };
+}
+
+/**
+ * `sellItem`'s refusal of an item given by name: its second argument is the
+ * item's own guid. The bag rows of that name are listed with their guids, so
+ * the next call can pass one.
+ */
+function sellItemNameHint(state: StateCache, given: string): string {
+  const want = given.trim().toLowerCase();
+  const rows = state.bag().items.filter((i) => i.name !== undefined && i.name.toLowerCase() === want);
+  const head =
+    `sellItem(vendor, itemGuid): ${JSON.stringify(given)} is not an item guid. sellItem takes the item's own guid, ` +
+    `the .guid of its row in state.bag().items`;
+  if (rows.length === 0) return `${head}; no row there is named that`;
+  const shown = rows.slice(0, SHOWN_MATCHES).map((i) => `guid ${i.guid} (bag ${i.bag} slot ${i.slot})`).join(", ");
+  return `${head}; ${JSON.stringify(rows[0]!.name)} is there as ${shown}${rows.length > SHOWN_MATCHES ? `, +${rows.length - SHOWN_MATCHES} more` : ""}`;
 }
 
 /**
@@ -772,7 +790,13 @@ export class WrathTransportError extends Error {
  * hit). Keyed by decimal code as it appears in `char_create_failed_code_<N>`.
  */
 const CHAR_RESPONSE_HINTS: Record<number, string> = {
-  0x30: "character creation error",
+  // CHAR_CREATE_ERROR is the core's answer when `Player::Create` fails, and
+  // what fails it for a create this stack sends is a race and class with no
+  // starting data: a pair the game does not allow (a Human Hunter read a
+  // bare "character creation error").
+  0x30:
+    "character creation error: the server answers this for a race/class combination the game does not allow " +
+    "(a Human cannot be a Hunter in 3.3.5a) — choose a race and class that go together",
   0x31: "character creation failed",
   // The name is the model's own choice, so this one code is not a
   // dead end but a retry: say what to do about it, in the game's own rules.
@@ -867,7 +891,8 @@ const ERROR_CODE_HINTS: Record<string, string> = {
   character_missing_after_create: "the character did not appear after creation — retry createSession once",
   timeout: "the module's internal wait ran out — the world may be busy; retry once before assuming failure",
   invalid_guid:
-    "the guid did not parse as a decimal u64 string — pass unit.guid exactly as the state cache gave it, never a rounded number",
+    "the guid did not parse as a decimal u64 string — pass the .guid exactly as the state cache gave it " +
+    "(a unit's from state.units(), an item's from state.bag()), never a name or a rounded number",
   weak_token:
     "the session token is shorter than 32 characters — the module refuses guessable tokens; " +
     "the runner issues a random one per run, so this means a hand-passed token needs replacing",
@@ -1222,8 +1247,10 @@ export type MoveResult =
       /**
        * `path_incomplete`: how far the mesh could get toward the request (the
        * module already tried one subdivision from here); route around, or
-       * approach from another side. `drop`: the last point before the route
+       * approach from another side. For a flown leg it is how far the
+       * straight line is clear. `drop`: the last point before the route
        * steps off a ledge — the edge, on the level the route reached it on.
+       * The point the hint names: read it here, not out of the hint's text.
        */
       readonly reachedPos?: Point3;
       /**
@@ -1293,10 +1320,10 @@ export const MOVE_HINTS: Readonly<Record<string, (point: MovePoint, data: MoveRe
   path_incomplete: (p, d) =>
     d.flight === true
       ? `the straight flight line to (${fmtXY(p)}, z ${p.z.toFixed(1)}) runs into terrain or a building` +
-        (d.reachedPos ? `; it is clear as far as (${fmtXY(d.reachedPos)}, z ${d.reachedPos.z.toFixed(1)})` : "") +
+        (d.reachedPos ? `; it is clear as far as reachedPos (${fmtXY(d.reachedPos)}, z ${d.reachedPos.z.toFixed(1)})` : "") +
         `. Fly higher (a point well above the ground between) or around it, in a leg or two.`
       : `the walkable mesh has no continuous route to (${fmtXY(p)})` +
-        (d.reachedPos ? `; it ends at (${fmtXY(d.reachedPos)}, z ${d.reachedPos.z.toFixed(1)})${heightGap(d.reachedPos.z - p.z)}` : "") +
+        (d.reachedPos ? `; it ends at reachedPos (${fmtXY(d.reachedPos)}, z ${d.reachedPos.z.toFixed(1)})${heightGap(d.reachedPos.z - p.z)}` : "") +
         `. The module already tried one subdivision. Route around (a road, a ramp, a door) or approach from ` +
         `another side.`,
   drop: (p, d) => {
@@ -1359,6 +1386,12 @@ const ASYNC_MOVE_UNREPORTED: ReadonlySet<string> = new Set(["arrived", "transfer
  * route, costs no more than this.
  */
 const ASYNC_MOVE_VERDICT_MS = 250;
+
+/**
+ * What a `path_incomplete` and a climb's `drop` end on: `unstuck()` named, and
+ * no more. Its first call sends nothing and says what a second will do.
+ */
+const UNSTUCK_POINTER = 'With no way out, unstuck() is the game\'s "I\'m stuck".';
 
 /** The refusal of a move while dead and not released; nothing is sent. */
 const DEAD_MOVE_HINT =
@@ -1906,7 +1939,15 @@ export function longRouteNote(
  */
 export type MoveToAsyncResponse =
   | (MoveToResponse & { readonly hint?: string })
-  | { readonly ok: false; readonly action: string; readonly moveId: number; readonly status: string; readonly hint?: string }
+  | {
+      readonly ok: false;
+      readonly action: string;
+      readonly moveId: number;
+      readonly status: string;
+      /** `path_incomplete` and `drop`: the point the hint names, as `MoveResult.reachedPos`. */
+      readonly reachedPos?: Point3;
+      readonly hint?: string;
+    }
   | { readonly ok: false; readonly status: "dead" | "unknown_target"; readonly hint: string; readonly action?: undefined; readonly moveId?: undefined };
 
 export interface WaitForTransferOptions {
@@ -2420,6 +2461,44 @@ const LOOT_REFUSED_HINTS: Record<LootErrorName, string> = {
 };
 
 /**
+ * Why `none_stored`: the inventory refusals the server sent while the window
+ * was open (a full bag is `SMSG_INVENTORY_CHANGE_FAILURE` per slot it could
+ * not store), each named once as the client would show it. With none, that
+ * the server gave no reason.
+ */
+function noneStoredHint(shown: number, refusals: readonly number[]): string {
+  const head = `the loot window showed ${shown} item${shown === 1 ? "" : "s"} and none entered your bags`;
+  const said = [...new Set(refusals)].map((code) => `${inventoryResultText(code) ?? "inventory error"} (inventory result ${code})`);
+  if (said.length === 0) return `${head}, and the server gave no reason; they are still there to loot`;
+  return `${head}: ${said.join("; ")}, so they are still there to loot`;
+}
+
+/**
+ * What the cache can say about a loot the server never answered: the core
+ * drops `CMSG_LOOT` without a word from a dead character and for anything
+ * but a creature, and the rest is what a client would check: is it in view,
+ * how far, does it show as lootable.
+ */
+function lootSilenceNote(state: StateCache, guid: string): string {
+  if (state.self.health?.value.current === 0 || state.self.ghost?.value === true) {
+    return "you are dead, and the server ignores a loot from a dead character";
+  }
+  const obj = state.nearby.get(guidKey(guid));
+  if (obj === undefined) return `${guid} is not in view`;
+  const name = obj.name?.value ?? guid;
+  const type = obj.objectType?.value;
+  if (type !== undefined && type !== "unit") return `${name} is a ${type}, and the server opens this window only on a creature's corpse`;
+  const row = state.units().find((u) => u.guid === guidKey(guid));
+  const distance = distanceToUnit(state, guid);
+  const facts = [
+    distance === undefined ? undefined : `${Math.round(distance)}y away`,
+    row?.dead === false ? "alive" : undefined,
+    row?.lootable === false ? "not showing as lootable (state.units() lootable)" : undefined,
+  ].filter((f): f is string => f !== undefined);
+  return facts.length === 0 ? `${name} is in view` : `${name} is ${facts.join(", ")}`;
+}
+
+/**
  * What a corpse actually gave up. `items` are the pushes the server confirmed
  * with `SMSG_ITEM_PUSH_RESULT` — reporting the loot *window* contents as a
  * success would call a possible no-op "looted", which is exactly the silent
@@ -2430,7 +2509,7 @@ const LOOT_REFUSED_HINTS: Record<LootErrorName, string> = {
  * - `empty`: the server closed the window at once — nothing was on the corpse.
  * - `none_stored`: the window showed items but not one entered the bag
  *   (bags full, or the items were not ours to take); `window` says what was
- *   shown.
+ *   shown, and `hint` the inventory refusal the server sent, if it sent one.
  * - `refused`: the server answered with the refusal form of
  *   `SMSG_LOOT_RESPONSE` instead of a window — too far, not ours to loot,
  *   someone else looting it, and so on (`LOOT_ERROR_NAMES`). Nothing opened,
@@ -2464,7 +2543,8 @@ export type LootResult =
       readonly gold: number;
       readonly items: readonly [];
       readonly window: readonly LootItemData[];
-      readonly hint?: string;
+      /** Why nothing was stored (`noneStoredHint`), then any group roll open on a slot. */
+      readonly hint: string;
     }
   | {
       /** The server refused to open a window: `SMSG_LOOT_RESPONSE` in its error form. */
@@ -2761,9 +2841,17 @@ const CAST_FAILURE_MEANING: Readonly<Record<string, string>> = {
   unit_not_infront: "the target is not in front of you; sdk.face({ x: target.x, y: target.y }) turns you to it",
   not_infront: "you are not facing the target",
   caster_dead: "you are dead",
-  interrupted: "the cast was interrupted (moving or acting during it)",
+  // An interrupt names no cause on the wire. `castVerdict` says more for a
+  // `castSpell` it watched (`INTERRUPT_NO_CAUSE` when it saw none).
+  interrupted: "the cast was interrupted",
   no_power: "not enough mana, rage or energy",
   moving: "you were moving, and a cast with a cast time needs you standing still",
+  // What `castVerdict` can tell an interrupt came from, beside a move and
+  // a death: the keys are its own, not the core's.
+  interrupted_by_loot: "your own loot interrupted it: the server ends a cast in progress to open a loot window",
+  interrupted_by_cancel: "your own cancelCast ended it",
+  interrupted_stunned: "you were stunned during it",
+  interrupted_target_gone: "its target is no longer in view, and the server ends a cast whose target is gone",
   not_ready: "its cooldown, or the global cooldown, is still running",
   spell_in_progress: "another cast was still in progress",
   bad_targets:
@@ -2792,7 +2880,15 @@ const CAST_FAILURE_MEANING: Readonly<Record<string, string>> = {
   // Revenges that wanted a dodge, block or parry first. The stance a spell
   // needs is its Spell.dbc Stances mask, which nothing serves, so
   // only_shapeshift says no more than that the form is wrong.
-  caster_aurastate: "needs a state first (e.g. after a dodge, parry or block)",
+  // caster_aurastate is the core's one answer for four checks
+  // (`Spell::CheckCast`: an aura state or an aura the caster must have, and
+  // one of each it must not), and which of them a spell makes is Spell.dbc
+  // knowledge nothing serves: a paladin read a warrior's example (a dodge,
+  // parry or block) about 170 times for casts an effect on it ruled out. So
+  // it names both sides and where the caster's own auras are read.
+  caster_aurastate:
+    "you are not in the state it needs: an effect it requires on you is missing, or one you carry rules it out " +
+    "(yours: state.aurasOf(state.self.guid))",
   target_aurastate: "the target is not in the state this spell needs (e.g. low enough health)",
   only_shapeshift: "needs a different stance or form",
   not_shapeshift: "it cannot be cast in your current stance or form",
@@ -2804,6 +2900,9 @@ const CAST_FAILURE_MEANING: Readonly<Record<string, string>> = {
   only_stealthed: "it needs you to be stealthed",
   only_outdoors: "it can only be cast outdoors",
   only_indoors: "it can only be cast indoors",
+  only_abovewater: "it cannot be cast while you are in water",
+  aura_bounced: "a more powerful spell is already active on the target",
+  incorrect_area: "it cannot be cast in this area",
   not_mounted: "you are mounted",
   only_mounted: "you must be mounted",
   fleeing: "you are fleeing (feared) and cannot act",
@@ -2849,7 +2948,15 @@ const CAST_FAILURE_WEAPON_SLOT: Readonly<Record<string, { slot: number; words: s
  * and its target by name where the cache has them, so a failure raised in a
  * background routine says which cast it was.
  */
-function castFailedHint(state: StateCache, cast: PendingCast, reason: string, cause: string = reason, casting?: string): string {
+function castFailedHint(
+  state: StateCache,
+  cast: PendingCast,
+  reason: string,
+  cause: string = reason,
+  casting?: string,
+  /** The meaning in words of its own, for a cause no table row can hold (`sameInstantHit`, a cooldown's time left). */
+  said?: string,
+): string {
   cause = aimedCause(cast, cause);
   if (cause === "bad_targets") cause = badTargetsCause(state, cast);
   const spell = state.spell(cast.spellId)?.name;
@@ -2866,9 +2973,10 @@ function castFailedHint(state: StateCache, cast: PendingCast, reason: string, ca
   // the 2026-10-21 mage's routine sent a cast 11 ms after the last one and
   // read not_ready as a cooldown.
   const meaning =
-    casting !== undefined && cause === "not_ready"
+    said ??
+    (casting !== undefined && cause === "not_ready"
       ? `you are still casting ${casting}; ${CAST_FAILURE_MEANING.not_ready}`
-      : CAST_FAILURE_MEANING[cause];
+      : CAST_FAILURE_MEANING[cause]);
   // A weapon-slot refusal with the slot's own item observed broken says
   // which item: the durability fields are what the client's tooltip reads.
   const weapon = CAST_FAILURE_WEAPON_SLOT[reason];
@@ -2915,6 +3023,96 @@ function castInProgress(state: StateCache, now: number): string | undefined {
   if (c === undefined || c.endsAt <= now) return undefined;
   const label = c.name === undefined ? `spell ${c.spellId}` : `${c.name} (${c.spellId})`;
   return `${label}, ${((c.endsAt - now) / 1000).toFixed(1)}s left`;
+}
+
+/**
+ * The longest the global cooldown runs after a cast, in ms: a cast of our
+ * own more recent than this is named beside a `not_ready`.
+ */
+const GLOBAL_COOLDOWN_MAX_MS = 1500;
+
+/** A span as a hint says it: "0.4s", "42s", "about 3 min". */
+function fmtSpan(ms: number): string {
+  if (ms < 10_000) return `${(Math.max(0, ms) / 1000).toFixed(1)}s`;
+  if (ms < 90_000) return `${Math.round(ms / 1000)}s`;
+  return `about ${Math.round(ms / 60_000)} min`;
+}
+
+/**
+ * What a `not_ready` can say past its meaning, from what this client has
+ * seen: the time left on a cooldown the server announced (`state.cooldowns()`),
+ * else when the spell last went off and, inside the global cooldown's reach,
+ * which other cast of ours just did. A cooldown's length is Spell.dbc
+ * knowledge nothing serves, and the server announces few (module/PROTOCOL.md),
+ * so mostly it is the second: the caller's own casts, timed. Undefined when
+ * neither was seen.
+ */
+function notReadyDetail(
+  state: StateCache,
+  spellId: number,
+  now: number,
+  lastGo: number | undefined,
+  lastAny: { readonly spellId: number; readonly ts: number } | undefined,
+): string | undefined {
+  const announced = state.cooldowns(now).find((c) => c.spellId === spellId);
+  if (announced?.readyAt !== undefined && Number.isFinite(announced.readyAt)) {
+    return `its cooldown has ${fmtSpan(announced.readyAt - now)} left (state.cooldowns())`;
+  }
+  const seen: string[] = [];
+  if (lastGo !== undefined && lastGo <= now) seen.push(`it last went off ${fmtSpan(now - lastGo)} ago`);
+  if (lastAny !== undefined && lastAny.spellId !== spellId && lastAny.ts <= now && now - lastAny.ts <= GLOBAL_COOLDOWN_MAX_MS) {
+    seen.push(`${state.spell(lastAny.spellId)?.name ?? `spell ${lastAny.spellId}`} went off ${fmtSpan(now - lastAny.ts)} ago`);
+  }
+  return seen.length === 0 ? undefined : `${CAST_FAILURE_MEANING.not_ready} (${seen.join("; ")})`;
+}
+
+/**
+ * An interrupted `castSpell` with nothing seen beside it: the server's
+ * silence said as that, with what was looked for and not found.
+ */
+const INTERRUPT_NO_CAUSE =
+  "the cast was interrupted, and the server names no cause: no move, loot or cancel of yours, no stun and no hit " +
+  "on you came with it";
+
+/**
+ * How close in time (ms, by the module's stamps) a hit on us must precede an
+ * interrupt to be named beside it. The core interrupts inside the hit's own
+ * handling, so the two leave in one world tick, the hit first.
+ */
+const INTERRUPT_HIT_WINDOW_MS = 20;
+/** How many buffered events back `sameInstantHit` looks; a tick's burst is far shorter. */
+const INTERRUPT_HIT_LOOKBACK = 64;
+
+/**
+ * What landed on us in the instant before `failure`: another unit's melee
+ * swing, a spell's damage, or a spell that hit us with none (a kick, a stun).
+ * Said as what was seen beside the interrupt, never as its cause: which
+ * casts a hit ends is Spell.dbc knowledge nothing serves. Undefined when
+ * nothing did, or our own guid is not known yet.
+ */
+function sameInstantHit(state: StateCache, recent: readonly StreamEvent[], failure: StreamEvent): string | undefined {
+  const self = state.self.guid;
+  if (self === undefined) return undefined;
+  const unit = (guid: string): string => {
+    const key = guidKey(guid);
+    return state.nearby.get(key)?.name?.value ?? state.nameOf(key) ?? `unit ${key}`;
+  };
+  for (let i = recent.length - 1; i >= 0; i--) {
+    const e = recent[i]!;
+    if (e.seq >= failure.seq || isDecodeError(e.data)) continue;
+    if (e.ts < failure.ts - INTERRUPT_HIT_WINDOW_MS) break;
+    if (isEvent(e, "SMSG_ATTACKERSTATEUPDATE")) {
+      const d = e.data as AttackerStateUpdateData;
+      if (guidKey(d.victimGuid) === self && guidKey(d.attackerGuid) !== self && !d.miss) return `${unit(d.attackerGuid)}'s melee hit`;
+    } else if (isEvent(e, "SMSG_SPELLNONMELEEDAMAGELOG")) {
+      const d = e.data as SpellNonMeleeDamageLogData;
+      if (guidKey(d.targetGuid) === self && guidKey(d.casterGuid) !== self) return `${unit(d.casterGuid)}'s ${d.name ?? `spell ${d.spellId}`}`;
+    } else if (isEvent(e, "SMSG_SPELL_GO")) {
+      const d = e.data as SpellGoData;
+      if (guidKey(d.casterGuid) !== self && d.hitGuids.some((g) => guidKey(g) === self)) return `${unit(d.casterGuid)}'s spell ${d.spellId}`;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -4211,7 +4409,9 @@ function unstuckFailedHint(reason: string | undefined, result: number): string {
           ? ": it cannot begin while you move, so stand still"
           : reason === "interrupted"
             ? ": its 10-second cast was interrupted (moving does that), so stand still until it ends"
-            : "";
+            : reason === "not_mounted"
+              ? ": it cannot be cast mounted, so dismount() first"
+              : "";
   return `${head}${why}. A new attempt asks for confirmation again.`;
 }
 
@@ -4418,6 +4618,14 @@ export class WrathClient {
 
   /** Until when (epoch ms) a first `unstuck()` stays armed for the confirming call; undefined when not armed. */
   private unstuckArmedUntil: number | undefined;
+  /** When each spell of ours last went off (`SMSG_SPELL_GO`, the module's stamp), for a `not_ready` to say (`notReadyDetail`). */
+  private readonly ownCastAt = new Map<number, number>();
+  /** The last cast of ours that went off, whatever the spell. */
+  private lastOwnCast: { readonly spellId: number; readonly ts: number } | undefined;
+  /** When this client last sent `CMSG_LOOT` (epoch ms): the server ends a cast in progress to open the window. */
+  private ownLootAt: number | undefined;
+  /** The last `cancelCast` this client sent: an interrupt of that spell after it is the cancel's own. */
+  private ownCancel: { readonly at: number; readonly spellId: number } | undefined;
 
   /**
    * The last `move_to` this client sent: when, and its moveId once acked. With
@@ -4481,6 +4689,13 @@ export class WrathClient {
     // cache first: the client-parity queries read what each event left in it.
     this.events.onAny((event: StreamEvent) => this.state.apply(event));
     this.events.onAny((event: StreamEvent) => this.clientParityQueries(event));
+    this.events.on("SMSG_SPELL_GO", (event: StreamEvent) => {
+      if (isDecodeError(event.data)) return;
+      const d = event.data as SpellGoData;
+      if (this.state.self.guid === undefined || guidKey(d.casterGuid) !== this.state.self.guid) return;
+      this.ownCastAt.set(d.spellId, event.ts);
+      this.lastOwnCast = { spellId: d.spellId, ts: event.ts };
+    });
     this.events.onAny((event: StreamEvent) => this.castVerdict(event));
     this.events.onAny((event: StreamEvent) => this.watchOwnJump(event));
     this.events.on("WB_MOVE_RESULT", (e) => {
@@ -4936,7 +5151,15 @@ export class WrathClient {
         if (verdict !== undefined && !ASYNC_MOVE_UNREPORTED.has(status_(verdict))) {
           const status = status_(verdict);
           const hint = this.asyncMoveRecipe(status, resolved.point, verdict);
-          return { ok: false, action: ack.action, moveId: ack.moveId, status, ...(hint !== undefined ? { hint } : {}) };
+          const r = verdict.reachedPos;
+          return {
+            ok: false,
+            action: ack.action,
+            moveId: ack.moveId,
+            status,
+            ...(r !== undefined ? { reachedPos: { x: r.x, y: r.y, z: r.z } } : {}),
+            ...(hint !== undefined ? { hint } : {}),
+          };
         }
         const note =
           from === undefined || ack.pathLength === undefined
@@ -5003,10 +5226,17 @@ export class WrathClient {
     // A ground refusal for a character that can fly: the flight is the
     // caller's to ask for, never taken on its own (operator decision).
     const noGround = GROUND_REFUSALS.has(status) && !(status === "drop" && (data.dz === undefined || data.dz < 0));
-    if (recipe !== undefined && noGround && data.flight !== true && this.state.self.canFly?.value === true) {
-      return `${recipe} You can fly here (state.self.canFly): moveTo(p, { fly: true }) flies a straight line to the point.`;
-    }
-    return recipe;
+    if (recipe === undefined) return undefined;
+    const fly =
+      noGround && data.flight !== true && this.state.self.canFly?.value === true
+        ? " You can fly here (state.self.canFly): moveTo(p, { fly: true }) flies a straight line to the point."
+        : "";
+    // The two refusals a stranded character meets at every turn, a route
+    // that ends and a step that cannot be climbed, name the client's own way
+    // out (operator decision, 2026-11-12). Last, after the flight a flyer
+    // has, so the harness block's cut takes it first.
+    const stranded = status === "path_incomplete" || (status === "drop" && data.dz !== undefined && data.dz > 0);
+    return `${recipe}${fly}${stranded ? ` ${UNSTUCK_POINTER}` : ""}`;
   }
 
   /**
@@ -5366,30 +5596,45 @@ export class WrathClient {
       return;
     }
     if (status !== "interrupted") {
-      this.tallyActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status));
+      const said =
+        status === "not_ready"
+          ? notReadyDetail(this.state, cast.spellId, event.ts, this.ownCastAt.get(cast.spellId), this.lastOwnCast)
+          : undefined;
+      this.tallyActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status, status, undefined, said));
       return;
     }
-    // An interrupt has two causes this client can tell apart from the rest:
-    // its own move (one sent while the cast was running, or still walking
-    // when it started), and its own death — which the core interrupts
-    // inside, so health 0 lands just after the failure. Each is said with
-    // the meaning of the refusal it amounts to.
-    if (this.ownMoveSince(cast.sentAt)) {
-      this.tallyActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status, "moving"));
-      return;
+    // An interrupt names no cause on the wire: the core answers every
+    // cancel `interrupted` (`Spell::cancel`). What this client can tell
+    // apart is what it sent itself during the cast (a move, a loot, a
+    // cancel), its own death or stun (the core interrupts inside either, so
+    // health 0 or the stunned flag lands just after the failure), a target
+    // that left view, and a hit that landed in the same instant. Each is
+    // said with the meaning of the refusal it amounts to; with none of
+    // them, that the server gave no cause.
+    const tally = (cause: string, said?: string): void =>
+      this.tallyActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status, cause, undefined, said));
+    if (this.ownMoveSince(cast.sentAt)) return tally("moving");
+    if (this.ownLootAt !== undefined && this.ownLootAt >= cast.sentAt) return tally("interrupted_by_loot");
+    if (this.ownCancel !== undefined && this.ownCancel.at >= cast.sentAt && this.ownCancel.spellId === cast.spellId) {
+      return tally("interrupted_by_cancel");
     }
     const dead = (): boolean => this.state.self.health?.value.current === 0 || this.state.self.ghost?.value === true;
-    if (dead()) {
-      this.tallyActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status, "caster_dead"));
-      return;
-    }
+    const stunned = (): boolean => this.state.self.stunned?.value === true;
+    const later = (): string | undefined => (dead() ? "caster_dead" : stunned() ? "interrupted_stunned" : undefined);
+    const now = later();
+    if (now !== undefined) return tally(now);
     // Noted now, so a drain in between still carries it, and reworded in
-    // place (the count unchanged) if the death follows.
-    this.tallyActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status));
+    // place (the count unchanged) if the death or the stun follows.
+    const target = cast.targetGuid === undefined ? undefined : guidKey(cast.targetGuid);
+    const hit = sameInstantHit(this.state, this.events.recent(INTERRUPT_HIT_LOOKBACK), event);
+    if (target !== undefined && target !== this.state.self.guid && !this.state.nearby.has(target)) tally("interrupted_target_gone");
+    else if (hit !== undefined) {
+      tally(status, `it was interrupted in the same instant ${hit} landed on you; the server names no cause, and a hit or an interrupt effect ends some casts`);
+    } else tally(status, INTERRUPT_NO_CAUSE);
     this.events
-      .waitFor(() => dead(), { timeout: CAST_DEATH_WINDOW_MS, includeBuffered: false, description: "own death after an interrupt" })
+      .waitFor(() => later() !== undefined, { timeout: CAST_DEATH_WINDOW_MS, includeBuffered: false, description: "own death or stun after an interrupt" })
       .then(
-        () => this.rewordActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status, "caster_dead")),
+        () => this.rewordActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status, later() ?? status)),
         () => {},
       );
   }
@@ -5431,6 +5676,7 @@ export class WrathClient {
 
   /** `CMSG_CANCEL_CAST`. */
   cancelCast(spellId: number): Promise<ActionResponse> {
+    this.ownCancel = { at: Date.now(), spellId };
     return this.action({ action: "cancel_cast", spellId });
   }
 
@@ -5697,6 +5943,10 @@ export class WrathClient {
     // The vendor is a unit in view and takes a name; `itemGuid` is an item's
     // own guid, which is not in that namespace — there is no name-to-item-guid
     // resolver, so it stays the strict guid string.
+    // A name here used to reach the wire and come back as the module's
+    // `invalid_guid`, worded for a unit; it is answered here, with the guid
+    // the bags hold that name under.
+    if (typeof itemGuid === "string" && !GUID_TEXT.test(itemGuid.trim())) throw new TypeError(sellItemNameHint(this.state, itemGuid));
     const item = guidArg(itemGuid, "sellItem(..., itemGuid)");
     return this.byName(target, "sellItem(guid, ...)", (guid) => this.sellAndConfirm(guid, item, count, options.timeout ?? 3000));
   }
@@ -6102,7 +6352,20 @@ export class WrathClient {
       return { ok: false, status: "refused", result: code, hint };
     }
     if (isEvent(first, "SMSG_LOOT_RELEASE_RESPONSE")) return { ok: false, status: "empty", gold: 0, items: [] };
-    return this.emptyLootWindow(first, first.data as LootWindowData, stored, timeout, item.guid);
+    // What the server refuses to store from here on, for `none_stored` to say.
+    const refusals: number[] = [];
+    const offRefusal = this.events.on("SMSG_INVENTORY_CHANGE_FAILURE", (e: StreamEvent) => {
+      if (isDecodeError(e.data) || e.seq <= first.seq) return;
+      const d = e.data as InventoryChangeFailureData;
+      if (d.result !== 0) refusals.push(d.result);
+    });
+    try {
+      const out = await this.emptyLootWindow(first, first.data as LootWindowData, stored, timeout, item.guid, refusals);
+      if (out.status === "none_stored") this.noteActionHint("useItem", "none_stored", out.hint);
+      return out;
+    } finally {
+      offRefusal();
+    }
   }
 
   /**
@@ -8898,6 +9161,14 @@ export class WrathClient {
         const d = e.data as ItemPushResultData;
         if (d.looted) stored.push({ itemId: d.itemId, count: d.count });
       });
+      // The server's word on a slot it could not store (bags full, a unique
+      // item already held), for `none_stored` to say.
+      const refusals: number[] = [];
+      const offRefusal = this.events.on("SMSG_INVENTORY_CHANGE_FAILURE", (e: StreamEvent) => {
+        if (isDecodeError(e.data) || (sinceSeq !== undefined && e.seq <= sinceSeq)) return;
+        const d = e.data as InventoryChangeFailureData;
+        if (d.result !== 0) refusals.push(d.result);
+      });
       try {
         const chest = this.isChest(id);
         let first: StreamEvent;
@@ -8920,13 +9191,23 @@ export class WrathClient {
           first = opened.window;
         } else {
           await this.lootAll(id);
-          first = await this.waitEvent(
-            (e) =>
-              (isEvent(e, "SMSG_LOOT_RESPONSE") || isEvent(e, "SMSG_LOOT_RELEASE_RESPONSE")) &&
-              !isDecodeError(e.data) &&
-              (sinceSeq === undefined || e.seq > sinceSeq),
-            { timeout, description: "the loot window (SMSG_LOOT_RESPONSE or SMSG_LOOT_RELEASE_RESPONSE)" },
-          );
+          try {
+            first = await this.waitEvent(
+              (e) =>
+                (isEvent(e, "SMSG_LOOT_RESPONSE") || isEvent(e, "SMSG_LOOT_RELEASE_RESPONSE")) &&
+                !isDecodeError(e.data) &&
+                (sinceSeq === undefined || e.seq > sinceSeq),
+              { timeout, description: "the loot window (SMSG_LOOT_RESPONSE or SMSG_LOOT_RELEASE_RESPONSE)" },
+            );
+          } catch (e) {
+            // Silence, still thrown: but said with what the cache shows of
+            // the corpse now, as a questgiver's silence names its distance.
+            if (!(e instanceof EventTimeoutError)) throw e;
+            throw withDistance(
+              new EventTimeoutError(e.timeoutMs, `${e.waitingFor ?? "the loot window"}: the server sent neither; ${lootSilenceNote(this.state, id)}`),
+              distanceToUnit(this.state, id),
+            );
+          }
         }
         if (first.opcode === "SMSG_LOOT_RELEASE_RESPONSE") {
           return { ok: false, status: "empty", gold: 0, items: [] };
@@ -8949,9 +9230,12 @@ export class WrathClient {
         }
         // The module's auto-loot replay rides on `loot_all`, which a chest
         // never goes through; the client's sequence is sent from here.
-        return await this.emptyLootWindow(first, response, stored, timeout, chest ? id : undefined);
+        const out = await this.emptyLootWindow(first, response, stored, timeout, chest ? id : undefined, refusals);
+        if (out.status === "none_stored") this.noteActionHint("lootCorpse", "none_stored", out.hint);
+        return out;
       } finally {
         offPush();
+        offRefusal();
       }
     });
   }
@@ -8972,6 +9256,8 @@ export class WrathClient {
     stored: StoredLootItem[],
     timeout: number,
     releaseGuid: string | undefined,
+    /** Inventory refusals seen since the loot was asked for, still being collected (`noneStoredHint`). */
+    refusals: readonly number[] = [],
   ): Promise<Extract<LootResult, { status: "looted" | "none_stored" }>> {
     // What the replay will try to store: slots free to loot (0, ALLOW_LOOT)
     // or owned outright (4, OWNER — every slot of a solo loot). Group-only
@@ -9010,7 +9296,10 @@ export class WrathClient {
     const frames = this.state.pendingRolls(now).filter((r) => rolling.some((i) => i.slot === r.slot && i.itemId === r.itemId));
     const roll = frames.length > 0 ? { hint: openRollsHint(frames, now) } : {};
     if (expected > 0 && stored.length === 0) {
-      return { ok: false, status: "none_stored", gold: window.gold, items: [], window: window.items, ...roll };
+      // Why nothing was stored, then any roll still open on another slot.
+      const why = noneStoredHint(expected, refusals);
+      const hint = roll.hint === undefined ? why : `${why}. ${roll.hint}`;
+      return { ok: false, status: "none_stored", gold: window.gold, items: [], window: window.items, hint };
     }
     return { ok: true, status: "looted", gold: window.gold, items: stored, window: window.items, ...roll };
   }
@@ -10032,6 +10321,8 @@ export class WrathClient {
 
   /** One `POST /action`, with the session token filled in. */
   private action(body: ActionBody): Promise<ActionResponse> {
+    // `CMSG_LOOT` ends a cast in progress (`HandleLootOpcode`): see `castVerdict`.
+    if (body.action === "loot" || body.action === "loot_all") this.ownLootAt = Date.now();
     const sent = this.request("POST", "/action", { token: this.token, ...body }, actionResponseSchema);
     if (!QUEST_EXCHANGE_ACTIONS.has(body.action)) return sent;
     return sent.then((ack) => {
