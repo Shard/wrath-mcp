@@ -57,14 +57,16 @@ describe("sessions", () => {
 });
 
 describe("the character at the end of its trace", () => {
-  test("the fixture's last window: its gauges, sheet and quest log", async () => {
+  test("the fixture's last window: its gauges, sheet, item names and quest log", async () => {
     const h = (await storeSource(root).open(CLOSED_ID, OPERATOR))!;
     const found = (await traceSegment(h, FIXTURE_T0 + 300_000, NOW + 3_600_000))!;
     const seg = decoded(found.segment)!;
     const c = characterAt(seg, segmentEnd(seg), 1);
     expect(c.gauges.level).not.toBeNull();
     expect(c.map).not.toBeNull();
-    expect(c.items === null || Array.isArray(c.items)).toBe(true);
+    // The worn hatchet rolled a random property, named as the client names it.
+    expect(c.items?.find((i) => i.slot === 15 && i.equipped)?.name).toBe("Brindle Hatchet of the Hare");
+    expect(c.items?.find((i) => i.slot === 4 && i.equipped)?.name).toBe("Wayfarer's Tunic");
     expect(c.powerType).toBeDefined();
     expect(decoded(null)).toBeNull();
   });

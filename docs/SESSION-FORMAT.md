@@ -204,9 +204,14 @@ characters. Neither is state: neither is in a `key` row or a fold, and the
 same value twice is two events. A chat line never carries a recipient.
 
 **The dictionary.** `items` is `[itemId, quality, name][]` (the item
-template's name, never an instance's suffix or description) and `quests` is
-`[questId, [c0, c1, c2, c3, [itemId, count]...]][]`, a quest's required
-counts. A segment's `key` row carries the entries its sheet references, and a
+template's name, never its description), `rands` is `[rand, suffix][]`, the
+name suffix ("of the Bear") of a random property id that `equip` or `inv`
+carries, and `quests` is `[questId, [c0, c1, c2, c3, [itemId, count]...]][]`,
+a quest's required counts. An item that has a `rand` is named as the client
+names it, the template's name, a space and the suffix; the suffix is the
+client's own `ItemRandomProperties.dbc` or `ItemRandomSuffix.dbc` text for
+that id, so one id always has one suffix and no row carries any text. A
+segment's `key` row carries the entries its sheet references, and a
 `dict` row carries any entry a later row of the same segment needs, ahead of
 that row when the entry was known by then. An id whose name the client was
 never told has no entry.

@@ -40,8 +40,8 @@ export interface InvItem {
   bag?: number | null;
   /**
    * The instance's random property id, negative for a random suffix, when the
-   * trace's sheet says it has one. The sheet names an item by its template, so
-   * the suffix reaches the reader only through the Wowhead link carrying it.
+   * trace's sheet says it has one. Its name suffix is on `name` when the
+   * segment's dictionary names it, and the Wowhead link carries the id.
    */
   rand?: number | null;
   /** A worn item's durability, current and maximum, when the trace's sheet carries it. */
@@ -120,6 +120,8 @@ export function splitLinked(
 export type SheetInventory = Pick<TraceSheet, "equip" | "inv" | "dur">;
 
 type Names = ReadonlyMap<number, TraceItemName>;
+/** A random property's name suffix, by its signed id. */
+type Suffixes = ReadonlyMap<number, string>;
 type Row = readonly number[];
 
 /** What one dictionary last built, so a sheet whose lists are the same arrays gets the same array back. */
@@ -127,6 +129,7 @@ interface Built {
   equip: Row[] | null;
   inv: Row[] | null;
   dur: Row[] | null;
+  suffixes: Suffixes;
   out: InvItem[];
 }
 
@@ -141,6 +144,8 @@ const BACKPACK_LAST_SLOT = 38;
  */
 const inABag = (row: Row): boolean => row[0] !== 255 || row[1]! <= BACKPACK_LAST_SLOT;
 
+const NO_SUFFIXES: Suffixes = new Map();
+
 /** Per segment dictionary: the names are a segment's, and one segment's rows are read against its own. */
 const builds = new WeakMap<Names, Built>();
 
@@ -154,22 +159,24 @@ let lastRows = new Map<string, InvItem>();
 let lastOut: InvItem[] = [];
 
 /**
- * The label a row is shown by, as the 60 s state line writes one
- * (`itemSample` in `runner/src/loop.ts`): the template's name, else `item
- * <id>` (which `entryOf` still links), else the slot for an item the cache has
- * not seen created yet.
+ * The label a row is shown by, as the client names the item (and the SDK's
+ * `bag()` does): the template's name and its random property's suffix when
+ * the dictionary names one ("Sentry's Leggings of the Bear"), else the
+ * template's name, else `item <id>` (which `entryOf` still links), else the
+ * slot for an item the cache has not seen created yet.
  */
-function labelOf(names: Names, itemId: number, slot: number): string {
+function labelOf(names: Names, itemId: number, slot: number, suffix: string | undefined): string {
   const name = itemId > 0 ? names.get(itemId)?.[1] : undefined;
-  return name ?? (itemId > 0 ? `item ${itemId}` : `slot ${slot}`);
+  if (name !== undefined) return suffix === undefined ? name : `${name} ${suffix}`;
+  return itemId > 0 ? `item ${itemId}` : `slot ${slot}`;
 }
 
-function rowItem(names: Names, row: Row, worn: boolean, dur: Row | undefined): InvItem {
+function rowItem(names: Names, row: Row, worn: boolean, dur: Row | undefined, suffix: string | undefined): InvItem {
   const [a, b, itemId] = worn ? [undefined, row[0]!, row[1]!] : [row[0]!, row[1]!, row[2]!];
   const quality = itemId > 0 ? names.get(itemId)?.[0] : undefined;
   const rand = worn ? row[2] : row[4];
   return {
-    name: labelOf(names, itemId, b),
+    name: labelOf(names, itemId, b, suffix),
     count: worn ? 1 : (row[3] ?? 1),
     equipped: worn,
     ...(itemId > 0 ? { itemId } : {}),
@@ -184,7 +191,8 @@ function rowItem(names: Names, row: Row, worn: boolean, dur: Row | undefined): I
 /**
  * The sheet's equipment and carried items as the panels' rows: the same rows
  * the 60 s reading would have given (`itemSample`), plus each item's random
- * property and a worn item's durability. Worn bags are not among them, nor
+ * property (its suffix on the name, when `suffixes` names it) and a worn
+ * item's durability. Worn bags are not among them, nor
  * the keyring and the currency slots, as none of them is on the reading.
  * Null when either list is not recorded, which the
  * caller reads as "the sheet cannot say" and falls back from, never as empty
@@ -195,20 +203,22 @@ function rowItem(names: Names, row: Row, worn: boolean, dur: Row | undefined): I
  * row that did not change keeps its object, so the bag and the paperdoll
  * redraw only what moved and keep the icons Wowhead put in them.
  */
-export function sheetItems(sheet: SheetInventory, names: Names): InvItem[] | null {
+export function sheetItems(sheet: SheetInventory, names: Names, suffixes: Suffixes = NO_SUFFIXES): InvItem[] | null {
   const { equip, inv, dur } = sheet;
   if (equip === null || inv === null) return null;
   const hit = builds.get(names);
-  if (hit !== undefined && hit.equip === equip && hit.inv === inv && hit.dur === dur) return hit.out;
+  if (hit !== undefined && hit.equip === equip && hit.inv === inv && hit.dur === dur && hit.suffixes === suffixes) return hit.out;
   const durOf = new Map<number, Row>();
   for (const d of dur ?? []) durOf.set(d[0]!, d);
   const rows = new Map<string, InvItem>();
   const one = (row: Row, worn: boolean): InvItem => {
     const d = worn ? durOf.get(row[0]!) : undefined;
     const id = worn ? row[1]! : row[2]!;
-    // Everything the row is built from: its numbers, its durability and its name.
-    const key = JSON.stringify([worn, row, d ?? null, id > 0 ? (names.get(id) ?? null) : null]);
-    const item = rows.get(key) ?? lastRows.get(key) ?? rowItem(names, row, worn, d);
+    const rand = worn ? row[2] : row[4];
+    const suffix = rand !== undefined && rand !== 0 ? suffixes.get(rand) : undefined;
+    // Everything the row is built from: its numbers, its durability, its name and its suffix.
+    const key = JSON.stringify([worn, row, d ?? null, id > 0 ? (names.get(id) ?? null) : null, suffix ?? null]);
+    const item = rows.get(key) ?? lastRows.get(key) ?? rowItem(names, row, worn, d, suffix);
     rows.set(key, item);
     return item;
   };
@@ -216,7 +226,7 @@ export function sheetItems(sheet: SheetInventory, names: Names): InvItem[] | nul
   const out = built.length === lastOut.length && built.every((it, i) => it === lastOut[i]) ? lastOut : built;
   lastRows = rows;
   lastOut = out;
-  builds.set(names, { equip, inv, dur, out });
+  builds.set(names, { equip, inv, dur, suffixes, out });
   return out;
 }
 
@@ -238,9 +248,9 @@ export interface SheetReading {
  * Either way the reading stands. An empty list is an observation and stands.
  */
 export function sheetReading(
-  view: { sheet: SheetInventory & Pick<TraceSheet, "money">; items: Names } | null,
+  view: { sheet: SheetInventory & Pick<TraceSheet, "money">; items: Names; rands?: Suffixes } | null,
   reading: SheetReading,
 ): SheetReading {
   if (view === null) return reading;
-  return { money: view.sheet.money ?? reading.money, items: sheetItems(view.sheet, view.items) ?? reading.items };
+  return { money: view.sheet.money ?? reading.money, items: sheetItems(view.sheet, view.items, view.rands) ?? reading.items };
 }

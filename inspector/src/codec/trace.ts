@@ -45,7 +45,10 @@
  * dictionaries make the segment decode alone, each holding exactly the ids
  * its keyframe and events reference: `items: {id: [quality, name]}`, the item
  * template's name, and `qreq: {id: [r0, r1, r2, r3, [itemId, n]...]}`, the
- * counts each quest needs. The unit-state readers (`stateAt`) never see the
+ * counts each quest needs. A third, `rands: {rand: suffix}`, names the random
+ * properties the `equip` and `inv` rows carry by their signed id: an item
+ * with one is shown as its name, a space and the suffix. It was added under
+ * the rule below, so a segment without it shows the template's name alone. The unit-state readers (`stateAt`) never see the
  * sheet; `sheetAt` folds it.
  *
  * **Chat** rides the event list too: `[ms, "chat", [kind, text]]`, one per
@@ -367,6 +370,8 @@ export const SHEET_KEY_LEN: { readonly [K in TraceSheetListKey]: number } = { eq
 const SHEET_ROW_MAX: { readonly [K in TraceSheetListKey]: number } = { equip: 3, bags: 3, inv: 5, dur: 3, quests: 7, rep: 2, skills: 3 };
 /** Which field of a row is an item id, for the dictionary. */
 const ITEM_FIELD: Partial<Record<TraceSheetListKey, number>> = { equip: 1, bags: 1, inv: 2 };
+/** Which field of a row is the item's signed random property id, for the dictionary. */
+const RAND_FIELD: Partial<Record<TraceSheetListKey, number>> = { equip: 2, inv: 4 };
 
 export function emptyTraceSheet(): TraceSheet {
   return { money: null, equip: null, bags: null, inv: null, dur: null, quests: null, rep: null, skills: null };
@@ -543,6 +548,8 @@ function sheetDiff(a: TraceSheet, b: TraceSheet): TraceSheetChange[] {
 export interface TraceDictLookup {
   item(itemId: number): TraceItemName | undefined;
   quest(questId: number): TraceQuestReq | undefined;
+  /** A random property's name suffix, by its signed id. */
+  rand?(rand: number): string | undefined;
 }
 
 /** An item dictionary entry rebuilt: a finite quality or null, and a string name. */
@@ -561,13 +568,29 @@ export function questReqOf(v: unknown): TraceQuestReq | undefined {
   return req;
 }
 
-/** The item and quest ids a sheet, or a change to one, references. */
-function refsOf(lists: Iterable<[TraceSheetKey | typeof QDONE, unknown]>, items: Set<number>, quests: Set<number>): void {
+/** A random property's suffix rebuilt: a non-empty string. */
+export function suffixOf(v: unknown): string | undefined {
+  return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
+/** The ids a sheet, or a change to one, references. */
+interface SheetRefs {
+  items: Set<number>;
+  rands: Set<number>;
+  quests: Set<number>;
+}
+
+/** The item, random property and quest ids a sheet, or a change to one, references. */
+function refsOf(lists: Iterable<[TraceSheetKey | typeof QDONE, unknown]>, refs: SheetRefs): void {
+  const { items, rands, quests } = refs;
   for (const [key, v] of lists) {
     if (key === "money" || key === QDONE || !Array.isArray(v)) continue;
     const at = ITEM_FIELD[key];
+    const randAt = RAND_FIELD[key];
     for (const r of v as number[][]) {
       if (at !== undefined && r.length > at && r[at]! > 0) items.add(r[at]!);
+      const rand = randAt === undefined ? undefined : r[randAt];
+      if (finite(rand) && rand !== 0) rands.add(rand);
       if (key === "quests" && r.length > 1) quests.add(r[1]!);
     }
   }
@@ -788,9 +811,8 @@ export function encodeSegment(rows: readonly TraceRow[], window: TraceWindow, di
   // before a keyframe taken from inside the window are not in it, as no
   // event is, so they lead the list.
   const ev: TraceEventWire[] = [];
-  const itemIds = new Set<number>();
-  const questIds = new Set<number>();
-  refsOf(SHEET_KEYS.map((key) => [key, sheet[key]]), itemIds, questIds);
+  const refs: SheetRefs = { items: new Set(), rands: new Set(), quests: new Set() };
+  refsOf(SHEET_KEYS.map((key) => [key, sheet[key]]), refs);
   for (const r of inWindow.slice(0, eventsFrom)) {
     if (r.kind !== "state") continue;
     for (const c of chatLines(parseData(r.data))) ev.push([int(r.ts - t0), CHAT, c]);
@@ -817,22 +839,23 @@ export function encodeSegment(rows: readonly TraceRow[], window: TraceWindow, di
       sheet = m.sheet;
     }
     for (const [key, v] of changes) ev.push([ms, key, v]);
-    refsOf(changes, itemIds, questIds);
+    refsOf(changes, refs);
     if (r.kind === "state") for (const c of chatLines(data)) ev.push([ms, CHAT, c]);
   }
 
   const seg: TraceSegment = { v: TRACE_VERSION, run, t0, t1, q: { p: Q_POS, o: Q_O }, k, dt, x: xs, y: ys, z: zs, o: os, cuts, flights, ev };
-  if (dict !== undefined) attachDict(seg, dict, itemIds, questIds);
+  if (dict !== undefined) attachDict(seg, dict, refs);
   return seg;
 }
 
 /**
  * The dictionaries for the ids a segment references, in id order: each
- * quest's required counts, and the names of its items and of the items its
- * quests ask for. An id the run never named is left out, and so is an empty
- * dictionary.
+ * quest's required counts, the names of its items and of the items its
+ * quests ask for, and the suffixes of its random properties. An id the run
+ * never named is left out, and so is an empty dictionary.
  */
-function attachDict(seg: TraceSegment, dict: TraceDictLookup, itemIds: Set<number>, questIds: Set<number>): void {
+function attachDict(seg: TraceSegment, dict: TraceDictLookup, refs: SheetRefs): void {
+  const { items: itemIds, quests: questIds } = refs;
   const qreq: Record<string, TraceQuestReq> = {};
   for (const id of [...questIds].sort((a, b) => a - b)) {
     const req = questReqOf(dict.quest(id));
@@ -845,7 +868,13 @@ function attachDict(seg: TraceSegment, dict: TraceDictLookup, itemIds: Set<numbe
     const name = itemNameOf(dict.item(id));
     if (name !== undefined) items[id] = name;
   }
+  const rands: Record<string, string> = {};
+  for (const id of [...refs.rands].sort((a, b) => a - b)) {
+    const suffix = suffixOf(dict.rand?.(id));
+    if (suffix !== undefined) rands[id] = suffix;
+  }
   if (Object.keys(items).length > 0) seg.items = items;
+  if (Object.keys(rands).length > 0) seg.rands = rands;
   if (Object.keys(qreq).length > 0) seg.qreq = qreq;
 }
 
@@ -915,6 +944,8 @@ export interface DecodedSegment {
   /** The names and qualities of the items it references, and the counts its quests need, by id. */
   items: ReadonlyMap<number, TraceItemName>;
   qreq: ReadonlyMap<number, TraceQuestReq>;
+  /** The name suffixes of the random properties its rows carry, by signed id. */
+  rands: ReadonlyMap<number, string>;
   /** The lines the character said, by time. */
   chat: TraceChatLine[];
 }
@@ -1029,13 +1060,18 @@ export function decodeSegment(seg: TraceSegment): DecodedSegment {
     const name = itemNameOf(v);
     if (name !== undefined && finite(Number(id))) items.set(Number(id), name);
   }
+  const rands = new Map<number, string>();
+  for (const [id, v] of Object.entries(isRecord(seg.rands) ? seg.rands : {})) {
+    const suffix = suffixOf(v);
+    if (suffix !== undefined && finite(Number(id))) rands.set(Number(id), suffix);
+  }
   const qreq = new Map<number, TraceQuestReq>();
   for (const [id, v] of Object.entries(isRecord(seg.qreq) ? seg.qreq : {})) {
     const req = questReqOf(v);
     if (req !== undefined && finite(Number(id))) qreq.set(Number(id), req);
   }
 
-  return { run: seg.run, t0: seg.t0, t1: seg.t1, frames, flights, key: stateOf(seg.k?.s), events, sheet: sheetOf(seg.k?.s), sheetEvents, items, qreq, chat };
+  return { run: seg.run, t0: seg.t0, t1: seg.t1, frames, flights, key: stateOf(seg.k?.s), events, sheet: sheetOf(seg.k?.s), sheetEvents, items, qreq, rands, chat };
 }
 
 const isRecord = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);

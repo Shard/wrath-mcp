@@ -123,6 +123,7 @@ const traceSheetShape = {
 };
 const traceDict = z.strictObject({
   items: z.array(z.tuple([num, nnum, z.string()])).optional(),
+  rands: z.array(z.tuple([num, z.string()])).optional(),
   quests: z.array(z.tuple([num, z.array(z.union([num, z.tuple([num, num])])).min(4)])).optional(),
 });
 const posFields = { map: nnum.optional(), x: nnum.optional(), y: nnum.optional(), z: nnum.optional(), o: nnum.optional() };
