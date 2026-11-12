@@ -331,6 +331,55 @@ socket families are outside Landlock. Closing those is the deployment's network
 policy; the child's only legitimate destinations are the module's port on the
 module's host, and DNS.
 
+### A program
+
+Off unless a host asks for it (`SandboxHostOptions.program`), and then the
+sandbox also holds the model's program: a small file workspace rooted at
+`main.ts`, whose exported functions are routines the model starts and stops by
+name. It exists because models left to themselves launch async loops and then
+poll them, with no handle and no stop; here the lifecycle is the stack's and
+the code is still the model's.
+
+- **Files** (`mcp/src/workspace.ts`). The host process alone writes the
+  workspace, through the four file tools. Each change to a code or JSON file
+  becomes a new version in a directory of its own, hard-linked into a
+  content-addressed store, and the confined child is granted read access to
+  those versions and nothing else (`--read=`, as a harness's child extension
+  is). The child has no write grant. Importing a version by its plain path
+  makes every load a fresh module graph, so running code never changes under
+  itself and the directories are the record of which code was live when.
+- **Load on save.** A save that changes `main.ts` or a file in its import
+  graph loads that version at once and the tool's result says so. A load that
+  fails changes nothing. The routines running when a load succeeds are stopped
+  and started again from the top with the arguments they had.
+- **Routines** (`mcp/src/sandbox/program.ts`). A routine runs once, in an
+  async context that carries its signal, its character and its owner
+  (`owners.ts`): when it returns, throws, is stopped or is restarted, its
+  signal is aborted and the timers and listeners it started are removed. An
+  ended routine has a moment to unwind and after that cannot act. In such a
+  sandbox a snippet is a one-off under the same rule: it keeps no bindings,
+  leaves nothing running, and may import the workspace's files.
+- **The registry and restarts** (`mcp/src/sandbox/program-host.ts`). The host
+  keeps one row per routine name and character and writes it beside the
+  workspace. After a sandbox restart, or in a new process over the same
+  directory, it loads the program and starts what was running from the top. A
+  child killed for a blocked event loop while no snippet was in flight is the
+  exception: the program is to blame, which routine is not knowable, and none
+  is started. A heartbeat is what notices that, since no snippet's timeout is
+  there to.
+- **Facts, not wording.** Routine ends, the first error or refusal of each
+  signature since a load, `wake(reason)`, a move of the model's that replaced
+  another of its own, loads and restarts reach a harness as data
+  (`ProgramOptions.onFact`, `ProgramHost.drainFacts`). Whether any of them
+  wakes a model, and what the model is shown, is the harness's. The stack
+  never holds, backs off or stops the model's code for repeating itself.
+- **Tools.** `programTools` beside `coreTools`: `read_file`, `write_file`,
+  `edit_file`, `delete_file`, `start_routine`, `stop_routine`, and a
+  `run_snippet` whose description says it is a one-off.
+
+Without the option none of this is loaded into what a model sees: the child
+is spawned with the arguments and environment it always had.
+
 ### Several characters
 
 A client granted more than one character (`fanout: { maxCharacters }`) gets

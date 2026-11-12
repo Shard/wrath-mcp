@@ -64,6 +64,25 @@
  * At fan-out 1 none of this exists: there is no `chars`, and the surface above
  * is the whole of it.
  *
+ * ### A program (a host started with `program`)
+ *
+ * The model keeps code in a file workspace rooted at `main.ts`, and every
+ * function `main.ts` exports is a routine the host starts and stops by name
+ * (`program.ts`, `program-host.ts`). This process may read the versions of
+ * those files and nothing else of the workspace; it writes none of it. What
+ * a snippet and a routine see then:
+ *
+ *   memory      one plain-JSON object the host saves as memory.json and hands
+ *               back to a new child
+ *   wake(reason)  a fact for the harness: the model's code asking for it
+ *   signal      a routine's is aborted when it is stopped or restarted, a
+ *               snippet's when it returns as well as when it is abandoned
+ *   import      a snippet may import the workspace's files by relative path
+ *
+ * and the persistence above is gone: a snippet's declarations are its own,
+ * and the timers and listeners a snippet or a routine starts end with it
+ * (`owners.ts`). Without `program` none of this exists.
+ *
  * ### Network posture — stated honestly
  *
  * The module is reachable only through the ambient client's own transport

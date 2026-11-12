@@ -11,7 +11,9 @@ import { leaseSessionSecret } from "../src/module-auth";
 import { Scratchpad } from "../src/scratchpad";
 import { SandboxHost } from "../src/sandbox/host";
 import type { ProgramFact } from "../src/sandbox/program-host";
-import { renderActionHints } from "../src/tools";
+import { CharacterRoster } from "../src/fanout";
+import { SecretRedactor } from "../src/redact";
+import { coreTools, programTools, renderActionHints, ToolSet, type CoreToolRender, type ProgramToolContext } from "../src/tools";
 import { Workspace } from "../src/workspace";
 import { startStubModule, STUB_PORT_SECRET, type StubModule } from "./fixtures/stub-module";
 
@@ -335,4 +337,261 @@ describe("snippets beside a program", () => {
     const next = await r.again();
     expect((await next.host.evalSnippet("memory.phase + memory.kills")).value).toBe('"grind3"');
   }, 30_000);
+});
+
+/** Answer every `move_to` the stub is sent with a verdict, until stopped. */
+function answerMoves(stub: StubModule, token: string, status: string): () => void {
+  let answered = 0;
+  const timer = setInterval(() => {
+    const moves = stub.calls.filter((c) => c.path === "/action" && c.body?.["action"] === "move_to");
+    while (answered < moves.length) {
+      answered++;
+      stub.push(token, { opcode: "WB_MOVE_RESULT", data: { moveId: answered, status, pos: { x: 0, y: 0, z: 0, o: 0 } } });
+    }
+  }, 10);
+  return () => clearInterval(timer);
+}
+
+describe("who is told what", () => {
+  test("a routine's refusal is a fact once per signature, counted after that, and a tool result's hint line names the routine", async () => {
+    const { host, stub, facts } = await rig();
+    const p = host.program!;
+    await host.evalSnippet(LOGIN);
+    const stop = answerMoves(stub, "program-token-0001", "too_far");
+    try {
+      await p.writeFile(
+        "main.ts",
+        `export async function walk() {
+  for (let i = 0; i < 4; i++) memory.status = (await sdk.moveTo({ x: -1200, y: 990, z: 42 }, { timeout: 4000 })).status;
+}
+`,
+      );
+      await p.startRoutine({ name: "walk" });
+      await until("the routine to finish", () => facts.some((f) => f.kind === "ended"), 20_000);
+      // The failures ride the next tool result, as they do without a program, owned by name.
+      const next = await host.evalSnippet("memory.status");
+      expect(next.value).toBe('"too_far"');
+      const hints = next.actionHints ?? [];
+      const refusals = facts.filter((f) => f.kind === "refusal");
+      expect(refusals.length).toBe(1);
+      expect(refusals[0]).toMatchObject({ routine: "walk", action: "moveTo", status: "too_far", signature: "walk||moveTo|too_far", fresh: true, deploy: 1 });
+      await p.beat();
+      const drained = p.drainFacts();
+      expect(drained.repeats).toEqual([{ signature: "walk||moveTo|too_far", count: 3, ts: expect.any(Number) }]);
+      expect(hints.every((h) => h.routine === "walk" && h.from === undefined)).toBe(true);
+      const block = renderActionHints(hints)!;
+      expect(block.split("\n").length).toBe(2);
+      expect(block).toContain("moveTo too_far ×4 (routine walk): ");
+      const routine = drained.routines.find((r) => r.name === "walk")!;
+      expect(["move_to", "stop"]).toContain(routine.lastAction!.action);
+    } finally {
+      stop();
+    }
+  }, 40_000);
+
+  test("a snippet's move that replaces a routine's says so in its own result, and the routine's side is a fact", async () => {
+    const { host, facts } = await rig();
+    const p = host.program!;
+    await host.evalSnippet(LOGIN);
+    await p.writeFile(
+      "main.ts",
+      `export async function walk() {
+  memory.walk = (await sdk.moveTo({ x: -1200, y: 990, z: 42 }, { timeout: 20000 })).status;
+}
+`,
+    );
+    await p.startRoutine({ name: "walk" });
+    await until("the move to be dispatched", async () => (await host.stateSnapshot())["move"] != null);
+    const res = await host.evalSnippet("await sdk.moveToAsync({ x: -1230, y: 980, z: 42 }); return 'sent';");
+    expect(res.ok).toBe(true);
+    expect(res.notes).toEqual(["this replaced the move routine walk had in flight"]);
+    const pre = facts.find((f) => f.kind === "preempted");
+    expect(pre).toMatchObject({ kind: "preempted", by: { snippet: true }, of: { routine: "walk" }, to: { x: -1230, y: 980, z: 42 } });
+    // A snippet with no routine's move under it says nothing.
+    await p.stopRoutine({ name: "walk" });
+    const again = await host.evalSnippet("await sdk.moveToAsync({ x: -1231, y: 981, z: 42 }); return 'sent';");
+    expect(again.notes).toBeUndefined();
+  }, 30_000);
+});
+
+describe("what a restart brings back", () => {
+  test("a new process over the same registry loads the program and starts what was running from the top", async () => {
+    const r = await rig();
+    await r.host.evalSnippet(LOGIN);
+    await r.host.program!.writeFile("main.ts", IDLE);
+    await r.host.program!.startRoutine({ name: "idle", args: { zone: "north" } });
+    await until("the first run", async () => (await r.host.evalSnippet("memory.started")).value === "1");
+    await r.host.stop();
+    const registry = JSON.parse(readFileSync(join(r.dir, "program", "registry.json"), "utf8")) as { deploy: number; routines: { name: string; state: string }[] };
+    expect(registry.deploy).toBe(1);
+    expect(registry.routines).toMatchObject([{ name: "idle", state: "running" }]);
+
+    const next = await r.again();
+    await next.host.start();
+    const restart = next.facts.find((f) => f.kind === "restart");
+    expect(restart).toMatchObject({ kind: "restart", blamed: false, restarted: [{ name: "idle", state: "running", args: { zone: "north" } }], interrupted: [] });
+    expect(next.facts.find((f) => f.kind === "loaded")).toMatchObject({ deploy: 1, by: "restart", routines: ["idle"] });
+    await until("the run from the top", async () => (await next.host.evalSnippet("memory.started")).value === "2");
+    // The stream was reopened for it: the routine reads a whole cache without a connect() of its own.
+    expect((await next.host.evalSnippet("state.self.name")).value).toContain("Thalvorn");
+  }, 40_000);
+
+  test("a child killed for a blocked loop while no snippet ran is the program's: no routine is restarted, and they are named", async () => {
+    const { host, facts } = await rig({ beatMs: 150, beatGraceMs: 700 });
+    const p = host.program!;
+    await p.writeFile("main.ts", `${IDLE}export async function spin() { await sleep(300, { wake: false }); for (;;) {} }\n`);
+    await p.startRoutine({ name: "idle" });
+    await p.startRoutine({ name: "spin" });
+    await until("the restart", () => facts.some((f) => f.kind === "restart"), 15_000);
+    const restart = facts.find((f) => f.kind === "restart")!;
+    if (restart.kind !== "restart") throw new Error("unreachable");
+    expect(restart.blamed).toBe(true);
+    expect(restart.restarted).toEqual([]);
+    expect(restart.interrupted.map((r) => [r.name, r.state, r.note])).toEqual([
+      ["idle", "interrupted", "the sandbox was restarted for a blocked event loop while no snippet was running"],
+      ["spin", "interrupted", "the sandbox was restarted for a blocked event loop while no snippet was running"],
+    ]);
+    expect(host.totalRestarts).toBe(1);
+    const notice = host.drainNotices().find((n) => n.kind === "sandbox_restarted")!;
+    expect(notice.text).toStartWith("sandbox restarted (its event loop was blocked while no snippet was running, so a routine blocked it). ");
+    expect(notice.text).toContain("when a routine was what blocked the sandbox none is");
+    // The program is loaded again, so a routine can be started by name; nothing runs until one is.
+    expect(p.deploy).toBe(1);
+    await Bun.sleep(400);
+    expect((await host.evalSnippet("memory.started")).value).toBe("1");
+    expect((await p.startRoutine({ name: "idle" })).ok).toBe(true);
+    expect(host.totalRestarts).toBe(1);
+  }, 40_000);
+
+  test("a child killed while a snippet was in flight restarts the routines: the snippet may be what blocked it", async () => {
+    const { host, facts } = await rig({ timeoutMs: 1_000, beatMs: 150, beatGraceMs: 10_000 });
+    const p = host.program!;
+    await p.writeFile("main.ts", IDLE);
+    await p.startRoutine({ name: "idle" });
+    await until("the first run", async () => (await host.evalSnippet("memory.started")).value === "1");
+    const blocked = await host.evalSnippet("for (;;) {}");
+    expect(blocked.restarted).toBe(true);
+    expect(blocked.error).toContain("the routines that were running are started again from the top");
+    const restart = facts.find((f) => f.kind === "restart");
+    expect(restart).toMatchObject({ kind: "restart", blamed: false, restarted: [{ name: "idle" }], interrupted: [] });
+    await until("the run from the top", async () => (await host.evalSnippet("memory.started")).value === "2");
+  }, 40_000);
+});
+
+describe("fan-out: a routine carries its character", () => {
+  test("the same routine runs once per character, each with that character's sdk, and every row and fact names whose it is", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wrathbench-mcp-program-fanout-"));
+    dirs.push(dir);
+    const stub = startStubModule();
+    stubs.push(stub);
+    const facts: ProgramFact[] = [];
+    const host = new SandboxHost({
+      moduleUrl: stub.baseUrl,
+      token: "",
+      scratchpad: new Scratchpad(join(dir, "scratchpad.md")),
+      snippetTimeoutMs: 5_000,
+      pingGraceMs: 1_000,
+      fanout: { maxCharacters: 3 },
+      logSink: () => {},
+      program: { workspace: new Workspace(join(dir, "program")), onFact: (f) => facts.push(f), beatMs: 200 },
+    });
+    hosts.push(host);
+    const roster = new CharacterRoster({
+      grant: { maxCharacters: 3, accounts: ["ACCA", "ACCB", "ACCC"] },
+      moduleUrl: stub.baseUrl,
+      sandbox: host,
+      secrets: new SecretRedactor(),
+      env: { WRATHBENCH_MODULE_SECRET: STUB_PORT_SECRET },
+    });
+    expect((await roster.login({ name: "Alpha" })).ok).toBe(true);
+    expect((await roster.login({ name: "Bravo" })).ok).toBe(true);
+    const p = host.program!;
+    await p.writeFile(
+      "main.ts",
+      `export async function report(args) {
+  memory[args.slot] = { self: state.self.name, others: Object.keys(chars).sort().join(",") };
+  if (args.fail) throw new Error("as " + state.self.name);
+  while (!signal.aborted) await sleep(50, { wake: false });
+}
+`,
+    );
+    expect((await p.startRoutine({ name: "report", args: { slot: "a" }, character: "Alpha" })).text).toStartWith("started report (Alpha) on deploy 1\n");
+    expect((await p.startRoutine({ name: "report", args: { slot: "b" }, character: "Bravo" })).ok).toBe(true);
+    // One run per name and character: the same name again for Alpha is refused, and for nobody known is said.
+    expect((await p.startRoutine({ name: "report", character: "Alpha" })).text).toStartWith("report (Alpha) is already running: started ");
+    expect((await p.startRoutine({ name: "report", character: "Zulu" })).text).toStartWith("unknown character: Zulu\n");
+    await until("both runs", async () => (await host.evalSnippet("Boolean(memory.a && memory.b)")).value === "true");
+    expect((await host.evalSnippet("memory.a.self + '/' + memory.b.self + '/' + memory.a.others")).value).toBe('"Alpha/Bravo/Alpha,Bravo"');
+    expect(p.routineLines()).toMatch(/^routines:\nreport \(Alpha\) running \d+s, deploy 1, no action yet\nreport \(Bravo\) running \d+s, deploy 1, no action yet$/);
+    // Stopping one leaves the other.
+    expect((await p.stopRoutine({ name: "report", character: "Alpha" })).ok).toBe(true);
+    expect(p.routines().map((r) => [r.character, r.state])).toEqual([
+      ["Alpha", "stopped"],
+      ["Bravo", "running"],
+    ]);
+    // A throw is a fact that names the character, and the two characters' errors are two signatures apart only by routine and place.
+    await p.startRoutine({ name: "report", args: { slot: "a", fail: true }, character: "Alpha" });
+    await until("the throw", () => facts.some((f) => f.kind === "ended"));
+    expect(facts.find((f) => f.kind === "ended")).toMatchObject({ routine: { name: "report", character: "Alpha", state: "threw", error: { text: "Error: as Alpha" } } });
+    await roster.shutdown({ logout: true });
+  }, 40_000);
+});
+
+describe("the program tools", () => {
+  const render: CoreToolRender<ProgramToolContext> = { eventLine: (e) => e.opcode, isAmbient: () => false, stateSummary: () => "state" };
+
+  test("are the one-off run_snippet, four file tools and two routine tools, beside a core that is untouched", () => {
+    const specs = programTools(render);
+    expect(Object.keys(specs)).toEqual(["run_snippet", "read_file", "write_file", "edit_file", "delete_file", "start_routine", "stop_routine"]);
+    const core = coreTools(render);
+    expect(specs.run_snippet.def.inputSchema).toEqual(core.run_snippet.def.inputSchema);
+    expect(specs.run_snippet.def.description).not.toBe(core.run_snippet.def.description);
+    expect(specs.run_snippet.def.description).toContain("Nothing a snippet declares or starts outlives it");
+    expect(core.run_snippet.def.description).toContain("Top-level bindings persist across snippets");
+    expect(Object.keys(specs.start_routine.def.inputSchema["properties"] as object)).toEqual(["name", "args"]);
+    expect(Object.keys(specs.edit_file.def.inputSchema["properties"] as object)).toEqual(["path", "old", "new", "replaceAll"]);
+    // Above fan-out 1 the routine tools name a character, optionally.
+    const many = programTools(render, { characters: true });
+    expect(Object.keys(many.start_routine.def.inputSchema["properties"] as object)).toEqual(["name", "args", "character"]);
+    expect(Object.keys(many.stop_routine.def.inputSchema["properties"] as object)).toEqual(["name", "character"]);
+    expect(many.start_routine.def.inputSchema["required"]).toEqual(["name"]);
+  });
+
+  test("drive a real program end to end: write, load, start, a snippet that pre-empts, stop", async () => {
+    const { host } = await rig();
+    const specs = programTools(render);
+    const tools = new ToolSet<ProgramToolContext>([specs.run_snippet, specs.read_file, specs.write_file, specs.edit_file, specs.delete_file, specs.start_routine, specs.stop_routine]);
+    const ctx: ProgramToolContext = { sandbox: host, scratchpad: new Scratchpad(join(mkdtempSync(join(tmpdir(), "wrathbench-mcp-program-pad-")), "pad.md")), sessionLive: () => true, turn: () => 3, secrets: new SecretRedactor(), program: host.program! };
+    const call = (name: string, args: unknown): Promise<{ text: string; isError?: boolean }> => tools.call(ctx, name, args);
+
+    expect((await call("run_snippet", { code: LOGIN })).text).toContain('=> "Thalvorn"');
+    const src = `export async function walk(args) {\n  memory.walk = (await sdk.moveTo(args.to, { timeout: 20000 })).status;\n}\n`;
+    const wrote = await call("write_file", { path: "main.ts", content: src });
+    expect(wrote).toEqual({ text: `created main.ts (${src.length} chars)\nloaded: deploy 1 · routines: walk` });
+    expect((await call("read_file", { path: "main.ts" })).text).toBe(src);
+    expect(await call("read_file", { path: "lib/none.ts" })).toEqual({ text: "no such file in the workspace: lib/none.ts. Files: main.ts.", isError: true });
+    // The alias keys an editing model reaches for are the canonical ones.
+    const edited = await call("edit_file", { file_path: "main.ts", old_string: "20000", new_string: "25000" });
+    expect(edited.text).toBe(`edited main.ts (1 replacement) (${src.length} chars)\nloaded: deploy 2 · routines: walk`);
+    const twice = await call("edit_file", { path: "main.ts", old: "a", new: "b" });
+    expect(twice.isError).toBe(true);
+    expect(twice.text).toMatch(/^old matches \d+ places in main\.ts, at lines /);
+    const broken = await call("write_file", { path: "main.ts", content: "export async function walk( {" });
+    expect(broken.isError).toBe(true);
+    expect(broken.text).toContain("load failed, deploy 2 keeps running: ");
+    await call("write_file", { path: "main.ts", content: src });
+
+    const started = await call("start_routine", { name: "walk", args: { to: { x: -1200, y: 990, z: 42 } } });
+    expect(started.text).toMatch(/^started walk on deploy 4\nroutines:\nwalk running 0s, deploy 4, /);
+    const again = await call("start_routine", { routine: "walk" });
+    expect(again.isError).toBe(true);
+    expect(again.text).toStartWith("walk is already running: started ");
+    await until("the move to be dispatched", async () => (await host.stateSnapshot())["move"] != null);
+    const snippet = await call("run_snippet", { code: "await sdk.moveToAsync({ x: -1230, y: 980, z: 42 }); return 'sent';" });
+    expect(snippet.text).toContain('=> "sent"\nthis replaced the move routine walk had in flight');
+    const stopped = await call("stop_routine", { name: "walk" });
+    expect(stopped.text).toMatch(/^stopped walk\nroutines:\nwalk stopped 0s ago$/);
+    expect((await call("stop_routine", { name: "walk" })).isError).toBe(true);
+    expect((await call("start_routine", {})).text).toStartWith("invalid arguments for start_routine: ");
+  }, 40_000);
 });
