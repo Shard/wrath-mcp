@@ -147,7 +147,7 @@ export function characterAt(seg: DecodedSegment, t: number, klass: number | null
     flags: unitFlags(state),
     auras: auraViews(state.auras, t),
     money: sheet.money,
-    items: sheetItems(sheet, seg.items),
+    items: sheetItems(sheet, seg.items, seg.rands),
     quests: questLog(sheet, seg.qreq, seg.items),
   };
 }

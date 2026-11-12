@@ -13,7 +13,8 @@
  * from), and `inventory` and `bag()` join every item to its template and
  * decode its enchantment slots; the trace wants ids and counts, so it takes
  * the slot guids, each item object's entry, stack count, random property and
- * durability, and each container's slots, directly. The slot numbering and
+ * durability, and each container's slots, directly; of the random property's
+ * text, only its name suffix, and only for the dictionary. The slot numbering and
  * the guid packing are the SDK's (`state.ts`, `guid.ts`), copied here
  * because the SDK does not export them. The SDK's views do not read the
  * keyring or the currency slots at all; their fields arrive by name from a
@@ -105,6 +106,12 @@ function guidOf(lo: number, hi: number): string {
 export interface SheetReading {
   sheet: TraceSheet;
   ts: Partial<Record<keyof TraceSheet, number>>;
+  /**
+   * The name suffix of each random property id the sheet's rows carry, where
+   * the item's object holds one (`suffixName`): for the dictionary, never
+   * for a row. Absent when no row has one.
+   */
+  rands?: Map<number, string>;
 }
 
 /**
@@ -118,6 +125,7 @@ export function readSheet(state: SheetSource): SheetReading {
   const self: Fields = state.self.fields;
   const sheet = emptyTraceSheet();
   const ts: SheetReading["ts"] = {};
+  const reading: SheetReading = { sheet, ts };
   const stamp = (key: keyof TraceSheet, t: number | undefined): void => {
     if (t !== undefined && t > (ts[key] ?? 0)) ts[key] = t;
   };
@@ -130,6 +138,12 @@ export function readSheet(state: SheetSource): SheetReading {
   const dur: TraceDurRow[] = [];
   const bags: TraceBagRow[] = [];
   const inv: TraceInvRow[] = [];
+  /** A random property's suffix, read off the item that carries it. */
+  const suffixOf = (rand: number, item: NearbyObject | undefined): void => {
+    if (reading.rands?.has(rand) === true) return;
+    const suffix = item?.texts.get("suffixName")?.value;
+    if (typeof suffix === "string" && suffix.length > 0) (reading.rands ??= new Map()).set(rand, suffix);
+  };
   const carried = (bag: number, slot: number, item: NearbyObject | undefined, slotTs: number): void => {
     const fields = item?.fields;
     const count = fields?.get("stackCount");
@@ -138,6 +152,7 @@ export function readSheet(state: SheetSource): SheetReading {
     const n = count?.value ?? 1;
     const r = rand?.value ?? 0;
     inv.push(r !== 0 ? [bag, slot, itemId, n, r] : n !== 1 ? [bag, slot, itemId, n] : [bag, slot, itemId]);
+    if (r !== 0) suffixOf(r, item);
     stamp("inv", Math.max(slotTs, item?.entry?.ts ?? 0, count?.ts ?? 0, rand?.ts ?? 0));
   };
   for (const slot of INV_SLOTS) {
@@ -155,6 +170,7 @@ export function readSheet(state: SheetSource): SheetReading {
       const rand = fields?.get("randomPropertyId");
       const itemId = item?.entry?.value ?? 0;
       equip.push(rand !== undefined && rand.value !== 0 ? [slot, itemId, rand.value] : [slot, itemId]);
+      if (rand !== undefined && rand.value !== 0) suffixOf(rand.value, item);
       stamp("equip", Math.max(item?.entry?.ts ?? 0, rand?.ts ?? 0));
       const max = fields?.get("maxDurability");
       if (max !== undefined && max.value > 0) {
@@ -226,7 +242,7 @@ export function readSheet(state: SheetSource): SheetReading {
     skills.push([id.value, value?.value ?? 0, max?.value ?? 0]);
   }
   sheet.skills = sortRows(skills);
-  return { sheet, ts };
+  return reading;
 }
 
 /**
@@ -254,7 +270,7 @@ export function sheetItemIds(sheet: TraceSheet, out: Set<number> = new Set()): S
   return out;
 }
 
-/** An item's quality and its template's name, from the item query the cache holds; never the instance's suffix. */
+/** An item's quality and its template's name, from the item query the cache holds; the instance's suffix is `rands`'. */
 export function itemEntry(state: Pick<SheetSource, "items">, itemId: number): [number, number | null, string] | undefined {
   const info = state.items.get(itemId)?.value;
   if (info === undefined || typeof info.name !== "string") return undefined;

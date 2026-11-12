@@ -28,8 +28,9 @@
  * a restarted child reattaches to its session with a `WB_SESSION_STATE` that
  * restates the position and the level and nothing else, and the cache's
  * empty bags then mean "not seen", not "empty". Reputation waits the same
- * way for the login's `SMSG_INITIALIZE_FACTIONS`. Item names and quest
- * requirements go to the host once per id (`TraceDict`), and turn-ins
+ * way for the login's `SMSG_INITIALIZE_FACTIONS`. Item names, random
+ * property suffixes and quest requirements go to the host once per id
+ * (`TraceDict`), and turn-ins
  * (`qdone`) as the server's receipts arrive.
  *
  * Bounded: the buffer drops its oldest rows past `cap` and counts the drops,
@@ -215,10 +216,10 @@ export class TraceRecorder {
   /** How many of the cache's turn-ins are already a `qdone`. */
   private turnIns = 0;
   /** Ids already named to the host, ids waiting on their query answer, and the names not yet drained. */
-  private readonly named = { items: new Set<number>(), quests: new Set<number>() };
+  private readonly named = { items: new Set<number>(), rands: new Set<number>(), quests: new Set<number>() };
   private readonly waiting = { items: new Set<number>(), quests: new Set<number>() };
   private namesDirty = false;
-  private dict: Required<TraceDict> = { items: [], quests: [] };
+  private dict: Required<TraceDict> = { items: [], rands: [], quests: [] };
 
   constructor(o: TraceRecorderOptions) {
     this.state = o.state;
@@ -254,10 +255,14 @@ export class TraceRecorder {
     const rows = this.rows.splice(0, this.rows.length);
     const dropped = this.dropped;
     this.dropped = 0;
-    const { items, quests } = this.dict;
-    if (items.length === 0 && quests.length === 0) return { rows, dropped };
-    this.dict = { items: [], quests: [] };
-    return { rows, dropped, dict: { ...(items.length > 0 ? { items } : {}), ...(quests.length > 0 ? { quests } : {}) } };
+    const { items, rands, quests } = this.dict;
+    if (items.length === 0 && rands.length === 0 && quests.length === 0) return { rows, dropped };
+    this.dict = { items: [], rands: [], quests: [] };
+    return {
+      rows,
+      dropped,
+      dict: { ...(items.length > 0 ? { items } : {}), ...(rands.length > 0 ? { rands } : {}), ...(quests.length > 0 ? { quests } : {}) },
+    };
   }
 
   private push(row: TraceRow): void {
@@ -388,12 +393,23 @@ export class TraceRecorder {
     this.sheetDirty = false;
     this.repDirty = false;
     this.lastSheetRead = this.now();
-    this.nameIds(reading.sheet);
+    this.nameIds(reading);
     return reading;
   }
 
-  /** Queue the dictionary entries a sheet's ids need, each once; an id whose query is not answered yet waits for it. */
-  private nameIds(sheet: TraceSheet): void {
+  /**
+   * Queue the dictionary entries a sheet's ids need, each once; an id whose
+   * query is not answered yet waits for it. A random property's suffix is
+   * named off the item that carries it, in the same reading, so it never
+   * waits: one the module served no text for has no entry.
+   */
+  private nameIds(reading: SheetReading): void {
+    const { sheet } = reading;
+    for (const [rand, suffix] of reading.rands ?? []) {
+      if (this.named.rands.has(rand)) continue;
+      this.named.rands.add(rand);
+      this.dict.rands.push([rand, suffix]);
+    }
     for (const id of sheetItemIds(sheet)) if (!this.named.items.has(id)) this.waiting.items.add(id);
     for (const r of sheet.quests ?? []) if (!this.named.quests.has(r[1])) this.waiting.quests.add(r[1]);
     this.resolveNames();

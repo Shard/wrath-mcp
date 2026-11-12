@@ -52,8 +52,8 @@ function rig(opts: { guard?: boolean } = {}) {
     events.ingest(JSON.stringify({ seq: seq++, opcode, opcodeId: 1, ts, data }));
   };
   const update = (objects: unknown[], ts: number): void => feed("SMSG_UPDATE_OBJECT", { blocks: objects.length, objects }, ts);
-  const values = (guid: string, fields: Record<string, number>, ts: number): void => update([{ update: "values", guid, fields }], ts);
-  const create = (guid: string, objectType: string, fields: Record<string, number>, self = false) => ({
+  const values = (guid: string, fields: Record<string, number | string>, ts: number): void => update([{ update: "values", guid, fields }], ts);
+  const create = (guid: string, objectType: string, fields: Record<string, number | string>, self = false) => ({
     update: "create",
     guid,
     objectType,
@@ -119,7 +119,7 @@ function login(r: ReturnType<typeof rig>, ts: number): void {
         },
         true,
       ),
-      r.create(itemGuid(1), "item", { entry: SWORD, stackCount: 1, durability: 40, maxDurability: 50, randomPropertyId: -77 }),
+      r.create(itemGuid(1), "item", { entry: SWORD, stackCount: 1, durability: 40, maxDurability: 50, randomPropertyId: -77, suffixName: "of the Badger" }),
       r.create(itemGuid(2), "container", { entry: POUCH, numSlots: 6, bagSlot2Lo: 4, bagSlot2Hi: HI }),
       r.create(itemGuid(3), "item", { entry: STONE, stackCount: 5 }),
       r.create(itemGuid(4), "item", { entry: RING, stackCount: 1 }),
@@ -362,7 +362,7 @@ describe("trace recorder: the character sheet", () => {
     r.rec.stop();
   });
 
-  test("names: each item once, its template's name and never the instance's suffix; a quest's needs as numbers; an id waits for its answer", () => {
+  test("names: each item once, its template's name, and its random property's suffix by id; a quest's needs as numbers; an id waits for its answer", () => {
     const r = rig();
     r.rec.start();
     login(r, 1_100_000);
@@ -375,6 +375,9 @@ describe("trace recorder: the character sheet", () => {
       [SWORD, 2, "Test Blade"],
       [STONE, 1, "Test Stone"],
     ]);
+    // The suffix rides beside the template's name, keyed by the id the row carries; the description never.
+    expect(d?.rands).toEqual([[-77, "of the Badger"]]);
+    expect(JSON.stringify(d)).not.toContain("flavour text");
     expect(d?.quests).toBeUndefined();
     // The pouch, the ring and the quest are answered later: each is named then, once.
     r.feed("SMSG_ITEM_QUERY_SINGLE_RESPONSE", { itemId: POUCH, found: true, name: "Test Pouch", quality: 1 }, 1_103_000);
@@ -414,11 +417,18 @@ describe("trace recorder: the character sheet", () => {
       [QUEST_ITEM, 1, "Test Token"],
     ]);
     expect(d?.quests).toEqual([[QUEST, [8, 1, 0, 0, [QUEST_ITEM, 4]]]]);
-    // Nothing is resent, whatever moves.
-    r.values(itemGuid(3), { stackCount: 9 }, 1_105_000);
+    // Nothing is resent, whatever moves: another item with a suffix already named
+    // is not named again, and a property the module served no text for has no entry.
+    r.values(itemGuid(3), { stackCount: 9, randomPropertyId: 5 }, 1_105_000);
+    r.values(itemGuid(4), { randomPropertyId: -77, suffixName: "of the Badger" }, 1_105_000);
     r.at(1_106_000);
     r.rec.poll();
-    expect(r.rec.drain().dict).toBeUndefined();
+    const last = r.rec.drain();
+    expect(last.dict).toBeUndefined();
+    expect(r.sheetRows(last.rows).at(-1)?.inv).toEqual([
+      [19, 2, RING, 1, -77],
+      [255, 23, STONE, 9, 5],
+    ]);
     r.rec.stop();
   });
 

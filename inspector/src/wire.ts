@@ -261,6 +261,12 @@ export interface TraceSegment {
   ev: TraceEventWire[];
   /** The items the sheet references, by id; absent when it references none. */
   items?: Record<string, TraceItemName>;
+  /**
+   * The random properties the sheet's `equip` and `inv` rows carry, by their
+   * signed id: each one's name suffix ("of the Bear"), which a reader puts
+   * after the item's name. Absent when none is named.
+   */
+  rands?: Record<string, string>;
   /** The quests the sheet's log references, by id: their required counts. */
   qreq?: Record<string, TraceQuestReq>;
 }

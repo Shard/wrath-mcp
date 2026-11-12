@@ -185,21 +185,22 @@ describe("segments", () => {
     const { dir, writer, reader } = rig();
     const reed: [number, number, string] = [70020, 1, "Marsh Reed"];
     const token: [number, number, string] = [70030, 2, "Ferryman's Token"];
+    const badger: [number, string] = [-77, "of the Badger"];
     writer.ingest(drain({ trace: [keyRow(T0 + 2000, {}, { inv: [[255, 23, 70020]], quests: [[0, 8101, 0]] })], dict: { items: [reed], quests: [[8101, [6, 0, 0, 0, [70030, 2]]]] } }));
-    writer.ingest(drain({ trace: [{ ts: T0 + 3000, kind: "state", data: { inv: [[255, 24, 70030]] } }], dict: { items: [token] } }));
+    writer.ingest(drain({ trace: [{ ts: T0 + 3000, kind: "state", data: { inv: [[255, 24, 70030, 1, -77]] } }], dict: { items: [token], rands: [badger] } }));
     // The same ids again in the same segment name nothing twice.
-    writer.ingest(drain({ trace: [{ ts: T0 + 4000, kind: "state", data: { inv: [[255, 24, 70030, 2]] } }] }));
+    writer.ingest(drain({ trace: [{ ts: T0 + 4000, kind: "state", data: { inv: [[255, 24, 70030, 2, -77]] } }] }));
     writer.ingest(drain({ trace: [{ ts: T0 + SEGMENT_MS + 1, kind: "state", data: { hp: 1 } }] }));
     await writer.close();
     const [first, second] = reader.segments("trace");
     const a = reader.segment("trace", first!);
     expect(a.map((r) => r.kind)).toEqual(["key", "dict", "state", "state"]);
     expect(a[0]!.dict).toEqual({ items: [reed], quests: [[8101, [6, 0, 0, 0, [70030, 2]]]] });
-    expect(a[1]!.dict).toEqual({ items: [token] });
-    // The next segment's key names everything its sheet references, the quest's item included.
+    expect(a[1]!.dict).toEqual({ items: [token], rands: [badger] });
+    // The next segment's key names everything its sheet references, the quest's item and the suffix included.
     const b = reader.segment("trace", second!);
     expect(b[0]!.kind).toBe("key");
-    expect(b[0]!.dict).toEqual({ items: [token, reed], quests: [[8101, [6, 0, 0, 0, [70030, 2]]]] });
+    expect(b[0]!.dict).toEqual({ items: [token, reed], rands: [badger], quests: [[8101, [6, 0, 0, 0, [70030, 2]]]] });
     valid(dir);
   });
 
