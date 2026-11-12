@@ -357,6 +357,22 @@ const EVAL_LINKS_MAX = 256;
 /** How often a repeat still going is counted in the log (`RepeatFolder.flush`), so a reader of a live log sees it. */
 const LOG_FOLD_FLUSH_MS = 60_000;
 
+/**
+ * The SDK's advice at the foot of an abandoned walk's note (`moveTo`,
+ * `moveAbandon`): dispatch it, or run it "from a background routine", and
+ * poll. A host with a program has no background routine of a snippet's: its
+ * timeout text says where a long walk goes instead (a routine), so the SDK's
+ * sentence is dropped there and the distance covered and left is kept.
+ */
+export const SDK_MOVE_ABANDON_ADVICE =
+  " A move that long does not fit one snippet — issue it with sdk.moveToAsync(target), or from a background routine, and poll " +
+  "state.self.position (or watch the WB_MOVE_RESULT event) instead of awaiting it inline.";
+
+/** An abandon note as a host with a program shows it: the SDK's advice dropped (`SDK_MOVE_ABANDON_ADVICE`). Pure. */
+export function programAbandonNote(note: string): string {
+  return note.endsWith(SDK_MOVE_ABANDON_ADVICE) ? note.slice(0, -SDK_MOVE_ABANDON_ADVICE.length) : note;
+}
+
 export class SandboxHost {
   private proc: Subprocess | null = null;
   private markReady: () => void = () => {};
@@ -1069,7 +1085,7 @@ export class SandboxHost {
             // showed models failing to act on (one retried the same blocking
             // call 5 times), and one e360 slept `sleep(30000, { wake: false })`
             // into a 30000ms ceiling 32 times without learning why.
-            (ping.note !== undefined ? `${ping.note} ` : "") +
+            (ping.note !== undefined ? `${this.program !== undefined ? programAbandonNote(ping.note) : ping.note} ` : "") +
             (this.program !== undefined
               ? `The sandbox, your routines and the session are still alive. ` +
                 `Work longer than ${Math.round(this.opts.snippetTimeoutMs / 1000)}s belongs in a routine: a function main.ts exports, ` +

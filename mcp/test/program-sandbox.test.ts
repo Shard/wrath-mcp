@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { leaseSessionSecret } from "../src/module-auth";
 import { Scratchpad } from "../src/scratchpad";
-import { SandboxHost } from "../src/sandbox/host";
+import { programAbandonNote, SandboxHost, SDK_MOVE_ABANDON_ADVICE } from "../src/sandbox/host";
 import type { ProgramFact } from "../src/sandbox/program-host";
 import { CharacterRoster } from "../src/fanout";
 import { SecretRedactor } from "../src/redact";
@@ -597,4 +597,14 @@ describe("the program tools", () => {
     expect((await call("stop_routine", { name: "walk" })).isError).toBe(true);
     expect((await call("start_routine", {})).text).toStartWith("invalid arguments for start_routine: ");
   }, 40_000);
+});
+
+describe("an abandoned walk's note with a program", () => {
+  test("drops the SDK's background-routine advice and keeps the distances", () => {
+    const note = `a moveTo was still walking when this was abandoned: ~15y covered, ~220y still to go.${SDK_MOVE_ABANDON_ADVICE}`;
+    expect(programAbandonNote(note)).toBe("a moveTo was still walking when this was abandoned: ~15y covered, ~220y still to go.");
+    expect(programAbandonNote(note)).not.toContain("background routine");
+    // A note of another kind (an abandoned sleep or wait) is left as it is.
+    expect(programAbandonNote("sleep(30000) could not finish in the 12s the snippet had left.")).toBe("sleep(30000) could not finish in the 12s the snippet had left.");
+  });
 });

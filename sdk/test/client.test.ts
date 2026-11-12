@@ -5114,6 +5114,12 @@ describe("client: moveTo target resolution", () => {
     expect(err.message).toContain("~220y still to go");
     expect(err.message).toContain("sdk.moveToAsync(target)");
     expect(err.moveAbandon).toContain("still walking when this was abandoned");
+    // Its advice is the sentence a host with a program drops (mcp `SDK_MOVE_ABANDON_ADVICE`):
+    // a change here is a change there.
+    expect(err.moveAbandon).toEndWith(
+      " A move that long does not fit one snippet — issue it with sdk.moveToAsync(target), or from a background routine, and poll " +
+        "state.self.position (or watch the WB_MOVE_RESULT event) instead of awaiting it inline.",
+    );
 
     client.close();
     await stub.stop();
