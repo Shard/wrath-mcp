@@ -378,6 +378,10 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
     legs, and names `questAreas` where quests are taken and read.
 - The harness block shows the same hint from several routines in one result
   as one line that names them, where it repeated the sentence per routine.
+- `CoreToolRender.isAmbient` is handed the event's data after its opcode,
+  so a harness can fold one kind of an opcode's events out of
+  `recent_events` and keep the rest. A render that reads only the opcode is
+  unchanged.
 
 ### Fixed
 

@@ -648,7 +648,7 @@ export function serveEvents<C extends CoreToolContext>(
   if (includeMovement) {
     return { visible: scanned, folded: 0, text: scanned.length === 0 ? "no events yet" : scanned.map((e) => render.eventLine(e)).join("\n") };
   }
-  const ambient = (e: EventSummary): boolean => render.isAmbient(e.opcode);
+  const ambient = (e: EventSummary): boolean => render.isAmbient(e.opcode, e.data);
   // An event a child extension marked as a bystander's (a harness's
   // spell combat-log line nobody of ours is in) is left out as the
   // harness's own event window leaves it out; it is not movement, so it
@@ -671,13 +671,14 @@ export function serveEvents<C extends CoreToolContext>(
 
 /**
  * How a harness shows the core tools' answers: the event line and the state
- * summary are its context rendering, and which opcodes are ambient is its
- * context policy. `afterSnippet` is what a snippet result ends with after its
+ * summary are its context rendering, and which events are ambient is its
+ * context policy: by opcode, and by the event's data where an opcode carries
+ * both signal and noise. `afterSnippet` is what a snippet result ends with after its
  * hint block, if anything (a harness's "what changed since the last snippet").
  */
 export interface CoreToolRender<C extends CoreToolContext> {
   eventLine(e: EventSummary): string;
-  isAmbient(opcode: string): boolean;
+  isAmbient(opcode: string, data?: unknown): boolean;
   stateSummary(snapshot: Record<string, unknown>, o: { sessionLive: boolean }): string;
   afterSnippet?(ctx: C): Promise<string | undefined>;
 }
