@@ -281,6 +281,9 @@ describe("routines", () => {
     expect(ended).toMatchObject({ kind: "ended", routine: { name: "trip", state: "returned", value: '{\n  arrived: "Goldshire",\n}', args: { to: "Goldshire" } } });
     const snippet = await host.evalSnippet("1 + 1");
     expect(snippet.logs).toEqual([]);
+    // Two callers at once share one beat: the second is answered when the first has folded, not before.
+    const first = p.beat();
+    expect(p.beat()).toBe(first);
     await p.beat();
     const drained = p.drainFacts();
     expect(drained.console.total).toBe(4);

@@ -176,7 +176,8 @@ export class ProgramHost {
   /** Saves, loads and routine calls, one at a time. */
   private queue: Promise<unknown> = Promise.resolve();
   private beatTimer: ReturnType<typeof setInterval> | undefined;
-  private beating = false;
+  /** The beat in flight, if any: a second caller awaits it rather than missing what it carries. */
+  private beating: Promise<void> | null = null;
   /** Set as the beat kills a blocked child: the restart that follows starts no routine. */
   private blame = false;
   /** Whether the child now running has had the program brought back. */
@@ -489,11 +490,21 @@ export class ProgramHost {
    * One beat: ask the child, fold its answer into the registry and the
    * ledger. An unanswered beat with no snippet in flight is a blocked event
    * loop nobody else will notice, and the program's to answer for; a child
-   * that is gone while routines should be running is started. Never throws.
+   * that is gone while routines should be running is started. A caller that
+   * arrives while a beat is in flight is handed that beat, so what it folds
+   * is there when the caller reads. Never throws.
    */
-  async beat(): Promise<void> {
-    if (this.beating || this.stopped) return;
-    this.beating = true;
+  beat(): Promise<void> {
+    if (this.beating !== null) return this.beating;
+    if (this.stopped) return Promise.resolve();
+    const p = this.beatOnce().finally(() => {
+      if (this.beating === p) this.beating = null;
+    });
+    this.beating = p;
+    return p;
+  }
+
+  private async beatOnce(): Promise<void> {
     try {
       if (!this.port.running()) {
         // The child died with routines running and nothing else is looking.
@@ -513,8 +524,6 @@ export class ProgramHost {
       this.fold(beat);
     } catch {
       // The next beat tries again.
-    } finally {
-      this.beating = false;
     }
   }
 
