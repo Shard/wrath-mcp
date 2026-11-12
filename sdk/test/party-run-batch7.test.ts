@@ -267,7 +267,8 @@ describe("cast refusals a client explains say what they need", () => {
       return `${h!.action} ${h!.status}: ${h!.hint}`;
     };
     expect(await refuse(6572, 22)).toBe(
-      "castSpell caster_aurastate: Riposte Slam (6572) on Thistlebore: needs a state first (e.g. after a dodge, parry or block)",
+      "castSpell caster_aurastate: Riposte Slam (6572) on Thistlebore: you are not in the state it needs: an effect it requires on you " +
+        "is missing, or one you carry rules it out (yours: state.aurasOf(state.self.guid))",
     );
     expect(await refuse(1715, 94)).toBe("castSpell only_shapeshift: Hock (1715) on Thistlebore: needs a different stance or form");
     expect(await refuse(7322, 34)).toBe("castSpell fleeing: Frost Lance (7322) on Thistlebore: you are fleeing (feared) and cannot act");
@@ -311,13 +312,16 @@ describe("state.self.casting: the cast bar, and the refusals it explains", () =>
       "castSpell not_ready: Frost Lance (7322) on Thistlebore: you are still casting Frost Lance (7322), 1.2s left; " +
         "its cooldown, or the global cooldown, is still running",
     ]);
-    // With nothing on the bar, not_ready keeps its own words.
+    // With nothing on the bar, not_ready keeps its own words, and says when
+    // the spell last went off: the server announced no cooldown for it.
     push(stub, spellGo(45, 7322, T + 3643));
     await folded(client, "SMSG_SPELL_GO", 45);
     await client.castSpell(7322, CREATURE_GUID);
     push(stub, castFailed(46, 7322, 67, T + 3700));
     await folded(client, "SMSG_CAST_FAILED", 46);
-    expect(client.drainActionHints()[0]?.hint).toBe("Frost Lance (7322) on Thistlebore: its cooldown, or the global cooldown, is still running");
+    expect(client.drainActionHints()[0]?.hint).toBe(
+      "Frost Lance (7322) on Thistlebore: its cooldown, or the global cooldown, is still running (it last went off 0.1s ago)",
+    );
     client.close();
     await stub.stop();
   });

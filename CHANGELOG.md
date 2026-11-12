@@ -339,6 +339,39 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   `status: "refused"` and the server's text, where it answered `no_transfer`
   after its timeout, and a `moveTo` that crossed such a portal carries the
   refusal in its hint.
+- **Hint and result text from two long single-character runs.** Text a model
+  reads, changed where it misled or said nothing:
+  - `run_snippet`'s description says the `scratchpad` calls return Promises
+    (`await scratchpad.read()`).
+  - Cast refusals: `caster_aurastate` no longer gives a warrior's example and
+    says an effect the spell needs is missing or one the caster carries rules
+    it out; `only_abovewater`, `aura_bounced` and `incorrect_area` have
+    meanings where they read "the server refused it". A `not_ready` gives the
+    time left on a cooldown the server announced, else when the spell last
+    went off and which other cast is inside the global cooldown's reach.
+  - An interrupted cast is attributed where this client saw the cause: its
+    own loot or `cancelCast` sent during the cast, a stun, a target gone from
+    view, or a hit that landed in the same instant, beside its own move and
+    death as before. With none of them it says the server names no cause,
+    where it said "moving or acting during it".
+  - `path_incomplete` hints name the point as `reachedPos`, the field
+    `moveTo`'s result already carried and `sdk/API.md` never mentioned;
+    `moveToAsync`'s refusal carries `reachedPos` too.
+  - A `path_incomplete` and a climb's `drop` end by naming `unstuck()`.
+  - `lootCorpse` and an opened item's `none_stored` carry a hint, in the
+    result and the harness block: the server's inventory refusal (bags full)
+    when it sent one. A loot window that never arrives still throws
+    `EventTimeoutError`, now with what the cache shows of the corpse.
+  - `sellItem` refuses an item given by name itself, listing the guid the
+    bags hold it under, where the module answered `invalid_guid` and named a
+    unit; the `invalid_guid` hint speaks of items as well as units.
+  - `unstuck()`'s `cast_failed` for `not_mounted` says to dismount first.
+  - `char_create_failed_code_48` says the race/class combination is not
+    allowed.
+  - `sdk/API.md` says areatriggers fire by themselves along walks and flown
+    legs, and names `questAreas` where quests are taken and read.
+- The harness block shows the same hint from several routines in one result
+  as one line that names them, where it repeated the sentence per routine.
 
 ### Fixed
 

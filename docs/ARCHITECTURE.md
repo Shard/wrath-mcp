@@ -396,7 +396,10 @@ wait for the next snippet.
 
 `renderActionHints` in `mcp/src/tools.ts` renders it as a short block at the
 foot of that result: one line per status with a count, the hint text unchanged
-and nothing added to it, the tool's own text above it untouched. It goes in the
+and nothing added to it, the tool's own text above it untouched. The tally is
+kept per routine of the agent's code so a line can say whose call it was, and
+the same sentence from several routines in one result is one line naming
+them. It goes in the
 tool result rather than in a harness's next-turn context because a CLI agent's
 turn can be a whole session, so a context notice would arrive a turn late, and
 delivery must not cost the agent a follow-up inspection. Every result passes

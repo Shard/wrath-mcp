@@ -171,6 +171,72 @@ describe("hints tallied per character", () => {
   });
 });
 
+describe("the same hint from several routines in one result", () => {
+  const SUPERSEDED = "a newer moveTo replaced this one";
+  test("is one line that names each routine once and sums the repeats", () => {
+    const text = renderActionHints([
+      { action: "moveTo", status: "superseded", count: 4, hint: SUPERSEDED, ts: 3, from: "trip" },
+      { action: "moveTo", status: "superseded", count: 2, hint: SUPERSEDED, ts: 9, from: "grind" },
+      { action: "moveTo", status: "superseded", count: 1, hint: SUPERSEDED, ts: 5, from: "trip" },
+      { action: "castSpell", status: "not_ready", count: 20, hint: "Divine Storm (53385): still cooling down", ts: 7, from: "grind" },
+    ]);
+    expect(text).toBe(
+      "--- harness ---\n" +
+        `moveTo superseded ×7 (from earlier snippets: trip; grind): ${SUPERSEDED}\n` +
+        "castSpell not_ready ×20 (from an earlier snippet: grind): Divine Storm (53385): still cooling down",
+    );
+  });
+
+  test("one routine under two snippets is named once; a routine nothing names is counted, never listed", () => {
+    expect(
+      renderActionHints([
+        { action: "moveTo", status: "superseded", count: 1, hint: SUPERSEDED, ts: 1, from: "trip" },
+        { action: "moveTo", status: "superseded", count: 1, hint: SUPERSEDED, ts: 2, from: "trip" },
+      ]),
+    ).toBe(`--- harness ---\nmoveTo superseded ×2 (from an earlier snippet: trip): ${SUPERSEDED}`);
+    const five = ["a", "b", "", "c", "d"].map((from, i) => ({ action: "moveTo", status: "superseded", count: 1, hint: SUPERSEDED, ts: i, from }));
+    expect(renderActionHints(five)).toBe(`--- harness ---\nmoveTo superseded ×5 (from earlier snippets: a; b; c; +2): ${SUPERSEDED}`);
+    expect(renderActionHints(five.filter((h) => h.from === "").concat({ ...five[2]!, ts: 9 }))).toBe(
+      `--- harness ---\nmoveTo superseded ×2 (from an earlier snippet): ${SUPERSEDED}`,
+    );
+  });
+
+  test("hints that differ in a character stay apart, and so does the current snippet's own line", () => {
+    const text = renderActionHints([
+      { action: "moveTo", status: "path_incomplete", count: 3, hint: "no route to (1.0, 2.0)", ts: 4, from: "trip" },
+      { action: "moveTo", status: "path_incomplete", count: 5, hint: "no route to (1.0, 3.0)", ts: 3, from: "grind" },
+      { action: "moveTo", status: "superseded", count: 1, hint: SUPERSEDED, ts: 2, from: "trip" },
+      { action: "moveTo", status: "superseded", count: 1, hint: SUPERSEDED, ts: 1 },
+    ]);
+    expect(text).toBe(
+      "--- harness ---\n" +
+        "moveTo path_incomplete ×3 (from an earlier snippet: trip): no route to (1.0, 2.0)\n" +
+        "moveTo path_incomplete ×5 (from an earlier snippet: grind): no route to (1.0, 3.0)\n" +
+        `moveTo superseded (from an earlier snippet: trip): ${SUPERSEDED}\n` +
+        `moveTo superseded: ${SUPERSEDED}`,
+    );
+  });
+
+  test("a collapsed line frees a place among the four a result shows", () => {
+    const routines = ["a", "b", "c", "d", "e"].map((from, i) => ({ action: "moveTo", status: "superseded", count: 1, hint: SUPERSEDED, ts: i, from }));
+    const text = renderActionHints([...routines, { action: "castSpell", status: "not_ready", count: 1, hint: "wait", ts: 9 }]);
+    expect(text).toBe(`--- harness ---\ncastSpell not_ready: wait\nmoveTo superseded ×5 (from earlier snippets: a; b; c; +2): ${SUPERSEDED}`);
+  });
+
+  test("above fan-out 1 the routines collapse per character, then the characters group", () => {
+    const text = renderActionHints([
+      { action: "moveTo", status: "superseded", count: 1, hint: SUPERSEDED, ts: 1, from: "trip", character: "Alfa" },
+      { action: "moveTo", status: "superseded", count: 2, hint: SUPERSEDED, ts: 2, from: "grind", character: "Alfa" },
+      { action: "moveTo", status: "superseded", count: 1, hint: SUPERSEDED, ts: 3, from: "trip", character: "Bravo" },
+    ]);
+    expect(text).toBe(
+      "--- harness ---\n" +
+        `moveTo superseded [Bravo] (from an earlier snippet: trip): ${SUPERSEDED}\n` +
+        `moveTo superseded [Alfa] ×3 (from earlier snippets: trip; grind): ${SUPERSEDED}`,
+    );
+  });
+});
+
 describe("where a call is recorded", () => {
   test("a call that names a character goes to its record, one that names none to every open record, all under one id", () => {
     const root = scratch();

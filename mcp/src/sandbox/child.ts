@@ -32,7 +32,8 @@
  *   signal      AbortSignal for the *current* snippet; fires when the host
  *               abandons it (timeout). Every SDK wait honors it by default.
  *   scratchpad  { read(), write(content), append(text) } — the run's markdown
- *               scratchpad, bridged to the host process which owns the file
+ *               scratchpad, bridged to the host process which owns the file,
+ *               so each returns a Promise: `await scratchpad.read()` is the text
  *   API_MD_PATH absolute path to the generated SDK reference (sdk/API.md);
  *               read it with `await Bun.file(API_MD_PATH).text()`, in slices
  *   setTimeout / setInterval / clearInterval / …  the normal timers; routines

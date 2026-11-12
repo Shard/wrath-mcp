@@ -113,6 +113,8 @@ describe("equipItem: an equip names what it displaced", () => {
 
 const moveResult = (seq: number, moveId: number, extra: Record<string, unknown>) =>
   frame(seq, "WB_MOVE_RESULT", { moveId, status: "drop", pos: { x: -1234.5, y: 987.25, z: 42.125, o: 0 }, ...extra });
+/** What a climb's refusal ends on: the client's own way out, named (operator, 2026-11-12). */
+const UNSTUCK = 'With no way out, unstuck() is the game\'s "I\'m stuck".';
 describe("moveTo: a climb refused at the character's own feet reads as any drop refusal", () => {
   test("moveTo and moveToAsync: the edge is where the move started, and the recipe stays the plain one", async () => {
     const stub = startStub({ onConnect: () => world() });
@@ -123,7 +125,7 @@ describe("moveTo: a climb refused at the character's own feet reads as any drop 
     push(stub, moveResult(90, 1, { dz: 46.08, reachedPos: { x: -1234.5, y: 987.25, z: 42.125 }, target: { x: -1200, y: 950, z: 40 } }));
     const r = await pending;
     expect(r).toMatchObject({ ok: false, status: "drop" });
-    expect(r.hint).toEndWith("find the ramp/stairs.");
+    expect(r.hint).toEndWith(`find the ramp/stairs. ${UNSTUCK}`);
     client.drainActionHints();
     const ack = await client.moveToAsync({ x: -1200, y: 950, z: 40 });
     push(stub, moveResult(91, ack.moveId!, { dz: 46.08, reachedPos: { x: -1234.5, y: 987.25, z: 42.125 } }));
@@ -131,7 +133,7 @@ describe("moveTo: a climb refused at the character's own feet reads as any drop 
     await Bun.sleep(5);
     const [drop] = client.drainActionHints();
     expect(drop).toMatchObject({ action: "moveToAsync", status: "drop" });
-    expect(drop!.hint).toEndWith("find the ramp/stairs.");
+    expect(drop!.hint).toEndWith(`find the ramp/stairs. ${UNSTUCK}`);
     client.close();
     await stub.stop();
   });
