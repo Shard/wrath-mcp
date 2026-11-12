@@ -27,6 +27,7 @@ import type { ActionHintNote, ActionNote, ChildToHost, EventSummary, EvalResultM
 import { RepeatFolder } from "./log-fold";
 import type { RecordDrain } from "../record/recorder";
 import type { DispatchLink, SessionWriter } from "../record/writer";
+import { ProgramHost, type ProgramOptions } from "./program-host";
 
 export interface SnippetResult {
   ok: boolean;
@@ -34,6 +35,8 @@ export interface SnippetResult {
   error?: string | undefined;
   /** A note about the completion value; see `EvalResultMsg.hint`. */
   hint?: string | undefined;
+  /** What this snippet did to the model's program, in a sandbox that hosts one; see `EvalResultMsg.notes`. */
+  notes?: string[] | undefined;
   /**
    * Hint-bearing action failures the SDK tallied since the last drain — while
    * the snippet ran, or before it in a background routine. The harness renders
@@ -177,6 +180,17 @@ export interface SandboxHostOptions {
    * single-character sandbox, unchanged.
    */
   fanout?: { maxCharacters: number };
+  /**
+   * Host the model's program (`program-host.ts`): a file workspace rooted at
+   * `main.ts` whose exported functions are routines the sandbox runs and
+   * tracks. The child is then granted read access to the workspace's
+   * versions and nothing more, snippets keep no bindings and leave nothing
+   * running, and `SandboxHost.program` is the surface the program tools and a
+   * harness use. Absent, none of it exists: the child is spawned with the
+   * arguments and environment it always had, and is the snippet sandbox
+   * unchanged.
+   */
+  program?: ProgramOptions;
   now?: () => number;
 }
 
@@ -316,6 +330,22 @@ export const STATE_LOSS_RECOVERY_FANOUT =
   "Every character that was logged in is reattached and its state replayed before the next call is answered; " +
   "`list_characters` shows them, and one that could not be reattached is named in a notice.";
 
+/**
+ * `STATE_LOSS_RECOVERY` for a sandbox that hosts a program: what survives is
+ * on disk, and the host brings the routines back itself.
+ */
+export const STATE_LOSS_RECOVERY_PROGRAM =
+  "The game session was not lost, and your character is where it was. Your files, memory and scratchpad are as they were, " +
+  "and the routines that were running are started again from the top; when a routine was what blocked the sandbox none is, " +
+  "and they are named. In a snippet, run `await connect()` before reading `state`: resubscribing replays your own state and " +
+  "everything in view, and `connect()` returns once that replay has landed.";
+
+/** `STATE_LOSS_RECOVERY_PROGRAM` at fan-out above 1: the host reattaches every character before it starts a routine. */
+export const STATE_LOSS_RECOVERY_PROGRAM_FANOUT =
+  "The game sessions were not lost, and each character is where it was. Your files, memory and scratchpad are as they were. " +
+  "Every character that was logged in is reattached, and the routines that were running are started again from the top; " +
+  "when a routine was what blocked the sandbox none is, and they are named.";
+
 /** The runner's own stream of the same name: the job log, or the pod log on the cluster. */
 function defaultLogSink(stream: "stdout" | "stderr", text: string): void {
   (stream === "stdout" ? process.stdout : process.stderr).write(text);
@@ -367,9 +397,45 @@ export class SandboxHost {
   private readonly seats = new Map<string, HostSeat>();
   /** The current child's seats reattached, after its ready; resolved at once at fan-out 1. */
   private reattached: Promise<void> = Promise.resolve();
+  /** The model's program, when this host was asked to hold one (`SandboxHostOptions.program`). */
+  readonly program: ProgramHost | undefined;
 
   constructor(private readonly opts: SandboxHostOptions) {
     this.redactor.redact(opts.secret);
+    if (opts.program !== undefined) {
+      this.program = new ProgramHost(opts.program, {
+        start: () => this.start(),
+        running: () => this.proc !== null,
+        request: async (msg, timeoutMs, link) => {
+          const id = this.nextId++;
+          if (link !== undefined) this.linkEval(id, link);
+          const res = await this.request<{ t: "rpc_result"; id: number; ok: boolean; value?: unknown; error?: string }>({ ...msg, id } as unknown as HostToChild & { id: number }, timeoutMs);
+          if (!res.ok) throw new Error(res.error ?? `${msg.t} failed`);
+          return res.value;
+        },
+        tell: (msg) => {
+          try {
+            this.send(msg as unknown as HostToChild);
+          } catch {
+            // no child to tell; the next one is told as it starts
+          }
+        },
+        isTimeout: (err) => err instanceof SandboxTimeoutError,
+        snippetsInFlight: () => this.evalsInFlight.size,
+        restartStalled: () => this.restart("its event loop was blocked while no snippet was running, so a routine blocked it"),
+        attached: (character) => character === undefined || this.seats.get(character)?.attached === true,
+        now: () => (this.opts.now ?? Date.now)(),
+      });
+    }
+  }
+
+  /** Remember which tool call an id of the child's is, for the action log (`evalLinks`). */
+  private linkEval(id: number, link: EvalLink): void {
+    this.evalLinks.set(id, link);
+    for (const key of this.evalLinks.keys()) {
+      if (this.evalLinks.size <= EVAL_LINKS_MAX) break;
+      this.evalLinks.delete(key);
+    }
   }
 
   /** How many characters this sandbox may hold: above 1 only for a fan-out sandbox. */
@@ -384,6 +450,7 @@ export class SandboxHost {
 
   /** What a state-loss notice ends with: how to get the session back, or that the host already did. */
   private get stateLoss(): string {
+    if (this.program !== undefined) return this.fanout ? STATE_LOSS_RECOVERY_PROGRAM_FANOUT : STATE_LOSS_RECOVERY_PROGRAM;
     return this.fanout ? STATE_LOSS_RECOVERY_FANOUT : STATE_LOSS_RECOVERY;
   }
 
@@ -449,7 +516,10 @@ export class SandboxHost {
     // `console.log` reaches the child's stdout as well as its result, and the
     // child holds its session secret, so both streams pass the redaction
     // before they reach the runner's own and the logs behind them (`pump`).
-    const readFlags = (this.opts.readDirs ?? []).map((d) => `--read=${d}`);
+    // With a program, the versions of the model's files are one more directory
+    // the child may read; it is written by this process alone.
+    const program = this.program;
+    const readFlags = [...(this.opts.readDirs ?? []), ...(program !== undefined ? [program.workspace.deploysDir] : [])].map((d) => `--read=${d}`);
     this.proc = Bun.spawn(["bun", "--env-file=/dev/null", this.confinePath, ...readFlags, "bun", "--env-file=/dev/null", this.entryPath], {
       env: sandboxChildEnv(process.env, {
         WRATHBENCH_MODULE_URL: this.opts.moduleUrl,
@@ -467,6 +537,8 @@ export class SandboxHost {
         // Fan-out only, and absent at 1: the child of a single-character
         // sandbox is spawned with exactly the environment it always had.
         ...(this.fanout ? { WRATHBENCH_MAX_CHARACTERS: String(this.maxCharacters) } : {}),
+        // A program only, and absent without one, for the same reason.
+        ...(program !== undefined ? { WRATHBENCH_PROGRAM: program.workspace.deploysDir } : {}),
       }),
       stdio: ["ignore", "pipe", "pipe"],
       serialization: "json",
@@ -520,6 +592,16 @@ export class SandboxHost {
     // opened in it again before anything else is asked of it.
     const proc = this.proc;
     this.reattached = this.fanout ? this.ready.then(() => this.reattachSeats(proc)) : Promise.resolve();
+    // With a program, the routines that were running come back once the
+    // child is ready and its characters are attached; whoever awaits this
+    // start is answered when they have.
+    if (program !== undefined) {
+      const attached = this.reattached;
+      this.reattached = this.ready
+        .then(() => attached)
+        .then(() => (this.proc === proc && proc !== null ? program.resume() : undefined))
+        .catch(() => undefined);
+    }
     await this.ready;
     await this.reattached;
   }
@@ -695,6 +777,13 @@ export class SandboxHost {
             // A child that died as it started is the onExit path's to report.
           }
         }
+        if (this.program !== undefined) {
+          try {
+            this.proc?.send(this.program.initMessage() satisfies HostToChild);
+          } catch {
+            // as above
+          }
+        }
         markReady();
         return;
       }
@@ -743,6 +832,12 @@ export class SandboxHost {
       }
       case "fatal":
         this.notice("session_note", `sandbox reported fatal error: ${msg.error}`);
+        return;
+      case "program":
+        this.program?.onEvents(msg.events);
+        return;
+      case "memory":
+        this.program?.onMemory(msg.json);
         return;
       case "actions": {
         const sink = this.opts.onActions;
@@ -897,13 +992,7 @@ export class SandboxHost {
     const proc = this.proc;
     const id = this.nextId++;
     const started = performance.now();
-    if (link !== undefined) {
-      this.evalLinks.set(id, link);
-      for (const key of this.evalLinks.keys()) {
-        if (this.evalLinks.size <= EVAL_LINKS_MAX) break;
-        this.evalLinks.delete(key);
-      }
-    }
+    if (link !== undefined) this.linkEval(id, link);
     this.evalsInFlight.add(id);
     try {
       const res = await this.request<EvalResultMsg>(
@@ -929,6 +1018,7 @@ export class SandboxHost {
         value: res.value,
         error: res.error,
         hint: res.hint,
+        ...(res.notes !== undefined ? { notes: res.notes } : {}),
         actionHints: res.hints ?? [],
         logs: res.logs,
         durationMs: res.durationMs,
@@ -980,7 +1070,12 @@ export class SandboxHost {
             // call 5 times), and one e360 slept `sleep(30000, { wake: false })`
             // into a 30000ms ceiling 32 times without learning why.
             (ping.note !== undefined ? `${ping.note} ` : "") +
-            `The runtime (bindings, routines, session) is still alive. ` +
+            (this.program !== undefined
+              ? `The sandbox, your routines and the session are still alive. ` +
+                `Work longer than ${Math.round(this.opts.snippetTimeoutMs / 1000)}s belongs in a routine: a function main.ts exports, ` +
+                `started with start_routine, has no time limit, and a long walk there is \`await sdk.moveTo(target)\`. ` +
+                `Code that was not awaiting the SDK may still be running, so check state/events before assuming it failed.`
+              : `The runtime (bindings, routines, session) is still alive. ` +
             `A walk longer than this limit is dispatched, not awaited: sdk.moveToAsync(target) returns as soon ` +
             `as the move is queued, and you poll state.self.position or the WB_MOVE_RESULT event for the ` +
             `verdict. ` +
@@ -988,7 +1083,7 @@ export class SandboxHost {
             `routine (launch it without awaiting, e.g. ` +
             `\`globalThis.trip = (async () => { for (const p of waypoints) await sdk.moveTo(p); return "done"; })().catch(String); "started"\` ` +
             `— the trailing value keeps the snippet from awaiting the promise REPL-style; it returns instantly, then a later snippet checks \`await Promise.race([trip, "running"])\`); ` +
-            `code that was not awaiting the SDK may still be running, so check state/events before assuming it failed.`,
+            `code that was not awaiting the SDK may still be running, so check state/events before assuming it failed.`),
           logs: ping.logs,
           // The abandoned snippet's hints: its result is discarded, so this
           // pong is the only channel that still reaches the model.
@@ -1167,6 +1262,7 @@ export class SandboxHost {
   }
 
   async stop(): Promise<void> {
+    this.program?.stop();
     // The last of the record, while there is still a child to ask.
     if (this.recordTimer !== undefined) clearInterval(this.recordTimer);
     this.recordTimer = undefined;
