@@ -78,7 +78,18 @@ export interface LeaseOptions {
   allowGm?: boolean;
   fetch?: typeof fetch;
   env?: Record<string, string | undefined>;
+  /** Waits between `/lease` attempts on an unreachable module; tests pass a no-op. */
+  sleep?: (ms: number) => Promise<void>;
 }
+
+/**
+ * Waits before each retry of `/lease` when the module cannot be reached: about
+ * a minute in all. A run pod can start before its network path to the
+ * worldserver is up (seen on the cluster: two of six pods refused at start, the
+ * other four fine), and a run that starts without its secret never
+ * authenticates, so it would play its whole episode blind.
+ */
+export const LEASE_RETRY_DELAYS_MS: readonly number[] = [1_000, 2_000, 4_000, 8_000, 15_000, 30_000];
 
 export type LeaseOutcome =
   /** `allowGm` is the module's word on the opt-in: false from a module that predates it, whatever was asked. */
@@ -95,7 +106,10 @@ export type LeaseOutcome =
  * not_found` to `/lease` (it predates authentication, so it will not ask the
  * child for a secret either). Everything else — a refused port secret, a
  * refused account, a malformed answer — throws, because starting a run whose
- * child cannot authenticate would only burn the attempt later.
+ * child cannot authenticate would only burn the attempt later. An unreachable
+ * module is retried over `LEASE_RETRY_DELAYS_MS` and then throws too: the
+ * module is up for every other run, so the likeliest cause is this pod's own
+ * network not being ready yet, and a bare launch would run the episode blind.
  */
 export async function leaseSessionSecret(o: LeaseOptions): Promise<LeaseOutcome> {
   const env = o.env ?? process.env;
@@ -104,22 +118,30 @@ export async function leaseSessionSecret(o: LeaseOptions): Promise<LeaseOutcome>
     return { secret: undefined, note: `${MODULE_SECRET_ENV} is not set — no session secret leased; the snippet child authenticates with nothing (a pre-auth module only)` };
   }
   const f = o.fetch ?? fetch;
-  let res: Response;
-  try {
-    res = await f(`${o.moduleUrl}/lease`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
-      body: JSON.stringify({
-        token: o.token,
-        ...(o.account === undefined ? {} : { account: o.account }),
-        ...(o.allowGm === true ? { allowGm: true } : {}),
-      }),
-      signal: AbortSignal.timeout(5_000),
-    });
-  } catch (err) {
-    // Unreachable module: hygiene and createSession will say the same thing
-    // in their own words; nothing is gained by failing here first.
-    return { secret: undefined, note: `module unreachable for /lease (${err instanceof Error ? err.message : String(err)}) — no session secret leased` };
+  const sleep = o.sleep ?? ((ms: number) => Bun.sleep(ms));
+  let res: Response | undefined;
+  let lastErr = "";
+  for (let attempt = 0; attempt <= LEASE_RETRY_DELAYS_MS.length; attempt++) {
+    if (attempt > 0) await sleep(LEASE_RETRY_DELAYS_MS[attempt - 1]!);
+    try {
+      res = await f(`${o.moduleUrl}/lease`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
+        body: JSON.stringify({
+          token: o.token,
+          ...(o.account === undefined ? {} : { account: o.account }),
+          ...(o.allowGm === true ? { allowGm: true } : {}),
+        }),
+        signal: AbortSignal.timeout(5_000),
+      });
+      break;
+    } catch (err) {
+      lastErr = err instanceof Error ? err.message : String(err);
+    }
+  }
+  if (res === undefined) {
+    const waited = LEASE_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0) / 1000;
+    throw new Error(`module unreachable for /lease after ${LEASE_RETRY_DELAYS_MS.length + 1} tries over ${waited}s (${lastErr}) — a run without its session secret cannot authenticate, so it does not start`);
   }
   const body = (await res.json().catch(() => null)) as { ok?: boolean; error?: string; secret?: unknown; account?: unknown; allowGm?: unknown } | null;
   if (res.status === 404 && body?.error === "not_found") {
