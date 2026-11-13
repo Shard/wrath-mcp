@@ -385,6 +385,13 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Fixed
 
+- `leaseSessionSecret` retries a module it cannot reach for about a minute
+  (`LEASE_RETRY_DELAYS_MS`), then throws. It used to return without a secret,
+  so a run whose pod started before its network path to the worldserver was
+  up played its whole episode unauthenticated: every event-stream connection
+  refused, nothing seen. A launch that cannot lease now fails, and is retried
+  as an attempt.
+
 - `state.pet().spells` carries the bar's own spell buttons beside the
   packet's `spells` list, and `petCast` sends a button as the bar types it.
   A possessed unit's bar (the Eye of Acherus, `Player::PossessSpellInitialize`)
