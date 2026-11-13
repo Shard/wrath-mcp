@@ -138,7 +138,7 @@ describe("load on save", () => {
     await p.startRoutine({ name: "other" });
     await until("the first run", async () => (await host.evalSnippet("memory.started")).value === "1");
     const saved = await p.writeFile("main.ts", `${IDLE}// changed\n`);
-    expect(saved.text).toEndWith("loaded: deploy 2 · routines: idle · restarted from the top: idle · stopped, no longer exported: other");
+    expect(saved.text).toEndWith("loaded: deploy 2 · routines: idle · restarts from the top 1s after the last load: idle · stopped, no longer exported: other");
     await until("the restarted run", async () => (await host.evalSnippet("memory.started")).value === "2");
     expect((await host.evalSnippet("memory.args.zone")).value).toBe('"north"');
     const rows = p.routines();
@@ -202,7 +202,34 @@ describe("routines", () => {
     expect(twice.ok).toBe(false);
     expect(twice.text).toMatch(/^idle is already running: started \d+s ago on deploy 1\. Stop it first with stop_routine to start it again\.\nroutines:\nidle running/);
     expect((await p.stopRoutine({ name: "idle" })).text).toMatch(/^stopped idle\nroutines:\nidle stopped 0s ago$/);
-    expect((await p.stopRoutine({ name: "idle" })).text).toMatch(/^idle is not running \(it stopped \d+s ago\)\. No routine is running\.\n/);
+    // A stop of a routine that has ended is a plain answer, not a failure: how and when it ended.
+    expect(await p.stopRoutine({ name: "idle" })).toEqual({ ok: true, text: "idle had already ended: it was stopped 0s ago.\nroutines:\nidle stopped 0s ago" });
+    // A name that never ran is still refused.
+    expect(await p.stopRoutine({ name: "grind" })).toEqual({ ok: false, text: "grind is not running. No routine is running.\nroutines:\nidle stopped 0s ago" });
+  }, 30_000);
+
+  test("a routine's returned value and error are shown whole once; later lines refer to them", async () => {
+    const { host } = await rig();
+    const p = host.program!;
+    await p.writeFile("main.ts", 'export async function trip(args) { return args ?? "done"; }\nexport async function fail() { throw new TypeError("no target in view"); }\n');
+    await p.startRoutine({ name: "trip" });
+    await p.startRoutine({ name: "fail" });
+    await until("both ended", () => p.routines().every((r) => r.state !== "running"));
+    const first = await p.stopRoutine({ name: "trip" });
+    expect(first.ok).toBe(true);
+    expect(first.text).toContain('\ntrip returned 0s ago: "done"\n');
+    expect(first.text).toMatch(/\nfail threw 0s ago: TypeError: no target in view at fail \(main\.ts:2:\d+\)$/);
+    // Shown once: the next result refers to them.
+    expect((await p.stopRoutine({ name: "fail" })).text).toBe("fail had already ended: it threw 0s ago.\nroutines:\ntrip returned 0s ago (value shown before)\nfail threw 0s ago: TypeError (shown before)");
+    // A new run's value is new, even an equal one; a changed one too.
+    await p.startRoutine({ name: "trip", args: "back" });
+    await until("trip ended again", () => p.routines().find((r) => r.name === "trip")?.state === "returned");
+    expect((await p.stopRoutine({ name: "trip" })).text).toContain('\ntrip returned 0s ago: "back"\n');
+    // A harness whose conversation lost them (a compaction, a trim) shows them whole again.
+    p.forgetShown();
+    expect((await p.stopRoutine({ name: "fail" })).text).toContain("\nfail threw 0s ago: TypeError: no target in view at fail");
+    // What a harness renders of its own, it marks.
+    expect(p.shownDetails().size).toBe(2);
   }, 30_000);
 
   test("stopping a routine aborts its signal and takes back the timers and listeners it started", async () => {
@@ -315,6 +342,13 @@ describe("snippets beside a program", () => {
     await p.editFile("lib/combat.ts", "5", "8", false);
     expect((await host.evalSnippet('import { reach } from "./lib/combat";\nreach')).value).toBe("8");
     expect((await host.evalSnippet('(await import("./lib/combat")).reach')).value).toBe("8");
+    // In a workspace file a bare builtin name is the builtin; in a snippet's import it is refused as one.
+    const bare = await host.evalSnippet('import { readdirSync } from "fs";\ntypeof readdirSync');
+    expect(bare.ok).toBe(false);
+    expect(bare.error).toContain('import "fs": fs is a builtin module, not a file in your workspace; in a snippet a bare name imports a workspace file, so import the builtin as "node:fs"');
+    expect((await host.evalSnippet('import { readdirSync } from "node:fs";\ntypeof readdirSync')).value).toBe('"function"');
+    await p.writeFile("lib/disk.ts", 'import { readdirSync } from "fs";\nexport const kind = typeof readdirSync;\n');
+    expect((await host.evalSnippet('import { kind } from "./lib/disk";\nkind')).value).toBe('"function"');
     const missing = await host.evalSnippet('import { nope } from "./lib/combat";\nnope');
     expect(missing.error).toContain('lib/combat.ts has no export named "nope"');
     // An error in a workspace file names it by its workspace path.
@@ -594,7 +628,8 @@ describe("the program tools", () => {
     expect(snippet.text).toContain('=> "sent"\nthis replaced the move routine walk had in flight');
     const stopped = await call("stop_routine", { name: "walk" });
     expect(stopped.text).toMatch(/^stopped walk\nroutines:\nwalk stopped 0s ago$/);
-    expect((await call("stop_routine", { name: "walk" })).isError).toBe(true);
+    // Stopping it again is a plain answer, not a tool error.
+    expect(await call("stop_routine", { name: "walk" })).toEqual({ text: "walk had already ended: it was stopped 0s ago.\nroutines:\nwalk stopped 0s ago" });
     expect((await call("start_routine", {})).text).toStartWith("invalid arguments for start_routine: ");
   }, 40_000);
 });
@@ -629,7 +664,7 @@ describe("round 3: saves, starts and what a result carries", () => {
     expect((await p.writeFile("main.ts", 'export { patrol } from "./lib/patrol";\n')).text).toEndWith("loaded: deploy 2 · routines: patrol");
     expect((await p.startRoutine({ name: "patrol" })).ok).toBe(true);
     const edited = await p.editFile("lib/patrol.ts", "?? null", "?? null ", false);
-    expect(edited.text).toEndWith("loaded: deploy 3 · routines: patrol · restarted from the top: patrol");
+    expect(edited.text).toEndWith("loaded: deploy 3 · routines: patrol · restarts from the top 1s after the last load: patrol");
   }, 30_000);
 
   test("a start after the save that restarted the routine is that run, said plainly; with other arguments it is refused truthfully", async () => {
@@ -638,7 +673,7 @@ describe("round 3: saves, starts and what a result carries", () => {
     const p = host.program!;
     await p.writeFile("main.ts", IDLE);
     await p.startRoutine({ name: "idle", args: { zone: "north" } });
-    expect((await p.editFile("main.ts", "?? 0) + 1", "?? 0) + 1 ", false)).text).toEndWith("restarted from the top: idle");
+    expect((await p.editFile("main.ts", "?? 0) + 1", "?? 0) + 1 ", false)).text).toEndWith("restarts from the top 1s after the last load: idle");
     const same = await p.startRoutine({ name: "idle", args: { zone: "north" } });
     expect(same.ok).toBe(true);
     expect(same.text).toMatch(/^idle is running: your save restarted it from the top on deploy 2, 0s ago, with these arguments\nroutines:\nidle running/);
@@ -660,8 +695,8 @@ describe("round 3: saves, starts and what a result carries", () => {
     await until("the first start", async () => (await host.evalSnippet("memory.started")).value === "1");
     const a = await p.editFile("main.ts", "?? 0) + 1", "?? 0) + 1 ", false);
     const b = await p.editFile("main.ts", "?? null", "?? null ", false);
-    expect(a.text).toEndWith("restarted from the top: idle");
-    expect(b.text).toEndWith("restarted from the top: idle");
+    expect(a.text).toEndWith("restarts from the top 1s after the last load: idle");
+    expect(b.text).toEndWith("restarts from the top 1s after the last load: idle");
     await until("the restart", async () => (await host.evalSnippet("memory.started")).value === "2");
     await Bun.sleep(1_500);
     // The first save's restart never ran: the second replaced it inside the settle window.

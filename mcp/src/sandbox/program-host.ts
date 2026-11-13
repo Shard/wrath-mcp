@@ -33,7 +33,7 @@
 
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { durationWords, LOAD_TIMEOUT_MS } from "./program";
+import { durationWords, LOAD_TIMEOUT_MS, RESTART_SETTLE_MS } from "./program";
 import type { ProgramBeat, ProgramErrorNote, ProgramEvent, ProgramLoadAnswer, ProgramLogLine, RoutineAnswer, RoutineNote } from "./ipc";
 import { isImportable, MAIN_PATH, sameImportGraph, type LineRange, type Workspace, type WorkspaceResult } from "../workspace";
 
@@ -133,11 +133,25 @@ const rowKey = (name: string, character: string | undefined): string => `${chara
 const label = (r: { name: string; character?: string | undefined }): string => (r.character === undefined ? r.name : `${r.name} (${r.character})`);
 
 /**
- * The routines as a tool result lists them, one per line. Pure: the rows and
- * the clock arrive as data. Durations, never clock times, so the lines mean
- * the same in any time zone.
+ * What identifies a routine line's error or returned value as shown: the run
+ * (name, character, start) and the text itself, so a new run's value and a
+ * changed one are new. Undefined for a row that has neither.
  */
-export function renderRoutines(rows: readonly RoutineRow[], now: number): string {
+export function routineDetailKey(r: RoutineRow): string | undefined {
+  const run = `${rowKey(r.name, r.character)}\u0000${r.startedAt}`;
+  if (r.state === "threw" && r.error !== undefined) return `${run}\u0000threw\u0000${r.error.text}\u0000${r.error.frames[0] ?? ""}`;
+  if (r.state === "returned" && r.value !== undefined) return `${run}\u0000returned\u0000${r.value}`;
+  return undefined;
+}
+
+/**
+ * The routines as a tool result lists them, one per line. Pure: the rows, the
+ * clock and what was shown before arrive as data. Durations, never clock
+ * times, so the lines mean the same in any time zone. An error or a returned
+ * value whose `routineDetailKey` is in `shown` is already in the
+ * conversation: its line refers to it rather than repeating it.
+ */
+export function renderRoutines(rows: readonly RoutineRow[], now: number, shown: ReadonlySet<string> = new Set()): string {
   if (rows.length === 0) return "routines: none started";
   const lines = rows.map((r) => {
     if (r.state === "running") {
@@ -145,12 +159,25 @@ export function renderRoutines(rows: readonly RoutineRow[], now: number): string
       return `${label(r)} running ${durationWords(now - r.startedAt)}, deploy ${r.deploy}, ${acted}`;
     }
     const ago = `${durationWords(now - (r.endedAt ?? now))} ago`;
-    if (r.state === "threw") return `${label(r)} threw ${ago}: ${r.error?.text ?? "an error"}${r.error?.frames[0] !== undefined ? ` ${r.error.frames[0]}` : ""}`;
+    const key = routineDetailKey(r);
+    const before = key !== undefined && shown.has(key);
+    if (r.state === "threw") {
+      if (before) return `${label(r)} threw ${ago}: ${r.error!.name} (shown before)`;
+      return `${label(r)} threw ${ago}: ${r.error?.text ?? "an error"}${r.error?.frames[0] !== undefined ? ` ${r.error.frames[0]}` : ""}`;
+    }
     if (r.state === "interrupted") return `${label(r)} interrupted ${ago}${r.note !== undefined ? `: ${r.note}` : ""}`;
-    if (r.state === "returned") return `${label(r)} returned ${ago}${r.value !== undefined ? `: ${r.value}` : ""}`;
+    if (r.state === "returned") {
+      if (before) return `${label(r)} returned ${ago} (value shown before)`;
+      return `${label(r)} returned ${ago}${r.value !== undefined ? `: ${r.value}` : ""}`;
+    }
     return `${label(r)} stopped ${ago}${r.note !== undefined ? `: ${r.note}` : ""}`;
   });
   return `routines:\n${lines.join("\n")}`;
+}
+
+/** How an ended routine's state reads after "it": `it returned`, `it was stopped`. */
+function endedWords(state: RoutineRow["state"]): string {
+  return state === "stopped" || state === "interrupted" ? `was ${state}` : state;
 }
 
 interface RegistryFile {
@@ -173,6 +200,8 @@ export class ProgramHost {
   private readonly repeats = new Map<string, { count: number; ts: number }>();
   private consoleLines: ProgramLogLine[] = [];
   private consoleTotal = 0;
+  /** Routine errors and values the model has been shown (`routineDetailKey`); not persisted, so a new process shows them whole. */
+  private readonly shown = new Set<string>();
   /** Saves, loads and routine calls, one at a time. */
   private queue: Promise<unknown> = Promise.resolve();
   private beatTimer: ReturnType<typeof setInterval> | undefined;
@@ -234,9 +263,41 @@ export class ProgramHost {
     return [...this.rows.values()].map((r) => ({ ...r }));
   }
 
-  /** The routine lines a tool result ends with. */
+  /** The routine lines a tool result ends with; what they show of errors and values counts as shown from then on. */
   routineLines(): string {
-    return renderRoutines(this.routines(), this.port.now());
+    const rows = this.routines();
+    const text = renderRoutines(rows, this.port.now(), this.shown);
+    this.markShown(rows);
+    return text;
+  }
+
+  /**
+   * The errors and returned values the model has been shown, by
+   * `routineDetailKey`: a harness that renders routine lines of its own (a
+   * wake) renders with this, and marks what it showed with `markShown` when
+   * the text stays in the model's conversation.
+   */
+  shownDetails(): ReadonlySet<string> {
+    return new Set(this.shown);
+  }
+
+  /** These rows' errors and values are in the model's conversation now. Only the current runs' are kept. */
+  markShown(rows: readonly RoutineRow[]): void {
+    for (const r of rows) {
+      const k = routineDetailKey(r);
+      if (k !== undefined) this.shown.add(k);
+    }
+    const current = new Set<string>();
+    for (const r of this.rows.values()) {
+      const k = routineDetailKey(r);
+      if (k !== undefined) current.add(k);
+    }
+    for (const k of this.shown) if (!current.has(k)) this.shown.delete(k);
+  }
+
+  /** The conversation lost what it held (a compaction, a trim, another thread): every error and value is shown whole again. */
+  forgetShown(): void {
+    this.shown.clear();
   }
 
   /** Everything since the last drain, and the routines as they stand. */
@@ -335,7 +396,8 @@ export class ProgramHost {
     this.persist();
     this.fact({ kind: "loaded", ts, deploy: answer.version, routines: answer.routines, restarted: answer.restarted.map(label), dropped: answer.dropped.map(label), by });
     const parts = [`loaded: deploy ${answer.version}`, answer.routines.length > 0 ? `routines: ${answer.routines.join(", ")}` : `${MAIN_PATH} exports no async function, so it has no routine`];
-    if (answer.restarted.length > 0) parts.push(`restarted from the top: ${answer.restarted.map(label).join(", ")}`);
+    // The restart waits out the settle window, and a load inside it restarts the routine in its place: one restart, on the last load's code.
+    if (answer.restarted.length > 0) parts.push(`restarts from the top ${durationWords(RESTART_SETTLE_MS)} after the last load: ${answer.restarted.map(label).join(", ")}`);
     if (answer.dropped.length > 0) parts.push(`stopped, no longer exported: ${answer.dropped.map(label).join(", ")}`);
     return { ok: true, text: parts.join(" · ") };
   }
@@ -373,7 +435,8 @@ export class ProgramHost {
       const row = this.rows.get(rowKey(o.name, o.character));
       // With no child there is nothing running to stop: the row is what is left of one.
       if (!this.port.running()) {
-        if (row === undefined || row.state !== "running") return { ok: false, text: `${label(o)} is not running.\n${this.routineLines()}` };
+        if (row === undefined) return { ok: false, text: `${label(o)} is not running.\n${this.routineLines()}` };
+        if (row.state !== "running") return { ok: true, text: `${this.alreadyEnded(row)}\n${this.routineLines()}` };
         this.rows.set(rowKey(o.name, o.character), { ...row, state: "stopped", endedAt: this.port.now() });
         this.persist();
         return { ok: true, text: `stopped ${label(o)}\n${this.routineLines()}` };
@@ -385,10 +448,17 @@ export class ProgramHost {
         return { ok: false, text: `stop_routine failed: ${err instanceof Error ? err.message : String(err)}\n${this.routineLines()}` };
       }
       if (!answer.ok) return { ok: false, text: `${answer.error}\n${this.routineLines()}` };
+      // Nothing to stop: a true answer about the run that ended, not a failure.
+      if (answer.ended === true) return { ok: true, text: `${this.alreadyEnded(answer.routine)}\n${this.routineLines()}` };
       this.rows.set(rowKey(answer.routine.name, answer.routine.character), { ...answer.routine });
       this.persist();
       return { ok: true, text: `stopped ${label(answer.routine)}\n${this.routineLines()}` };
     });
+  }
+
+  /** What a stop of a routine that had already ended answers: how and when it ended. */
+  private alreadyEnded(r: RoutineRow): string {
+    return `${label(r)} had already ended: it ${endedWords(r.state)} ${durationWords(this.port.now() - (r.endedAt ?? this.port.now()))} ago.`;
   }
 
   // -------------------------------------------------------- from the child

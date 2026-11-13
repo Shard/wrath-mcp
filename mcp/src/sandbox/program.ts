@@ -451,10 +451,11 @@ export class ProgramRuntime<S> {
 
   stop(name: string, character: string | undefined): RoutineAnswer {
     const run = this.runs.get(key(name, character));
-    if (run === undefined || run.ended) {
+    // A run that already ended is the answer, not a refusal: the host says how it ended.
+    if (run !== undefined && run.ended) return { ok: true, routine: { ...run.note }, ended: true };
+    if (run === undefined) {
       const running = [...this.runs.values()].filter((r) => !r.ended).map((r) => this.label(r.note.name, r.note.character));
-      const was = run === undefined ? "" : ` (it ${run.note.state} ${durationWords(Date.now() - run.endedAt)} ago)`;
-      return { ok: false, error: `${this.label(name, character)} is not running${was}. ${running.length > 0 ? `Running: ${running.join(", ")}.` : "No routine is running."}` };
+      return { ok: false, error: `${this.label(name, character)} is not running. ${running.length > 0 ? `Running: ${running.join(", ")}.` : "No routine is running."}` };
     }
     this.end(run, "stopped", new RoutineStopped("the routine was stopped (stop_routine); pending waits cancelled"), Date.now());
     return { ok: true, routine: { ...run.note } };

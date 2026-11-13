@@ -30,7 +30,7 @@ export {
   STATE_LOSS_RECOVERY_PROGRAM,
   STATE_LOSS_RECOVERY_PROGRAM_FANOUT,
 } from "./sandbox/host";
-export { PROGRAM_BEAT_GRACE_MS, PROGRAM_BEAT_MS, ProgramHost, renderRoutines } from "./sandbox/program-host";
+export { PROGRAM_BEAT_GRACE_MS, PROGRAM_BEAT_MS, ProgramHost, renderRoutines, routineDetailKey } from "./sandbox/program-host";
 export type { ProgramAnswer, ProgramFact, ProgramFacts, ProgramOptions, RoutineRow } from "./sandbox/program-host";
 export {
   FILE_MAX_CHARS,

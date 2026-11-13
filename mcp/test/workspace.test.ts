@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { compileOneOff, compileSnippet, extractImportStatements, resolveWorkspaceImport } from "../src/sandbox/rewrite";
 import { durationWords } from "../src/sandbox/program";
-import { renderRoutines } from "../src/sandbox/program-host";
+import { renderRoutines, routineDetailKey } from "../src/sandbox/program-host";
 import { FILE_MAX_CHARS, MEMORY_MAX_CHARS, sameImportGraph, Workspace, WORKSPACE_MAX_BYTES, workspaceImportGraph } from "../src/workspace";
 
 const dirs: string[] = [];
@@ -202,6 +202,20 @@ describe("a one-off snippet", () => {
     expect(() => resolveWorkspaceImport("./memory.json", root)).toThrow("memory.json is your memory, not a module");
   });
 
+  test("a bare builtin name is refused as what it is, once no workspace file answers to it", () => {
+    // DeepSeek round 3: `import "fs"` was refused as a missing fs.ts.
+    const refusal = 'import "fs": fs is a builtin module, not a file in your workspace; in a snippet a bare name imports a workspace file, so import the builtin as "node:fs"';
+    expect(() => resolveWorkspaceImport("fs", root)).toThrow(refusal);
+    expect(() => resolveWorkspaceImport("fs", undefined)).toThrow(refusal);
+    expect(() => resolveWorkspaceImport("fs/promises", root)).toThrow('so import the builtin as "node:fs/promises"');
+    // Bun's own builtins have no node: name to point to.
+    expect(() => resolveWorkspaceImport("bun", root)).toThrow(/^import "bun": bun is a builtin module, not a file in your workspace; in a snippet a bare name imports a workspace file$/);
+    // A workspace file of the same name is the file; ./ is never a builtin.
+    writeFileSync(join(root, "events.ts"), "export const e = 1;\n");
+    expect(resolveWorkspaceImport("events", root)).toEqual({ abs: `${root}/events.ts`, rel: "events.ts" });
+    expect(() => resolveWorkspaceImport("./path", root)).toThrow('import "./path": no such file in the workspace');
+  });
+
   test("named, default, namespace and side-effect imports become awaited dynamic imports with checked exports", () => {
     const c = compileOneOff(['import { one, one as uno } from "./util";', 'import dflt, { two } from "lib/deep/two";', 'import * as ns from "util.ts";', 'import "./util";', 'import { join } from "node:path";', "return one + uno + two + ns.one + (dflt ?? 0) + join.length;"].join("\n"), { root });
     const util = JSON.stringify(`${root}/util.ts`);
@@ -271,5 +285,17 @@ describe("the routine lines", () => {
       ].join("\n"),
     );
     expect([0, 59_400, 60_000, 3_599_000, 3_600_000].map(durationWords)).toEqual(["0s", "59s", "1m", "59m", "1h00m"]);
+  });
+
+  test("an error or a value already shown is referred to, not repeated; a changed one is shown again", () => {
+    const now = 1_000_000_000;
+    const trip = { name: "trip", deploy: 7, startedAt: now - 500_000, state: "returned" as const, endedAt: now - 65_000, value: '"done"' };
+    const heal = { name: "heal", character: "Bravo", deploy: 6, startedAt: now - 4_000_000, state: "threw" as const, endedAt: now - 3_900_000, error: { name: "TypeError", text: "TypeError: x is undefined", frames: ["at heal (main.ts:9:3)"], signature: "heal|TypeError|main.ts:9" } };
+    const shown = new Set([routineDetailKey(trip)!, routineDetailKey(heal)!]);
+    expect(renderRoutines([trip, heal], now, shown)).toBe(["routines:", "trip returned 1m ago (value shown before)", "heal (Bravo) threw 1h05m ago: TypeError (shown before)"].join("\n"));
+    expect(renderRoutines([{ ...trip, value: '"back"' }, { ...heal, startedAt: now - 3_950_000 }], now, shown)).toBe(
+      ["routines:", 'trip returned 1m ago: "back"', "heal (Bravo) threw 1h05m ago: TypeError: x is undefined at heal (main.ts:9:3)"].join("\n"),
+    );
+    expect(routineDetailKey({ name: "grind", deploy: 7, startedAt: now, state: "running" })).toBeUndefined();
   });
 });

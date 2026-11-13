@@ -33,6 +33,7 @@
  */
 
 import { statSync } from "node:fs";
+import { isBuiltin } from "node:module";
 
 export interface ScanResult {
   /** Every name declared at the top level. */
@@ -812,6 +813,7 @@ export function resolveWorkspaceImport(specifier: string, root: string | undefin
   if (SCHEME.test(specifier)) return null;
   const shown = JSON.stringify(specifier);
   if (root === undefined || root.length === 0) {
+    if (isBareBuiltin(specifier)) throw new ImportError(builtinRefusal(specifier));
     throw new ImportError(`import ${shown}: there are no workspace files to import yet; write one with write_file`);
   }
   if (specifier.startsWith("/")) {
@@ -830,7 +832,31 @@ export function resolveWorkspaceImport(specifier: string, root: string | undefin
   if (isFile(`${root}/${rel}`)) {
     throw new ImportError(`import ${shown}: only code and JSON files can be imported (${IMPORTABLE_EXTENSIONS.join(", ")})`);
   }
+  // Only once no workspace file answers to it: a bare name is a workspace file first, so a model's events.ts imports as "events".
+  if (isBareBuiltin(specifier)) throw new ImportError(builtinRefusal(specifier));
   throw new ImportError(`import ${shown}: no such file in the workspace (looked for ${tried.join(", ")})`);
+}
+
+/** A specifier with no path and no scheme that names one of the runtime's builtin modules (`fs`, `path`). */
+function isBareBuiltin(specifier: string): boolean {
+  return !specifier.startsWith(".") && isBuiltin(specifier);
+}
+
+/**
+ * The refusal of a bare builtin name. The sandbox does import builtins (a
+ * snippet's `node:fs` passes through, and a workspace file's `import "fs"`
+ * is the runtime's own); in a snippet a bare name means a workspace file, so
+ * the builtin is named by its scheme.
+ */
+function builtinRefusal(specifier: string): string {
+  const scheme = `node:${specifier}`;
+  let resolves = false;
+  try {
+    resolves = Bun.resolveSync(scheme, import.meta.dir) === scheme;
+  } catch {
+    // Bun's own builtins (`bun`, `ws`) have no node: name.
+  }
+  return `import ${JSON.stringify(specifier)}: ${specifier} is a builtin module, not a file in your workspace; in a snippet a bare name imports a workspace file${resolves ? `, so import the builtin as ${JSON.stringify(scheme)}` : ""}`;
 }
 
 function isFile(path: string): boolean {

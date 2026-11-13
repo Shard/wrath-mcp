@@ -310,9 +310,10 @@ export type ProgramLoadAnswer =
 /**
  * A routine call's answer. `restartedBy` on a start: the routine was already
  * running, restarted from the top by the load of that deploy (a save), with
- * the same arguments, so the start is that run.
+ * the same arguments, so the start is that run. `ended` on a stop: the run
+ * had already ended by itself or been stopped, and `routine` is how it ended.
  */
-export type RoutineAnswer = { ok: true; routine: RoutineNote; restartedBy?: number } | { ok: false; error: string };
+export type RoutineAnswer = { ok: true; routine: RoutineNote; restartedBy?: number; ended?: true } | { ok: false; error: string };
 
 /** A line a routine printed. `count` above 1 folds consecutive repeats. */
 export interface ProgramLogLine {
