@@ -607,12 +607,34 @@ const RECENT_EVENTS_SCAN_MAX = 500;
  * rest"). Two matches have two readings, so the harness refuses rather than
  * picking one.
  */
+const EDIT_SCRATCHPAD_NOT_FOUND =
+  "edit_scratchpad: old was not found in the scratchpad; copy the text exactly, whitespace included. The scratchpad as last written is in this turn's context.";
+
+/**
+ * The same refusal as a harness serving a program says it: a scaffold's
+ * program loop sends the pad only when the conversation does not already
+ * hold it as it stands, so the pad as last written may be in an earlier
+ * message rather than this turn's (`programEditScratchpad`).
+ */
+export const PROGRAM_EDIT_SCRATCHPAD_NOT_FOUND =
+  "edit_scratchpad: old was not found in the scratchpad; copy the text exactly, whitespace included. The scratchpad as last written is in this turn's context or earlier in this conversation.";
+
+/** `edit_scratchpad` as a harness serving a program serves it: its not-found refusal says where the pad as last written may be. */
+export function programEditScratchpad<C extends CoreToolContext>(spec: ToolSpec<C>): ToolSpec<C> {
+  return {
+    ...spec,
+    run: async (ctx, args, origin) => {
+      const res = await spec.run(ctx, args, origin);
+      return res.isError === true && res.text === EDIT_SCRATCHPAD_NOT_FOUND ? { ...res, text: PROGRAM_EDIT_SCRATCHPAD_NOT_FOUND } : res;
+    },
+  };
+}
+
 const EDIT_SCRATCHPAD_HINTS: Record<"empty_old" | "identical" | "not_found" | "ambiguous", (matches: number) => string> = {
   empty_old: () =>
     "edit_scratchpad: old was empty. There is nothing to match — use write_scratchpad to start a pad, then edit it.",
   identical: () => "edit_scratchpad: old and new are the same text, so this edit would change nothing.",
-  not_found: () =>
-    "edit_scratchpad: old was not found in the scratchpad; copy the text exactly, whitespace included. The scratchpad as last written is in this turn's context.",
+  not_found: () => EDIT_SCRATCHPAD_NOT_FOUND,
   ambiguous: (matches) =>
     `edit_scratchpad: old matches ${matches} places; include more surrounding text or set replaceAll.`,
 };
