@@ -208,6 +208,20 @@ describe("routines", () => {
     expect(await p.stopRoutine({ name: "grind" })).toEqual({ ok: false, text: "grind is not running. No routine is running.\nroutines:\nidle stopped 0s ago" });
   }, 30_000);
 
+  test("a stop of a routine that ended before a restart is the same plain answer: the new child never ran it", async () => {
+    const r = await rig();
+    await r.host.program!.writeFile("main.ts", 'export async function trip() { return "done"; }\n');
+    await r.host.program!.startRoutine({ name: "trip" });
+    await until("trip ended", () => r.host.program!.routines()[0]?.state === "returned");
+    await r.host.stop();
+    const next = await r.again();
+    // A child is running, and it holds no run of trip.
+    expect((await next.host.evalSnippet("1 + 1")).value).toBe("2");
+    const stopped = await next.host.program!.stopRoutine({ name: "trip" });
+    expect(stopped.ok).toBe(true);
+    expect(stopped.text).toMatch(/^trip had already ended: it returned \d+s ago\.\nroutines:\ntrip returned \d+s ago: "done"$/);
+  }, 30_000);
+
   test("a routine's returned value and error are shown whole once; later lines refer to them", async () => {
     const { host } = await rig();
     const p = host.program!;

@@ -433,10 +433,12 @@ export class ProgramHost {
   stopRoutine(o: { name: string; character?: string | undefined }): Promise<ProgramAnswer> {
     return this.serial(async () => {
       const row = this.rows.get(rowKey(o.name, o.character));
+      // A run the registry holds as ended is the answer, child or none: a
+      // restarted child holds only the runs it started again.
+      if (row !== undefined && row.state !== "running") return { ok: true, text: `${this.alreadyEnded(row)}\n${this.routineLines()}` };
       // With no child there is nothing running to stop: the row is what is left of one.
       if (!this.port.running()) {
         if (row === undefined) return { ok: false, text: `${label(o)} is not running.\n${this.routineLines()}` };
-        if (row.state !== "running") return { ok: true, text: `${this.alreadyEnded(row)}\n${this.routineLines()}` };
         this.rows.set(rowKey(o.name, o.character), { ...row, state: "stopped", endedAt: this.port.now() });
         this.persist();
         return { ok: true, text: `stopped ${label(o)}\n${this.routineLines()}` };
