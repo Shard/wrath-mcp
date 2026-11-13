@@ -622,6 +622,16 @@ describe("round 3: saves, starts and what a result carries", () => {
     expect((await p.writeFile("main.ts", "export function helper() {}\n")).text).toEndWith("loaded: deploy 2 · main.ts exports no async function, so it has no routine");
   }, 30_000);
 
+  test("a routine re-exported from another file, as the prompt's example writes it, is a routine, and a save of that file restarts it", async () => {
+    const { host } = await rig();
+    const p = host.program!;
+    await p.writeFile("lib/patrol.ts", IDLE.replace("export async function idle", "export async function patrol"));
+    expect((await p.writeFile("main.ts", 'export { patrol } from "./lib/patrol";\n')).text).toEndWith("loaded: deploy 2 · routines: patrol");
+    expect((await p.startRoutine({ name: "patrol" })).ok).toBe(true);
+    const edited = await p.editFile("lib/patrol.ts", "?? null", "?? null ", false);
+    expect(edited.text).toEndWith("loaded: deploy 3 · routines: patrol · restarted from the top: patrol");
+  }, 30_000);
+
   test("a start after the save that restarted the routine is that run, said plainly; with other arguments it is refused truthfully", async () => {
     // Sol's race: write_file then start_routine in one batch, the save restarting the running routine.
     const { host } = await rig();
