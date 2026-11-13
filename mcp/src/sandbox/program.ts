@@ -1,8 +1,8 @@
 /**
  * The program runtime, in the sandbox child of a host that asked for one
  * (`SandboxHostOptions.program`). The model keeps its code in a small file
- * workspace rooted at `main.ts`; every function `main.ts` exports is a
- * routine, started and stopped by name, and this is what runs them.
+ * workspace rooted at `main.ts`; every async function `main.ts` exports is
+ * a routine, started and stopped by name, and this is what runs them.
  *
  *  - Versions. The host keeps each version of the files in a directory of
  *    its own (`workspace.ts`) and names the one to load. `main.ts` is
@@ -17,7 +17,10 @@
  *    character at a time.
  *  - A load restarts. The routines running when a load succeeds are stopped
  *    and started again from the top on the new version, with the arguments
- *    they had; one whose export is gone is stopped.
+ *    they had, after a settle window (`RESTART_SETTLE_MS`) in which a
+ *    second load restarts them in the first one's place; one whose export is
+ *    gone is stopped. A start of a routine a save restarted, with the same
+ *    arguments, is that run: the answer says so rather than refusing.
  *  - An ended routine cannot act. Its pending waits reject as its signal
  *    aborts, and it has a moment to unwind (`UNWIND_GRACE_MS`); after that a
  *    `sleep` or a dispatch from its context rejects, slowly, so a loop that
@@ -43,6 +46,14 @@ import type { ChildToHost, LogEntry, MoveOwner, ProgramBeat, ProgramErrorNote, P
 
 /** How long an ended routine may still dispatch: long enough to unwind (a `finally` that stops an attack), no longer. */
 export const UNWIND_GRACE_MS = 250;
+/**
+ * How long a routine a load restarted waits before it runs again. A load
+ * that follows inside it (the second of two saves sent together) restarts
+ * the routine in its place, so the first restart never runs: saves sent
+ * together restart a routine once. At least `UNWIND_GRACE_MS`, so the stop
+ * the old run's abort sends cannot land on the new run's first move.
+ */
+export const RESTART_SETTLE_MS = 1_000;
 /** How slowly a call from an ended context rejects after that, so a loop that swallows the rejection yields. */
 export const ENDED_REJECT_DELAY_MS = 100;
 /** How long a load waits for `main.ts` to finish importing. */
@@ -85,6 +96,8 @@ export interface RoutineRun<S = unknown> {
   endedAt: number;
   /** Its call-site id in the SDK's hint tally, once it made a call. */
   site?: number;
+  /** The deploy whose load restarted it from the top (a save), when that is how this run began. */
+  restartedBy?: number;
 }
 
 export interface ProgramDeps<S> {
@@ -122,6 +135,20 @@ function isFile(path: string): boolean {
 }
 
 const key = (name: string, character: string | undefined): string => `${character ?? ""}\u0000${name}`;
+
+/** Whether an export is a routine: an async function (`export async function`, or an async arrow). */
+export function isRoutine(value: unknown): boolean {
+  return typeof value === "function" && (value as { constructor?: { name?: unknown } }).constructor?.name === "AsyncFunction";
+}
+
+/** Two routine arguments are the same when their JSON is (absent equals absent). */
+function sameArgs(a: unknown, b: unknown): boolean {
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
+}
 
 function short(text: string): string {
   return text.length > SHORT_TEXT_MAX_CHARS ? `${text.slice(0, SHORT_TEXT_MAX_CHARS - 1)}…` : text;
@@ -169,6 +196,36 @@ export class ProgramRuntime<S> {
    */
   relative(text: string): string {
     return text.split(`${this.deps.root}/`).join("\u0001").replace(/\u0001\d+\//g, "").split("\u0001").join("");
+  }
+
+  /**
+   * The workspace file a path names, when a file read failed on it: the
+   * path's own text or any tail of it after a `/` (`main.ts`, `./main.ts`,
+   * `/workspace/lib/combat.ts`) that is a file of the newest version.
+   */
+  workspaceFileOf(path: string): string | undefined {
+    const root = this.importRoot;
+    if (root === undefined) return undefined;
+    const parts = path.replace(/\\/g, "/").split("/");
+    for (let i = 0; i < parts.length; i++) {
+      const rel = parts.slice(i).filter((p) => p !== "" && p !== ".").join("/");
+      if (rel.length === 0 || rel.split("/").includes("..")) continue;
+      if (isFile(`${root}/${rel}`)) return rel;
+    }
+    return undefined;
+  }
+
+  /**
+   * The note a failed read of a workspace file ends with (a snippet's
+   * `Bun.file("main.ts")` or `readFileSync`, which look on the sandbox's own
+   * disk): where the file is read instead. Undefined for any other error.
+   */
+  missingFileNote(err: unknown): string | undefined {
+    const e = err as { code?: unknown; path?: unknown } | null;
+    if (e === null || typeof e !== "object" || e.code !== "ENOENT" || typeof e.path !== "string") return undefined;
+    const rel = this.workspaceFileOf(e.path);
+    if (rel === undefined) return undefined;
+    return ` — ${rel} is one of your workspace files, which are not on the sandbox's disk: read_file({ path: "${rel}" }) returns it, and a snippet imports its exports by relative path.`;
   }
 
   /** The owner of a module's top-level code while a load's import is in flight (`OwnershipOptions.fallback`). */
@@ -230,7 +287,7 @@ export class ProgramRuntime<S> {
       this.deps.ownership.real.clearTimeout(timer);
       if (this.loading === loading) this.loading = undefined;
     }
-    const routines = Object.keys(module).filter((k) => k !== "default" && typeof module[k] === "function");
+    const routines = Object.keys(module).filter((k) => k !== "default" && isRoutine(module[k]));
     const old = this.loaded;
     this.loaded = { version, module, owner, routines };
     this.loadError = undefined;
@@ -246,9 +303,11 @@ export class ProgramRuntime<S> {
         dropped.push({ ...run.note });
         continue;
       }
-      // After the old run has had its moment to unwind, so the stop its
-      // abort sends cannot land on the new run's first move.
-      const next = this.launch(run.note.name, run.note.args, run.note.character, run.seat, evalId, UNWIND_GRACE_MS);
+      // After the settle window: past the old run's moment to unwind, and long
+      // enough that a second save sent with this one restarts it in this
+      // run's place, before this run has started (`RESTART_SETTLE_MS`).
+      const next = this.launch(run.note.name, run.note.args, run.note.character, run.seat, evalId, RESTART_SETTLE_MS);
+      next.restartedBy = version;
       restarted.push({ ...next.note });
     }
     if (old !== null) this.deps.ownership.close(old.owner);
@@ -299,9 +358,11 @@ export class ProgramRuntime<S> {
       };
     }
     const fn = msg.name === "default" ? undefined : loaded.module[msg.name];
-    if (typeof fn !== "function") {
-      const has = loaded.routines.length > 0 ? `Its routines: ${loaded.routines.join(", ")}.` : "It exports no function.";
-      return { ok: false, error: `${MAIN_PATH} exports no function named ${msg.name}. ${has}` };
+    if (!isRoutine(fn)) {
+      const has = loaded.routines.length > 0 ? `Its routines: ${loaded.routines.join(", ")}.` : "It exports no async function.";
+      const what =
+        typeof fn === "function" ? `${MAIN_PATH} exports ${msg.name}, but it is not an async function, so it is not a routine.` : `${MAIN_PATH} exports no function named ${msg.name}.`;
+      return { ok: false, error: `${what} ${has}` };
     }
     let seat: S | null = null;
     if (msg.seat !== undefined) {
@@ -311,6 +372,14 @@ export class ProgramRuntime<S> {
     }
     const existing = this.runs.get(key(msg.name, msg.seat));
     if (existing !== undefined && !existing.ended) {
+      // A save restarted it from the top: it already runs the code just saved.
+      if (existing.restartedBy !== undefined && msg.resumed !== true) {
+        if (sameArgs(msg.args, existing.note.args)) return { ok: true, routine: { ...existing.note }, restartedBy: existing.restartedBy };
+        return {
+          ok: false,
+          error: `${this.label(msg.name, msg.seat)} is already running: your save restarted it from the top ${durationWords(Date.now() - existing.note.startedAt)} ago on deploy ${existing.restartedBy}, with the arguments it had. Stop it first with stop_routine to start it with these.`,
+        };
+      }
       return {
         ok: false,
         error: `${this.label(msg.name, msg.seat)} is already running: started ${durationWords(Date.now() - existing.note.startedAt)} ago on deploy ${existing.note.deploy}. Stop it first with stop_routine to start it again.`,

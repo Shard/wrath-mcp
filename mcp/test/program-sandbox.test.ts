@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { leaseSessionSecret } from "../src/module-auth";
 import { Scratchpad } from "../src/scratchpad";
-import { programAbandonNote, SandboxHost, SDK_MOVE_ABANDON_ADVICE } from "../src/sandbox/host";
+import { programAbandonNote, programWalkText, SandboxHost, SDK_MOVE_ABANDON_ADVICE, SDK_WALK_BUDGET_ADVICE } from "../src/sandbox/host";
 import type { ProgramFact } from "../src/sandbox/program-host";
 import { CharacterRoster } from "../src/fanout";
 import { SecretRedactor } from "../src/redact";
@@ -607,4 +607,133 @@ describe("an abandoned walk's note with a program", () => {
     // A note of another kind (an abandoned sleep or wait) is left as it is.
     expect(programAbandonNote("sleep(30000) could not finish in the 12s the snippet had left.")).toBe("sleep(30000) could not finish in the 12s the snippet had left.");
   });
+});
+
+describe("round 3: saves, starts and what a result carries", () => {
+  const render: CoreToolRender<ProgramToolContext> = { eventLine: (e) => e.opcode, isAmbient: () => false, stateSummary: () => "state" };
+
+  test("only an async export is a routine; a sync one is named as not being one", async () => {
+    const { host } = await rig();
+    const p = host.program!;
+    const src = "export async function grind() {}\nexport const trip = async () => {};\nexport function selfPos() { return 1; }\n";
+    expect((await p.writeFile("main.ts", src)).text).toEndWith("loaded: deploy 1 · routines: grind, trip");
+    const sync = await p.startRoutine({ name: "selfPos" });
+    expect(sync).toEqual({ ok: false, text: "main.ts exports selfPos, but it is not an async function, so it is not a routine. Its routines: grind, trip.\nroutines: none started" });
+    expect((await p.writeFile("main.ts", "export function helper() {}\n")).text).toEndWith("loaded: deploy 2 · main.ts exports no async function, so it has no routine");
+  }, 30_000);
+
+  test("a start after the save that restarted the routine is that run, said plainly; with other arguments it is refused truthfully", async () => {
+    // Sol's race: write_file then start_routine in one batch, the save restarting the running routine.
+    const { host } = await rig();
+    const p = host.program!;
+    await p.writeFile("main.ts", IDLE);
+    await p.startRoutine({ name: "idle", args: { zone: "north" } });
+    expect((await p.editFile("main.ts", "?? 0) + 1", "?? 0) + 1 ", false)).text).toEndWith("restarted from the top: idle");
+    const same = await p.startRoutine({ name: "idle", args: { zone: "north" } });
+    expect(same.ok).toBe(true);
+    expect(same.text).toMatch(/^idle is running: your save restarted it from the top on deploy 2, 0s ago, with these arguments\nroutines:\nidle running/);
+    const other = await p.startRoutine({ name: "idle", args: { zone: "south" } });
+    expect(other.ok).toBe(false);
+    expect(other.text).toMatch(/^idle is already running: your save restarted it from the top \d+s ago on deploy 2, with the arguments it had\. Stop it first with stop_routine to start it with these\./);
+    // A run started by start_routine is refused as before.
+    await p.stopRoutine({ name: "idle" });
+    await p.startRoutine({ name: "idle" });
+    expect((await p.startRoutine({ name: "idle" })).text).toMatch(/^idle is already running: started \d+s ago on deploy 2\. Stop it first/);
+  }, 30_000);
+
+  test("two saves sent together restart a running routine once", async () => {
+    // Sol P t21/t23: two edit_file calls 7 ms apart, two loads, two restarts, a Holy Light interrupted.
+    const { host } = await rig();
+    const p = host.program!;
+    await p.writeFile("main.ts", IDLE);
+    await p.startRoutine({ name: "idle" });
+    await until("the first start", async () => (await host.evalSnippet("memory.started")).value === "1");
+    const a = await p.editFile("main.ts", "?? 0) + 1", "?? 0) + 1 ", false);
+    const b = await p.editFile("main.ts", "?? null", "?? null ", false);
+    expect(a.text).toEndWith("restarted from the top: idle");
+    expect(b.text).toEndWith("restarted from the top: idle");
+    await until("the restart", async () => (await host.evalSnippet("memory.started")).value === "2");
+    await Bun.sleep(1_500);
+    // The first save's restart never ran: the second replaced it inside the settle window.
+    expect((await host.evalSnippet("memory.started")).value).toBe("2");
+    expect(p.routines().find((r) => r.name === "idle")).toMatchObject({ state: "running", deploy: 3 });
+  }, 30_000);
+
+  test("read_file returns a range of lines under a line saying which, and refuses one past the end", async () => {
+    const { host } = await rig();
+    const specs = programTools(render);
+    const tools = new ToolSet<ProgramToolContext>([specs.read_file, specs.write_file]);
+    const ctx: ProgramToolContext = { sandbox: host, scratchpad: new Scratchpad(join(mkdtempSync(join(tmpdir(), "wrathbench-mcp-program-pad-")), "pad.md")), sessionLive: () => true, turn: () => 1, secrets: new SecretRedactor(), program: host.program! };
+    const src = Array.from({ length: 10 }, (_, i) => `// line ${i + 1}`).join("\n") + "\n";
+    await tools.call(ctx, "write_file", { path: "notes.txt", content: src });
+    expect((await tools.call(ctx, "read_file", { path: "notes.txt" })).text).toBe(src);
+    expect((await tools.call(ctx, "read_file", { path: "notes.txt", offset: 4, limit: 2 })).text).toBe("notes.txt, lines 4-5 of 10:\n// line 4\n// line 5");
+    expect((await tools.call(ctx, "read_file", { path: "notes.txt", offset: "9" })).text).toBe("notes.txt, lines 9-10 of 10:\n// line 9\n// line 10");
+    expect((await tools.call(ctx, "read_file", { path: "notes.txt", limit: 1 })).text).toBe("notes.txt, lines 1-1 of 10:\n// line 1");
+    expect(await tools.call(ctx, "read_file", { path: "notes.txt", offset: 11 })).toEqual({ text: "notes.txt has 10 lines; offset 11 is past its end", isError: true });
+    expect(specs.read_file.def.description).toContain("offset and limit, both optional, return part of it instead");
+    expect(Object.keys(specs.read_file.def.inputSchema["properties"] as object)).toEqual(["path", "offset", "limit"]);
+  }, 30_000);
+
+  test("a snippet's read of a workspace file off the sandbox's disk says where the file is read instead", async () => {
+    const { host } = await rig();
+    await host.program!.writeFile("main.ts", IDLE);
+    for (const code of ['return await Bun.file("main.ts").text()', 'const fs = await import("node:fs"); return fs.readFileSync("/workspace/main.ts", "utf8")']) {
+      const res = await host.evalSnippet(code);
+      expect(res.ok).toBe(false);
+      expect(res.error).toContain("ENOENT");
+      expect(res.error).toEndWith(' — main.ts is one of your workspace files, which are not on the sandbox\'s disk: read_file({ path: "main.ts" }) returns it, and a snippet imports its exports by relative path.');
+    }
+    // A missing file that is not the workspace's gets no such line.
+    const other = await host.evalSnippet('return await Bun.file("nope.ts").text()');
+    expect(other.error).toContain("ENOENT");
+    expect(other.error).not.toContain("read_file");
+  }, 30_000);
+
+  test("a walk's budget note keeps its facts and loses the SDK's background-routine advice", () => {
+    // The note exactly as sdk/test/walk-budget.test.ts pins walkBudgetNote's text.
+    const note =
+      "this move's route is ~660y (~165y in a straight line) — about 94s at a base run speed of 7yd/s, and the " +
+      "caller had ~30s of its budget left when it was issued. Awaiting a move this long does not fit one snippet: " +
+      "dispatch it with sdk.moveToAsync(target) or from a background routine, then poll state.self.position.";
+    expect(note).toEndWith(`Awaiting a move this long does not fit one snippet${SDK_WALK_BUDGET_ADVICE}`);
+    const cut = programWalkText(`=> { status: "arrived", note: "${note}" }`);
+    expect(cut).not.toContain("background routine");
+    expect(cut).toContain("Awaiting a move this long does not fit one snippet.");
+    expect(cut).toContain("this move's route is ~660y");
+  });
+
+  test("the hints a result carries are handed to onHintsDelivered: a snippet's own and those drained onto another tool's", async () => {
+    const { host, stub, facts } = await rig();
+    const specs = programTools(render);
+    const tools = new ToolSet<ProgramToolContext>([specs.run_snippet, specs.read_file]);
+    const delivered: { action: string; status: string; routine?: string }[][] = [];
+    const ctx: ProgramToolContext = {
+      sandbox: host,
+      scratchpad: new Scratchpad(join(mkdtempSync(join(tmpdir(), "wrathbench-mcp-program-pad-")), "pad.md")),
+      sessionLive: () => true,
+      turn: () => 1,
+      secrets: new SecretRedactor(),
+      program: host.program!,
+      onHintsDelivered: (h) => delivered.push(h.map((x) => ({ action: x.action, status: x.status, ...(x.routine !== undefined ? { routine: x.routine } : {}) }))),
+    };
+    await tools.call(ctx, "run_snippet", { code: LOGIN });
+    expect(delivered).toEqual([]);
+    const stop = answerMoves(stub, "program-token-0001", "too_far");
+    try {
+      // A routine's refusal rides the next result whatever tool it is, its owner named.
+      await host.program!.writeFile("main.ts", "export async function far() { await sdk.moveTo({ x: -1200, y: 990, z: 42 }, { timeout: 4000 }); }\n");
+      await host.program!.startRoutine({ name: "far" });
+      await until("the routine to end", () => facts.some((f) => f.kind === "ended"), 20_000);
+      await tools.call(ctx, "read_file", { path: "main.ts" });
+      expect(delivered).toEqual([[{ action: "moveTo", status: "too_far", routine: "far" }]]);
+      delivered.length = 0;
+      // A snippet's own rides its own result.
+      const own = await tools.call(ctx, "run_snippet", { code: "return (await sdk.moveTo({ x: -1200, y: 990, z: 42 }, { timeout: 4000 })).status" });
+      expect(own.text).toContain("too_far");
+      expect(delivered).toEqual([[{ action: "moveTo", status: "too_far" }]]);
+    } finally {
+      stop();
+    }
+  }, 30_000);
 });

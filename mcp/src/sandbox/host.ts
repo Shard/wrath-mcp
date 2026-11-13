@@ -373,6 +373,20 @@ export function programAbandonNote(note: string): string {
   return note.endsWith(SDK_MOVE_ABANDON_ADVICE) ? note.slice(0, -SDK_MOVE_ABANDON_ADVICE.length) : note;
 }
 
+/**
+ * The SDK's advice at the end of a walk's budget note (`walkBudgetNote`):
+ * dispatch it, or run it "from a background routine", and poll. As with
+ * `SDK_MOVE_ABANDON_ADVICE`, a host with a program has no background routine
+ * of a snippet's, so the advice is cut there and the note ends on the fact
+ * that a move this long does not fit one snippet.
+ */
+export const SDK_WALK_BUDGET_ADVICE = ": dispatch it with sdk.moveToAsync(target) or from a background routine, then poll state.self.position.";
+
+/** Text a snippet's result carries, as a host with a program shows it: the SDK's walk-budget advice cut (`SDK_WALK_BUDGET_ADVICE`). Pure. */
+export function programWalkText(text: string): string {
+  return text.includes(SDK_WALK_BUDGET_ADVICE) ? text.split(SDK_WALK_BUDGET_ADVICE).join(".") : text;
+}
+
 export class SandboxHost {
   private proc: Subprocess | null = null;
   private markReady: () => void = () => {};
@@ -1029,14 +1043,17 @@ export class SandboxHost {
         this.opts.snippetTimeoutMs,
       );
       this.consecutiveRestarts = 0;
+      // With a program, the SDK's walk-budget advice is cut from whatever carries it.
+      const cut = this.program !== undefined ? programWalkText : (t: string): string => t;
+      const opt = (t: string | undefined): string | undefined => (t === undefined ? t : cut(t));
       return {
         ok: res.ok,
-        value: res.value,
-        error: res.error,
-        hint: res.hint,
-        ...(res.notes !== undefined ? { notes: res.notes } : {}),
-        actionHints: res.hints ?? [],
-        logs: res.logs,
+        value: opt(res.value),
+        error: opt(res.error),
+        hint: opt(res.hint),
+        ...(res.notes !== undefined ? { notes: res.notes.map(cut) } : {}),
+        actionHints: this.program !== undefined ? (res.hints ?? []).map((h) => ({ ...h, hint: cut(h.hint) })) : (res.hints ?? []),
+        logs: this.program !== undefined ? res.logs.map((l) => ({ ...l, text: cut(l.text) })) : res.logs,
         durationMs: res.durationMs,
       };
     } catch (err) {

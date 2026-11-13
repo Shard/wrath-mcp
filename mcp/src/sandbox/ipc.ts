@@ -307,7 +307,12 @@ export type ProgramLoadAnswer =
   | { ok: false; error: string };
 
 /** What `routine_start` and `routine_stop` answer: the refusal, or the routine as it now stands. */
-export type RoutineAnswer = { ok: true; routine: RoutineNote } | { ok: false; error: string };
+/**
+ * A routine call's answer. `restartedBy` on a start: the routine was already
+ * running, restarted from the top by the load of that deploy (a save), with
+ * the same arguments, so the start is that run.
+ */
+export type RoutineAnswer = { ok: true; routine: RoutineNote; restartedBy?: number } | { ok: false; error: string };
 
 /** A line a routine printed. `count` above 1 folds consecutive repeats. */
 export interface ProgramLogLine {

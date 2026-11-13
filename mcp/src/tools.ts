@@ -74,6 +74,13 @@ export interface CoreToolContext {
    */
   onEventsServed?: (events: unknown[], folded?: number) => void;
   /**
+   * Called with the action hints a result carries, as it is built: a
+   * snippet's own and the ones drained onto any other result. What the model
+   * was told, by signature, so a harness can tell a fact it has delivered
+   * from one it has not.
+   */
+  onHintsDelivered?: (hints: readonly ActionHintNote[]) => void;
+  /**
    * The secret registry every result passes through (`redact.ts`'s
    * `SecretRedactor`, or a harness's own): each result `ToolSet.call` and
    * `ToolSet.appendPending` return has passed its `scrub`, so a secret a
@@ -436,6 +443,7 @@ export async function appendPendingActionHints(ctx: CoreToolContext, result: Too
     return scrubResult(ctx, result);
   }
   const block = renderActionHints(hints);
+  if (hints.length > 0) ctx.onHintsDelivered?.(hints);
   return scrubResult(ctx, block === undefined ? result : { ...result, text: `${result.text}\n${block}` });
 }
 
@@ -630,6 +638,7 @@ export async function snippetToolResult<C extends CoreToolContext>(ctx: C, res: 
   // while swallowing 41 hints, so this is the main case, not the edge.
   const hints = renderActionHints(res.actionHints ?? []);
   if (hints !== undefined) lines.push(hints);
+  if ((res.actionHints ?? []).length > 0) ctx.onHintsDelivered?.(res.actionHints!);
   // After the hint block and carrying no action outcome, so nothing a
   // background routine did is said twice; before the result is marked,
   // so it is still the one `EVALUATED` holds.
@@ -894,7 +903,7 @@ export function coreTools<C extends CoreToolContext>(render: CoreToolRender<C>):
  * tool result carries.
  */
 export interface ToolProgram {
-  readFile(path: unknown): ProgramToolAnswer;
+  readFile(path: unknown, range?: { offset?: number | undefined; limit?: number | undefined }): ProgramToolAnswer;
   writeFile(path: unknown, content: unknown, link?: { callTs?: number | undefined; turn?: number | undefined }): Promise<ProgramToolAnswer>;
   editFile(path: unknown, oldText: unknown, newText: unknown, replaceAll: unknown, link?: { callTs?: number | undefined; turn?: number | undefined }): Promise<ProgramToolAnswer>;
   deleteFile(path: unknown, link?: { callTs?: number | undefined; turn?: number | undefined }): Promise<ProgramToolAnswer>;
@@ -943,18 +952,27 @@ export function programTools<C extends ProgramToolContext>(render: CoreToolRende
     read_file: {
       def: {
         name: "read_file",
-        description: "Return one file from your workspace, its text exactly as stored. The path is relative to the workspace, e.g. main.ts or lib/combat.ts.",
+        description:
+          "Return one file from your workspace, its text exactly as stored. The path is relative to the workspace, e.g. main.ts or lib/combat.ts. " +
+          "offset and limit, both optional, return part of it instead: limit lines from line offset (counted from 1), under one line saying which lines of how many they are.",
         inputSchema: {
           type: "object",
-          properties: { path: { type: "string", description: "Workspace-relative path, e.g. main.ts or lib/combat.ts." } },
+          properties: {
+            path: { type: "string", description: "Workspace-relative path, e.g. main.ts or lib/combat.ts." },
+            offset: { type: "integer", minimum: 1, description: "The first line to return, counted from 1. Omit to start at the first line." },
+            limit: { type: "integer", minimum: 1, description: "How many lines to return. Omit to read to the last line." },
+          },
           required: ["path"],
           additionalProperties: false,
         },
       },
-      schema: z.strictObject({ path: z.string() }),
-      help: "read_file expects { path: string } — a workspace-relative path such as main.ts or lib/combat.ts.",
-      aliases: { file: "path", file_path: "path", filePath: "path" },
-      run: async (ctx, args) => answer(ctx.program.readFile((args as { path: string }).path)),
+      schema: z.strictObject({ path: z.string(), offset: z.coerce.number().int().min(1).optional(), limit: z.coerce.number().int().min(1).optional() }),
+      help: "read_file expects { path: string, offset?: number, limit?: number } — a workspace-relative path such as main.ts or lib/combat.ts, and optionally the first line (from 1) and how many lines.",
+      aliases: { file: "path", file_path: "path", filePath: "path", start: "offset", from: "offset", line: "offset", lines: "limit", count: "limit" },
+      run: async (ctx, args) => {
+        const a = args as { path: string; offset?: number; limit?: number };
+        return answer(ctx.program.readFile(a.path, a.offset === undefined && a.limit === undefined ? undefined : { offset: a.offset, limit: a.limit }));
+      },
     },
     write_file: {
       def: {

@@ -68,6 +68,29 @@ export interface WorkspaceEntry {
 
 type ResolvedPath = { ok: true; rel: string; abs: string } | { ok: false; error: string };
 
+/** A part of a file `read_file` returns: `limit` lines from line `offset` (1-based); either absent reads from the first line or to the last. */
+export interface LineRange {
+  offset?: number | undefined;
+  limit?: number | undefined;
+}
+
+/**
+ * Lines `offset` to `offset + limit - 1` of a file's text, exactly as stored,
+ * under one line saying which lines of how many they are. A final newline
+ * ends the last line rather than starting one more. Pure.
+ */
+export function lineRange(rel: string, text: string, range: LineRange): WorkspaceResult {
+  const lines = text.split("\n");
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  const total = lines.length;
+  const offset = range.offset ?? 1;
+  if (!Number.isInteger(offset) || offset < 1) return { ok: false, error: `offset must be a whole number from 1, got ${offset}` };
+  if (range.limit !== undefined && (!Number.isInteger(range.limit) || range.limit < 1)) return { ok: false, error: `limit must be a whole number from 1, got ${range.limit}` };
+  if (offset > total) return { ok: false, error: `${rel} has ${total} line${total === 1 ? "" : "s"}; offset ${offset} is past its end` };
+  const last = range.limit === undefined ? total : Math.min(total, offset + range.limit - 1);
+  return { ok: true, text: `${rel}, lines ${offset}-${last} of ${total}:\n${lines.slice(offset - 1, last).join("\n")}` };
+}
+
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 
 /** Every file under a directory, sorted by path (code-unit order, so a listing is locale-free and stable). */
@@ -270,12 +293,14 @@ export class Workspace {
     return this.list().reduce((n, f) => n + f.bytes, 0);
   }
 
-  read(path: unknown): WorkspaceResult {
+  /** One file exactly as stored, or a range of its lines (`lineRange`) when one is asked for. */
+  read(path: unknown, range?: LineRange): WorkspaceResult {
     const r = this.resolve(path);
     if (!r.ok) return r;
     if (!existsSync(r.abs)) return { ok: false, error: this.missing(r.rel) };
     if (statSync(r.abs).isDirectory()) return { ok: false, error: `${r.rel} is a directory; read_file reads one file` };
-    return { ok: true, text: readFileSync(r.abs, "utf8") };
+    const text = readFileSync(r.abs, "utf8");
+    return range === undefined || (range.offset === undefined && range.limit === undefined) ? { ok: true, text } : lineRange(r.rel, text, range);
   }
 
   /** A missing file, with what is there: a model that misremembers a path should not need a second call to find it. */

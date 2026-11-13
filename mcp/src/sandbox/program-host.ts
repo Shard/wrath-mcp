@@ -35,7 +35,7 @@ import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { durationWords, LOAD_TIMEOUT_MS } from "./program";
 import type { ProgramBeat, ProgramErrorNote, ProgramEvent, ProgramLoadAnswer, ProgramLogLine, RoutineAnswer, RoutineNote } from "./ipc";
-import { isImportable, MAIN_PATH, sameImportGraph, type Workspace, type WorkspaceResult } from "../workspace";
+import { isImportable, MAIN_PATH, sameImportGraph, type LineRange, type Workspace, type WorkspaceResult } from "../workspace";
 
 /** How often a running program is asked for a beat. */
 export const PROGRAM_BEAT_MS = 5_000;
@@ -268,8 +268,8 @@ export class ProgramHost {
 
   // ------------------------------------------------------------------ files
 
-  readFile(path: unknown): ProgramAnswer {
-    const r = this.workspace.read(path);
+  readFile(path: unknown, range?: LineRange): ProgramAnswer {
+    const r = this.workspace.read(path, range);
     return r.ok ? { ok: true, text: r.text } : { ok: false, text: r.error };
   }
 
@@ -334,7 +334,7 @@ export class ProgramHost {
     for (const r of answer.dropped) this.rows.set(rowKey(r.name, r.character), { ...r, note: `${MAIN_PATH} no longer exports it` });
     this.persist();
     this.fact({ kind: "loaded", ts, deploy: answer.version, routines: answer.routines, restarted: answer.restarted.map(label), dropped: answer.dropped.map(label), by });
-    const parts = [`loaded: deploy ${answer.version}`, answer.routines.length > 0 ? `routines: ${answer.routines.join(", ")}` : `${MAIN_PATH} exports no function, so it has no routine`];
+    const parts = [`loaded: deploy ${answer.version}`, answer.routines.length > 0 ? `routines: ${answer.routines.join(", ")}` : `${MAIN_PATH} exports no async function, so it has no routine`];
     if (answer.restarted.length > 0) parts.push(`restarted from the top: ${answer.restarted.map(label).join(", ")}`);
     if (answer.dropped.length > 0) parts.push(`stopped, no longer exported: ${answer.dropped.map(label).join(", ")}`);
     return { ok: true, text: parts.join(" · ") };
@@ -356,6 +356,11 @@ export class ProgramHost {
         return { ok: false, text: `start_routine failed: ${err instanceof Error ? err.message : String(err)}\n${this.routineLines()}` };
       }
       if (!answer.ok) return { ok: false, text: `${answer.error}\n${this.routineLines()}` };
+      // Already running the code just saved: a save restarted it, with these arguments.
+      if (answer.restartedBy !== undefined) {
+        const r = answer.routine;
+        return { ok: true, text: `${label(r)} is running: your save restarted it from the top on deploy ${answer.restartedBy}, ${durationWords(this.port.now() - r.startedAt)} ago, with these arguments\n${this.routineLines()}` };
+      }
       this.rows.set(rowKey(answer.routine.name, answer.routine.character), { ...answer.routine });
       this.persist();
       this.ensureBeat();

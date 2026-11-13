@@ -335,7 +335,7 @@ module's host, and DNS.
 
 Off unless a host asks for it (`SandboxHostOptions.program`), and then the
 sandbox also holds the model's program: a small file workspace rooted at
-`main.ts`, whose exported functions are routines the model starts and stops by
+`main.ts`, whose exported async functions are routines the model starts and stops by
 name. It exists because models left to themselves launch async loops and then
 poll them, with no handle and no stop; here the lifecycle is the stack's and
 the code is still the model's.
@@ -351,7 +351,10 @@ the code is still the model's.
 - **Load on save.** A save that changes `main.ts` or a file in its import
   graph loads that version at once and the tool's result says so. A load that
   fails changes nothing. The routines running when a load succeeds are stopped
-  and started again from the top with the arguments they had.
+  and started again from the top with the arguments they had, after a settle
+  window in which a further load restarts them in that one's place, so saves
+  sent together restart a routine once. A start of a routine a save just
+  restarted, with the same arguments, is answered as that run.
 - **Routines** (`mcp/src/sandbox/program.ts`). A routine runs once, in an
   async context that carries its signal, its character and its owner
   (`owners.ts`): when it returns, throws, is stopped or is restarted, its
@@ -370,7 +373,10 @@ the code is still the model's.
 - **Facts, not wording.** Routine ends, the first error or refusal of each
   signature since a load, `wake(reason)`, a move of the model's that replaced
   another of its own, loads and restarts reach a harness as data
-  (`ProgramOptions.onFact`, `ProgramHost.drainFacts`). Whether any of them
+  (`ProgramOptions.onFact`, `ProgramHost.drainFacts`), and the action hints
+  each tool result carries are handed to it as the result is built
+  (`CoreToolContext.onHintsDelivered`), so it can tell a refusal the model
+  has been told of from one it has not. Whether any of them
   wakes a model, and what the model is shown, is the harness's. The stack
   never holds, backs off or stops the model's code for repeating itself.
 - **Tools.** `programTools` beside `coreTools`: `read_file`, `write_file`,

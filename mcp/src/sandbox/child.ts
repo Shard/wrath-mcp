@@ -1645,7 +1645,8 @@ const BIGINT_STRINGIFY_RE = /serialize\s+(a\s+)?BigInt/i;
  */
 export function renderError(err: unknown): string {
   const text = renderErrorText(err);
-  return program === null ? text : program.relative(text);
+  if (program === null) return text;
+  return `${program.relative(text)}${program.missingFileNote(err) ?? ""}`;
 }
 
 function renderErrorText(err: unknown): string {
