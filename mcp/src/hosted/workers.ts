@@ -17,7 +17,7 @@
 
 import { randomBytes } from "node:crypto";
 import { connect } from "node:net";
-import { dirname, join, resolve } from "node:path";
+import { join } from "node:path";
 import { z } from "zod";
 import type { Leaser } from "../module-auth";
 import type { ToolResult } from "../tools";
@@ -71,7 +71,7 @@ export function localWorkerEnv(secret: string, env: Record<string, string | unde
 }
 
 /** The worker entry, beside this file. */
-export const WORKER_ENTRY = resolve(dirname(new URL(import.meta.url).pathname), "worker.ts");
+export const WORKER_ENTRY = join(import.meta.dir, "worker.ts");
 
 /**
  * A process per credential on this machine, listening on loopback. Its
@@ -80,12 +80,13 @@ export const WORKER_ENTRY = resolve(dirname(new URL(import.meta.url).pathname), 
  * serves one machine and its tests. A deployment for people outside it runs
  * a worker per pod.
  */
-export function localWorkers(o: { entry?: string; startTimeoutMs?: number; env?: Record<string, string | undefined> } = {}): WorkerProvider {
+export function localWorkers(o: { entry?: string; startTimeoutMs?: number; env?: Record<string, string | undefined>; cwd?: string } = {}): WorkerProvider {
   return {
     async start({ secret, dir }) {
-      const proc = Bun.spawn([process.execPath, o.entry ?? WORKER_ENTRY, "--host", "127.0.0.1", "--port", "0"], {
+      // No `.env` and no `bunfig.toml` is read from anywhere: a file there could carry the port secret, or preload code.
+      const proc = Bun.spawn([process.execPath, "--no-env-file", o.entry ?? WORKER_ENTRY, "--host", "127.0.0.1", "--port", "0"], {
         env: localWorkerEnv(secret, o.env),
-        cwd: dir,
+        cwd: o.cwd ?? "/",
         stdin: "ignore",
         stdout: "pipe",
         stderr: "inherit",

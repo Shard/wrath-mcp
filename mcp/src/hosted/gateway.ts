@@ -46,7 +46,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { hostToolDefs, type HostSurface } from "../host";
-import { MODULE_SECRET_ENV, moduleAuthHeaders, moduleSecret, portSecretLeaser, tokenFingerprint, type Leaser, type LeaseOutcome } from "../module-auth";
+import { MODULE_SECRET_ENV, moduleAuthHeaders, moduleIdentity, moduleSecret, portSecretLeaser, tokenFingerprint, type Leaser, type LeaseOutcome } from "../module-auth";
 import type { ToolResult } from "../tools";
 import { MCP_PACKAGE_VERSION } from "../version";
 import { authenticate, toFanoutGrant, type Authentication, type GrantSource, type HostedLimits, type TenantGrant } from "./grants";
@@ -472,6 +472,8 @@ export class Gateway {
         record: { root: handle.paths.sessions, retentionMs: this.o.recordRetentionMs ?? 3 * 86_400_000 },
         owner: t.person,
         ...(this.o.snippetTimeoutMs !== undefined ? { snippetTimeoutMs: this.o.snippetTimeoutMs } : {}),
+        // The worker has no port secret to ask `/health` with; the gateway asks for it.
+        module: await moduleIdentity(this.o.moduleUrl, moduleAuthHeaders(this.o.env ?? process.env), this.o.fetch ?? fetch),
       },
       leaser: this.leaserFor(t),
       log: (line) => this.log(`[${t.id}] ${line}`),
@@ -485,11 +487,14 @@ export class Gateway {
 
   /** A worker that went away unasked: its seats are released, and the next call starts another. */
   private async lostHost(t: Tenant, host: CredentialHost, why: string): Promise<void> {
+    // Cleared at once, so a call queued behind this does not pick up the dead host; released in the chain.
     if (t.host !== host) return;
     t.host = undefined;
-    await this.releaseSeats(t, `worker lost: ${why}`);
-    this.audit.write(t.person, { kind: "host", event: "lost", why, credential: t.id });
-    this.log(`[${t.id}] worker lost: ${why}`);
+    await this.serial(t, async () => {
+      await this.releaseSeats(t, `worker lost: ${why}`);
+      this.audit.write(t.person, { kind: "host", event: "lost", why, credential: t.id });
+      this.log(`[${t.id}] worker lost: ${why}`);
+    });
   }
 
   private async stopHost(t: Tenant, why: string): Promise<void> {

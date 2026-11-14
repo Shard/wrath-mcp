@@ -23,7 +23,7 @@ import { localWorkers, type WorkerHandle, type WorkerProvider } from "../src/hos
 function inProcessWorkers(open: typeof openHost): WorkerProvider {
   return {
     async start({ secret, dir }) {
-      const w = await serveWorker({ secret, openHost: open, orphanMs: 1_000 });
+      const w = await serveWorker({ secret, openHost: open });
       let exit!: () => void;
       const exited = new Promise<void>((r) => (exit = r));
       return { host: w.host, port: w.port, paths: { state: join(dir, "state"), sessions: join(dir, "sessions") }, exited, stop: async () => (await w.stop(), exit()) };
