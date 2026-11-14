@@ -44,7 +44,10 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   stops by name, loaded on save, tracked in a registry that survives a
   restart, with facts handed to the harness. `programTools` serves the file
   and routine tools beside the core tools (`docs/ARCHITECTURE.md`, "A
-  program"). Without the option nothing a model is served changes.
+  program"). Without the option nothing a model is served changes. A
+  workspace a harness filled before the first start (files carried over from
+  another run, `memory.json` among them) is loaded at that start, starting no
+  routine.
 - **Jump.** `sdk.jump()` (in place) and `sdk.jump({ forward: true })` (at the
   run speed along the facing), the `jump` action: `MSG_MOVE_JUMP` with the
   stock client's launch, the arc flown as a client's physics fly it, and
