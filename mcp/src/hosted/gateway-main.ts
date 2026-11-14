@@ -12,9 +12,9 @@
  * process holds. TLS is the deployment's (a reverse proxy or an ingress):
  * bound to anything but loopback, the gateway expects one in front of it,
  * since a key must never cross the network in the clear. With
- * `--trust-forwarded-for` the audit names the first `X-Forwarded-For`
- * address, which only a proxy that sets it may be trusted for; otherwise the
- * socket's peer.
+ * `--trust-forwarded-for` the audit names the address the one proxy in front
+ * of it added, the last `X-Forwarded-For` entry (`forwardedFor`); otherwise
+ * the socket's peer.
  *
  * SIGINT or SIGTERM stops every credential's host, logging its characters
  * out and giving their leases back.
@@ -82,6 +82,17 @@ export function parseGatewayArgs(argv: readonly string[], env: Record<string, st
   return { grants: resolve(grants), state: resolve(state), host: flags.get("host") ?? "127.0.0.1", port, program, allowedOrigins: origins, trustForwardedFor, recordRetentionMs };
 }
 
+/**
+ * The client's address as the one trusted proxy in front of the gateway saw
+ * it: the LAST `X-Forwarded-For` entry. A proxy appends the address it saw to
+ * whatever the client sent, so every entry before the last is the client's
+ * own say and could name anyone.
+ */
+export function forwardedFor(headers: Headers): string | undefined {
+  const last = headers.get("x-forwarded-for")?.split(",").at(-1)?.trim();
+  return last !== undefined && last.length > 0 ? last : undefined;
+}
+
 export interface RunningGateway {
   readonly gateway: Gateway;
   readonly port: number;
@@ -122,7 +133,7 @@ export async function runGateway(
     idleTimeout: 255,
     maxRequestBodySize: MAX_BODY_BYTES,
     fetch: (req, srv) => {
-      const forwarded = args.trustForwardedFor ? req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() : undefined;
+      const forwarded = args.trustForwardedFor ? forwardedFor(req.headers) : undefined;
       return gateway.fetch(req, forwarded ?? srv.requestIP(req)?.address);
     },
   });

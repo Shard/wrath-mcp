@@ -49,3 +49,11 @@ test("runGateway refuses to start without the port secret", async () => {
   writeGrantsFile(join(dir, "grants.json"), emptyGrantsFile());
   await expect(runGateway({ grants: join(dir, "grants.json"), state: join(dir, "state"), host: "127.0.0.1", port: 0, program: false, allowedOrigins: [], trustForwardedFor: false, recordRetentionMs: 1 }, { env: {}, log: () => {} })).rejects.toThrow("WRATHBENCH_MODULE_SECRET");
 });
+
+test("behind a proxy, the audit names the address the proxy added, never one the client sent", async () => {
+  const { forwardedFor } = await import("../src/hosted/gateway-main");
+  expect(forwardedFor(new Headers({ "x-forwarded-for": "6.6.6.6, 10.0.0.9" }))).toBe("10.0.0.9");
+  expect(forwardedFor(new Headers({ "x-forwarded-for": "10.0.0.9" }))).toBe("10.0.0.9");
+  expect(forwardedFor(new Headers({ "x-forwarded-for": "6.6.6.6," }))).toBeUndefined();
+  expect(forwardedFor(new Headers())).toBeUndefined();
+});
