@@ -88,6 +88,32 @@ describe("units() unknown keys point at the real thing", () => {
   });
 });
 
+describe("too_far hint", () => {
+  const at = { pos: { x: 0, y: 0, z: 100, o: 0, map: 571 } } as never;
+
+  test("a point out of reach across is named by its distance across, as before", () => {
+    expect(MOVE_HINTS.too_far!({ x: 300, y: 400, z: 100 }, at)).toBe(
+      "(300.0, 400.0) is 500y from where you stand, in a straight line; " +
+        "one move (moveTo or moveToAsync alike) covers ~250y. Walk to an intermediate point first.",
+    );
+    // Out of reach both ways: the distance across is still the one to close.
+    expect(MOVE_HINTS.too_far!({ x: 300, y: 400, z: 900 }, at)).toMatch(/^\(300\.0, 400\.0\) is 500y from where you stand/);
+  });
+
+  test("a flown leg within reach across and more than 250y up or down is named by its height", () => {
+    // The module's reach holds up and down on a flown leg (PROTOCOL.md,
+    // "Flying"): the distance across, 50y here, would read as a point well
+    // inside one move.
+    expect(MOVE_HINTS.too_far!({ x: 30, y: 40, z: 760 }, at)).toBe(
+      "(30.0, 40.0, z 760.0) is 660y above where you are; " +
+        "one flown move (moveTo or moveToAsync alike) covers ~250y up or down. Fly to an intermediate height first.",
+    );
+    expect(MOVE_HINTS.too_far!({ x: 30, y: 40, z: -200 }, at)).toMatch(/is 300y below where you are/);
+    // At the reach itself the module does not refuse for height.
+    expect(MOVE_HINTS.too_far!({ x: 30, y: 40, z: 350 }, at)).toMatch(/is 50y from where you stand/);
+  });
+});
+
 describe("start_off_mesh hint", () => {
   test("says the position itself is the problem and names the hearthstone recovery", () => {
     const hint = MOVE_HINTS.start_off_mesh!(

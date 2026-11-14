@@ -19,6 +19,7 @@
 #include <boost/beast/version.hpp>
 #include <boost/beast/websocket.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <deque>
@@ -89,15 +90,29 @@ namespace WrathBench
     // a peer that trickles bytes does not extend them.
     static constexpr std::chrono::seconds kReadTimeout{60};
     static constexpr std::chrono::seconds kWriteTimeout{30};
+    // The same for a connection no request has authenticated on yet: a
+    // caller sends its first request as it connects, so one that has sent
+    // none this long after is holding a slot and nothing else.
+    static constexpr std::chrono::seconds kFirstReadTimeout{10};
 
-    // The connection count, total and per peer address. A connection holds a
-    // ConnSlot from accept until its object dies, the WebSocket it may have
-    // become included.
+    // The connection count: in total, per peer address, per lease, and those
+    // no request has authenticated on yet. A connection holds a ConnSlot from
+    // accept until its object dies, the WebSocket it may have become
+    // included.
+    //
+    // A slot costs nothing to take: the port answers anyone who can reach
+    // it, and where every caller shares one address (one host runs every
+    // sandbox) the per-peer count cannot tell them apart. So the
+    // unauthenticated may hold at most half the table, which leaves the rest
+    // for connections that have shown a credential, and a lease's secret
+    // authenticates only so many at once (IHttpPeer::Admit).
     struct ConnTable
     {
         std::mutex mutex;
         std::uint32_t total{0};
+        std::uint32_t unauthenticated{0};
         std::map<asio::ip::address, std::uint32_t> byPeer;
+        std::map<std::string, std::uint32_t> byLease;
     };
 
     class ConnSlot
@@ -114,6 +129,29 @@ namespace WrathBench
             auto it = _table->byPeer.find(_peer);
             if (it != _table->byPeer.end() && --it->second == 0)
                 _table->byPeer.erase(it);
+            Unbind();
+        }
+
+        // IHttpPeer::Admit for the connection holding this slot. A connection
+        // that authenticates as another lease later is counted as that one
+        // from then on; refused, it stays what it was.
+        bool Admit(std::string const& lease, std::uint32_t maxPerLease)
+        {
+            std::lock_guard<std::mutex> lock(_table->mutex);
+            if (_admitted && _lease == lease)
+                return true;
+            if (!lease.empty())
+            {
+                auto it = _table->byLease.find(lease);
+                if (maxPerLease && it != _table->byLease.end() && it->second >= maxPerLease)
+                    return false;
+            }
+            Unbind();
+            _admitted = true;
+            _lease = lease;
+            if (!lease.empty())
+                ++_table->byLease[lease];
+            return true;
         }
 
         // A slot for one more connection from this peer, or nullptr when a
@@ -125,6 +163,8 @@ namespace WrathBench
                 std::lock_guard<std::mutex> lock(table->mutex);
                 if (limits.maxConnections && table->total >= limits.maxConnections)
                     return nullptr;
+                if (limits.maxConnections && table->unauthenticated >= std::max<std::uint32_t>(1, limits.maxConnections / 2))
+                    return nullptr;
                 std::uint32_t& mine = table->byPeer[peer];
                 if (limits.maxConnectionsPerPeer && mine >= limits.maxConnectionsPerPeer)
                 {
@@ -134,13 +174,32 @@ namespace WrathBench
                 }
                 ++mine;
                 ++table->total;
+                ++table->unauthenticated;
             }
             return std::make_shared<ConnSlot>(table, peer);
         }
 
     private:
+        // Under the table's mutex: give back whichever count this slot holds.
+        void Unbind()
+        {
+            if (!_admitted)
+            {
+                --_table->unauthenticated;
+                return;
+            }
+            if (_lease.empty())
+                return;
+            auto it = _table->byLease.find(_lease);
+            if (it != _table->byLease.end() && --it->second == 0)
+                _table->byLease.erase(it);
+        }
+
         std::shared_ptr<ConnTable> _table;
         asio::ip::address _peer;
+        // Under the table's mutex.
+        bool _admitted{false};
+        std::string _lease;
     };
 
     // A subscriber's socket lives for hours and the server only ever writes
@@ -314,13 +373,25 @@ namespace WrathBench
     };
 
     // ----------------------------------------------------------- HTTP conn
-    class HttpConnection : public std::enable_shared_from_this<HttpConnection>
+    class HttpConnection : public IHttpPeer, public std::enable_shared_from_this<HttpConnection>
     {
     public:
         HttpConnection(tcp::socket&& socket, IHttpSink* sink, std::shared_ptr<ConnSlot> slot, bool loopbackPeer,
-            std::uint64_t backlogLimit)
+            HttpLimits const& limits)
             : _stream(std::move(socket)), _sink(sink), _slot(std::move(slot)), _loopbackPeer(loopbackPeer),
-              _backlogLimit(backlogLimit), _buffer(kHeaderLimit + kBodyLimit) { }
+              _maxPerLease(limits.maxConnectionsPerLease), _backlogLimit(limits.eventsBacklogBytes),
+              _buffer(kHeaderLimit + kBodyLimit) { }
+
+        // IHttpPeer: called by the sink from inside HandleHttp or
+        // AuthorizeWs, on this connection's strand.
+        bool Loopback() const override { return _loopbackPeer; }
+        bool Admit(std::string const& lease) override
+        {
+            if (!_slot->Admit(lease, _maxPerLease))
+                return false;
+            _admitted = true;
+            return true;
+        }
 
         void Run()
         {
@@ -336,7 +407,7 @@ namespace WrathBench
             _parser.emplace();
             _parser->header_limit(kHeaderLimit);
             _parser->body_limit(kBodyLimit);
-            _stream.expires_after(kReadTimeout);
+            _stream.expires_after(_admitted ? kReadTimeout : kFirstReadTimeout);
             http::async_read(_stream, _buffer, *_parser,
                 beast::bind_front_handler(&HttpConnection::OnRead, shared_from_this()));
         }
@@ -367,7 +438,7 @@ namespace WrathBench
             // not-yet-upgraded stream.
             if (websocket::is_upgrade(_req) && path == "/events")
             {
-                WsAdmit const admit = _sink->AuthorizeWs(token, authorization);
+                WsAdmit const admit = _sink->AuthorizeWs(token, authorization, *this);
                 if (admit.status != 0)
                 {
                     SendReply({admit.status, std::string(R"({"ok":false,"error":")") + admit.error + "\"}"}, false);
@@ -379,8 +450,8 @@ namespace WrathBench
             }
 
             std::string method(_req.method_string());
-            HttpReply reply = _sink->HandleHttp(method, path, _req.body(), authorization, _loopbackPeer);
-            SendReply(reply, _req.keep_alive());
+            HttpReply reply = _sink->HandleHttp(method, path, _req.body(), authorization, *this);
+            SendReply(reply, _req.keep_alive() && !reply.close);
         }
 
         void SendReply(HttpReply const& reply, bool keepAlive)
@@ -416,6 +487,9 @@ namespace WrathBench
         IHttpSink* _sink;
         std::shared_ptr<ConnSlot> _slot;
         bool _loopbackPeer{false};
+        std::uint32_t _maxPerLease{0};
+        // A request has authenticated on this connection (Admit). Strand only.
+        bool _admitted{false};
         std::uint64_t _backlogLimit{0};
         beast::flat_buffer _buffer;
         std::optional<http::request_parser<http::string_body>> _parser;
@@ -453,7 +527,7 @@ namespace WrathBench
                     {
                         if (auto slot = ConnSlot::Take(table, limits, peer.address()))
                             std::make_shared<HttpConnection>(std::move(socket), sink, std::move(slot),
-                                peer.address().is_loopback(), limits.eventsBacklogBytes)->Run();
+                                peer.address().is_loopback(), limits)->Run();
                         else
                             NoteRefused(peer.address());
                     }
@@ -472,7 +546,8 @@ namespace WrathBench
             if (now - lastRefusedLog < std::chrono::seconds(10))
                 return;
             LOG_WARN("module", "wrathbench: refused {} connection(s) at a connection limit, the last from {} "
-                "(WrathBench.MaxConnections, WrathBench.MaxConnectionsPerPeer)", refusedSinceLog, peer.to_string());
+                "(WrathBench.MaxConnections, of which unauthenticated connections may hold half; "
+                "WrathBench.MaxConnectionsPerPeer)", refusedSinceLog, peer.to_string());
             lastRefusedLog = now;
             refusedSinceLog = 0;
         }

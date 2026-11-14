@@ -7,6 +7,7 @@
  */
 
 #include "WbManager.h"
+#include "WbBounds.h"
 #include "WbJson.h"
 #include "WbNav.h"
 
@@ -226,11 +227,12 @@ namespace WrathBench
         std::string secret = sConfigMgr->GetOption<std::string>("WrathBench.Secret", "");
         _auditDir = sConfigMgr->GetOption<std::string>("WrathBench.AuditDir", "/azerothcore/env/dist/logs/wrathbench");
 
-        // The module's own protection (mod_wrathbench.conf.dist): the three
+        // The module's own protection (mod_wrathbench.conf.dist): those
         // the server takes at Start(), and the per-lease caps, which a
         // `.reload config` re-applies.
         _httpLimits.maxConnections = sConfigMgr->GetOption<uint32>("WrathBench.MaxConnections", 4096);
         _httpLimits.maxConnectionsPerPeer = sConfigMgr->GetOption<uint32>("WrathBench.MaxConnectionsPerPeer", 0);
+        _httpLimits.maxConnectionsPerLease = sConfigMgr->GetOption<uint32>("WrathBench.MaxConnectionsPerLease", 0);
         _httpLimits.eventsBacklogBytes = sConfigMgr->GetOption<uint32>("WrathBench.EventsBacklogBytes", 16u * 1024 * 1024);
         _actionRate = sConfigMgr->GetOption<uint32>("WrathBench.ActionRate", 0);
         _actionBurst = sConfigMgr->GetOption<uint32>("WrathBench.ActionBurst", 40);
@@ -559,17 +561,20 @@ namespace WrathBench
         return false;
     }
 
-    WsAdmit Manager::AuthorizeWs(std::string const& token, std::string const& authorization)
+    WsAdmit Manager::AuthorizeWs(std::string const& token, std::string const& authorization, IHttpPeer& peer)
     {
         std::string leaseToken;
         switch (Authenticate(authorization, &leaseToken, nullptr))
         {
-            case Cred::Operator: return {};
+            case Cred::Operator: peer.Admit(""); return {};
             case Cred::Session:  break;
             default:             return {401, "unauthorized"};
         }
         if (token.empty() || token != leaseToken)
             return {401, "unauthorized"};
+        // The lease's connections, this socket among them (HandleHttp).
+        if (!peer.Admit(leaseToken))
+            return {429, "connection_limit"};
         // A subscribe by a session that is in world costs the world thread a
         // state frame (OnWsOpen), so a subscribe draws from the lease's
         // bucket as an action does: a caller looping on connects is refused
@@ -606,7 +611,7 @@ namespace WrathBench
     }
 
     HttpReply Manager::HandleHttp(std::string const& method, std::string const& target, std::string const& body,
-        std::string const& authorization, bool loopbackPeer)
+        std::string const& authorization, IHttpPeer& peer)
     {
         try
         {
@@ -617,10 +622,26 @@ namespace WrathBench
             Lease lease;
             Cred const cred = Authenticate(authorization, &leaseToken, &lease);
             if (cred == Cred::None)
-                return ErrorReply(401, "unauthorized");
+            {
+                // And the connection goes: it has no caller behind it that
+                // the module knows, and is counted as such until it closes.
+                HttpReply refusal = ErrorReply(401, "unauthorized");
+                refusal.close = true;
+                return refusal;
+            }
+            // Whose connection this is, for the server's count of them. A
+            // lease secret authenticates only so many at once
+            // (WrathBench.MaxConnectionsPerLease): one past it is refused
+            // before any route and closed, as any request on it would be.
+            if (!peer.Admit(cred == Cred::Session ? leaseToken : std::string()))
+            {
+                HttpReply refusal = ErrorReply(429, "connection_limit");
+                refusal.close = true;
+                return refusal;
+            }
 
             if (method == "GET" && target == "/health")
-                return HttpHealth(loopbackPeer);
+                return HttpHealth(peer.Loopback());
 
             // Operator-only surfaces: leasing itself, and the character-select
             // utilities that act on an account rather than a session.
@@ -863,6 +884,7 @@ namespace WrathBench
             .Add("actionRate", _actionRate.load()).Add("actionBurst", _actionBurst.load())
             .Add("eventsSubscribersPerToken", _eventsSubscribersMax.load()).Add("leases", _leasesMax.load())
             .Add("connections", _httpLimits.maxConnections).Add("connectionsPerPeer", _httpLimits.maxConnectionsPerPeer)
+            .Add("connectionsPerLease", _httpLimits.maxConnectionsPerLease)
             .Add("eventsBacklogBytes", _httpLimits.eventsBacklogBytes).Str());
         w.Add("droppedPackets", _totalDrops.load()); // lifetime
         w.Add("droppedPacketsLive", liveDrops);      // across current sessions
@@ -1279,6 +1301,21 @@ namespace WrathBench
         return 0;
     }
 
+    // A caller-written string in an audit record: cut to Bounds::kAuditTextMax
+    // bytes, with its full length beside it (`<key>Bytes`) when it was cut.
+    // The record says what was asked without growing with it; what went to
+    // the core is the whole string, which the core bounds for itself.
+    static void AddAuditText(Json::Writer& w, std::string const& key, std::string const& text)
+    {
+        if (text.size() <= Bounds::kAuditTextMax)
+        {
+            w.Add(key, text);
+            return;
+        }
+        w.Add(key, Bounds::AuditText(text));
+        w.Add(key + "Bytes", (uint64_t)text.size());
+    }
+
     // Every missing/invalid-param reply names the action and the param it was
     // about: a bare "missing_guid" cost live-run turns to diagnose.
     static HttpReply MissingParam(std::string const& action, char const* code, char const* param)
@@ -1320,12 +1357,17 @@ namespace WrathBench
             if (!req.Has("x") || !req.Has("y") || !req.Has("z"))
                 return MissingParam(action, "missing_position",
                     !req.Has("x") ? "x" : (!req.Has("y") ? "y" : "z"));
-            float x = (float)req.GetDouble("x"), y = (float)req.GetDouble("y"), z = (float)req.GetDouble("z");
-            // Not a number is not a place. No JSON number parses to one, so
-            // only a hand-built body carries it, and it would pass every
-            // range test the planner makes (each compares false).
-            if (std::isnan(x) || std::isnan(y) || std::isnan(z))
-                return MissingParam(action, "invalid_position", std::isnan(x) ? "x" : (std::isnan(y) ? "y" : "z"));
+            // Not a number is not a place, and neither is one no map reaches
+            // (Bounds::FieldOk). A number that is not finite would pass every
+            // range test the planner makes (each compares false), and a
+            // finite one far enough out sizes whatever is then sampled along
+            // the way to it. Judged as the doubles the body carried, before
+            // they narrow to the floats the game uses.
+            double const dx = req.GetDouble("x"), dy = req.GetDouble("y"), dz = req.GetDouble("z");
+            if (!Bounds::FieldOk(dx) || !Bounds::FieldOk(dy) || !Bounds::FieldOk(dz))
+                return MissingParam(action, "invalid_position",
+                    !Bounds::FieldOk(dx) ? "x" : (!Bounds::FieldOk(dy) ? "y" : "z"));
+            float x = (float)dx, y = (float)dy, z = (float)dz;
             // Optional: the guid of the unit the point was read from. Only a
             // planning hint (the z of a patrolling NPC is resolved to the
             // ground under it before pathing, see ResolvePath); never a
@@ -1357,11 +1399,15 @@ namespace WrathBench
             bool hasXY = req.Has("x") && req.Has("y");
             if (!hasO && !hasXY)
                 return MissingParam(action, "missing_face_target", "orientation or x,y");
-            float o = (float)req.GetDouble("orientation");
-            float x = (float)req.GetDouble("x"), y = (float)req.GetDouble("y");
-            if ((hasO && std::isnan(o)) || (hasXY && (std::isnan(x) || std::isnan(y))))
+            // As for move_to: a facing that is not finite has no normal form
+            // (the core's NormalizeOrientation answers NaN for it).
+            double const dor = req.GetDouble("orientation");
+            double const dx = req.GetDouble("x"), dy = req.GetDouble("y");
+            if ((hasO && !Bounds::FieldOk(dor)) || (hasXY && (!Bounds::FieldOk(dx) || !Bounds::FieldOk(dy))))
                 return MissingParam(action, "invalid_position",
-                    hasO && std::isnan(o) ? "orientation" : (std::isnan(x) ? "x" : "y"));
+                    hasO && !Bounds::FieldOk(dor) ? "orientation" : (!Bounds::FieldOk(dx) ? "x" : "y"));
+            float o = (float)dor;
+            float x = (float)dx, y = (float)dy;
             PushTask([this, token, hasO, o, hasXY, x, y, ack]() { DoFace(token, hasO, o, hasXY, x, y, ack); });
         }
         else if (action == "jump")
@@ -1802,9 +1848,13 @@ namespace WrathBench
             _byWs[ws] = s;
         }
 
-        Audit(*s, "action", Json::Writer().Add("op", s->deleteMode ? "character_delete" : "session_create")
-            .Add("account", s->account).Add("character", s->charName)
-            .Add("race", (uint32)s->charRace).Add("class", (uint32)s->charClass).Str());
+        {
+            Json::Writer a;
+            a.Add("op", s->deleteMode ? "character_delete" : "session_create").Add("account", s->account);
+            AddAuditText(a, "character", s->charName);
+            a.Add("race", (uint32)s->charRace).Add("class", (uint32)s->charClass);
+            Audit(*s, "action", a.Str());
+        }
 
         s->phase.store(BenchSession::P_AUTH);
         sWorldSessionMgr->AddSession(ws);
@@ -1859,7 +1909,12 @@ namespace WrathBench
         }
         s->ws->QueuePacket(p);
 
-        Audit(*s, "action", Json::Writer().Add("op", "say").Add("text", text).Str());
+        {
+            Json::Writer a;
+            a.Add("op", "say");
+            AddAuditText(a, "text", text);
+            Audit(*s, "action", a.Str());
+        }
         reply(200, Json::Writer().Add("ok", true).Add("action", "say").Str());
     }
 
@@ -2300,7 +2355,14 @@ namespace WrathBench
                 seconds += len / run;
                 continue;
             }
-            uint32 const n = std::max<uint32>(1, uint32(std::ceil(len / ETA_SAMPLE_YARDS)));
+            // A route's water reads are bounded in total (Bounds::kSamplesMax):
+            // past the bound a stretch is timed at the run speed, unsampled.
+            uint32 const n = Bounds::Samples(len, ETA_SAMPLE_YARDS, Bounds::kSamplesMax - std::min(eta.samples, Bounds::kSamplesMax));
+            if (n == 0)
+            {
+                seconds += len / run;
+                continue;
+            }
             float const step = len / float(n);
             for (uint32 k = 0; k < n; ++k)
             {
@@ -2351,7 +2413,11 @@ namespace WrathBench
         points.push_back(from);
         float const sx = to.x - from.x, sy = to.y - from.y, sz = to.z - from.z;
         float const len = std::sqrt(sx * sx + sy * sy + sz * sz);
-        uint32 const n = std::max<uint32>(1, uint32(std::ceil(len / FLIGHT_SAMPLE_YARDS)));
+        // Never more than Bounds::kSamplesMax, whatever the line's length:
+        // each sample is a terrain read and a line-of-sight query made while
+        // the world waits. DoMoveTo refuses a leg longer than its reach
+        // before it gets here, so the bound is not met by one it lets through.
+        uint32 const n = Bounds::Samples(len, FLIGHT_SAMPLE_YARDS);
         WbVec clear = from;
         for (uint32 k = 1; k <= n; ++k)
         {
@@ -4081,7 +4147,7 @@ namespace WrathBench
             EmitEvent(*s, "WB_MOVE_RESULT", 0xFF01, w.Str());
         };
 
-        if (mover->GetExactDist2d(x, y) > 250.0f)
+        if (mover->GetExactDist2d(x, y) > Bounds::kMoveReachYards)
             return failEvent("too_far");
 
         // A flying mover (the Eye of Acherus, a flying vehicle) is not walked
@@ -4103,6 +4169,12 @@ namespace WrathBench
         bool const flying = mover != player
             ? (s->moverMoveFlags.load() & (MOVEMENTFLAG_CAN_FLY | MOVEMENTFLAG_DISABLE_GRAVITY)) != 0
             : ownCanFly && (fly || s->airborne.load());
+        // A flown leg goes to the z asked for, so its reach holds up and down
+        // as it does across: the line's length is what PlanFlight samples.
+        // A walked one ends on the ground the mesh finds at x,y, whatever z
+        // was asked from, and is bounded by that.
+        if (flying && !Bounds::WithinReach(mover->GetPositionZ(), z, Bounds::kMoveReachYards))
+            return failEvent("too_far");
         auto planFlight = [&](PathResolve& out) {
             out = PathResolve{};
             FlightPlan const fp = PlanFlight(mover, x, y, z, out.points);
@@ -4138,7 +4210,11 @@ namespace WrathBench
             Transport* targetT = FindTransportAt(map, x, y, z);
             if (flying)
                 planFlight(r);
-            else if (mover == player && (startT || targetT) && mover->GetExactDist2d(x, y) <= 30.0f)
+            // The straight leg is short in height as it is across: it ends at
+            // the z asked for where no ground is found under it, and no
+            // client's character crosses more than a deck's height that way.
+            else if (mover == player && (startT || targetT) && mover->GetExactDist2d(x, y) <= Bounds::kTransportLegYards
+                && Bounds::WithinReach(mover->GetPositionZ(), z, Bounds::kTransportLegYards))
             {
                 transportLeg = true;
                 bool leaving = startT != nullptr && !targetT;
@@ -4596,11 +4672,12 @@ namespace WrathBench
         if (req.Has("destX"))
         {
             t.hasDest = true;
-            t.x = (float)req.GetDouble("destX");
-            t.y = (float)req.GetDouble("destY");
-            t.z = (float)req.GetDouble("destZ");
-            if (!std::isfinite(t.x) || !std::isfinite(t.y) || !std::isfinite(t.z))
+            double const dx = req.GetDouble("destX"), dy = req.GetDouble("destY"), dz = req.GetDouble("destZ");
+            if (!Bounds::FieldOk(dx) || !Bounds::FieldOk(dy) || !Bounds::FieldOk(dz))
                 return "invalid_dest";
+            t.x = (float)dx;
+            t.y = (float)dy;
+            t.z = (float)dz;
         }
         return nullptr;
     }
@@ -4731,7 +4808,7 @@ namespace WrathBench
             {
                 std::string code = req.GetString("code");
                 *p << code;
-                auditW.Add("code", code);
+                AddAuditText(auditW, "code", code);
             }
         }
         else if (action == "quest_list")
@@ -5067,7 +5144,14 @@ namespace WrathBench
             *p << uint32(pairs.size());
             for (auto const& [id, rank] : pairs)
                 *p << uint32(id) << uint32(rank);
-            auditW.Add("count", (uint64_t)pairs.size()).Raw("talents", raw.empty() ? "[]" : raw);
+            // The pairs as read, never the caller's text: that is whatever
+            // the body held between the digits, of any size and not
+            // necessarily JSON.
+            std::string list = "[";
+            for (size_t k = 0; k < pairs.size(); ++k)
+                list += (k ? ",[" : "[") + std::to_string(pairs[k].first) + "," + std::to_string(pairs[k].second) + "]";
+            list += "]";
+            auditW.Add("count", (uint64_t)pairs.size()).Raw("talents", list);
         }
         else if (action == "vehicle_exit")
         {

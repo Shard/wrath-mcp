@@ -490,8 +490,8 @@ namespace WrathBench
 
         // IHttpSink (io_context threads).
         HttpReply HandleHttp(std::string const& method, std::string const& target, std::string const& body,
-            std::string const& authorization, bool loopbackPeer) override;
-        WsAdmit AuthorizeWs(std::string const& token, std::string const& authorization) override;
+            std::string const& authorization, IHttpPeer& peer) override;
+        WsAdmit AuthorizeWs(std::string const& token, std::string const& authorization, IHttpPeer& peer) override;
         void ReleaseWsSlot(std::string const& token) override;
         void OnWsOpen(std::string const& token, std::shared_ptr<IWsConn> conn, bool replay) override;
         void OnWsClose(std::string const& token, IWsConn* conn) override;

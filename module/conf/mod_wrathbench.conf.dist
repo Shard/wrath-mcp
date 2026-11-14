@@ -125,6 +125,9 @@ WrathBench.AuditDir = "/azerothcore/env/dist/logs/wrathbench"
 #                     hosted world); 20 and 40 are several times what one
 #                     character's client sends, there so that such a caller
 #                     cannot occupy the world thread, not to pace play.
+#                     Nothing checks that a hosted deployment has set it: a
+#                     world that hands lease secrets to callers it does not
+#                     trust sets it, in its own conf.
 #                     Re-read on `.reload config`.
 #        Default:     0 (no limit) and 40
 #                     Hosted:      20 and 40
@@ -166,22 +169,41 @@ WrathBench.MaxLeases = 1024
 #
 #    WrathBench.MaxConnections
 #    WrathBench.MaxConnectionsPerPeer
+#    WrathBench.MaxConnectionsPerLease
 #        Description: Open connections to the port, HTTP and WebSocket
-#                     together, in total and from one peer address. A
-#                     connection past either is closed at accept, unanswered.
+#                     together: in total, from one peer address, and
+#                     authenticated by one lease's secret. A connection past
+#                     the total or the per-peer limit is closed at accept,
+#                     unanswered; a request that would make its connection
+#                     one more than its lease may hold is answered 429
+#                     connection_limit and the connection closed.
 #                     Keep the total under the worldserver's open-file limit
-#                     with room for the game's own sockets. The per-peer limit
+#                     with room for the game's own sockets. Connections on
+#                     which no request has authenticated yet may hold at most
+#                     half of it, and each has ten seconds to send one, so
+#                     that a caller with no credential cannot take the table
+#                     from those that have shown one. The per-peer limit
 #                     is off by default because a deployment's own callers
 #                     usually share one address (one host runs every sandbox);
 #                     set it where callers that do not trust each other reach
 #                     the port from addresses of their own, so that one cannot
-#                     take every connection. Read at startup only.
-#        Default:     4096 and 0
+#                     take every connection. The per-lease limit is what
+#                     tells such callers apart where they do share an
+#                     address. It is off by default because a caller's
+#                     concurrent requests each hold a connection, so a world
+#                     whose callers are all the operator's own changes
+#                     nothing; 32 leaves a character its event sockets and
+#                     more requests in flight than a client makes. The port
+#                     secret's connections are never counted against a lease.
+#                     Read at startup only.
+#        Default:     4096, 0 and 0
+#                     Hosted:      per lease 32
 #                     0 - No limit
 #
 
 WrathBench.MaxConnections = 4096
 WrathBench.MaxConnectionsPerPeer = 0
+WrathBench.MaxConnectionsPerLease = 0
 
 #
 #    WrathBench.EventsBacklogBytes
