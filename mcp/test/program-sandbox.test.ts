@@ -684,7 +684,7 @@ describe("the program tools", () => {
     expect(specs.run_snippet.def.description).toContain("Nothing a snippet declares or starts outlives it");
     expect(core.run_snippet.def.description).toContain("Top-level bindings persist across snippets");
     expect(Object.keys(specs.start_routine.def.inputSchema["properties"] as object)).toEqual(["name", "args"]);
-    expect((specs.start_routine.def.inputSchema["properties"] as Record<string, unknown>)["args"]).toEqual({ type: "object", description: "Passed to the function as its one argument: a JSON object; omit for none." });
+    expect((specs.start_routine.def.inputSchema["properties"] as Record<string, unknown>)["args"]).toEqual({ description: "Passed to the function as its one argument: a JSON object; omit for none." });
     expect(Object.keys(specs.edit_file.def.inputSchema["properties"] as object)).toEqual(["path", "old", "new", "replaceAll"]);
     // Above fan-out 1 the routine tools name a character, optionally.
     const many = programTools(render, { characters: true });

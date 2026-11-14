@@ -10,7 +10,7 @@
  * character's model is served, which is WrathBench's `docs/METHODOLOGY.md`
  * ("The model surface") to decide. Refreshed once on such a decision
  * (operator, 2026-11-15): `run_snippet` states the snippet time limit,
- * `read_file` serves `API.md`, and `start_routine`'s `args` is typed object.
+ * `read_file` serves `API.md`, and `start_routine`'s `args` is described as a JSON object.
  */
 
 import { expect, test } from "bun:test";

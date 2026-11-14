@@ -185,7 +185,6 @@
               "description": "The export of main.ts to run, e.g. grind."
             },
             "args": {
-              "type": "object",
               "description": "Passed to the function as its one argument: a JSON object; omit for none."
             }
           },

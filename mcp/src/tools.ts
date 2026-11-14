@@ -996,8 +996,9 @@ export const PROGRAM_RUN_SNIPPET_DESCRIPTION =
   SNIPPET_TIME_LIMIT_SENTENCE;
 
 /**
- * `start_routine`'s `args`. Its schema says object; what is refused is a
- * string, the object's JSON text sent in its place, which the routine would
+ * `start_routine`'s `args`. Its description says a JSON object, and its
+ * schema stays untyped, the one shape every provider takes. What is
+ * refused is a string, the object's JSON text sent in its place, which the routine would
  * get as a string and fail on at its first field. Any other value is passed
  * on as it always was.
  */
@@ -1146,7 +1147,7 @@ export function programTools<C extends ProgramToolContext>(render: CoreToolRende
           type: "object",
           properties: {
             name: { type: "string", description: "The export of main.ts to run, e.g. grind." },
-            args: { type: "object", description: "Passed to the function as its one argument: a JSON object; omit for none." },
+            args: { description: "Passed to the function as its one argument: a JSON object; omit for none." },
             ...characterProp,
           },
           required: ["name"],

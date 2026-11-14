@@ -477,7 +477,8 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   default), and an abandoned snippet that was awaiting an SDK wait whose
   `timeout` was the limit or longer says so, as one awaiting such a `sleep`
   already did (`EventAbortedError.timeoutMs`). `start_routine`'s `args` is
-  typed `object`, and a string there, the object's JSON text, is refused
+  described as a JSON object (its schema stays untyped), and a string there,
+  the object's JSON text, is refused
   with "must be a JSON object, not a string"; any other value passes as
   before. A `ReferenceError` naming a tool (`stop_routine is
   not defined`) in a snippet's or a routine tool's result gets a line saying
