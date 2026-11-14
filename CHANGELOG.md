@@ -28,6 +28,11 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Added
 
+- **Leasing through an interface.** `Leaser` (`@wrathbench/mcp`): the
+  roster (`CharacterRosterOptions.leaser`) and the standalone server's
+  shutdown take, end and give back leases through it, so a host that must
+  not hold the port secret can be handed one that asks whoever does.
+  `portSecretLeaser` is the default and behaves as before.
 - **Several characters for one client (fan-out).** Off unless the operator
   grants it: `--max-characters <n> --accounts <a,b,…>` on the standalone
   server, `SandboxHostOptions.fanout` with a `CharacterRoster` and
