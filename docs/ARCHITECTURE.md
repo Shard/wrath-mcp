@@ -457,7 +457,7 @@ forty servers would put forty copies of the tool list in a model's context.
 
 ### Hosted
 
-Hosted mode, being built under wrath-mcp#43, serves the tools to people other
+Hosted mode (wrath-mcp#43) serves the tools to people other
 than the operator, each driving their own agent from any MCP client on their
 own model spend, over Streamable HTTP. It changes the shape of one thing: the
 sandbox host as `main.ts` runs it holds the port secret beside the child that
@@ -485,7 +485,15 @@ worst place for it when the code is a stranger's. So the host is split in two:
   of runs.
 
 A credential is served the tool list the stdio server serves for the same
-options, byte for byte at fan-out 1. The module's part is to protect itself:
+options, byte for byte at fan-out 1: both build it in `host.ts`.
+
+The gateway is `mcp/src/hosted/gateway.ts`. For now it opens each
+credential's host in its own process, each host's child confined as every
+sandbox is; the worker process per credential and the `WorkerProvider` hook
+are the next step, and the gateway's leaser already holds every lease to the
+grant (the account, the character count, the token's owner, never GM) as it
+must once the host is a process the gateway does not trust. Its ledger lives
+outside the credentials' directories and is never read back from them. The module's part is to protect itself:
 per-lease caps on the action rate, the `/events` subscribers and the number
 of leases. `docs/CONTRACTS.md`, "Control-surface authentication", states what
 each side holds.

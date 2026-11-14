@@ -122,7 +122,11 @@ It serves `programTools` beside the core tools and reads what happened from
 `SandboxHost.program`. At fan-out a client has one workspace and one program
 with routines per character: `programTools(render, { characters: true })`
 beside `fanoutTools(render, fan, { program: true })`. The standalone server
-does not offer it.
+serves it with `--program`: the workspace is `program/` in the state
+directory, and the tools are `run_snippet` (a one-off), `read_file`,
+`write_file`, `edit_file`, `delete_file`, `start_routine` and
+`stop_routine`, then the other four core tools (`src/host.ts`,
+`hostToolSpecs`).
 
 ## GM accounts
 
@@ -186,6 +190,42 @@ bun run grants list
   of 20, 4 calls at once, 20 logins an hour, logged out after 30 idle
   minutes), each at most the file's `ceiling`.
 
+## The hosted gateway
+
+`bun run gateway --grants <file> --state <dir>` serves the tools over
+Streamable HTTP at `/mcp` to the people the grants file names
+(`src/hosted/gateway-main.ts`; `docs/ARCHITECTURE.md`, "Hosted"). A client
+connects with its key as `Authorization: Bearer <key>`:
+
+```json
+{ "mcpServers": { "wrath": { "type": "http", "url": "https://wrath.example/mcp", "headers": { "Authorization": "Bearer wmk_…" } } } }
+```
+
+- Only the gateway holds the port secret (`WRATHBENCH_MODULE_SECRET`). Each
+  credential gets a host of its own, opened at its first tool call, with its
+  state in `<state>/tenants/<credential>/` and its own session store there;
+  its records carry the person as `owner`.
+- Every lease is held to the grant by the gateway: the credential's
+  accounts, its character count and the file's `globalMaxCharacters`, the
+  hourly logins, and never the GM opt-in. Leases are kept in
+  `<state>/ledger.json` (0600) and released on the next start if the
+  process died with them.
+- Requests past the grant's rate are `429`; tool calls of one credential run
+  one at a time, and past its in-flight cap are refused. With no
+  authenticated request for the idle minutes, the credential's characters are
+  logged out and its host stopped; the next call opens it again. A grant
+  disabled or removed stops its host at the next sweep, and so does a
+  worldserver restart.
+- `<state>/audit/<person>/<day>.jsonl` records who called what: keys tried,
+  each request and tool call (by its call id, with the arguments as a size
+  and a hash), leases by token fingerprint, refusals and stops. Kept 30 days.
+- Both eras of the protocol are served: 2026-07-28's per-request metadata
+  and `server/discover`, and the `initialize` handshake of 2025-03-26 to
+  2025-11-25, answered without a session.
+- Bound to anything but loopback it expects TLS in front of it.
+  `--allowed-origin` names browser origins it accepts; `--trust-forwarded-for`
+  audits the proxy's `X-Forwarded-For` address.
+
 ## Pieces
 
 - `src/sandbox/` — the host (`SandboxHost`), the child runtime (`child.ts`,
@@ -203,7 +243,11 @@ bun run grants list
   child runs, the writer, the reader, the store and the validator.
 - `src/server.ts`, `src/bridge.ts` — the MCP transport, and the stdio-to-TCP
   bridge a CLI is handed when the harness keeps its sandbox in-process.
-- `src/hosted/` — hosted mode: the grants file, keys and `authenticate`.
+- `src/host.ts` — one host: the sandbox, record, roster, program and the
+  tool list, as `main.ts` serves it over stdio and the gateway per credential.
+- `src/hosted/` — hosted mode: the grants file, keys and `authenticate`; the
+  Streamable HTTP transport (`http.ts`); the gateway (`gateway.ts`) and its
+  entry (`gateway-main.ts`).
 - `src/main.ts` — the standalone server above.
 
 Entry points: the root, `./sandbox-child` (the child runtime, for a harness's

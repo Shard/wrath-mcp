@@ -28,6 +28,15 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Added
 
+- **The hosted gateway.** `bun run gateway --grants <file> --state <dir>`
+  serves the tools over Streamable HTTP (both 2026-07-28 and the
+  `initialize` revisions) to the people a grants file names, each with a
+  key, a host of their own, a lease ledger, rate, in-flight, login and idle
+  limits, and an audit per person (`mcp/README.md`, "The hosted gateway").
+  Only the gateway holds the port secret.
+- **`--program` on the standalone server**: the model's program beside the
+  core tools. The host is now `src/host.ts`, shared by `main.ts` and the
+  gateway; without `--program` the stdio server is unchanged.
 - **The module limits what a caller can make the worldserver hold.** Ahead of
   callers that hold only a lease secret and are not trusted (wrath-mcp#43,
   wrath-mcp#29). Per lease: a request rate (`429 rate_limited`;
@@ -60,7 +69,7 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   `bun run grants` to add, rotate, revoke, disable and list. The loader
   refuses a grant naming `allowGm`, an account in two grants or reserved for
   the operator, and more than 5 characters at once (`mcp/README.md`,
-  "Hosted grants"). Nothing serves it yet.
+  "Hosted grants").
 - **Several characters for one client (fan-out).** Off unless the operator
   grants it: `--max-characters <n> --accounts <a,b,…>` on the standalone
   server, `SandboxHostOptions.fanout` with a `CharacterRoster` and

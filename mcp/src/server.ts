@@ -31,6 +31,15 @@ interface JsonRpcResponse {
 
 export const MCP_PROTOCOL_VERSION = "2024-11-05";
 
+/**
+ * A tool list as `tools/list` serves it: name, description and input schema,
+ * nothing else. Every transport lists through this, so a client is served
+ * the same bytes over stdio and over HTTP.
+ */
+export function listedTools(defs: readonly ToolDef[]): { name: string; description: string; inputSchema: ToolDef["inputSchema"] }[] {
+  return defs.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema }));
+}
+
 /** What the server serves: the tool list as of now, and the dispatcher behind it. */
 export interface ToolHost {
   list(): ToolDef[];
@@ -106,13 +115,7 @@ export class McpServer {
       case "ping":
         return respond({});
       case "tools/list":
-        return respond({
-          tools: this.tools.list().map((t) => ({
-            name: t.name,
-            description: t.description,
-            inputSchema: t.inputSchema,
-          })),
-        });
+        return respond({ tools: listedTools(this.tools.list()) });
       case "tools/call": {
         if (!this.initialized) return fail(-32002, "server not initialized");
         const name = String(msg.params?.["name"] ?? "");

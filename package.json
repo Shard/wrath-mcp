@@ -17,7 +17,8 @@
     "docs:api": "bun run sdk/generate-api-docs.ts",
     "docs:api:check": "bun run sdk/generate-api-docs.ts && git diff --exit-code -- sdk/API.md",
     "mcp": "bun mcp/src/main.ts",
-    "grants": "bun mcp/src/hosted/grants-cli.ts"
+    "grants": "bun mcp/src/hosted/grants-cli.ts",
+    "gateway": "bun mcp/src/hosted/gateway-main.ts"
   },
   "devDependencies": {
     "@types/bun": "1.4.4",
