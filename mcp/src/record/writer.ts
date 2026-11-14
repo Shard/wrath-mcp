@@ -74,6 +74,8 @@ export interface SessionWriterOptions {
   module?: SessionFile["module"];
   owner?: string;
   group?: string;
+  /** The world the session plays on (`SessionFile.world`), when the host has more than one. */
+  world?: string;
   /** Whether a player guid is another session of the same deployment (`gate.ts`). Default: none is. */
   own?: OwnGuid;
   /** Applied to every line before it is written: the host's secret scrub. */
@@ -360,6 +362,7 @@ export class SessionWriter {
         module: this.o.module ?? null,
         ...(this.o.owner !== undefined ? { owner: this.o.owner } : {}),
         ...(this.o.group !== undefined ? { group: this.o.group } : {}),
+        ...(this.o.world !== undefined ? { world: this.o.world } : {}),
         started: before.id === this.o.id && typeof before.started === "number" ? before.started : now,
         opened: now,
         ended: null,

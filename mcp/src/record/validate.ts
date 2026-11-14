@@ -49,6 +49,7 @@ export const sessionFileSchema = z.strictObject({
   module: z.strictObject({ build: z.string().nullable(), protocol: nnum }).nullable(),
   owner: z.string().optional(),
   group: z.string().optional(),
+  world: z.string().min(1).optional(),
   started: ts,
   opened: ts,
   ended: ts.nullable(),
