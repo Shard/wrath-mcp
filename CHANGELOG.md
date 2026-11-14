@@ -28,6 +28,11 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Added
 
+- **Leasing through an interface.** `Leaser` (`@wrathbench/mcp`): the
+  roster (`CharacterRosterOptions.leaser`) and the standalone server's
+  shutdown take, end and give back leases through it, so a host that must
+  not hold the port secret can be handed one that asks whoever does.
+  `portSecretLeaser` is the default and behaves as before.
 - **Grants for hosted mode.** `mcp/src/hosted/grants.ts`: a grants file
   (one credential per grant: person, key hashes, accounts, characters at
   once, limits), `authenticate` over `Authorization: Bearer`, and

@@ -94,15 +94,17 @@ export type { SandboxChildApi, SandboxChildExtension, SandboxChildExtensionFacto
 
 export { compactJson, jsonLine, toJsonSafe } from "./jsonsafe";
 export {
+  leaseRedacted,
   leaseRunSecret,
   leaseSessionSecret,
   MODULE_SECRET_ENV,
   moduleAuthHeaders,
   moduleIdentity,
   moduleSecret,
+  portSecretLeaser,
   releaseSessionSecret,
 } from "./module-auth";
-export type { LeaseOptions, LeaseOutcome } from "./module-auth";
+export type { LeaseOptions, LeaseOutcome, Leaser } from "./module-auth";
 export { MIN_SECRET_CHARS, REDACTED, SCRUB_HOLD_CHARS, SCRUB_MAX_PENDING_CHARS, ScrubbedStream, SecretRedactor } from "./redact";
 export {
   overCapText,

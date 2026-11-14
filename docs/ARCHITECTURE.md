@@ -134,7 +134,10 @@ A harness plugs in through hooks, each a narrow interface:
   `SandboxHostOptions.fanout` makes the child hold a client per character,
   `CharacterRoster` takes a lease per character on the accounts the grant
   names and remembers where each lives, and `fanoutTools` is the tool list a
-  granted client is served. The roll-up and merged feed a model reads when it
+  granted client is served. Every lease, the single character's included, is
+  taken, ended and given back through a `Leaser` (`mcp/src/module-auth.ts`):
+  `portSecretLeaser` for a host that holds the port secret, or one the host is
+  handed when it must not. The roll-up and merged feed a model reads when it
   names no character are rendered through `FanoutRender`, the harness's
   context policy like `CoreToolRender`; `PLAIN_FANOUT_RENDER` is the bare
   stack's. A harness that grants nothing builds `coreTools` and none of this

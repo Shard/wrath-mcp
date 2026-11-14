@@ -109,7 +109,8 @@ may have up to `n` characters in the world at once.
 A harness grants it through `SandboxHostOptions.fanout`, a `CharacterRoster`
 and `fanoutTools` (`src/fanout.ts`; `docs/ARCHITECTURE.md`, "Several
 characters"), and words the roll-up and the merged feed its own way through
-`FanoutRender`.
+`FanoutRender`. The roster leases with the port secret unless it is handed a
+`Leaser` (`src/module-auth.ts`) that asks whoever holds it.
 
 ## A program
 

@@ -211,6 +211,48 @@ export async function releaseSessionSecret(o: Omit<LeaseOptions, "account">): Pr
   }
 }
 
+/**
+ * How a host takes, ends and gives back the module leases its sessions run
+ * on. The operator's own hosts do it themselves with the port secret
+ * (`portSecretLeaser`); a host that must never hold the port secret, such as
+ * a hosted worker running a stranger's code, is handed one that asks
+ * whoever does (`docs/ARCHITECTURE.md`, "Hosted"). The roster and the
+ * single-character server lease through this and nothing else.
+ */
+export interface Leaser {
+  /** Lease `token` on `account`: the session secret its child is built with. Throws as `leaseSessionSecret` does. */
+  lease(o: { token: string; account?: string; allowGm?: boolean }): Promise<LeaseOutcome>;
+  /** Best effort: log the token's character out, however its child answered. Never throws. */
+  logout(token: string): Promise<void>;
+  /** Best effort: give the token's lease back. Never throws. */
+  release(token: string): Promise<void>;
+}
+
+/** The leaser of a host that holds the port secret itself (in `env`, `WRATHBENCH_MODULE_SECRET`). */
+export function portSecretLeaser(o: { moduleUrl: string; env?: Record<string, string | undefined>; fetch?: typeof fetch; sleep?: (ms: number) => Promise<void> }): Leaser {
+  const base = { moduleUrl: o.moduleUrl, ...(o.env !== undefined ? { env: o.env } : {}), ...(o.fetch !== undefined ? { fetch: o.fetch } : {}) };
+  return {
+    lease: (l) => leaseSessionSecret({ ...base, ...(o.sleep !== undefined ? { sleep: o.sleep } : {}), ...l }),
+    logout: (token) => logoutSession({ ...base, token }),
+    release: (token) => releaseSessionSecret({ ...base, token }),
+  };
+}
+
+/**
+ * Lease through `leaser` and register the secret for redaction in the same
+ * step, as `leaseRunSecret` does with the port secret: no caller holds a
+ * secret that is not yet on the scrub list.
+ */
+export async function leaseRedacted(
+  leaser: Pick<Leaser, "lease">,
+  o: { token: string; account?: string; allowGm?: boolean },
+  sink: { redact(secret: string | undefined): void },
+): Promise<LeaseOutcome> {
+  const lease = await leaser.lease(o);
+  sink.redact(lease.secret);
+  return lease;
+}
+
 /** What the module says of itself on `GET /health`, for `session.json`; null when it does not answer. */
 export async function moduleIdentity(moduleUrl: string, headers: Record<string, string>, fetchImpl: typeof fetch = fetch): Promise<{ build: string | null; protocol: number | null } | null> {
   try {
