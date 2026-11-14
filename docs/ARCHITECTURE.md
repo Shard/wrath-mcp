@@ -158,11 +158,15 @@ A harness plugs in through hooks, each a narrow interface:
 - **Reading it back** (`inspector/`). The inspector reads through one
   interface, `SessionSource`: list sessions, open one, read `session.json`
   and `live.json`, read a stream's segments for a range, tail a stream, each
-  scoped to who is asking (the operator sees every session, a user their
-  own). `storeSource(dir)` is the store's; a harness that lays its records out
-  its own way implements the interface over its layout and mounts
-  `createInspectorApi` and the views (`@wrathbench/inspector/views`) in its
-  own pages. It never calls the module and never holds the port secret.
+  scoped to who is asking: the operator sees every session, and a person
+  signed in with a hosted grant's key the session stores of the credentials
+  they hold, placed by path and never by a record's `owner`.
+  `storeSource(dir)` is the store's and `hostedSource(stateDir)` a hosted
+  gateway's; a harness that lays its records out its own way implements the
+  interface over its layout and mounts `createInspectorApi` and the views
+  (`@wrathbench/inspector/views`) in its own pages. It never calls the module
+  and never holds the port secret; from the grants it takes only their read
+  side.
 
 ## Versions
 

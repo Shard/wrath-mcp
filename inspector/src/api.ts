@@ -19,7 +19,8 @@
  *
  * Nothing here writes, and nothing takes a body. A session the caller's
  * scope does not cover is a 404 on every path, the same as one that does not
- * exist; a request with no scope at all is a 401.
+ * exist; a request with no scope at all is a 401. A tail asks the scope again
+ * on every poll and ends when the caller may no longer read the session.
  */
 
 import { SEGMENT_MS, STREAMS, type StreamName } from "@wrathbench/mcp/record/read";
@@ -77,6 +78,17 @@ export function createInspectorApi(source: SessionSource, o: InspectorApiOptions
   const tailPollMs = o.tailPollMs ?? 1_000;
   const heartbeatMs = o.heartbeatMs ?? 15_000;
 
+  /**
+   * Whether the request that opened `h` may still read it: a tail outlives the
+   * request's first check, and a sign-out, an expired sign-in or a revoked
+   * key must end it too.
+   */
+  async function stillInScope(req: Request, h: SessionHandle): Promise<boolean> {
+    const scope = await scopeOf(req);
+    if (scope === null) return false;
+    return scope.kind === "operator" || (await source.open(h.id, scope)) !== null;
+  }
+
   function tail(req: Request, url: URL, h: SessionHandle, stream: StreamName): Response {
     let timer: ReturnType<typeof setInterval> | undefined;
     let closed = false;
@@ -104,6 +116,15 @@ export function createInspectorApi(source: SessionSource, o: InspectorApiOptions
           if (busy || closed) return;
           busy = true;
           try {
+            if (!(await stillInScope(req, h))) {
+              stop();
+              try {
+                controller.close();
+              } catch {
+                /* already closed */
+              }
+              return;
+            }
             const t = await h.tail(stream, cursor);
             if (t.cursor !== null) cursor = t.cursor;
             if (t.rows.length > 0) {

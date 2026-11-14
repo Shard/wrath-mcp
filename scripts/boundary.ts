@@ -12,11 +12,12 @@
  *    the SDK through `@wrathbench/sdk` alone, at an exported entry point.
  *  - The inspector reads records and nothing else: from the stack it imports
  *    `@wrathbench/mcp/record/read` (the store reader and the format's types)
- *    and no other entry point, and never the SDK, so it can never reach a
- *    module, a sandbox or a writer. sdk/ and mcp/ never import it. In
- *    substance as well as by name: no module that entry loads, followed
- *    through every import, and no source of the inspector's own calls a
- *    filesystem function that writes or deletes.
+ *    and `@wrathbench/mcp/hosted/grants-read` (the hosted grants, to sign a
+ *    person in with their key) and no other entry point, and never the SDK,
+ *    so it can never reach a module, a sandbox or a writer. sdk/ and mcp/
+ *    never import it. In substance as well as by name: no module those
+ *    entries load, followed through every import, and no source of the
+ *    inspector's own calls a filesystem function that writes or deletes.
  *  - The UI's dependency graph (Solid, Vite and their kin) is declared by
  *    inspector/ alone; sdk/ and mcp/ never take one on.
  *  - The inspector's browser-side files (`src/wire.ts`, `src/codec/`,
@@ -39,8 +40,8 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 
 export const STACK_PACKAGES = ["sdk", "mcp", "inspector"] as const;
 
-/** The only entry point of the stack the inspector may import: the read side of the session record. */
-export const INSPECTOR_STACK_IMPORTS: ReadonlySet<string> = new Set(["@wrathbench/mcp/record/read"]);
+/** The only entry points of the stack the inspector may import: the read sides of the session record and of the hosted grants. */
+export const INSPECTOR_STACK_IMPORTS: ReadonlySet<string> = new Set(["@wrathbench/mcp/record/read", "@wrathbench/mcp/hosted/grants-read"]);
 
 /** The UI's dependencies: declared by inspector/ and by no other stack package. */
 export const UI_DEPENDENCIES = ["solid-js", "@solidjs/router", "vite", "vite-plugin-solid", "happy-dom"] as const;
@@ -270,7 +271,7 @@ export function checkStackBoundary(root: string): string[] {
     }
   }
 
-  // The read side reads: what the inspector may import from the stack, through
+  // The read sides read: what the inspector may import from the stack, through
   // everything it loads, and the inspector's own sources, write nothing.
   const readOnly = new Set<string>();
   const mcp = stackManifests.get(manifest(join(root, "mcp")).name);
@@ -286,7 +287,7 @@ export function checkStackBoundary(root: string): string[] {
     readOnly.add(file);
   }
   for (const file of [...readOnly].sort()) {
-    for (const w of fsWritesOf(readFileSync(file, "utf8"))) problems.push(`${relative(root, file)}: calls ${w}, on the record's read side`);
+    for (const w of fsWritesOf(readFileSync(file, "utf8"))) problems.push(`${relative(root, file)}: calls ${w}, on the read side`);
   }
 
   // The module: quoted includes by bare name only.
@@ -303,5 +304,5 @@ if (import.meta.main) {
   const problems = checkStackBoundary(resolve(import.meta.dir, ".."));
   for (const p of problems) console.error(p);
   if (problems.length > 0) process.exit(1);
-  console.log("stack boundary holds: module/, sdk/, mcp/ and inspector/ import nothing outside themselves but declared dependencies, and the inspector only the record's read side, which writes nothing");
+  console.log("stack boundary holds: module/, sdk/, mcp/ and inspector/ import nothing outside themselves but declared dependencies, and the inspector only the read sides of the record and the grants, which write nothing");
 }

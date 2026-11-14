@@ -30,6 +30,12 @@ describe("binds", () => {
     expect(() => serveInspector({ source: storeSource(tmp), host: "::", port: 0 })).toThrow("bearer secret");
   });
 
+  test("with grants every request needs a credential, so the secret is optional on any bind, and a short one still refused", () => {
+    expect(bindRefusal("0.0.0.0", undefined, { grants: true })).toBeNull();
+    expect(bindRefusal("127.0.0.1", "short", { grants: true })).toContain("at least");
+    expect(bindRefusal("127.0.0.1", "short")).toBeNull();
+  });
+
   test("on loopback it serves", async () => {
     const server = serveInspector({ source: storeSource(tmp), port: 0 });
     try {
@@ -45,11 +51,21 @@ describe("binds", () => {
 describe("flags", () => {
   test("the store is required; host and port default to loopback and 8091", () => {
     expect(() => parseArgs([], {})).toThrow("usage");
-    expect(parseArgs(["--store", tmp], {})).toEqual({ store: tmp, host: "127.0.0.1", port: 8091, secret: undefined, tiles: undefined, wowhead: false });
+    expect(parseArgs(["--store", tmp], {})).toEqual({ store: tmp, hostedState: undefined, grants: undefined, host: "127.0.0.1", port: 8091, secret: undefined, tiles: undefined, wowhead: false });
     expect(parseArgs(["--store", tmp, "--wowhead"], {}).wowhead).toBe(true);
     expect(() => parseArgs(["--store", tmp, "--wowhead=yes"], {})).toThrow("unknown argument");
     expect(parseArgs([`--store=${tmp}`, "--host", "0.0.0.0", "--port=9000"], {}).port).toBe(9000);
     expect(() => parseArgs(["--store", tmp, "--secret", SECRET], {})).toThrow("unknown argument");
+  });
+
+  test("exactly one of --store and --hosted-state; --grants only with the latter, from the flag or the gateway's variable", () => {
+    expect(() => parseArgs(["--store", tmp, "--hosted-state", tmp], {})).toThrow("one of --store and --hosted-state");
+    expect(() => parseArgs(["--grants", join(tmp, "g.json")], {})).toThrow("one of --store and --hosted-state");
+    expect(() => parseArgs(["--store", tmp, "--grants", join(tmp, "g.json")], {})).toThrow("--grants is for --hosted-state");
+    const hosted = parseArgs(["--hosted-state", tmp, "--grants", join(tmp, "g.json")], {});
+    expect([hosted.store, hosted.hostedState, hosted.grants]).toEqual([undefined, tmp, join(tmp, "g.json")]);
+    expect(parseArgs(["--hosted-state", tmp], { WRATH_MCP_GRANTS_FILE: join(tmp, "e.json") }).grants).toBe(join(tmp, "e.json"));
+    expect(parseArgs(["--store", tmp], { WRATH_MCP_GRANTS_FILE: join(tmp, "e.json") }).grants).toBeUndefined();
   });
 
   test("the secret comes from the environment or a file", () => {

@@ -12,8 +12,7 @@ import { CLOSED_ID, FIXTURE_T0, LIVE_ID, plant, plantStore, tempDir } from "./fi
 
 const tmp = tempDir();
 const root = plantStore(join(tmp, "store"));
-const alice: SessionScope = { kind: "user", owner: "alice" };
-const bob: SessionScope = { kind: "user", owner: "bob" };
+const alice: SessionScope = { kind: "user", person: "alice", credentials: new Set(["alice-1"]) };
 
 describe("listing and scope", () => {
   test("a store lists every session, newest opened first", async () => {
@@ -40,14 +39,13 @@ describe("listing and scope", () => {
     expect(await src.open(LIVE_ID, OPERATOR)).toBeNull();
   });
 
-  test("a user sees only the sessions they own, on the listing and on every open", async () => {
+  test("a plain store shows a user nothing, though a record names them its owner", async () => {
+    // The closed fixture's `owner` is alice: a label its writer set, which grants nothing.
     const src = storeSource(root);
-    expect((await src.list(alice)).map((e) => e.id)).toEqual([CLOSED_ID]);
-    expect(await src.list(bob)).toEqual([]);
-    expect(await src.open(CLOSED_ID, alice)).not.toBeNull();
-    expect(await src.open(CLOSED_ID, bob)).toBeNull();
-    // A session with no owner is the operator's alone.
+    expect(await src.list(alice)).toEqual([]);
+    expect(await src.open(CLOSED_ID, alice)).toBeNull();
     expect(await src.open(LIVE_ID, alice)).toBeNull();
+    expect(await src.open(CLOSED_ID, OPERATOR)).not.toBeNull();
     expect(await src.open(LIVE_ID, OPERATOR)).not.toBeNull();
   });
 

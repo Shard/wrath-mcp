@@ -81,6 +81,13 @@ export interface SessionListResponse {
   sessions: (SessionSummary & { session: SessionFileWire })[];
 }
 
+/**
+ * `GET /api/me` in the bin: who the request is, and whether it came by the
+ * sign-in's cookie (so signing out means something). A user's `credentials`
+ * are the grant ids whose sessions they see.
+ */
+export type MeResponse = { kind: "operator"; signedIn: boolean } | { kind: "user"; person: string; credentials: string[]; signedIn: boolean };
+
 /** `GET <base>/sessions/<id>/rows/<stream>`. */
 export interface RowsResponse {
   stream: StreamNameWire;

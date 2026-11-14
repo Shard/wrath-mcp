@@ -90,13 +90,15 @@ describe("scope", () => {
   });
 
   test("a session out of scope is not there, on the listing and on every per-session path", async () => {
-    const bob = as({ kind: "user", owner: "bob" });
+    // A plain store places no session under a credential, so a user sees none of it, whatever its records claim.
+    const bob = as({ kind: "user", person: "bob", credentials: new Set(["bob-1"]) });
     expect(((await (await bob(new Request("http://x/sessions")))!.json()) as { sessions: unknown[] }).sessions).toEqual([]);
     for (const rest of ["", "/trace", `/trace/${FIXTURE_T0}`, "/rows/calls", "/tail/calls", "/nearby", "/moves", "/recent"]) {
       expect((await bob(new Request(`http://x/sessions/${CLOSED_ID}${rest}`)))!.status).toBe(404);
     }
-    const alice = as({ kind: "user", owner: "alice" });
-    expect((await alice(new Request(`http://x/sessions/${CLOSED_ID}/trace`)))!.status).toBe(200);
+    const alice = as({ kind: "user", person: "alice", credentials: new Set(["alice-1"]) });
+    expect((await alice(new Request(`http://x/sessions/${CLOSED_ID}/trace`)))!.status).toBe(404);
+    expect((await as({ kind: "operator" })(new Request(`http://x/sessions/${CLOSED_ID}/trace`)))!.status).toBe(200);
   });
 });
 
@@ -147,7 +149,12 @@ describe("the bin's handler", () => {
     expect(ok.status).toBe(204);
     const cookie = ok.headers.get("set-cookie")!.split(";")[0]!;
     expect(ok.headers.get("set-cookie")).toContain("HttpOnly");
+    // An opaque id, never the secret.
+    expect(ok.headers.get("set-cookie")).not.toContain(secret);
+    expect(ok.headers.get("set-cookie")).not.toContain(encodeURIComponent(secret));
     expect((await h(new Request("http://x/api/sessions", { headers: { cookie } }))).status).toBe(200);
+    // The secret itself as the cookie's value is no sign-in.
+    expect((await h(new Request("http://x/api/sessions", { headers: { cookie: `wrath_inspector=${secret}` } }))).status).toBe(401);
   });
 
   test("tiles come from the directory it was given, by three integers, and are gated like the API", async () => {

@@ -9,7 +9,8 @@ It is released with the stack as `@wrathbench/inspector`, in three parts:
 
 - **The server library.** `createInspectorApi(source)` answers read-only JSON
   and server-sent events over a `SessionSource`, and `wrath-inspector` is a bin
-  that serves it over a store directory with its own page.
+  that serves it over a store directory, or a hosted gateway's state
+  directory, with its own page.
 - **The views.** SolidJS components (`src/views/`, `@wrathbench/inspector/views`):
   the live map, the session list, a session's page, its character (unit
   frame, money, inventory and quest log), its party and its event feed. The
@@ -33,6 +34,7 @@ bun run --cwd inspector build                              # the page, once, int
 bun inspector/src/bin.ts --store <dir>                     # http://127.0.0.1:8091
 bun inspector/src/bin.ts --store <dir> --port 9000
 WRATH_INSPECTOR_SECRET=… bun inspector/src/bin.ts --store <dir> --host 0.0.0.0
+WRATH_INSPECTOR_SECRET=… bun inspector/src/bin.ts --hosted-state <dir> --grants <file> --host 0.0.0.0
 ```
 
 `--tiles <dir>` gives the map minimap tiles, `<map>/<row>_<col>.png` (the
@@ -51,9 +53,52 @@ Bound to loopback, the default, it needs no credential. Bound to any other
 address it refuses to start without a bearer secret of at least 16 characters,
 from `WRATH_INSPECTOR_SECRET` or the first line of `--secret-file <path>`, and
 never from the command line. Every request must then carry
-`Authorization: Bearer <secret>`, or the cookie `POST /api/sign-in` (a JSON
-body `{ "secret": … }`) sets for a browser. It is not a public surface: it
-shows raw records, unprojected.
+`Authorization: Bearer <secret>`, or the cookie the sign-in sets for a
+browser. Whoever holds the secret is the operator and sees every session. It
+is not a public surface: it shows raw records, unprojected.
+
+## Hosted: a person's own sessions
+
+`--hosted-state <dir>` reads a hosted gateway's state directory
+(`mcp/README.md`, "The hosted gateway") in place of `--store`: the session
+store of every credential, `tenants/<credential>/sessions`. With
+`--grants <file>` (or `WRATH_MCP_GRANTS_FILE`), the gateway's grants file,
+which the inspector only reads, a person signs in with the same `wmk_…` key
+their MCP client holds and sees the sessions of every credential their
+person holds now, and nobody else's. The file is the gateway's, mode 0600, so
+the inspector runs as a user that may read it. Given grants, no request is
+anonymous, on loopback too, since a loopback inspector behind a proxy for
+tenants must not give every visitor the operator's view; the secret is then
+optional, and without it nobody is the operator.
+
+A person is scoped by where a session is, never by what it says. A
+credential's directory is written by its host, which runs the tenant's
+code, so `owner` in `session.json` is shown and grants nothing, a session's
+id is `<credential>.<directory>` from the path rather than its record's
+`id`, a record's `group` is kept within its credential, and a link out of a
+credential's directory (at the session, its store, a stream, `session.json`,
+`live.json` or a segment) reads nothing. A hard link is not caught: one to
+another tenant's file needs the writer to be able to read it, which a
+deployment denies by keeping each credential's directory to its own
+worker's user.
+
+The sign-in, `POST /api/sign-in`, takes the secret or a key as
+`Authorization: Bearer …` or in a JSON body (`{ "key": … }`; `{ "secret": … }`
+is the same), never in a URL's query, and answers with a cookie,
+`wrath_inspector`: an opaque random id, never the credential, `HttpOnly`,
+`SameSite=Strict`, `Path=/`, `Secure` over TLS or off loopback, for twelve
+hours. The bin keeps what the id stands for in memory (a restart signs
+everyone out), for a key only its digest, and checks it against the grants
+file on every request: a key revoked, a grant disabled or removed, ends that
+cookie's access at the next request, and an open tail at its next poll.
+`POST /api/sign-out` forgets it, and `GET /api/me` says who the page is
+signed in as. A key also works as a bearer header on any request, as the
+MCP takes it.
+
+Tenant records are hostile strings: the views only ever set text, and a
+test (`test/html-sinks.test.ts`) keeps `innerHTML`, `outerHTML`,
+`insertAdjacentHTML`, `document.write` and their kin out of `src/` and the
+page.
 
 ## The API
 
@@ -73,7 +118,9 @@ Under `/api` in the bin; wherever a host mounts it otherwise.
 
 The streams are `trace`, `events`, `calls` and `nearby`. Nothing takes a
 body and nothing writes. A session the caller may not see is a 404 on every
-path, the same as one that does not exist.
+path, the same as one that does not exist, and a tail ends once its caller
+may no longer read it. The bin adds `POST /sign-in`, `POST /sign-out` and
+`GET /me` beside them (above).
 
 ## The page and the views
 
@@ -82,7 +129,8 @@ session (`#/session/<id>`): what it is, its character now, its party and what
 happened to it, the feed following the `events` stream while the session is
 live. Drag the map to pan, wheel to zoom, click a pip to see the units around
 that character. A session is live while its writer's heartbeat is under two
-minutes old.
+minutes old. Where a credential is needed the page asks for the secret or a
+key, and once signed in names who, with a sign-out.
 
 The views take what they show from the API and from the codecs' readings, and
 nothing else: names come from the record's dictionaries, never from game
@@ -121,12 +169,16 @@ harness's own unit, as WrathBench's run). `storeSource` takes it from the
 record's `group` label. The session list shows a group as one block, and a
 session's page links its siblings.
 
-Every read is scoped (wrath-mcp#29, decision 11): the operator sees every
-session, a user only the sessions whose `owner` is theirs. A source filters by
-the scope it is handed, on the listing and on every open, and the API asks a
-hook (`scope`) for each request's. Today the only scope anything grants is the
-operator's: whoever holds the secret, or anyone on loopback. A user's scope
-comes with tenancy, as a different hook rather than a change to the interface.
+Every read is scoped (wrath-mcp#29): the operator sees every session, and a
+user (`{ kind: "user", person, credentials }`) the sessions in the stores of
+the credentials, grant ids, they hold. A source filters by the scope it is
+handed, on the listing and on every open, and the API asks a hook (`scope`)
+for each request's; the bin's is `inspectorAuth` (`src/auth.ts`).
+`hostedSource(stateDir)` places each session under its credential by path
+and checks `credentialInScope`. A source that cannot place a session under a
+credential, `storeSource` or a harness's own, shows a user nothing:
+`inScope(session, scope)` is true for the operator alone, because a record's
+labels are its writer's.
 
 ## Embedding
 
@@ -145,8 +197,10 @@ exported for a host that serves the same shapes under paths of its own.
 ## Boundaries
 
 From the stack the inspector imports `@wrathbench/mcp/record/read` (the store
-reader and the format's types) and nothing else, and nothing that entry
-loads, nor anything of the inspector's own, writes or deletes a file. `sdk/`
+reader and the format's types) and `@wrathbench/mcp/hosted/grants-read` (the
+grants file's reader and `authenticate`, for the sign-in) and nothing else,
+and nothing those entries load, nor anything of the inspector's own, writes
+or deletes a file. `sdk/`
 and `mcp/` never import it or the UI's dependencies, which are this
 package's alone. Its browser-side files (`src/wire.ts`, `src/codec/`,
 `src/views/`, `page/`) import no runtime built-in and nothing of its server
