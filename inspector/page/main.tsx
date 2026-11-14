@@ -79,7 +79,7 @@ function App() {
           wrath-inspector
         </a>
         <span class="dim">{sessions().length}</span>
-        <Show when={me()?.signedIn === true ? me() : null}>
+        <Show when={!locked() && me()?.signedIn === true ? me() : null}>
           {(who) => (
             <>
               <span class="dim">{whoName(who())}</span>

@@ -69,7 +69,9 @@ person holds now, and nobody else's. The file is the gateway's, mode 0600, so
 the inspector runs as a user that may read it. Given grants, no request is
 anonymous, on loopback too, since a loopback inspector behind a proxy for
 tenants must not give every visitor the operator's view; the secret is then
-optional, and without it nobody is the operator.
+optional, and without it nobody is the operator. Without grants,
+`--hosted-state` is as `--store` is: on loopback with no secret, whoever
+reaches it is the operator and sees every tenant.
 
 A person is scoped by where a session is, never by what it says. A
 credential's directory is written by its host, which runs the tenant's
@@ -87,7 +89,8 @@ The sign-in, `POST /api/sign-in`, takes the secret or a key as
 is the same), never in a URL's query, and answers with a cookie,
 `wrath_inspector`: an opaque random id, never the credential, `HttpOnly`,
 `SameSite=Strict`, `Path=/`, `Secure` over TLS or off loopback, for twelve
-hours. The bin keeps what the id stands for in memory (a restart signs
+hours. Off loopback a browser therefore signs in only over TLS, the bin's
+own or a proxy's in front of it. The bin keeps what the id stands for in memory (a restart signs
 everyone out), for a key only its digest, and checks it against the grants
 file on every request: a key revoked, a grant disabled or removed, ends that
 cookie's access at the next request, and an open tail at its next poll.

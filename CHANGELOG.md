@@ -26,7 +26,16 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   in `rbac_account_permissions`. A deployment whose sessions send commands on
   purpose opts in; one that never does changes nothing.
 
+- **A browser off loopback signs in to the inspector over TLS.** Its
+  sign-in cookie is now `Secure` whenever the bin is bound off loopback,
+  where it was only over `https:`, so a browser reaching it over plain HTTP
+  (a LAN with no TLS or proxy) drops the cookie and stays at the sign-in.
+  Put TLS in front, directly or by a proxy; a bearer header still works
+  without it.
+
 ### Added
+
+- **The hosted gateway.**### Added
 
 - **The hosted gateway.** `bun run gateway --grants <file> --state <dir>`
   serves the tools over Streamable HTTP (both 2026-07-28 and the
