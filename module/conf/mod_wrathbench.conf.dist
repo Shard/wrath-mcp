@@ -107,3 +107,90 @@ WrathBench.Secret = ""
 #
 
 WrathBench.AuditDir = "/azerothcore/env/dist/logs/wrathbench"
+
+#
+#    WrathBench.ActionRate
+#    WrathBench.ActionBurst
+#        Description: The request rate one lease may sustain, per second, and
+#                     the burst it may spend at once (a token bucket per
+#                     lease). It covers what a lease secret may ask of the
+#                     world thread: POST /action (raw included), POST /session,
+#                     DELETE /session and the /events upgrade. A request over
+#                     it is answered 429 rate_limited and nothing is
+#                     dispatched. The port secret is exempt. The defaults are
+#                     several times what one character's client sends; they
+#                     are there so that a caller holding only a lease secret
+#                     cannot occupy the world thread, not to pace play.
+#                     Re-read on `.reload config`.
+#        Default:     20 and 40
+#                     0 (ActionRate) - No limit
+#
+
+WrathBench.ActionRate = 20
+WrathBench.ActionBurst = 40
+
+#
+#    WrathBench.EventsSubscribersPerToken
+#        Description: Concurrent /events subscribers one lease secret may hold
+#                     on its token. An upgrade past it is refused 429
+#                     subscriber_limit. One consumer holds one socket; the
+#                     rest is room for a reconnect that overlaps a socket the
+#                     server has not yet seen close. Subscribers that present
+#                     the port secret are neither counted nor refused.
+#                     Re-read on `.reload config`.
+#        Default:     4
+#                     0 - No limit
+#
+
+WrathBench.EventsSubscribersPerToken = 4
+
+#
+#    WrathBench.MaxLeases
+#        Description: Leases the module holds at once. POST /lease for a new
+#                     token past it is refused 429 lease_limit; re-leasing a
+#                     token already held never is. The module forgets a lease
+#                     only on DELETE /lease, so this bounds what a caller that
+#                     leases and never releases can leave behind. Size it to
+#                     the characters the deployment runs at once, with room.
+#                     Re-read on `.reload config`.
+#        Default:     1024
+#                     0 - No limit
+#
+
+WrathBench.MaxLeases = 1024
+
+#
+#    WrathBench.MaxConnections
+#    WrathBench.MaxConnectionsPerPeer
+#        Description: Open connections to the port, HTTP and WebSocket
+#                     together, in total and from one peer address. A
+#                     connection past either is closed at accept, unanswered.
+#                     Keep the total under the worldserver's open-file limit
+#                     with room for the game's own sockets. The per-peer limit
+#                     is off by default because a deployment's own callers
+#                     usually share one address (one host runs every sandbox);
+#                     set it where callers that do not trust each other reach
+#                     the port from addresses of their own, so that one cannot
+#                     take every connection. Read at startup only.
+#        Default:     4096 and 0
+#                     0 - No limit
+#
+
+WrathBench.MaxConnections = 4096
+WrathBench.MaxConnectionsPerPeer = 0
+
+#
+#    WrathBench.EventsBacklogBytes
+#        Description: Bytes of events one /events subscriber may have queued
+#                     and unsent. A subscriber past it has stopped reading, or
+#                     reads slower than its session produces: it is dropped
+#                     (it sees a closed socket, as for any connection loss)
+#                     rather than left to grow in the worldserver's memory.
+#                     The default is meant to sit well above the largest burst a
+#                     session's stream carries (the reattach replay in a busy
+#                     place). Read at startup only.
+#        Default:     16777216 (16 MiB)
+#                     0 - No limit
+#
+
+WrathBench.EventsBacklogBytes = 16777216
