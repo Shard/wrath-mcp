@@ -19,9 +19,10 @@ The stack's two security surfaces:
   authority on that surface and its two credential classes: the operator's port
   secret, and per-session lease secrets that reach one session and nothing else.
 - **The snippet sandbox** (`mcp/src/sandbox/`): agent-written code runs in a
-  child process with an allowlisted environment and a Linux Landlock ruleset
+  child process with an allowlisted environment, a Linux Landlock ruleset
   that limits what it can read, which ports it can reach and what it can
-  execute. The child's header (`mcp/src/sandbox/child.ts`) and
+  execute, a seccomp filter on the socket families it may open, and
+  resource limits. The child's header (`mcp/src/sandbox/child.ts`) and
   `mcp/src/sandbox/confine.ts` say what a snippet may reach. Anything that lets
   a snippet read a credential, a file or a process it should not, or reach the
   network beyond the module's port, is a finding.

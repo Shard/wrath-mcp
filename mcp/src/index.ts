@@ -130,17 +130,21 @@ export {
   ACCESS_NET,
   ConfinementError,
   confinementPlan,
+  DEFAULT_SANDBOX_LIMITS,
   DEV_NODES,
   elfInterpreter,
   landlockAbi,
   MANIFEST_FILES,
+  moduleNeedsDns,
   modulePort,
   PROC_GLOBAL_FILES,
   REQUIRED_ABI,
   SCOPE,
+  seccompArch,
+  seccompProgram,
   stackReadPaths,
 } from "./sandbox/confine";
-export type { ConfinementPlan, FsRule, NetRule, PlanInput, StackReadPaths } from "./sandbox/confine";
+export type { ConfinementPlan, FsRule, NetRule, PlanInput, SandboxLimits, SockFilter, StackReadPaths } from "./sandbox/confine";
 export { RepeatFolder } from "./sandbox/log-fold";
 export { REATTACH_REPLAY_WAIT_MS, REATTACH_STATE_WAIT_MS } from "./sandbox/reattach-waits";
 export { compileOneOff, compileSnippet, extractPatternNames, scanTopLevelDeclarations } from "./sandbox/rewrite";

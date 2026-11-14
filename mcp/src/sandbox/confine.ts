@@ -1,15 +1,17 @@
 /**
- * Confinement for the sandbox child: filesystem, TCP, exec and process scope.
+ * Confinement for the sandbox child: filesystem, TCP, socket families, exec,
+ * process scope and resource limits.
  *
  * The host spawns THIS file, not the child's entry:
  *
- *   bun confine.ts [--read=<dir>]... <bun argv for the child>
+ *   bun confine.ts [--read=<dir>]... [--limit-<as|cpu|fsize>=<n|unlimited>]... <bun argv for the child>
  *
- * It builds a Linux Landlock ruleset, applies it to itself and then `execv`s
- * the real child in place. Landlock is inherited across exec and cannot be
- * lifted by the restricted process, so whatever a snippet reaches for —
- * `node:fs`, `node:net`, `Bun.connect`, `Bun.spawn`, a re-exec'd `bun` — the
- * kernel answers, not a JavaScript shim. The ruleset (`confinementPlan`):
+ * It builds a Linux Landlock ruleset and a seccomp filter, applies both to
+ * itself with the resource limits, and then `execv`s the real child in place.
+ * All three are inherited across exec and cannot be lifted by the restricted
+ * process, so whatever a snippet reaches for — `node:fs`, `node:net`,
+ * `Bun.connect`, `Bun.spawn`, `bun:ffi`, a re-exec'd `bun` — the kernel
+ * answers, not a JavaScript shim. The ruleset (`confinementPlan`):
  *
  *  - Filesystem: reads only where the child legitimately needs them (the Bun
  *    binary and system libraries, the `mcp` and `sdk` packages and the
@@ -39,16 +41,43 @@
  *    sockets outside its domain or signal processes outside it (the runner
  *    host included).
  *
- * What Landlock does not cover and this wrapper therefore does not claim:
- * UDP (DNS resolution is the legitimate user), raw and non-IP socket families,
- * and which hosts the allowed port is reached on. Those are the network
- * policy's job.
+ * Socket families are a seccomp filter's (`seccompProgram`), because Landlock
+ * on the kernels this runs on (ABI 6 on the fleet) rules only TCP ports. What
+ * the child legitimately opens was traced, not assumed: TCP sockets to the
+ * module, unix stream socketpairs (Bun's own pipes for a `Bun.spawn`, which
+ * Landlock then refuses to exec), and, when the module URL names a host
+ * rather than an address, the UDP sockets name resolution sends from. The
+ * IPC channel to the host is an inherited descriptor and needs no socket
+ * call. So `socket()` is allowed for `AF_INET`/`AF_INET6` stream sockets of
+ * protocol TCP, and datagram sockets of protocol UDP only when there is a
+ * name to resolve; `socketpair()` for unix stream pairs only, which reach
+ * nothing outside the pair. Everything else is `EACCES`: a pathname or
+ * abstract unix socket, netlink, packet, raw and every other family, and
+ * SCTP or MPTCP streams, which Landlock's TCP rules would not see. io_uring is
+ * `ENOSYS`, since its socket and connect operations never pass a seccomp
+ * filter, as is any syscall of another ABI (x32, i386) than the filter's.
+ *
+ * Resource limits (`SandboxLimits`, set with `setrlimit` and inherited by the
+ * exec): an address-space cap, an optional CPU-time cap, a file-size cap, and
+ * no core dumps. The address-space cap is generous because the runtime
+ * reserves several GiB of address space it never touches; it bounds a
+ * runaway allocation, not the child's ordinary use. The CPU cap is off by
+ * default: `RLIMIT_CPU` counts the process's whole life, and a session with
+ * no end would reach any finite cap however idle it is. A CPU rate is the
+ * deployment's (a container's CPU limit).
+ *
+ * What none of this covers and this wrapper therefore does not claim: which
+ * hosts the allowed TCP port is reached on, and, with a module host to
+ * resolve, which hosts UDP reaches (a module URL by address allows no UDP at
+ * all). Those are the network policy's job.
  *
  * Fail closed, no knob: without Landlock at all, or with an ABI below 4 (no
- * TCP rules), this wrapper exits instead of exec'ing the child, so a snippet
- * never runs with the filesystem or the network open. Scoping is applied when
- * the kernel has it and announced on stderr when it does not — the fleet's
- * kernel has it; the kernels without it that run this code are CI's.
+ * TCP rules), on a CPU architecture the filter is not written for, or when
+ * the kernel or container refuses the filter or a limit, this wrapper exits
+ * instead of exec'ing the child, so a snippet never runs with the filesystem
+ * or the network open. Scoping is applied when the kernel has it and
+ * announced on stderr when it does not — the fleet's kernel has it; the
+ * kernels without it that run this code are CI's.
  *
  * Why a wrapper and not a call inside the child: `landlock_restrict_self`
  * restricts the calling *thread*, and Bun starts its GC and I/O threads before
@@ -60,10 +89,13 @@
  *
  * Why Landlock and not bubblewrap / user namespaces / a uid switch: it is in
  * the kernel, needs no privileges, no extra binaries, no namespace support in
- * the container's seccomp profile — only the three `landlock_*` syscalls.
+ * the container's seccomp profile — only the three `landlock_*` syscalls, and
+ * for the socket filter `prctl(PR_SET_SECCOMP)`, which a container's default
+ * seccomp profile allows.
  */
 
 import { closeSync, existsSync, openSync, readFileSync, readSync } from "node:fs";
+import { isIP } from "node:net";
 import { dirname, join, resolve, sep } from "node:path";
 import { dlopen, FFIType, ptr, read } from "bun:ffi";
 
@@ -109,15 +141,235 @@ function handledAccessFs(abi: number): bigint {
 const O_CLOEXEC = 0x80000;
 const O_PATH = 0x200000;
 const PR_SET_NO_NEW_PRIVS = 38;
+const PR_SET_SECCOMP = 22;
+const SECCOMP_MODE_FILTER = 2;
 
 const LIBC_SYMBOLS = {
   syscall: { args: [FFIType.i64, FFIType.i64, FFIType.i64, FFIType.i64, FFIType.i64], returns: FFIType.i64 },
   open: { args: [FFIType.ptr, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
   close: { args: [FFIType.i32], returns: FFIType.i32 },
   prctl: { args: [FFIType.i32, FFIType.u64, FFIType.u64, FFIType.u64, FFIType.u64], returns: FFIType.i32 },
+  getrlimit: { args: [FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
+  setrlimit: { args: [FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
   execv: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
   __errno_location: { args: [], returns: FFIType.ptr },
 } as const;
+
+// ------------------------------------------------------------ socket filter
+
+/** Address families, socket types and protocols the filter names (include/linux/socket.h, net.h, in.h). */
+export const AF = { UNIX: 1, INET: 2, INET6: 10 } as const;
+export const SOCK = { STREAM: 1, DGRAM: 2, NONBLOCK: 0x800, CLOEXEC: 0x80000 } as const;
+export const IPPROTO = { TCP: 6, UDP: 17 } as const;
+const EACCES = 13;
+const ENOSYS = 38;
+
+/** The syscalls the filter rules, per architecture: `AUDIT_ARCH_*` and the numbers from each unistd.h. */
+interface SeccompArch {
+  audit: number;
+  socket: number;
+  socketpair: number;
+  /** io_uring_setup, io_uring_enter, io_uring_register: the unified table's numbers, the same on both. */
+  ioUring: readonly number[];
+  /** x86-64 shares its `AUDIT_ARCH` with x32, whose syscall numbers carry this bit. */
+  x32Bit?: number;
+}
+
+export const SECCOMP_ARCHES: Readonly<Record<"x64" | "arm64", SeccompArch>> = {
+  x64: { audit: 0xc000003e, socket: 41, socketpair: 53, ioUring: [425, 426, 427], x32Bit: 0x40000000 },
+  arm64: { audit: 0xc00000b7, socket: 198, socketpair: 199, ioUring: [425, 426, 427] },
+};
+
+/** One classic BPF instruction, as `struct sock_filter` lays it out. */
+export interface SockFilter {
+  code: number;
+  jt: number;
+  jf: number;
+  k: number;
+}
+
+export const BPF = {
+  LD_W_ABS: 0x20,
+  ALU_AND_K: 0x54,
+  JEQ_K: 0x15,
+  JGE_K: 0x35,
+  RET_K: 0x06,
+} as const;
+
+export const SECCOMP_RET = {
+  ALLOW: 0x7fff0000,
+  ERRNO: 0x00050000,
+} as const;
+
+/** `struct seccomp_data` offsets: nr, arch, then the low 32 bits of each argument (both arches are little-endian). */
+const DATA_NR = 0;
+const DATA_ARCH = 4;
+const dataArg = (i: number): number => 16 + 8 * i;
+
+/**
+ * The socket filter, as classic BPF over `struct seccomp_data`
+ * (Documentation/userspace-api/seccomp_filter.rst). Pure, so a test can run it
+ * on every case it should allow and refuse.
+ *
+ * - Another ABI than this one's (i386 through `int 0x80`, x32): `ENOSYS`.
+ * - io_uring: `ENOSYS`, as on a kernel built without it.
+ * - `socket(domain, type, protocol)`: `AF_INET`/`AF_INET6` only; a stream
+ *   socket with protocol 0 or TCP; a datagram socket with protocol 0 or UDP,
+ *   and only when `udp` (there is a module host to resolve); `EACCES`
+ *   otherwise. Only the low 32 bits of each argument are read: the kernel
+ *   takes them as `int`.
+ * - `socketpair(domain, type, protocol)`: `AF_UNIX` stream pairs only.
+ * - Everything else is allowed: Landlock rules it.
+ */
+export function seccompProgram(arch: SeccompArch, o: { udp: boolean }): SockFilter[] {
+  type Op = { code: number; k: number; jt?: string; jf?: string } | { label: string };
+  const allow = SECCOMP_RET.ALLOW;
+  const eacces = SECCOMP_RET.ERRNO | EACCES;
+  const enosys = SECCOMP_RET.ERRNO | ENOSYS;
+  const typeMask = ~(SOCK.NONBLOCK | SOCK.CLOEXEC) >>> 0;
+  const ld = (k: number): Op => ({ code: BPF.LD_W_ABS, k });
+  const jeq = (k: number, jt: string, jf = "next"): Op => ({ code: BPF.JEQ_K, k, jt, jf });
+  const ret = (k: number): Op => ({ code: BPF.RET_K, k });
+  const ops: Op[] = [
+    ld(DATA_ARCH),
+    jeq(arch.audit, "next", "enosys"),
+    ld(DATA_NR),
+    ...(arch.x32Bit !== undefined ? [{ code: BPF.JGE_K, k: arch.x32Bit, jt: "enosys", jf: "next" }] : []),
+    jeq(arch.socket, "socket"),
+    jeq(arch.socketpair, "socketpair"),
+    ...arch.ioUring.map((nr) => jeq(nr, "enosys")),
+    ret(allow),
+
+    { label: "socket" },
+    ld(dataArg(0)),
+    jeq(AF.INET, "type"),
+    jeq(AF.INET6, "type", "eacces"),
+    { label: "type" },
+    ld(dataArg(1)),
+    { code: BPF.ALU_AND_K, k: typeMask },
+    jeq(SOCK.STREAM, "stream"),
+    ...(o.udp ? [jeq(SOCK.DGRAM, "dgram", "eacces")] : [ret(eacces)]),
+    { label: "stream" },
+    ld(dataArg(2)),
+    jeq(0, "allow"),
+    jeq(IPPROTO.TCP, "allow", "eacces"),
+    ...(o.udp ? [{ label: "dgram" }, ld(dataArg(2)), jeq(0, "allow"), jeq(IPPROTO.UDP, "allow", "eacces")] : []),
+
+    { label: "socketpair" },
+    ld(dataArg(0)),
+    jeq(AF.UNIX, "next", "eacces"),
+    ld(dataArg(1)),
+    { code: BPF.ALU_AND_K, k: typeMask },
+    jeq(SOCK.STREAM, "allow", "eacces"),
+
+    { label: "allow" },
+    ret(allow),
+    { label: "eacces" },
+    ret(eacces),
+    { label: "enosys" },
+    ret(enosys),
+  ];
+  // Resolve labels to the relative offsets classic BPF jumps by.
+  const at = new Map<string, number>();
+  let n = 0;
+  for (const op of ops) {
+    if ("label" in op) at.set(op.label, n);
+    else n++;
+  }
+  const out: SockFilter[] = [];
+  for (const op of ops) {
+    if ("label" in op) continue;
+    const i = out.length;
+    const rel = (target: string | undefined): number => {
+      if (target === undefined || target === "next") return 0;
+      const to = at.get(target);
+      if (to === undefined || to <= i || to - i - 1 > 255) throw new ConfinementError(`seccomp program: bad jump to ${target}`);
+      return to - i - 1;
+    };
+    out.push({ code: op.code, jt: rel(op.jt), jf: rel(op.jf), k: op.k >>> 0 });
+  }
+  return out;
+}
+
+/** The filter's architecture for this process, or a refusal: an unknown one is not run unfiltered. */
+export function seccompArch(arch: string = process.arch): SeccompArch {
+  const a = (SECCOMP_ARCHES as Record<string, SeccompArch>)[arch];
+  if (a === undefined) throw new ConfinementError(`no socket filter is written for the ${arch} architecture`);
+  return a;
+}
+
+/**
+ * Whether the child must resolve a name to reach the module: true unless the
+ * module URL's host is an IP address. Name resolution sends UDP, so only then
+ * does the filter allow a datagram socket.
+ */
+export function moduleNeedsDns(moduleUrl: string): boolean {
+  let host: string;
+  try {
+    host = new URL(moduleUrl).hostname;
+  } catch {
+    throw new ConfinementError(`module URL ${JSON.stringify(moduleUrl)} does not parse`);
+  }
+  return isIP(host.replace(/^\[(.*)\]$/, "$1")) === 0;
+}
+
+// ----------------------------------------------------------------- limits
+
+/**
+ * The child's resource limits, each applied as both the soft and the hard
+ * limit (so the child cannot raise it), and never above a hard limit the
+ * wrapper already inherited. `null` leaves that limit as inherited.
+ */
+export interface SandboxLimits {
+  /** `RLIMIT_AS`: the address space, in bytes. Bun reserves about 6.5 GiB at start and peaks near 10 GiB while starting. */
+  addressSpaceBytes: number | null;
+  /** `RLIMIT_CPU`: CPU seconds over the child's whole life, every thread counted. Off by default (see the header). */
+  cpuSeconds: number | null;
+  /** `RLIMIT_FSIZE`: the largest file the child may write, in bytes. */
+  fileBytes: number | null;
+}
+
+const GiB = 1024 ** 3;
+
+/**
+ * The defaults: far above what a long run uses. A child at fan-out 40 under
+ * a synthetic 8,000 frames a second (`test/fixtures/fanout-load.ts`) held
+ * 7.1 GiB of address space and 170 MiB resident; a bare one, 6.1 GiB, with a
+ * 10.1 GiB peak while starting.
+ */
+export const DEFAULT_SANDBOX_LIMITS: Readonly<SandboxLimits> = Object.freeze({
+  addressSpaceBytes: 16 * GiB,
+  cpuSeconds: null,
+  fileBytes: 1 * GiB,
+});
+
+/** The `RLIMIT_*` resource numbers (the same on x86-64 and arm64). */
+export const RLIMIT = { CPU: 0, FSIZE: 1, CORE: 4, AS: 9 } as const;
+const RLIM_INFINITY = 0xffffffffffffffffn;
+
+/** The limits as the wrapper's flags, every one stated so the child's limits are the host's and nothing implicit. */
+export function limitFlags(limits: SandboxLimits): string[] {
+  const v = (n: number | null): string => (n === null ? "unlimited" : String(n));
+  return [`--limit-as=${v(limits.addressSpaceBytes)}`, `--limit-cpu=${v(limits.cpuSeconds)}`, `--limit-fsize=${v(limits.fileBytes)}`];
+}
+
+/** One `--limit-*=` value: a positive whole number, or `unlimited`. */
+export function parseLimit(flag: string, value: string): number | null {
+  if (value === "unlimited") return null;
+  const n = Number(value);
+  if (!Number.isSafeInteger(n) || n <= 0) throw new ConfinementError(`${flag} must be a positive whole number or "unlimited", not ${JSON.stringify(value)}`);
+  return n;
+}
+
+/** The rlimits to set, in order: core dumps off (a dump would hold the lease secret), then the three limits. */
+export function rlimitPlan(limits: SandboxLimits): { resource: number; value: number | null }[] {
+  return [
+    { resource: RLIMIT.CORE, value: 0 },
+    { resource: RLIMIT.AS, value: limits.addressSpaceBytes },
+    { resource: RLIMIT.CPU, value: limits.cpuSeconds },
+    { resource: RLIMIT.FSIZE, value: limits.fileBytes },
+  ];
+}
 
 let libcHandle: ReturnType<typeof dlopen<typeof LIBC_SYMBOLS>> | undefined;
 
@@ -151,8 +403,8 @@ function fail(step: string, detail?: string): never {
   console.error(
     `[sandbox] confinement failed at ${step}${detail ? ` (${detail})` : ""}` +
       `${e ? `: errno ${e}` : ""} — refusing to start the snippet child unconfined. ` +
-      `Landlock ABI ${REQUIRED_ABI} or newer (Linux 6.7+, syscalls 444-446) must be available to this process; ` +
-      `if this is a container, its seccomp profile must permit them.`,
+      `Landlock ABI ${REQUIRED_ABI} or newer (Linux 6.7+, syscalls 444-446), prctl(PR_SET_SECCOMP) and setrlimit ` +
+      `must be available to this process on x86-64 or arm64; if this is a container, its seccomp profile must permit them.`,
   );
   process.exit(78); // EX_CONFIG
 }
@@ -177,6 +429,10 @@ export interface ConfinementPlan {
   attrSize: number;
   fs: FsRule[];
   net: NetRule[];
+  /** The socket filter's one choice: whether a datagram (UDP) socket may be opened, for name resolution. */
+  sockets: { udp: boolean };
+  /** The resource limits the child is exec'd under. */
+  limits: SandboxLimits;
   /** What the plan could not do on this kernel, one line each, for stderr. */
   notes: string[];
 }
@@ -360,6 +616,8 @@ export interface PlanInput {
    * workspaces.
    */
   readDirs?: readonly string[];
+  /** The child's resource limits; default `DEFAULT_SANDBOX_LIMITS`. */
+  limits?: SandboxLimits;
 }
 
 /**
@@ -439,6 +697,8 @@ export function confinementPlan(input: PlanInput): ConfinementPlan {
     attrSize: abi >= SCOPE_ABI ? 24 : 16,
     fs: fs.filter((r) => exists(r.path)),
     net,
+    sockets: { udp: moduleNeedsDns(moduleUrl) },
+    limits: input.limits ?? { ...DEFAULT_SANDBOX_LIMITS },
     notes,
   };
 }
@@ -496,6 +756,47 @@ function restrict(plan: ConfinementPlan): void {
   libc().symbols.close(rulesetFd);
 }
 
+/**
+ * Install the socket filter on the calling thread. Like the Landlock domain
+ * it is the thread's, and the exec makes this thread the whole process.
+ * Needs `PR_SET_NO_NEW_PRIVS`, which `restrict` has set.
+ */
+function filterSockets(program: readonly SockFilter[]): void {
+  // struct sock_filter { __u16 code; __u8 jt; __u8 jf; __u32 k; }
+  const filter = Buffer.alloc(program.length * 8);
+  program.forEach((op, i) => {
+    filter.writeUInt16LE(op.code, i * 8);
+    filter.writeUInt8(op.jt, i * 8 + 2);
+    filter.writeUInt8(op.jf, i * 8 + 3);
+    filter.writeUInt32LE(op.k, i * 8 + 4);
+  });
+  // struct sock_fprog { unsigned short len; struct sock_filter *filter; }
+  const fprog = Buffer.alloc(16);
+  fprog.writeUInt16LE(program.length, 0);
+  fprog.writeBigUInt64LE(BigInt(ptr(filter)), 8);
+  if (libc().symbols.prctl(PR_SET_SECCOMP, BigInt(SECCOMP_MODE_FILTER), BigInt(ptr(fprog)), 0n, 0n) !== 0) fail("prctl(PR_SET_SECCOMP)");
+}
+
+/**
+ * Set the child's resource limits, last before the exec: the address-space
+ * cap is below what this wrapper's own runtime has reserved, so it applies to
+ * the image the exec starts, not to anything this process still allocates.
+ * Each is set as soft and hard alike, never above an inherited hard limit.
+ */
+function applyLimits(limits: SandboxLimits): void {
+  const rl = new BigUint64Array(2);
+  for (const { resource, value } of rlimitPlan(limits)) {
+    if (value === null) continue;
+    if (libc().symbols.getrlimit(resource, ptr(rl)) !== 0) fail("getrlimit", `resource ${resource}`);
+    const hard = rl[1]!;
+    const want = BigInt(value);
+    const v = hard !== RLIM_INFINITY && hard < want ? hard : want;
+    rl[0] = v;
+    rl[1] = v;
+    if (libc().symbols.setrlimit(resource, ptr(rl)) !== 0) fail("setrlimit", `resource ${resource} to ${v}`);
+  }
+}
+
 function execv(argv: readonly string[]): never {
   const bufs = argv.map(cstr);
   const vec = new BigUint64Array(bufs.length + 1);
@@ -508,14 +809,31 @@ function execv(argv: readonly string[]): never {
 }
 
 if (import.meta.main) {
-  // Leading `--read=<dir>` flags are this wrapper's; everything after them is
-  // the child's argv (bun swallows a `--`), which the child sees unchanged.
+  // Leading `--read=<dir>` and `--limit-*=` flags are this wrapper's;
+  // everything after them is the child's argv (bun swallows a `--`), which
+  // the child sees unchanged. A limit not named keeps its default.
   const args = process.argv.slice(2);
   const readDirs: string[] = [];
-  while (args[0]?.startsWith("--read=") === true) readDirs.push(resolve(args.shift()!.slice("--read=".length)));
+  const limits: SandboxLimits = { ...DEFAULT_SANDBOX_LIMITS };
+  const LIMIT_FLAGS = { "--limit-as": "addressSpaceBytes", "--limit-cpu": "cpuSeconds", "--limit-fsize": "fileBytes" } as const;
+  for (;;) {
+    const a = args[0];
+    if (a?.startsWith("--read=") === true) {
+      readDirs.push(resolve(args.shift()!.slice("--read=".length)));
+      continue;
+    }
+    const m = a === undefined ? null : /^(--limit-(?:as|cpu|fsize))=(.*)$/.exec(a);
+    if (m === null) break;
+    args.shift();
+    try {
+      limits[LIMIT_FLAGS[m[1] as keyof typeof LIMIT_FLAGS]] = parseLimit(m[1]!, m[2]!);
+    } catch (err) {
+      fail("reading the limits", err instanceof Error ? err.message : String(err));
+    }
+  }
   const childArgv = args;
   if (childArgv.length === 0) {
-    console.error("usage: bun confine.ts [--read=<dir>]... <argv of the child to exec>");
+    console.error("usage: bun confine.ts [--read=<dir>]... [--limit-<as|cpu|fsize>=<n|unlimited>]... <argv of the child to exec>");
     process.exit(64);
   }
   // Relative interpreters resolve through PATH the way the shell would; the
@@ -528,12 +846,16 @@ if (import.meta.main) {
   // the host's value and never an autoloaded `.env`'s.
   const moduleUrl = process.env["WRATHBENCH_MODULE_URL"] ?? "http://worldserver:8086";
   let plan: ConfinementPlan;
+  let program: SockFilter[];
   try {
     const stack = stackReadPaths(import.meta.dir);
-    plan = confinementPlan({ stack, bunExe: exe, moduleUrl, abi: landlockAbi(), pid: process.pid, readDirs });
+    plan = confinementPlan({ stack, bunExe: exe, moduleUrl, abi: landlockAbi(), pid: process.pid, readDirs, limits });
+    program = seccompProgram(seccompArch(), plan.sockets);
   } catch (err) {
     fail("planning the ruleset", err instanceof Error ? err.message : String(err));
   }
   restrict(plan);
+  filterSockets(program);
+  applyLimits(plan.limits);
   execv([exe, ...childArgv.slice(1)]);
 }

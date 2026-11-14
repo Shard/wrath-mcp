@@ -5,7 +5,7 @@
  * here before it is a behaviour in sandbox-fs.test.ts / sandbox-net.test.ts.
  */
 import { describe, expect, test } from "bun:test";
-import { ACCESS_FS, ACCESS_NET, ConfinementError, confinementPlan, DEV_NODES, elfInterpreter, modulePort, PROC_GLOBAL_FILES, REQUIRED_ABI, SCOPE } from "../src/sandbox/confine";
+import { ACCESS_FS, ACCESS_NET, ConfinementError, confinementPlan, DEFAULT_SANDBOX_LIMITS, DEV_NODES, elfInterpreter, modulePort, PROC_GLOBAL_FILES, REQUIRED_ABI, SCOPE } from "../src/sandbox/confine";
 
 const REPO = "/srv/wrathbench";
 const BUN = "/home/bun/.bun/bin/bun";
@@ -110,6 +110,16 @@ describe("confinementPlan", () => {
     for (const p of [plan(4), plan(6)]) {
       expect(p.net.some((r) => (r.access & ACCESS_NET.BIND_TCP) !== 0n)).toBe(false);
     }
+  });
+});
+
+describe("confinementPlan: sockets and limits", () => {
+  test("UDP only for a module named by host; the limits default, or are the ones given", () => {
+    expect(plan(6).sockets).toEqual({ udp: true });
+    expect(plan(6, "http://10.0.0.5:8086").sockets).toEqual({ udp: false });
+    expect(plan(6).limits).toEqual(DEFAULT_SANDBOX_LIMITS);
+    const limits = { addressSpaceBytes: 1 << 30, cpuSeconds: 60, fileBytes: null };
+    expect(confinementPlan({ stack: STACK, bunExe: BUN, moduleUrl: "http://m:8086", abi: 6, pid: PID, interpreter: LOADER, exists: () => true, limits }).limits).toEqual(limits);
   });
 });
 

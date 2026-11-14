@@ -5,7 +5,8 @@
  *
  *   bun mcp/src/hosted/gateway-main.ts --grants <file> --state <dir> [--host 127.0.0.1] [--port 8095]
  *                                      [--no-program] [--allowed-origin <origin>]… [--trust-forwarded-for]
- *                                      [--record-retention-days <n>]
+ *                                      [--record-retention-days <n>] [--trusted-local-workers]
+ *                                      [--limit-as <bytes>] [--limit-cpu <seconds>] [--limit-fsize <bytes>]
  *
  * Environment: `WRATHBENCH_MODULE_URL` (default `http://127.0.0.1:8086`) and
  * `WRATHBENCH_MODULE_SECRET`, the module's port secret, which only this
@@ -16,21 +17,31 @@
  * of it added, the last `X-Forwarded-For` entry (`forwardedFor`); otherwise
  * the socket's peer.
  *
+ * Workers: this entry starts them only as processes of its own user on this
+ * machine (`localWorkers`), and only with `--trusted-local-workers`, which
+ * says every grant the file holds is the operator's own: such a worker runs
+ * beside this process's environment and state, the port secret included. A
+ * deployment for anyone else calls `runGateway` with its own provider.
+ * `--limit-as`, `--limit-cpu` and `--limit-fsize` set every credential's
+ * sandbox child's resource limits (`SandboxLimits`; a number, or
+ * `unlimited`), each replacing its default.
+ *
  * SIGINT or SIGTERM stops every credential's host, logging its characters
  * out and giving their leases back.
  */
 
 import { resolve } from "node:path";
 import { DEFAULT_RETENTION_MS } from "../record/retention";
+import { parseLimit, type SandboxLimits } from "../sandbox/confine";
 import { Gateway, MAX_BODY_BYTES } from "./gateway";
-import type { WorkerProvider } from "./workers";
+import { localWorkers, type WorkerProvider } from "./workers";
 
 export { Gateway, type GatewayOptions } from "./gateway";
 export type { CredentialHost, WorkerHandle, WorkerProvider } from "./workers";
 import { FileGrantSource, GRANTS_FILE_ENV } from "./grants";
 
 export const GATEWAY_USAGE =
-  "usage: gateway-main --grants <file> --state <dir> [--host 127.0.0.1] [--port 8095] [--no-program] [--allowed-origin <origin>]… [--trust-forwarded-for] [--record-retention-days <n>]";
+  "usage: gateway-main --grants <file> --state <dir> [--host 127.0.0.1] [--port 8095] [--no-program] [--allowed-origin <origin>]… [--trust-forwarded-for] [--record-retention-days <n>] [--trusted-local-workers] [--limit-as <bytes>] [--limit-cpu <seconds>] [--limit-fsize <bytes>]";
 
 export interface GatewayArgs {
   grants: string;
@@ -41,6 +52,10 @@ export interface GatewayArgs {
   allowedOrigins: string[];
   trustForwardedFor: boolean;
   recordRetentionMs: number;
+  /** Start workers as local processes of this user (`localWorkers({ trusted: true })`) when no provider is given. */
+  trustedLocalWorkers?: boolean;
+  /** Every credential's sandbox child's resource limits, each replacing its default. */
+  sandboxLimits?: Partial<SandboxLimits>;
 }
 
 /** The flags, parsed; throws with the usage on anything it does not know. */
@@ -49,6 +64,7 @@ export function parseGatewayArgs(argv: readonly string[], env: Record<string, st
   const origins: string[] = [];
   let program = true;
   let trustForwardedFor = false;
+  let trustedLocalWorkers = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "--help" || a === "-h") throw new Error(GATEWAY_USAGE);
@@ -60,7 +76,11 @@ export function parseGatewayArgs(argv: readonly string[], env: Record<string, st
       trustForwardedFor = true;
       continue;
     }
-    const m = /^--(grants|state|host|port|allowed-origin|record-retention-days)(?:=(.*))?$/.exec(a);
+    if (a === "--trusted-local-workers") {
+      trustedLocalWorkers = true;
+      continue;
+    }
+    const m = /^--(grants|state|host|port|allowed-origin|record-retention-days|limit-as|limit-cpu|limit-fsize)(?:=(.*))?$/.exec(a);
     if (m === null) throw new Error(`unknown argument ${a}\n${GATEWAY_USAGE}`);
     const v = m[2] ?? argv[++i];
     if (v === undefined) throw new Error(`--${m[1]} needs a value\n${GATEWAY_USAGE}`);
@@ -79,7 +99,28 @@ export function parseGatewayArgs(argv: readonly string[], env: Record<string, st
     if (!Number.isFinite(n) || n <= 0) throw new Error("--record-retention-days must be a number of days above 0");
     recordRetentionMs = n * 86_400_000;
   }
-  return { grants: resolve(grants), state: resolve(state), host: flags.get("host") ?? "127.0.0.1", port, program, allowedOrigins: origins, trustForwardedFor, recordRetentionMs };
+  const sandboxLimits: Partial<SandboxLimits> = {};
+  for (const [flag, key] of [["limit-as", "addressSpaceBytes"], ["limit-cpu", "cpuSeconds"], ["limit-fsize", "fileBytes"]] as const) {
+    const v = flags.get(flag);
+    if (v === undefined) continue;
+    try {
+      sandboxLimits[key] = parseLimit(`--${flag}`, v);
+    } catch (err) {
+      throw new Error(`${err instanceof Error ? err.message : String(err)}\n${GATEWAY_USAGE}`);
+    }
+  }
+  return {
+    grants: resolve(grants),
+    state: resolve(state),
+    host: flags.get("host") ?? "127.0.0.1",
+    port,
+    program,
+    allowedOrigins: origins,
+    trustForwardedFor,
+    recordRetentionMs,
+    trustedLocalWorkers,
+    ...(Object.keys(sandboxLimits).length > 0 ? { sandboxLimits } : {}),
+  };
 }
 
 /**
@@ -102,10 +143,12 @@ export interface RunningGateway {
 
 /**
  * Run a gateway as this entry does: grants from the file, workers from
- * `workers` (default a process per credential on this machine), MCP served
- * at `/mcp`. A deployment that starts its workers its own way (a pod per
- * credential) calls this with its own provider. Throws on a configuration
- * the gateway refuses, such as no port secret.
+ * `workers`, MCP served at `/mcp`. A deployment that starts its workers its
+ * own way (a pod per credential) calls this with its own provider; without
+ * one, workers are processes of this user on this machine, and only when
+ * `args.trustedLocalWorkers` says every grant is the operator's own. Throws
+ * on a configuration the gateway refuses, such as no port secret or no way
+ * to start a worker.
  */
 export async function runGateway(
   args: GatewayArgs,
@@ -113,6 +156,13 @@ export async function runGateway(
 ): Promise<RunningGateway> {
   const env = o.env ?? process.env;
   const log = o.log ?? ((line: string): void => console.error(`[wrath-mcp gateway] ${line}`));
+  const workers = o.workers ?? (args.trustedLocalWorkers === true ? localWorkers({ trusted: true }) : undefined);
+  if (workers === undefined) {
+    throw new Error(
+      "no way to start a worker: local workers run as this process's own user, beside the module's port secret, so this entry starts them only with " +
+        "--trusted-local-workers, for grants that are the operator's own; a deployment for anyone else calls runGateway with its own provider",
+    );
+  }
   const grants = new FileGrantSource(args.grants, { onProblem: (p) => log(`grants file refused, granting nothing until it stands: ${p.join("; ")}`) });
   const gateway = new Gateway({
     grants,
@@ -122,7 +172,8 @@ export async function runGateway(
     program: args.program,
     allowedOrigins: args.allowedOrigins,
     recordRetentionMs: args.recordRetentionMs,
-    ...(o.workers !== undefined ? { workers: o.workers } : {}),
+    workers,
+    ...(args.sandboxLimits !== undefined ? { sandboxLimits: args.sandboxLimits } : {}),
     log,
   });
   await gateway.start();

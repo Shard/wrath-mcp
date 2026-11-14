@@ -47,6 +47,7 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFile
 import { join } from "node:path";
 import { hostToolDefs, type HostSurface } from "../host";
 import { MODULE_SECRET_ENV, moduleAuthHeaders, moduleIdentity, moduleSecret, portSecretLeaser, tokenFingerprint, type Leaser, type LeaseOutcome } from "../module-auth";
+import type { SandboxLimits } from "../sandbox/confine";
 import type { ToolResult } from "../tools";
 import { pruneSessions } from "../record/retention";
 import { SessionStore } from "../record/store";
@@ -54,7 +55,7 @@ import { MCP_PACKAGE_VERSION } from "../version";
 import { authenticate, toFanoutGrant, type Authentication, type GrantSource, type HostedLimits, type TenantGrant } from "./grants";
 import { serveMcpPost, type CallRefusal, type McpEndpoint } from "./http";
 import { isHostedToken, newHostedToken } from "./tokens";
-import { connectWorker, localWorkers, newWorkerSecret, type CredentialHost, type WorkerProvider } from "./workers";
+import { connectWorker, newWorkerSecret, type CredentialHost, type WorkerProvider } from "./workers";
 
 /** The person audit's directory for a request no key named a person for. */
 export const UNAUTHENTICATED = "_unauthenticated";
@@ -220,9 +221,15 @@ export interface GatewayOptions {
   sweepMs?: number;
   now?: () => number;
   log?: (line: string) => void;
-  /** Starts each credential's worker. Default `localWorkers()`: a process per credential on this machine. */
-  workers?: WorkerProvider;
+  /**
+   * Starts each credential's worker: the deployment's own provider (a pod per
+   * credential), or `localWorkers({ trusted: true })` for the operator's own
+   * grants on one machine.
+   */
+  workers: WorkerProvider;
   snippetTimeoutMs?: number;
+  /** The resource limits of every credential's sandbox child, each replacing its default (`SandboxLimits`). */
+  sandboxLimits?: Partial<SandboxLimits>;
 }
 
 /** Why a lease was refused before the module was asked. */
@@ -240,7 +247,6 @@ export class Gateway {
   private worldStartedAt: number | undefined;
   private sweeping = false;
   private lastStorePrune = 0;
-  private defaultWorkers: WorkerProvider | undefined;
 
   constructor(private readonly o: GatewayOptions) {
     this.now = o.now ?? Date.now;
@@ -468,7 +474,7 @@ export class Gateway {
     const grant = t.grant;
     const surface = this.surfaceOf(grant);
     const secret = newWorkerSecret();
-    const handle = await (this.o.workers ?? (this.defaultWorkers ??= localWorkers())).start({ credential: t.id, secret, dir: base });
+    const handle = await this.o.workers.start({ credential: t.id, secret, dir: base });
     const host = await connectWorker({
       handle,
       secret,
@@ -484,6 +490,7 @@ export class Gateway {
         record: { root: handle.paths.sessions, retentionMs: this.o.recordRetentionMs ?? 3 * 86_400_000 },
         owner: t.person,
         ...(this.o.snippetTimeoutMs !== undefined ? { snippetTimeoutMs: this.o.snippetTimeoutMs } : {}),
+        ...(this.o.sandboxLimits !== undefined ? { sandboxLimits: this.o.sandboxLimits } : {}),
         // The worker has no port secret to ask `/health` with; the gateway asks for it.
         module: await moduleIdentity(this.o.moduleUrl, moduleAuthHeaders(this.o.env ?? process.env), this.o.fetch ?? fetch),
       },

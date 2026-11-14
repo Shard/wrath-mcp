@@ -30,7 +30,7 @@ function inProcessWorkers(open: typeof openHost): WorkerProvider {
     },
   };
 }
-import { Gateway, LeaseRefused, UNAUTHENTICATED } from "../src/hosted/gateway";
+import { Gateway, LeaseRefused, UNAUTHENTICATED, type GatewayOptions } from "../src/hosted/gateway";
 import { HOSTED_FINGERPRINT_PREFIX, isHostedToken, newHostedToken } from "../src/hosted/tokens";
 import { emptyGrantsFile, FileGrantSource, GrantSet, keyDigest, writeGrantsFile, type TenantGrant } from "../src/hosted/grants";
 import { ERR_GATEWAY, ERR_HEADER_MISMATCH, ERR_METHOD_NOT_FOUND, ERR_UNSUPPORTED_VERSION, LEGACY_VERSIONS } from "../src/hosted/http";
@@ -63,7 +63,7 @@ interface Rig {
   audit(person: string): Record<string, unknown>[];
 }
 
-async function rig(o: { grants: TenantGrant[]; program?: boolean; health?: () => number | undefined; start?: (state: string, stub: StubModule) => void; openHost?: typeof openHost; workers?: WorkerProvider } = { grants: [grant("a")] }): Promise<Rig> {
+async function rig(o: { grants: TenantGrant[]; program?: boolean; health?: () => number | undefined; start?: (state: string, stub: StubModule) => void; openHost?: typeof openHost; workers?: WorkerProvider; sandboxLimits?: GatewayOptions["sandboxLimits"] } = { grants: [grant("a")] }): Promise<Rig> {
   const stub = startStubModule();
   const state = mkdtempSync(join(tmpdir(), "wm-gateway-"));
   const grantsPath = join(state, "..", `${state.split("/").pop()}-grants.json`);
@@ -87,7 +87,8 @@ async function rig(o: { grants: TenantGrant[]; program?: boolean; health?: () =>
     now: () => clock.now,
     log: () => {},
     snippetTimeoutMs: 5_000,
-    ...(o.openHost !== undefined ? { workers: inProcessWorkers(o.openHost) } : o.workers !== undefined ? { workers: o.workers } : {}),
+    workers: o.openHost !== undefined ? inProcessWorkers(o.openHost) : (o.workers ?? localWorkers({ trusted: true })),
+    ...(o.sandboxLimits !== undefined ? { sandboxLimits: o.sandboxLimits } : {}),
   });
   await gateway.start();
   const server = Bun.serve({ port: 0, hostname: "127.0.0.1", idleTimeout: 60, fetch: (req) => gateway.fetch(req, "127.0.0.1") });
@@ -398,9 +399,44 @@ describe("the entry", () => {
     expect(parseGatewayArgs(["--state", "s"], { WRATH_MCP_GRANTS_FILE: "/x/g.json" }).grants).toBe("/x/g.json");
     expect(() => parseGatewayArgs(["--grants", "g", "--state", "s", "--allow-gm"], {})).toThrow("unknown argument --allow-gm");
   });
+
+  test("local workers only when told the grants are trusted; sandbox limits from flags", async () => {
+    const { parseGatewayArgs } = await import("../src/hosted/gateway-main");
+    expect(parseGatewayArgs(["--grants", "g", "--state", "s"], {})).toMatchObject({ trustedLocalWorkers: false });
+    expect(parseGatewayArgs(["--grants", "g", "--state", "s"], {}).sandboxLimits).toBeUndefined();
+    const a = parseGatewayArgs(["--grants", "g", "--state", "s", "--trusted-local-workers", "--limit-as", "8589934592", "--limit-cpu=3600", "--limit-fsize", "unlimited"], {});
+    expect(a.trustedLocalWorkers).toBe(true);
+    expect(a.sandboxLimits).toEqual({ addressSpaceBytes: 8589934592, cpuSeconds: 3600, fileBytes: null });
+    expect(() => parseGatewayArgs(["--grants", "g", "--state", "s", "--limit-cpu", "0"], {})).toThrow("--limit-cpu must be");
+  });
+
+  test("localWorkers refuses to start a worker unless trusted", async () => {
+    const { LocalWorkersRefused } = await import("../src/hosted/workers");
+    const dir = mkdtempSync(join(tmpdir(), "wm-local-"));
+    try {
+      await expect(localWorkers().start({ credential: "a", secret: "s", dir })).rejects.toThrow(LocalWorkersRefused);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("hardening", () => {
+  test("the gateway's sandbox limits reach every credential's child", async () => {
+    const seen: unknown[] = [];
+    const r = await rig({
+      grants: [grant("a")],
+      sandboxLimits: { cpuSeconds: 3600, fileBytes: null },
+      openHost: async (h) => {
+        seen.push(h.sandboxLimits);
+        return openHost(h);
+      },
+    });
+    const res = await r.call(KEY.a, "run_snippet", { code: 'return (await Bun.file("/proc/self/limits").text()).split("\\n").find((l) => l.startsWith("Max cpu time"))' });
+    expect(seen).toEqual([{ cpuSeconds: 3600, fileBytes: null }]);
+    expect(res.body.result!.content[0]!.text).toMatch(/Max cpu time\s+3600\s+3600/);
+  }, 30_000);
+
   test("a host that leased and then failed to open gives the lease back, so the next call is not locked out", async () => {
     let fail = true;
     const r = await rig({
@@ -441,14 +477,14 @@ describe("hardening", () => {
     const state = mkdtempSync(join(tmpdir(), "wm-gateway-nosecret-"));
     cleanups.push(() => rmSync(state, { recursive: true, force: true }));
     const grants = { current: () => new GrantSet(emptyGrantsFile()), close: () => {} };
-    expect(() => new Gateway({ grants, stateDir: state, moduleUrl: "http://module.invalid", env: {} })).toThrow("WRATHBENCH_MODULE_SECRET is not set");
+    expect(() => new Gateway({ grants, stateDir: state, moduleUrl: "http://module.invalid", env: {}, workers: localWorkers({ trusted: true }) })).toThrow("WRATHBENCH_MODULE_SECRET is not set");
   });
 });
 
 describe("workers", () => {
   test("each credential's host runs in a worker process of its own, which never holds the port secret", async () => {
     const handles: WorkerHandle[] = [];
-    const local = localWorkers();
+    const local = localWorkers({ trusted: true });
     const r = await rig({ grants: [grant("a"), grant("b")], workers: { start: async (x) => { const h = await local.start(x); handles.push(h); return h; } } });
     await r.call(KEY.a, "run_snippet", { code: "1" });
     await r.call(KEY.b, "run_snippet", { code: "1" });
@@ -460,7 +496,7 @@ describe("workers", () => {
 
   test("a worker that dies: its seats are released, and the next call starts another", async () => {
     const handles: WorkerHandle[] = [];
-    const local = localWorkers();
+    const local = localWorkers({ trusted: true });
     const r = await rig({ grants: [grant("a")], workers: { start: async (x) => { const h = await local.start(x); handles.push(h); return h; } } });
     await r.call(KEY.a, "run_snippet", { code: "1" });
     expect(r.gateway.ledger.seats()).toHaveLength(1);

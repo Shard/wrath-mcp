@@ -140,18 +140,20 @@ The floor that closes that (`module/PROTOCOL.md`
   `.env`, the repo root, the home directory, `/tmp`, `/dev/shm` and every
   other process's `/proc` entry answer `EACCES`; TCP
   connections only to the port in the run's module URL, and no listening
-  socket; no executable but the interpreter itself, so a spawned shell or
-  `curl` never starts; and, where the kernel has Landlock scopes, no signal
-  to a process outside the sandbox. The sandbox refuses to start rather than
-  run unconfined. This is the client-fidelity boundary as much as a security
+  socket; no socket of another family or protocol (a seccomp filter): no unix
+  socket but its own stream pairs, no netlink, raw or packet socket, and UDP
+  only to resolve the module's host name when the URL has one; no executable
+  but the interpreter itself, so a spawned shell or `curl` never starts; and,
+  where the kernel has Landlock scopes, no signal to a process outside the
+  sandbox. The sandbox refuses to start rather than run unconfined. This is the client-fidelity boundary as much as a security
   one: a game client talks to the game server, and a snippet that could reach
   a database, a harness's own services or an orchestrator would be observing and
   acting through something no client has.
 
   Stated plainly, what the kernel rules do not cover: Landlock's TCP rules
   are per port, not per host, so the child may dial the module's port on any
-  address; UDP (name resolution is its legitimate use), raw sockets and other
-  socket families are outside Landlock. Closing those is the deployment's
+  address; and where the module URL names a host, the UDP it resolves that
+  name with may reach any address. Closing those is the deployment's
   network policy — the sandbox child's egress is the module's port on the
   module's host and DNS, and nothing else is a legitimate destination.
 

@@ -25,7 +25,7 @@ test("runGateway serves with the provider it is handed", async () => {
   const key = "wmk_entry-key";
   writeGrantsFile(join(dir, "grants.json"), { ...emptyGrantsFile(), grants: [{ id: "a", person: "pat", keyHashes: [{ id: "kaaaa", sha256: keyDigest(key) }], accounts: ["A1"], maxCharacters: 1 }] });
   const started: string[] = [];
-  const local = localWorkers();
+  const local = localWorkers({ trusted: true });
   const workers: WorkerProvider = { start: async (o) => (started.push(o.credential), local.start(o)) };
   const running = await runGateway(
     { grants: join(dir, "grants.json"), state: join(dir, "state"), host: "127.0.0.1", port: 0, program: false, allowedOrigins: [], trustForwardedFor: false, recordRetentionMs: 3_600_000 },
@@ -47,7 +47,18 @@ test("runGateway refuses to start without the port secret", async () => {
   const dir = mkdtempSync(join(tmpdir(), "wm-entry-"));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   writeGrantsFile(join(dir, "grants.json"), emptyGrantsFile());
-  await expect(runGateway({ grants: join(dir, "grants.json"), state: join(dir, "state"), host: "127.0.0.1", port: 0, program: false, allowedOrigins: [], trustForwardedFor: false, recordRetentionMs: 1 }, { env: {}, log: () => {} })).rejects.toThrow("WRATHBENCH_MODULE_SECRET");
+  await expect(runGateway({ grants: join(dir, "grants.json"), state: join(dir, "state"), host: "127.0.0.1", port: 0, program: false, allowedOrigins: [], trustForwardedFor: false, recordRetentionMs: 1, trustedLocalWorkers: true }, { env: {}, log: () => {} })).rejects.toThrow("WRATHBENCH_MODULE_SECRET");
+});
+
+test("runGateway refuses to start with no provider unless local workers are trusted", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "wm-entry-"));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  writeGrantsFile(join(dir, "grants.json"), emptyGrantsFile());
+  const args = { grants: join(dir, "grants.json"), state: join(dir, "state"), host: "127.0.0.1", port: 0, program: false, allowedOrigins: [], trustForwardedFor: false, recordRetentionMs: 1 };
+  const env = { WRATHBENCH_MODULE_SECRET: STUB_PORT_SECRET, WRATHBENCH_MODULE_URL: "http://127.0.0.1:1" };
+  await expect(runGateway(args, { env, log: () => {} })).rejects.toThrow("--trusted-local-workers");
+  const running = await runGateway({ ...args, trustedLocalWorkers: true }, { env, log: () => {} });
+  await running.stop();
 });
 
 test("behind a proxy, the audit names the address the proxy added, never one the client sent", async () => {
