@@ -21,7 +21,7 @@ Not allowed, even though the server knows them:
 - Aggro and leash radii, loot tables, respawn timers, spawn coordinates, quest objective coordinates read from the database, creature AI state. The objective areas the server sends in `SMSG_QUEST_POI_QUERY_RESPONSE` are a packet the client receives, and are served (below).
 - Objects beyond update range or behind the server's visibility checks.
 - Anything about other sessions' characters beyond what a nearby player would see.
-- The module's own diagnostics: the global session and lease counts, the limits, the packet-drop census and the world-load store counts. `GET /health` serves those to the port secret only, wherever it calls from; a lease secret gets the liveness view, from loopback too (operator, 2026-11-15; see PROTOCOL.md).
+- The module's own diagnostics: the global session and lease counts, the limits, the packet-drop census and the world-load store counts. `GET /health` serves those to the port secret only, wherever it calls from; a lease secret gets the liveness view, from loopback too (see PROTOCOL.md).
 
 Ambiguity resolves toward the client: if it is unclear whether a client could see something, it is not served until someone checks.
 
@@ -132,7 +132,7 @@ The floor that closes that (`module/PROTOCOL.md`
   succeeds under it binds the character; a later same-token create for another
   is refused, as is one made while a first create naming another is still in
   flight, so creates at once cannot bind the token to a character it does not
-  play (operator, 2026-11-15). A snippet cannot delete any character — its own included — and
+  play. A snippet cannot delete any character — its own included — and
   cannot open a session on any account or character but the one it was
   launched as.
 - **The snippet child can reach the module's port and nothing else it was
