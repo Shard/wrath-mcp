@@ -8,7 +8,7 @@
  *
  *   bun mcp/src/main.ts [--account <name>] [--dir <state-dir>] [--token-file <path> | --token <session-token>] [--allow-gm]
  *                       [--record-dir <store> | --no-record] [--record-retention-days <n>]
- *                       [--max-characters <n> --accounts <a,b,…>]
+ *                       [--max-characters <n> --accounts <a,b,…>] [--program]
  *
  * Environment: `WRATHBENCH_MODULE_URL` (default `http://127.0.0.1:8086`) and
  * `WRATHBENCH_MODULE_SECRET`, the module's port secret, which this process
@@ -39,73 +39,36 @@
  * `--dir` brings back the ones that were logged in. Absent, or 1, everything
  * here is the single-character server, byte for byte.
  *
+ * `--program` serves the model's program beside the core tools (`host.ts`,
+ * `hostToolSpecs`): `run_snippet` as a one-off, the file tools over a
+ * workspace in the state directory (`program/`), and routines that keep
+ * running between calls, at fan-out each for a character. Absent, nothing of
+ * it is served.
+ *
+ * The host itself (sandbox, record, roster, program and the tool list) is
+ * `host.ts`'s, which a hosted gateway opens once per credential, so the two
+ * serve the same tools.
+ *
  * A clean exit — stdin closing, SIGINT or SIGTERM — logs the character out and
  * releases the lease. A killed process leaves the character in the world until
  * a create on its account reclaims it (module/PROTOCOL.md, "POST /session").
  */
 
 import { randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import type { EventSummary } from "./sandbox/ipc";
-import { compactJson } from "./jsonsafe";
-import { CharacterRoster, FANOUT_TOOL_ORDER, fanoutGrantProblem, fanoutTools, MAX_CHARACTERS_LIMIT, type FanoutGrant, type FanoutToolContext, type RosterEntry } from "./fanout";
-import { leaseRedacted, moduleAuthHeaders, moduleIdentity, portSecretLeaser, tokenFingerprint, tokenTag, type Leaser } from "./module-auth";
-import { ownGuidIndex } from "./record/gate";
-import { DEFAULT_RETENTION_MS, pruneSessions } from "./record/retention";
-import { SessionStore } from "./record/store";
-import { SessionWriter } from "./record/writer";
-import { SecretRedactor } from "./redact";
-import { CLIENT_CACHE_FILE, ClientCacheStore } from "./sandbox/client-cache";
-import { SandboxHost } from "./sandbox/host";
-import { Scratchpad } from "./scratchpad";
+import { fanoutGrantProblem, MAX_CHARACTERS_LIMIT, type FanoutGrant } from "./fanout";
+import { openHost } from "./host";
+import { portSecretLeaser, tokenFingerprint, tokenTag, type Leaser } from "./module-auth";
+import { DEFAULT_RETENTION_MS } from "./record/retention";
+import type { SessionWriter } from "./record/writer";
+import type { SandboxHost } from "./sandbox/host";
 import { McpServer, serveStdio } from "./server";
-import { coreTools, ToolSet, type CoreToolContext, type CoreToolRender, type ToolResult } from "./tools";
 import { MCP_PACKAGE_VERSION } from "./version";
 
-/**
- * Ambient motion, out-of-sight party frames, threat list updates and world
- * state changes: folded out of `recent_events` unless asked for, as its fold
- * note says. The state cache keeps them all.
- */
-const AMBIENT = /^(SMSG_MONSTER_MOVE|MSG_MOVE_|SMSG_PARTY_MEMBER_STATS|SMSG_THREAT_UPDATE|SMSG_HIGHEST_THREAT_UPDATE|SMSG_UPDATE_WORLD_STATE)/;
-
-/** The bare stack's rendering: one event per line, and the snapshot's own fields as JSON. */
-export const PLAIN_RENDER: CoreToolRender<CoreToolContext> = {
-  eventLine: (e: EventSummary) =>
-    `${e.opcode === "stream_gap" ? "#gap" : `#${e.seq}`} ${e.opcode}${e.schemaError !== undefined ? " [schema mismatch]" : ""} ${compactJson(e.data, 220)}${e.note !== undefined ? ` — ${e.note}` : ""}`,
-  isAmbient: (opcode) => AMBIENT.test(opcode),
-  stateSummary: (snapshot, o) =>
-    JSON.stringify({
-      sessionLive: o.sessionLive,
-      self: snapshot["self"],
-      xp: snapshot["xp"],
-      money: snapshot["money"],
-      questLog: snapshot["questLog"],
-      eventCount: snapshot["eventCount"],
-      lastSeq: snapshot["lastSeq"],
-      observation: snapshot["observation"],
-      move: snapshot["move"],
-    }),
-};
-
-/**
- * `result` with the sandbox's pending notices at its foot — a restart and the
- * state it lost, a background fault — scrubbed like the result. A harness
- * puts these in its own turn context; the bare stack has no turns, so the
- * next tool result is where the agent hears of them.
- */
-export function withNotices(
-  sandbox: Pick<SandboxHost, "drainNotices">,
-  secrets: { scrub(text: string): string },
-  result: ToolResult,
-): ToolResult {
-  const notices = sandbox.drainNotices();
-  if (notices.length === 0) return result;
-  const block = ["--- notices ---", ...notices.map((n) => `${n.kind}: ${n.text}`)].join("\n");
-  return { ...result, text: secrets.scrub(`${result.text}\n${block}`) };
-}
+// The host's pieces, where they were before the host was its own module.
+export { PLAIN_RENDER, readRoster, ROSTER_FILE, withNotices, writeRoster } from "./host";
 
 /** The environment variable that turns the GM opt-in on, as `--allow-gm` does. */
 export const ALLOW_GM_ENV = "WRATHBENCH_ALLOW_GM";
@@ -154,31 +117,6 @@ export function fanoutOption(argv: readonly string[], allowGm = false): FanoutGr
   const problem = fanoutGrantProblem(grant);
   if (problem !== null) throw new Error(`--max-characters ${n}: ${problem} (--accounts <a,b,…>)`);
   return grant;
-}
-
-/** The file in the state directory that keeps where each character lives, at fan-out above 1. Mode 0600: it holds tokens. */
-export const ROSTER_FILE = "roster.json";
-
-/** The entries a state directory's roster file holds; none when it has no file or one that does not read. */
-export function readRoster(path: string): RosterEntry[] {
-  try {
-    const raw: unknown = JSON.parse(readFileSync(path, "utf8"));
-    if (!Array.isArray(raw)) return [];
-    return raw.filter(
-      (e): e is RosterEntry =>
-        e !== null && typeof e === "object" && typeof (e as RosterEntry).character === "string" && typeof (e as RosterEntry).account === "string" && typeof (e as RosterEntry).token === "string",
-    ).map((e) => ({ character: e.character, account: e.account, token: e.token, in: e.in === true }));
-  } catch {
-    return [];
-  }
-}
-
-/** Write the roster file whole, 0600, by rename, so a reader never sees half and never a looser mode. */
-export function writeRoster(path: string, entries: readonly RosterEntry[]): void {
-  const tmp = `${path}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify(entries, null, 2)}\n`, { mode: 0o600 });
-  chmodSync(tmp, 0o600);
-  renameSync(tmp, path);
 }
 
 /** The file in the state directory that holds the session token. */
@@ -280,76 +218,25 @@ async function main(): Promise<void> {
   const moduleUrl = process.env["WRATHBENCH_MODULE_URL"] ?? "http://127.0.0.1:8086";
   const allowGm = allowGmOption(argv, process.env);
   const grant = fanoutOption(argv, allowGm);
-  if (grant !== null) return mainFanout({ argv, grant, token, dir, tokenPath, moduleUrl });
-
-  const secrets = new SecretRedactor();
-  const leaser = portSecretLeaser({ moduleUrl });
-  // The opt-in rides the lease, which only this process can take: the child's
-  // creates inherit it, and nothing a snippet sends can raise it.
-  const lease = await leaseRedacted(
-    leaser,
-    { token, ...(account !== undefined ? { account } : {}), ...(allowGm ? { allowGm } : {}) },
-    secrets,
-  );
-  if (lease.secret === undefined) console.error(`[wrathbench-mcp] ${lease.note}`);
-  else if (allowGm && !lease.allowGm) {
-    console.error("[wrathbench-mcp] --allow-gm: the module did not confirm the GM opt-in (it predates it), so it serves player use only");
-  } else if (allowGm) console.error("[wrathbench-mcp] GM opt-in on: the module serves a GM account and passes command chat for this session");
-
-  // The session record: on unless refused, in a store beside the state
-  // directory, named by the token's fingerprint and never by the token.
-  const recordAt = recordOption(argv, dir);
-  let record: SessionWriter | undefined;
-  if (recordAt !== null) {
-    const store = new SessionStore(recordAt.root);
-    const id = tokenFingerprint(token);
-    const pruned = pruneSessions(store, recordAt.retentionMs, { except: id });
-    if (pruned.length > 0) console.error(`[wrathbench-mcp] removed ${pruned.length} session record(s) past retention from ${recordAt.root}`);
-    record = new SessionWriter({ dir: store.sessionDir(id), id, stack: { version: MCP_PACKAGE_VERSION }, own: ownGuidIndex(() => store.dirs()), scrub: (text) => secrets.scrub(text), token });
-    record.open();
-    const writer = record;
-    void moduleIdentity(moduleUrl, moduleAuthHeaders()).then((m) => writer.setModule(m));
-  }
-
-  const scratchpad = new Scratchpad(join(dir, "scratchpad.md"));
-  const clientCache = new ClientCacheStore(join(dir, CLIENT_CACHE_FILE));
-  process.on("exit", () => clientCache.flush());
-  const sandbox = new SandboxHost({
+  const record = recordOption(argv, dir);
+  const host = await openHost({
     moduleUrl,
+    dir,
     token,
-    ...(lease.secret !== undefined ? { secret: lease.secret } : {}),
-    ...(account !== undefined ? { account } : {}),
-    scratchpad,
-    snippetTimeoutMs: 30_000,
-    pingGraceMs: 5_000,
-    clientCache,
-    ...(record !== undefined ? { record: { writer: record } } : {}),
-    // Scrubbed like everything else this process writes: a crash notice
-    // quotes the child's stderr, and the child holds the lease secret.
-    onNotice: (n) => console.error(secrets.scrub(`[wrathbench-mcp] ${n.kind}: ${n.text}`)),
+    account,
+    allowGm,
+    grant,
+    program: argv.includes("--program"),
+    record,
+    log: (line) => console.error(`[wrathbench-mcp] ${line}`),
     // stdout is the MCP transport: what a snippet prints goes to stderr with the rest of this process's log.
     logSink: (_stream, text) => void process.stderr.write(text),
   });
-  const ctx: CoreToolContext = {
-    sandbox,
-    scratchpad,
-    sessionLive: () => true,
-    turn: () => 0,
-    secrets,
-    ...(record !== undefined ? { record } : {}),
-  };
-  const core = coreTools(PLAIN_RENDER);
-  const tools = new ToolSet([core.run_snippet, core.recent_events, core.state_summary, core.write_scratchpad, core.edit_scratchpad]);
-  const server = new McpServer(
-    {
-      list: () => tools.defs,
-      coerce: (name, raw) => tools.coerce(name, raw),
-      call: async (name, args, origin) => withNotices(sandbox, secrets, await tools.call(ctx, name, args, origin)),
-      appendPending: async (result) => withNotices(sandbox, secrets, await tools.appendPending(ctx, result)),
-    },
-    { serverVersion: MCP_PACKAGE_VERSION },
-  );
-  const shutdown = sessionShutdown({ sandbox, moduleUrl, token, record, leaser });
+  const server = new McpServer(host.tools, { serverVersion: MCP_PACKAGE_VERSION });
+  // A fan-out host's characters need the leases the roster holds, logged out with the port secret however the child answered.
+  const timeoutMs = grant !== null ? 10_000 + 1_000 * grant.maxCharacters : 25_000;
+  let done: Promise<void> | undefined;
+  const shutdown = (): Promise<void> => (done ??= Promise.race([host.shutdown({ logout: true }), Bun.sleep(timeoutMs)]));
   let signalled = false;
   const onSignal = (code: number) => () => {
     // A second signal does not wait for the first one's logout.
@@ -359,102 +246,19 @@ async function main(): Promise<void> {
   };
   process.on("SIGINT", onSignal(130));
   process.on("SIGTERM", onSignal(143));
-  console.error(
-    `[wrathbench-mcp] session ${tokenTag(token)}, state in ${dir}; its token is in ${tokenPath} (mode 0600), and --dir ${dir} resumes it` +
-      (record !== undefined ? `; recorded in ${record.dir}` : "; not recorded"),
-  );
-  await serveStdio(server);
-  await shutdown();
-  process.exit(0);
-}
-
-/**
- * The server for a client granted more than one character. The state
- * directory's token names the client, not a session: it is never leased, and
- * its fingerprint is the `group` every one of the client's session records
- * carries, which is how a reader finds the sessions one client drove.
- */
-async function mainFanout(o: { argv: readonly string[]; grant: FanoutGrant; token: string; dir: string; tokenPath: string; moduleUrl: string }): Promise<void> {
-  const { grant, dir, moduleUrl } = o;
-  const secrets = new SecretRedactor();
-  const group = tokenFingerprint(o.token);
-  const rosterPath = join(dir, ROSTER_FILE);
-  const known = readRoster(rosterPath);
-
-  const recordAt = recordOption(o.argv, dir);
-  const store = recordAt !== null ? new SessionStore(recordAt.root) : null;
-  if (store !== null && recordAt !== null) {
-    const pruned = pruneSessions(store, recordAt.retentionMs);
-    if (pruned.length > 0) console.error(`[wrathbench-mcp] removed ${pruned.length} session record(s) past retention from ${recordAt.root}`);
+  if (grant === null) {
+    console.error(
+      `[wrathbench-mcp] session ${tokenTag(token)}, state in ${dir}; its token is in ${tokenPath} (mode 0600), and --dir ${dir} resumes it` +
+        (host.recordedIn !== undefined ? `; recorded in ${host.recordedIn}` : "; not recorded"),
+    );
+  } else {
+    // The state directory's token names the client, not a session: it is never leased, and its fingerprint is every one of the client's session records' `group`.
+    console.error(
+      `[wrathbench-mcp] up to ${grant.maxCharacters} characters on ${grant.accounts.length} accounts, state in ${dir} (--dir ${dir} resumes it)` +
+        (host.recordedIn !== undefined ? `; each recorded in ${host.recordedIn}, group ${tokenFingerprint(token)}` : "; not recorded"),
+    );
   }
-  const module = store !== null ? moduleIdentity(moduleUrl, moduleAuthHeaders()) : null;
-
-  const scratchpad = new Scratchpad(join(dir, "scratchpad.md"));
-  const clientCache = new ClientCacheStore(join(dir, CLIENT_CACHE_FILE));
-  process.on("exit", () => clientCache.flush());
-  const sandbox = new SandboxHost({
-    moduleUrl,
-    token: "",
-    scratchpad,
-    snippetTimeoutMs: 30_000,
-    pingGraceMs: 5_000,
-    clientCache,
-    fanout: { maxCharacters: grant.maxCharacters },
-    ...(store !== null ? { record: {} } : {}),
-    onNotice: (n) => console.error(secrets.scrub(`[wrathbench-mcp] ${n.kind}: ${n.text}`)),
-    logSink: (_stream, text) => void process.stderr.write(text),
-  });
-  const roster: CharacterRoster = new CharacterRoster({
-    grant,
-    moduleUrl,
-    sandbox,
-    secrets,
-    known,
-    onChange: (entries) => writeRoster(rosterPath, entries),
-    ...(store !== null
-      ? {
-          record: (seat) => {
-            const id = tokenFingerprint(seat.token);
-            const writer = new SessionWriter({ dir: store.sessionDir(id), id, stack: { version: MCP_PACKAGE_VERSION }, group, own: ownGuidIndex(() => store.dirs()), scrub: (text) => roster.scrubTokens(secrets.scrub(text)), token: seat.token });
-            writer.open();
-            void module?.then((m) => writer.setModule(m));
-            return writer;
-          },
-        }
-      : {}),
-  });
-  const ctx: FanoutToolContext = { sandbox, scratchpad, sessionLive: () => true, turn: () => 0, secrets, fanout: roster, ...(store !== null ? { record: roster.calls } : {}) };
-  const specs = fanoutTools<FanoutToolContext>(PLAIN_RENDER);
-  const tools = new ToolSet(FANOUT_TOOL_ORDER.map((name) => specs[name]));
-  const server = new McpServer(
-    {
-      list: () => tools.defs,
-      coerce: (name, raw) => tools.coerce(name, raw),
-      call: async (name, args, origin) => withNotices(sandbox, secrets, await tools.call(ctx, name, args, origin)),
-      appendPending: async (result) => withNotices(sandbox, secrets, await tools.appendPending(ctx, result)),
-    },
-    { serverVersion: MCP_PACKAGE_VERSION },
-  );
-  let done: Promise<void> | undefined;
-  const shutdown = (): Promise<void> =>
-    (done ??= (async () => {
-      await Promise.race([sandbox.stop().catch(() => {}), Bun.sleep(5_000)]);
-      await Promise.race([roster.shutdown({ logout: true }).catch(() => {}), Bun.sleep(5_000 + 1_000 * grant.maxCharacters)]);
-    })());
-  let signalled = false;
-  const onSignal = (code: number) => () => {
-    if (signalled) process.exit(code);
-    signalled = true;
-    void shutdown().finally(() => process.exit(code));
-  };
-  process.on("SIGINT", onSignal(130));
-  process.on("SIGTERM", onSignal(143));
-  console.error(
-    `[wrathbench-mcp] up to ${grant.maxCharacters} characters on ${grant.accounts.length} accounts, state in ${dir} (--dir ${dir} resumes it)` +
-      (recordAt !== null ? `; each recorded in ${recordAt.root}, group ${group}` : "; not recorded"),
-  );
-  // The characters that were logged in when this state directory was last used.
-  for (const f of await roster.resume()) console.error(secrets.scrub(`[wrathbench-mcp] ${f.character} was not brought back: ${f.error}`));
+  await host.resume();
   await serveStdio(server);
   await shutdown();
   process.exit(0);
