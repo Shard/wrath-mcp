@@ -297,6 +297,27 @@ describe("bounded audit and leases", () => {
     expect(hour.filter((x) => x.status === "fulfilled")).toHaveLength(1);
   }, 30_000);
 
+  test("a held seat being leased again counts once: a new character beside it is not refused", async () => {
+    const r = await rig({ grants: [grant("a", { accounts: ["A1", "A2"], maxCharacters: 2 })] });
+    const a = { id: "a", person: "p-a", grant: grant("a", { accounts: ["A1", "A2"], maxCharacters: 2 }), limits: { ...LIMITS }, logins: [] as number[] };
+    const held = newHostedToken();
+    expect((await r.gateway.leaserFor(a).lease({ token: held, account: "A1" })).secret).toBeDefined();
+    const base = (r.gateway as unknown as { base: { lease: (o: { token: string }) => Promise<unknown> } }).base;
+    const real = base.lease.bind(base);
+    let release!: () => void;
+    const gate = new Promise<void>((res) => (release = res));
+    base.lease = async (o) => {
+      if (o.token === held) await gate;
+      return real(o);
+    };
+    const again = r.gateway.leaserFor(a).lease({ token: held, account: "A1" });
+    const fresh = await r.gateway.leaserFor(a).lease({ token: newHostedToken(), account: "A2" });
+    expect(fresh.secret).toBeDefined();
+    release();
+    expect((await again).secret).toBeDefined();
+    expect(r.gateway.ledger.of("a")).toHaveLength(2);
+  }, 30_000);
+
   test("a lease the module does not grant gives its reservation and its login back", async () => {
     const r = await rig({ grants: [grant("a")] });
     const a = { id: "a", person: "p-a", grant: grant("a"), limits: { ...LIMITS, loginsPerHour: 1 }, logins: [] as number[] };

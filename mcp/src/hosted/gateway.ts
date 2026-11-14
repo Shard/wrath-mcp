@@ -754,11 +754,13 @@ export class Gateway {
         // Seats held and seats being taken alike: every check and its
         // reservation happen before the first await, so concurrent asks see
         // each other.
-        const others = [...this.ledger.seats().map((s) => ({ token: s.token, credential: s.credential })), ...[...this.leasing].map(([token, credential]) => ({ token, credential }))].filter((s) => s.token !== o.token);
-        const mine = others.filter((s) => s.credential === t.id).length;
+        // By token, so a held seat being leased again counts once.
+        const seats = new Map<string, string>([...this.ledger.seats().map((s) => [s.token, s.credential] as const), ...this.leasing]);
+        seats.delete(o.token);
+        const mine = [...seats.values()].filter((c) => c === t.id).length;
         if (mine >= t.grant.maxCharacters) refuse(`${mine} of ${t.grant.maxCharacters} characters are already in the world for this key`);
         const global = this.o.grants.current().file.globalMaxCharacters;
-        if (others.length >= global) refuse(`the server has ${others.length} characters in the world, its most; try again later`);
+        if (seats.size >= global) refuse(`the server has ${seats.size} characters in the world, its most; try again later`);
         const hourAgo = this.now() - 3_600_000;
         while (t.logins.length > 0 && t.logins[0]! < hourAgo) t.logins.shift();
         if (held === undefined && t.logins.length >= t.limits.loginsPerHour) refuse(`${t.limits.loginsPerHour} logins in the last hour, this key's most; try again later`);
