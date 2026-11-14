@@ -488,15 +488,22 @@ worst place for it when the code is a stranger's. So the host is split in two:
 A credential is served the tool list the stdio server serves for the same
 options, byte for byte at fan-out 1: both build it in `host.ts`.
 
-The gateway is `mcp/src/hosted/gateway.ts`. For now it opens each
-credential's host in the gateway's process, beside the port secret, with
-only each host's child confined as every sandbox is: enough for an
-operator's own multi-user tests, and not for people outside the deployment.
-The worker process per credential and the `WorkerProvider` hook are the next
-step, and outsiders connect only after them, and the gateway's leaser already holds every lease to the
-grant (the account, the character count, the token's owner, never GM) as it
-must once the host is a process the gateway does not trust. Its ledger lives
-outside the credentials' directories and is never read back from them. The module's part is to protect itself:
+The gateway is `mcp/src/hosted/gateway.ts`, the worker
+`mcp/src/hosted/worker.ts`. The gateway starts a credential's worker through
+its provider at the credential's first tool call, connects to it, greets it
+with that worker's own secret and opens the host with its own decisions
+(the directories, the accounts, the owner); the worker asks back over the
+same channel for every lease, which the gateway's leaser holds to the grant
+(the account, the character count, the token's owner, never GM) since the
+worker is not trusted. Everything the worker sends is checked for its shape,
+and a line past the channel's limit closes it. A worker that dies has its
+seats released and is started again at the next call; one whose gateway is
+gone exits. The gateway's ledger lives outside the credentials' directories
+and is never read back from them, and on a restart it releases every seat:
+its workers have exited or will. The local provider, a process per
+credential, shares the gateway's machine and user, which suits an
+operator's own tests; people outside the deployment get a worker per pod,
+which a deployment's own provider starts. The module's part is to protect itself:
 per-lease caps on the action rate, the `/events` subscribers and the number
 of leases. `docs/CONTRACTS.md`, "Control-surface authentication", states what
 each side holds.

@@ -4,16 +4,16 @@
  * (`docs/ARCHITECTURE.md`, "Hosted"; `docs/CONTRACTS.md`,
  * "Control-surface authentication").
  *
- * It is the only holder of the port secret. For each credential it opens a
- * host (`host.ts`: the confined sandbox, the record, the roster and the
- * program) on the first tool call, and every lease that host takes goes
- * through this gateway's leaser, which holds it to the grant whatever the
- * host asks: the account must be the credential's, the token no other
- * credential's, the characters within the grant's count and the deployment's
- * cap, the logins within the hourly limit, and the GM opt-in is never sent.
- * Here the host runs in this process, its child confined by the kernel as
- * every sandbox is; a worker process per credential, holding only the lease
- * secrets it is handed, is the next step and changes none of this.
+ * It is the only holder of the port secret. For each credential it starts
+ * a worker (`worker.ts`, through a `WorkerProvider`) on the first tool call,
+ * which runs the credential's host (`host.ts`: the confined sandbox, the
+ * record, the roster and the program) holding only the lease secrets it is
+ * handed. Every lease that host takes is asked of this gateway over the
+ * worker's channel and goes through its leaser, which holds it to the grant
+ * whatever the worker asks: the account must be the credential's, the token
+ * no other credential's, the characters within the grant's count and the
+ * deployment's cap, the logins within the hourly limit, and the GM opt-in is
+ * never sent.
  *
  * What it keeps, all under its state directory and none of it under
  * `tenants/`, which belongs to the credentials' hosts and is never read
@@ -45,12 +45,13 @@
 import { createHash, randomBytes } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { hostToolDefs, openHost, type HostSurface, type OpenedHost } from "../host";
-import { MODULE_SECRET_ENV, moduleAuthHeaders, moduleSecret, portSecretLeaser, tokenFingerprint, type Leaser, type LeaseOutcome } from "../module-auth";
+import { hostToolDefs, type HostSurface } from "../host";
+import { MODULE_SECRET_ENV, moduleAuthHeaders, moduleIdentity, moduleSecret, portSecretLeaser, tokenFingerprint, type Leaser, type LeaseOutcome } from "../module-auth";
 import type { ToolResult } from "../tools";
 import { MCP_PACKAGE_VERSION } from "../version";
 import { authenticate, toFanoutGrant, type Authentication, type GrantSource, type HostedLimits, type TenantGrant } from "./grants";
 import { serveMcpPost, type CallRefusal, type McpEndpoint } from "./http";
+import { connectWorker, localWorkers, newWorkerSecret, type CredentialHost, type WorkerProvider } from "./workers";
 
 /** The person audit's directory for a request no key named a person for. */
 export const UNAUTHENTICATED = "_unauthenticated";
@@ -186,7 +187,7 @@ interface Tenant {
   pending: number;
   /** Calls, opens and stops of this credential's host, one at a time. */
   chain: Promise<unknown>;
-  host: OpenedHost | undefined;
+  host: CredentialHost | undefined;
   /** The last dispatch stamp handed out: strictly increasing, the call's key in the record and the audit. */
   lastDispatchTs: number;
   /** When each lease of the last hour was taken. */
@@ -214,8 +215,8 @@ export interface GatewayOptions {
   sweepMs?: number;
   now?: () => number;
   log?: (line: string) => void;
-  /** Opens a credential's host; tests hand a stand-in. Default `openHost`. */
-  openHost?: typeof openHost;
+  /** Starts each credential's worker. Default `localWorkers()`: a process per credential on this machine. */
+  workers?: WorkerProvider;
   snippetTimeoutMs?: number;
 }
 
@@ -233,6 +234,7 @@ export class Gateway {
   /** The worldserver's start as `/health` last said it; a change means every lease is gone. */
   private worldStartedAt: number | undefined;
   private sweeping = false;
+  private defaultWorkers: WorkerProvider | undefined;
 
   constructor(private readonly o: GatewayOptions) {
     this.now = o.now ?? Date.now;
@@ -414,7 +416,7 @@ export class Gateway {
         const text = JSON.stringify(args ?? {});
         const target = args !== null && typeof args === "object" ? ((args as Record<string, unknown>)["character"] ?? (name === "login_character" ? (args as Record<string, unknown>)["name"] : undefined)) : undefined;
         const line = { kind: "call", credential: t.id, keyId, remote, tool: name, callId: dispatchTs, ...(typeof target === "string" ? { character: target } : {}), argBytes: Buffer.byteLength(text), argSha256: createHash("sha256").update(text).digest("hex") };
-        let host: OpenedHost;
+        let host: CredentialHost;
         try {
           host = await this.hostFor(t);
         } catch (err) {
@@ -424,8 +426,13 @@ export class Gateway {
           this.audit.write(t.person, { ...line, outcome: "error", durationMs: this.now() - started, error: `host: ${why}` });
           return { text: `${name} failed: your session could not be opened: ${why}`, isError: true };
         }
-        const coerced = host.tools.coerce(name, args);
-        const result = coerced.ok ? await host.tools.call(name, coerced.args, { dispatchTs }) : await host.tools.appendPending({ text: coerced.error, isError: true });
+        let result: ToolResult;
+        try {
+          result = await host.invoke(name, args, dispatchTs);
+        } catch (err) {
+          const why = err instanceof Error ? err.message : String(err);
+          result = { text: `${name} failed: your session's worker did not answer (${why}); the next call starts it again`, isError: true };
+        }
         this.audit.write(t.person, { ...line, outcome: result.isError === true ? "error" : "ok", durationMs: this.now() - started });
         return result;
       });
@@ -435,34 +442,59 @@ export class Gateway {
     }
   }
 
-  /** The credential's host, opened on its first call. Only ever called inside the credential's chain. */
-  private async hostFor(t: Tenant): Promise<OpenedHost> {
+  /**
+   * The credential's host, opened on its first call in a worker of its own:
+   * the provider starts it, the gateway greets it with its secret and opens
+   * the host with the gateway's own decisions. Only ever called inside the
+   * credential's chain.
+   */
+  private async hostFor(t: Tenant): Promise<CredentialHost> {
     if (t.host !== undefined) return t.host;
     const base = join(this.o.stateDir, "tenants", t.id);
-    const dir = join(base, "state");
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    chmodSync(dir, 0o700);
+    mkdirSync(base, { recursive: true, mode: 0o700 });
+    chmodSync(base, 0o700);
+    for (const sub of ["state", "sessions"]) mkdirSync(join(base, sub), { recursive: true, mode: 0o700 });
     const grant = t.grant;
     const surface = this.surfaceOf(grant);
-    const host = await (this.o.openHost ?? openHost)({
-      moduleUrl: this.o.moduleUrl,
-      dir,
-      // The single character's token is minted here and never shown; at fan-out it names the client's records (`group`) and is never leased.
-      token: surface.fanout ? `hosted-client-${t.id}` : randomBytes(16).toString("hex"),
-      account: grant.accounts[0],
-      grant: surface.fanout ? toFanoutGrant(grant) : null,
-      program: surface.program,
-      record: { root: join(base, "sessions"), retentionMs: this.o.recordRetentionMs ?? 3 * 86_400_000 },
-      owner: t.person,
+    const secret = newWorkerSecret();
+    const handle = await (this.o.workers ?? (this.defaultWorkers ??= localWorkers())).start({ credential: t.id, secret, dir: base });
+    const host = await connectWorker({
+      handle,
+      secret,
+      open: {
+        moduleUrl: this.o.moduleUrl,
+        dir: handle.paths.state,
+        // The single character's token is minted here; at fan-out it names the client's records (`group`) and is never leased.
+        token: surface.fanout ? `hosted-client-${t.id}` : randomBytes(16).toString("hex"),
+        account: grant.accounts[0],
+        grant: surface.fanout ? { maxCharacters: grant.maxCharacters, accounts: [...toFanoutGrant(grant).accounts] } : null,
+        program: surface.program,
+        record: { root: handle.paths.sessions, retentionMs: this.o.recordRetentionMs ?? 3 * 86_400_000 },
+        owner: t.person,
+        ...(this.o.snippetTimeoutMs !== undefined ? { snippetTimeoutMs: this.o.snippetTimeoutMs } : {}),
+        // The worker has no port secret to ask `/health` with; the gateway asks for it.
+        module: await moduleIdentity(this.o.moduleUrl, moduleAuthHeaders(this.o.env ?? process.env), this.o.fetch ?? fetch),
+      },
       leaser: this.leaserFor(t),
       log: (line) => this.log(`[${t.id}] ${line}`),
-      logSink: () => {},
-      ...(this.o.snippetTimeoutMs !== undefined ? { snippetTimeoutMs: this.o.snippetTimeoutMs } : {}),
     });
     t.host = host;
+    void host.lost.then((why) => this.lostHost(t, host, why));
     this.audit.write(t.person, { kind: "host", event: "open", credential: t.id, fanout: surface.fanout, program: surface.program });
     await host.resume();
     return host;
+  }
+
+  /** A worker that went away unasked: its seats are released, and the next call starts another. */
+  private async lostHost(t: Tenant, host: CredentialHost, why: string): Promise<void> {
+    // Cleared at once, so a call queued behind this does not pick up the dead host; released in the chain.
+    if (t.host !== host) return;
+    t.host = undefined;
+    await this.serial(t, async () => {
+      await this.releaseSeats(t, `worker lost: ${why}`);
+      this.audit.write(t.person, { kind: "host", event: "lost", why, credential: t.id });
+      this.log(`[${t.id}] worker lost: ${why}`);
+    });
   }
 
   private async stopHost(t: Tenant, why: string): Promise<void> {
@@ -470,7 +502,7 @@ export class Gateway {
       const host = t.host;
       if (host === undefined) return;
       t.host = undefined;
-      await host.shutdown({ logout: true });
+      await host.shutdown();
       // Whatever the host did not give back, the gateway does.
       await this.releaseSeats(t, why);
       this.audit.write(t.person, { kind: "host", event: "stop", why, credential: t.id });

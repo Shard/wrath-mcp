@@ -154,6 +154,12 @@ export interface HostOptions {
   /** A snippet's output, which the standalone server writes to stderr. */
   logSink?: (stream: "stdout" | "stderr", text: string) => void;
   snippetTimeoutMs?: number;
+  /**
+   * What the module says of itself, for `session.json`'s `module`, when the
+   * host must not ask: a hosted worker has no port secret for `/health`, so
+   * the gateway asks and hands the answer. Absent, the host asks itself.
+   */
+  module?: { build: string | null; protocol: number | null } | null;
 }
 
 export interface OpenedHost {
@@ -220,7 +226,7 @@ async function openSingleHost(o: HostOptions): Promise<OpenedHost> {
     record = new SessionWriter({ dir: store.sessionDir(id), id, stack: { version: MCP_PACKAGE_VERSION }, own: ownGuidIndex(() => store.dirs()), scrub: (text) => secrets.scrub(text), token, ...(o.owner !== undefined ? { owner: o.owner } : {}) });
     record.open();
     const writer = record;
-    void moduleIdentity(moduleUrl, moduleAuthHeaders()).then((m) => writer.setModule(m));
+    void (o.module !== undefined ? Promise.resolve(o.module) : moduleIdentity(moduleUrl, moduleAuthHeaders())).then((m) => writer.setModule(m));
   }
 
   const scratchpad = new Scratchpad(join(dir, "scratchpad.md"));
@@ -308,7 +314,7 @@ async function openFanoutHost(o: HostOptions, grant: FanoutGrant): Promise<Opene
     const pruned = pruneSessions(store, o.record.retentionMs);
     if (pruned.length > 0) o.log(`removed ${pruned.length} session record(s) past retention from ${o.record.root}`);
   }
-  const module = store !== null ? moduleIdentity(moduleUrl, moduleAuthHeaders()) : null;
+  const module = store === null ? null : o.module !== undefined ? Promise.resolve(o.module) : moduleIdentity(moduleUrl, moduleAuthHeaders());
 
   const scratchpad = new Scratchpad(join(dir, "scratchpad.md"));
   const clientCache = new ClientCacheStore(join(dir, CLIENT_CACHE_FILE));

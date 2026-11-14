@@ -34,6 +34,12 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   key, a host of their own, a lease ledger, rate, in-flight, login and idle
   limits, and an audit per person (`mcp/README.md`, "The hosted gateway").
   Only the gateway holds the port secret.
+- **A worker per credential.** The gateway runs each credential's host in a
+  worker of its own (`mcp/src/hosted/worker.ts`), which never holds the port
+  secret and asks the gateway for every lease over a channel the gateway
+  opens and greets with the worker's secret. Workers start through a
+  `WorkerProvider`; `localWorkers` is a process per credential on the
+  gateway's machine, and a deployment supplies one for pods.
 - **`--program` on the standalone server**: the model's program beside the
   core tools. The host is now `src/host.ts`, shared by `main.ts` and the
   gateway; without `--program` the stdio server is unchanged.
