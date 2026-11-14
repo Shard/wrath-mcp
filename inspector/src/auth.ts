@@ -4,6 +4,10 @@
  * Bound to loopback with no credential configured, it needs none: only this
  * machine can reach it, and whoever does is the operator. Bound to anything
  * else it refuses to start without a bearer secret, the module's own posture.
+ * Serving a hosted gateway's state it refuses to start without grants or a
+ * secret even on loopback, unless told to (`allowAnonymous`): a hosted
+ * deployment's inspector is the one a proxy on the same machine brings the
+ * internet to, and every visitor would arrive from loopback.
  *
  * Two kinds of credential, each presented as `Authorization: Bearer …` on a
  * request or once to the sign-in:
@@ -25,7 +29,11 @@
  * (a restart signs everyone out), for a bounded time, and for a grant key
  * only the key's digest. Every request re-checks a key's grant, so a key
  * revoked, a grant disabled or removed, ends that cookie's access at its
- * next request. Sign-out forgets the id.
+ * next request. Sign-out forgets the id. Sign-in is bounded: its body is a
+ * few kilobytes at most, an address that fails `SIGN_IN_FAILURES` times in
+ * `SIGN_IN_FAILURE_WINDOW_MS` is refused (429) until the window passes, and
+ * one credential holds at most `MAX_SIGN_INS_PER_CREDENTIAL` sign-ins, so a
+ * key holder signing in over and over evicts only their own.
  *
  * The secret is never taken on the command line, where any process can read
  * it: from the environment or a file. Neither credential is ever read from a
@@ -48,8 +56,20 @@ export const SIGN_IN_TTL_MS = 12 * 60 * 60_000;
 /** The most sign-ins held at once; past it the oldest is forgotten. */
 export const MAX_SIGN_INS = 10_000;
 
-/** Shorter than this is refused: a secret anyone could guess is no gate. */
-export const MIN_SECRET_LENGTH = 16;
+/** The most sign-ins one credential (the operator's secret, or one key) holds; past it its own oldest is forgotten. */
+export const MAX_SIGN_INS_PER_CREDENTIAL = 32;
+
+/** The largest sign-in body read: a key or a secret in a small JSON object. */
+export const SIGN_IN_BODY_MAX = 4_096;
+
+/** Failed sign-ins one address may make in `SIGN_IN_FAILURE_WINDOW_MS` before it is refused until the window passes. */
+export const SIGN_IN_FAILURES = 10;
+export const SIGN_IN_FAILURE_WINDOW_MS = 60_000;
+/** The most addresses the throttle remembers; past it the oldest is forgotten. */
+const THROTTLE_ADDRESSES_MAX = 10_000;
+
+/** Shorter than this is refused: a secret anyone could guess is no gate. The module asks the same of its port secret. */
+export const MIN_SECRET_LENGTH = 32;
 
 /** Whether `host` reaches only this machine: `localhost`, `127.0.0.0/8` or `::1`. `0.0.0.0` and `::` are every interface. */
 export function isLoopbackHost(host: string): boolean {
@@ -63,12 +83,21 @@ export function isLoopbackHost(host: string): boolean {
  * Why the inspector may not start bound to `host` with this secret, or null
  * when it may. With grants, a request without a credential is refused on any
  * bind, so the secret is then optional (without one, nobody is the operator).
+ * Serving a hosted gateway's state (`hosted`), it needs grants or a secret on
+ * loopback too, unless `allowAnonymous`.
  */
-export function bindRefusal(host: string, secret: string | undefined, o: { grants?: boolean } = {}): string | null {
-  const gated = !isLoopbackHost(host) || o.grants === true;
-  if (!gated) return null;
-  if (secret === undefined || secret.length === 0) return o.grants === true ? null : `bound to ${host}, which is not loopback, the inspector needs a bearer secret (${SECRET_ENV}, or --secret-file)`;
-  if (secret.length < MIN_SECRET_LENGTH) return `the bearer secret must be at least ${MIN_SECRET_LENGTH} characters`;
+export function bindRefusal(host: string, secret: string | undefined, o: { grants?: boolean; hosted?: boolean; allowAnonymous?: boolean } = {}): string | null {
+  const loopback = isLoopbackHost(host);
+  if (loopback && o.grants !== true && o.hosted !== true) return null;
+  if (secret !== undefined && secret.length > 0) return secret.length < MIN_SECRET_LENGTH ? `the bearer secret must be at least ${MIN_SECRET_LENGTH} characters` : null;
+  if (o.grants === true) return null;
+  if (!loopback) return `bound to ${host}, which is not loopback, the inspector needs a bearer secret (${SECRET_ENV}, or --secret-file)`;
+  if (o.hosted === true && o.allowAnonymous !== true) {
+    return (
+      "serving a hosted gateway's state, the inspector needs grants (--grants) or a bearer secret even on loopback, where a proxy may bring anyone; " +
+      "--allow-anonymous serves every tenant's sessions to whoever reaches the port"
+    );
+  }
   return null;
 }
 
@@ -101,6 +130,9 @@ export function userScope(set: GrantSet, person: string): UserScope {
 /** What a sign-in stands for: the operator, or one grant's key by its digest. */
 type Signed = { kind: "operator"; expires: number } | { kind: "user"; grant: string; digest: string; person: string; expires: number };
 
+/** The credential a sign-in was made with, for the per-credential cap. */
+const principal = (s: Signed): string => (s.kind === "operator" ? "operator" : `key:${s.digest}`);
+
 /** Who a request is, and whether it came by the sign-in's cookie. */
 export interface Caller {
   scope: SessionScope;
@@ -130,8 +162,12 @@ export interface InspectorAuth {
   scope(req: Request): SessionScope | null;
   /** The scope and how it was presented, or null. */
   caller(req: Request): Caller | null;
-  /** `POST` a credential (the `Authorization` header, or a JSON body `{ key }` or `{ secret }`): a cookie, or 401. */
-  signIn(req: Request): Promise<Response>;
+  /**
+   * `POST` a credential (the `Authorization` header, or a JSON body `{ key }`
+   * or `{ secret }`): a cookie, or 401; 413 past `SIGN_IN_BODY_MAX`, 429 for
+   * an address (`remote`, the peer as the server saw it) past its failures.
+   */
+  signIn(req: Request, remote?: string): Promise<Response>;
   /** `POST`: forget the cookie's sign-in, and clear it. */
   signOut(req: Request): Response;
   /** How many sign-ins are held. */
@@ -201,10 +237,36 @@ export function inspectorAuth(o: InspectorAuthOptions = {}): InspectorAuth {
   const cookie = (url: URL, value: string, maxAge: number): string =>
     `${SESSION_COOKIE}=${value}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}${secureCookie(url) ? "; Secure" : ""}`;
 
-  const prune = (): void => {
+  const prune = (adding: Signed): void => {
     const t = now();
     for (const [id, s] of held) if (s.expires <= t) held.delete(id);
+    const who = principal(adding);
+    const own = [...held].filter(([, s]) => principal(s) === who);
+    for (const [id] of own.slice(0, Math.max(0, own.length - MAX_SIGN_INS_PER_CREDENTIAL + 1))) held.delete(id);
     while (held.size >= MAX_SIGN_INS) held.delete(held.keys().next().value!);
+  };
+
+  /** Failed sign-ins by address: how many in the window that started at `since`. */
+  const failures = new Map<string, { since: number; count: number }>();
+  const throttled = (remote: string): number | null => {
+    const f = failures.get(remote);
+    if (f === undefined) return null;
+    const left = f.since + SIGN_IN_FAILURE_WINDOW_MS - now();
+    if (left <= 0) {
+      failures.delete(remote);
+      return null;
+    }
+    return f.count >= SIGN_IN_FAILURES ? left : null;
+  };
+  const failed = (remote: string): void => {
+    const t = now();
+    const f = failures.get(remote);
+    if (f !== undefined && t - f.since < SIGN_IN_FAILURE_WINDOW_MS) f.count++;
+    else {
+      failures.delete(remote);
+      failures.set(remote, { since: t, count: 1 });
+    }
+    while (failures.size > THROTTLE_ADDRESSES_MAX) failures.delete(failures.keys().next().value!);
   };
 
   return {
@@ -214,16 +276,21 @@ export function inspectorAuth(o: InspectorAuthOptions = {}): InspectorAuth {
       return held.size;
     },
 
-    async signIn(req) {
+    async signIn(req, remote = "unknown") {
       if (req.method !== "POST") return new Response("POST only", { status: 405, headers: { allow: "POST" } });
+      const wait = throttled(remote);
+      if (wait !== null) return new Response("too many failed sign-ins; wait", { status: 429, headers: { "retry-after": String(Math.ceil(wait / 1000)) } });
       // From the header, else a JSON body: never the URL. JSON only, so a form
       // on another site cannot post it without a preflight this server never grants.
       let candidate: unknown = null;
       if (req.headers.get("authorization") !== null) candidate = bearerKey(req.headers);
       else {
         if (!(req.headers.get("content-type") ?? "").toLowerCase().startsWith("application/json")) return new Response("JSON only", { status: 415 });
+        if (Number(req.headers.get("content-length") ?? "0") > SIGN_IN_BODY_MAX) return new Response("body too large", { status: 413 });
         try {
-          const body = (await req.json()) as { key?: unknown; secret?: unknown } | null;
+          const text = await req.text();
+          if (text.length > SIGN_IN_BODY_MAX) return new Response("body too large", { status: 413 });
+          const body = JSON.parse(text) as { key?: unknown; secret?: unknown } | null;
           candidate = body?.key ?? body?.secret ?? null;
         } catch {
           return new Response("bad body", { status: 400 });
@@ -231,8 +298,11 @@ export function inspectorAuth(o: InspectorAuthOptions = {}): InspectorAuth {
       }
       if (open) return new Response(null, { status: 204 });
       const hit = typeof candidate === "string" && candidate.length > 0 ? ofCredential(candidate) : null;
-      if (hit === null) return new Response("refused", { status: 401 });
-      prune();
+      if (hit === null) {
+        failed(remote);
+        return new Response("refused", { status: 401 });
+      }
+      prune(hit.signed);
       const id = randomBytes(32).toString("base64url");
       held.set(id, hit.signed);
       return new Response(null, { status: 204, headers: { "set-cookie": cookie(new URL(req.url), id, Math.floor(ttlMs / 1000)), "cache-control": "no-store" } });

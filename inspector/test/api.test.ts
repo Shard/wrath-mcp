@@ -137,7 +137,7 @@ describe("tail", () => {
 
 describe("the bin's handler", () => {
   test("off loopback it wants the secret, as a bearer header or the sign-in's cookie", async () => {
-    const secret = "an-inspector-secret-of-length";
+    const secret = "an-inspector-secret-of-at-least-32-characters";
     const h = inspectorHandler({ source: storeSource(root), host: "0.0.0.0", secret });
     expect((await h(new Request("http://x/api/sessions"))).status).toBe(401);
     expect((await h(new Request("http://x/api/sessions", { headers: { authorization: `Bearer ${secret}` } }))).status).toBe(200);
@@ -167,7 +167,7 @@ describe("the bin's handler", () => {
     expect((await open(new Request("http://x/tiles/0/31_33.png"))).status).toBe(404);
     expect((await open(new Request("http://x/tiles/0/..%2F..%2Fsecret.png"))).status).toBe(404);
     expect((await inspectorHandler({ source: storeSource(root) })(new Request("http://x/tiles/0/31_32.png"))).status).toBe(404);
-    const gated = inspectorHandler({ source: storeSource(root), tilesDir: tiles, host: "0.0.0.0", secret: "an-inspector-secret-of-length" });
+    const gated = inspectorHandler({ source: storeSource(root), tilesDir: tiles, host: "0.0.0.0", secret: "an-inspector-secret-of-at-least-32-characters" });
     expect((await gated(new Request("http://x/tiles/0/31_32.png"))).status).toBe(401);
   });
 

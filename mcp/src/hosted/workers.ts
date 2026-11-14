@@ -50,6 +50,12 @@ export interface WorkerHandle {
   readonly pid?: number;
 }
 
+/**
+ * How a deployment starts its workers. The channel the gateway then opens to
+ * one is plain TCP on which only the gateway proves itself, so a provider
+ * keeps the worker's port where nothing but the gateway reaches it (loopback,
+ * a pod network a policy closes), or brings its own transport security.
+ */
 export interface WorkerProvider {
   /**
    * Start a worker for `credential`. `secret` is the one it must be handed

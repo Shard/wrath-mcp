@@ -2,18 +2,23 @@
 /**
  * wrath-inspector: read a session store, serve its API and page.
  *
- *   wrath-inspector --store <dir> [--host 127.0.0.1] [--port 8091] [--secret-file <path>] [--tiles <dir>] [--wowhead]
- *   wrath-inspector --hosted-state <dir> [--grants <file>] [same options]
+ *   wrath-inspector --store <dir> [--host 127.0.0.1] [--port 8091] [--secret-file <path>] [--tiles <dir>] [--wowhead] [--secure-cookie]
+ *   wrath-inspector --hosted-state <dir> [--grants <file>] [--allow-anonymous] [same options]
  *
  * `--store` is a session store (`mcp/src/main.ts`'s `--record-dir`) or one
  * session directory. `--hosted-state` is a hosted gateway's state directory
  * instead: every credential's store under `tenants/`. With `--grants` (the
  * gateway's grants file, which it only reads) a person signs in with their
  * key and sees their own credentials' sessions, and no request is anonymous.
- * Bound to loopback, the default, and without grants, it needs no credential.
- * Bound to anything else it refuses to start without a bearer secret or
- * grants; the secret comes from `WRATH_INSPECTOR_SECRET` or the first line of
- * `--secret-file`, never from the command line. `--tiles` is a directory of minimap tiles,
+ * Bound to loopback, the default, and without grants, a `--store` needs no
+ * credential; a `--hosted-state` does, grants or a bearer secret, unless
+ * `--allow-anonymous` says to serve every tenant's sessions to whoever
+ * reaches the port (a proxy on this machine would bring anyone). Bound to
+ * anything else it refuses to start without a bearer secret or grants; the
+ * secret, at least 32 characters, comes from `WRATH_INSPECTOR_SECRET` or the
+ * first line of `--secret-file`, never from the command line.
+ * `--secure-cookie` marks the sign-in cookie `Secure` on a loopback bind,
+ * for a TLS proxy in front of it. `--tiles` is a directory of minimap tiles,
  * `<map>/<row>_<col>.png`, for the map to draw over its grid. `--wowhead`
  * lets the page load Wowhead's tooltip script for item, spell and quest icons
  * and names, a third-party request it makes only when asked. It only ever
@@ -28,7 +33,8 @@ import { hostedSource } from "./hosted-source";
 import { serveInspector } from "./serve";
 import { storeSource } from "./store-source";
 
-const USAGE = "usage: wrath-inspector (--store <dir> | --hosted-state <dir> [--grants <file>]) [--host 127.0.0.1] [--port 8091] [--secret-file <path>] [--tiles <dir>] [--wowhead]";
+const USAGE =
+  "usage: wrath-inspector (--store <dir> | --hosted-state <dir> [--grants <file>] [--allow-anonymous]) [--host 127.0.0.1] [--port 8091] [--secret-file <path>] [--tiles <dir>] [--wowhead] [--secure-cookie]";
 
 export interface InspectorArgs {
   /** A session store or one session directory; or else `hostedState`. */
@@ -42,17 +48,31 @@ export interface InspectorArgs {
   secret: string | undefined;
   tiles: string | undefined;
   wowhead: boolean;
+  /** Serve a hosted state with no credential (`--allow-anonymous`). */
+  allowAnonymous: boolean;
+  /** Mark the sign-in cookie `Secure` whatever the bind (`--secure-cookie`). */
+  secureCookie: boolean;
 }
 
 /** The flags, parsed; throws with the usage on anything it does not know. */
 export function parseArgs(argv: readonly string[], env: Record<string, string | undefined> = process.env): InspectorArgs {
   const flags = new Map<string, string>();
   let wowhead = false;
+  let allowAnonymous = false;
+  let secureCookie = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "--help" || a === "-h") throw new Error(USAGE);
     if (a === "--wowhead") {
       wowhead = true;
+      continue;
+    }
+    if (a === "--allow-anonymous") {
+      allowAnonymous = true;
+      continue;
+    }
+    if (a === "--secure-cookie") {
+      secureCookie = true;
       continue;
     }
     const m = /^--(store|hosted-state|grants|host|port|secret-file|tiles)(?:=(.*))?$/.exec(a);
@@ -65,6 +85,7 @@ export function parseArgs(argv: readonly string[], env: Record<string, string | 
   const hostedState = flags.get("hosted-state");
   if ((store === undefined) === (hostedState === undefined)) throw new Error(`one of --store and --hosted-state\n${USAGE}`);
   if (flags.has("grants") && hostedState === undefined) throw new Error(`--grants is for --hosted-state\n${USAGE}`);
+  if (allowAnonymous && hostedState === undefined) throw new Error(`--allow-anonymous is for --hosted-state\n${USAGE}`);
   const grants = flags.get("grants") ?? (hostedState === undefined ? undefined : env[GRANTS_FILE_ENV]);
   const port = Number(flags.get("port") ?? 8091);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("--port must be a port number");
@@ -81,6 +102,8 @@ export function parseArgs(argv: readonly string[], env: Record<string, string | 
     secret: secret !== undefined && secret.length > 0 ? secret : undefined,
     tiles: tiles === undefined ? undefined : resolve(tiles),
     wowhead,
+    allowAnonymous,
+    secureCookie,
   };
 }
 
@@ -99,6 +122,9 @@ if (import.meta.main) {
       ...(grants === undefined ? {} : { grants }),
       ...(args.tiles === undefined ? {} : { tilesDir: args.tiles }),
       wowhead: args.wowhead,
+      hosted: args.hostedState !== undefined,
+      allowAnonymous: args.allowAnonymous,
+      secureCookie: args.secureCookie,
     });
     const gate = [args.secret === undefined ? null : "bearer secret", grants === undefined ? null : "grant keys"].filter((g) => g !== null);
     console.log(`[wrath-inspector] ${dir} on http://${server.hostname}:${server.port}${gate.length === 0 ? "" : ` (${gate.join(" or ")} required)`}`);
