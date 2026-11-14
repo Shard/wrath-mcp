@@ -27,7 +27,25 @@ export {
   SEAT_OPEN_TIMEOUT_MS,
   STATE_LOSS_RECOVERY,
   STATE_LOSS_RECOVERY_FANOUT,
+  STATE_LOSS_RECOVERY_PROGRAM,
+  STATE_LOSS_RECOVERY_PROGRAM_FANOUT,
 } from "./sandbox/host";
+export { PROGRAM_BEAT_GRACE_MS, PROGRAM_BEAT_MS, ProgramHost, renderRoutines, routineDetailKey } from "./sandbox/program-host";
+export type { ProgramAnswer, ProgramFact, ProgramFacts, ProgramOptions, RoutineRow } from "./sandbox/program-host";
+export {
+  FILE_MAX_CHARS,
+  IMPORTABLE_EXTENSIONS,
+  isImportable,
+  MAIN_PATH,
+  MEMORY_MAX_CHARS,
+  MEMORY_PATH,
+  MEMORY_WRITE_REFUSAL,
+  sameImportGraph,
+  Workspace,
+  WORKSPACE_MAX_BYTES,
+  workspaceImportGraph,
+} from "./workspace";
+export type { WorkspaceEntry, WorkspaceResult } from "./workspace";
 export type {
   ActionsFlush,
   EvalLink,
@@ -122,8 +140,8 @@ export {
 export type { ConfinementPlan, FsRule, NetRule, PlanInput, StackReadPaths } from "./sandbox/confine";
 export { RepeatFolder } from "./sandbox/log-fold";
 export { REATTACH_REPLAY_WAIT_MS, REATTACH_STATE_WAIT_MS } from "./sandbox/reattach-waits";
-export { compileSnippet, extractPatternNames, scanTopLevelDeclarations } from "./sandbox/rewrite";
-export type { CompiledSnippet, ScanResult } from "./sandbox/rewrite";
+export { compileOneOff, compileSnippet, extractPatternNames, scanTopLevelDeclarations } from "./sandbox/rewrite";
+export type { CompiledSnippet, OneOffOptions, ScanResult } from "./sandbox/rewrite";
 export type {
   ActionBatch,
   ActionHintNote,
@@ -135,6 +153,15 @@ export type {
   HostToChild,
   LogEntry,
   MoveIntentNote,
+  MoveOwner,
+  ProgramBeat,
+  ProgramErrorNote,
+  ProgramEvent,
+  ProgramLoadAnswer,
+  ProgramLogLine,
+  RoutineAnswer,
+  RoutineNote,
+  RoutineState,
   SeatClosed,
   SeatOpened,
 } from "./sandbox/ipc";
@@ -146,6 +173,10 @@ export {
   coreTools,
   foldedNote,
   parseToolArgsText,
+  PROGRAM_EDIT_SCRATCHPAD_NOT_FOUND,
+  PROGRAM_RUN_SNIPPET_DESCRIPTION,
+  programEditScratchpad,
+  programTools,
   recentEventsScan,
   renderActionHints,
   serveEvents,
@@ -160,7 +191,11 @@ export type {
   CoreToolContext,
   CoreToolName,
   CoreToolRender,
+  ProgramToolAnswer,
+  ProgramToolContext,
+  ProgramToolName,
   ToolDef,
+  ToolProgram,
   ToolResult,
   ToolSandbox,
   ToolSpec,

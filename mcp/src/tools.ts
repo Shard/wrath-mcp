@@ -2,7 +2,9 @@
  * The tool surface: one dispatcher (`ToolSet`) for every tool a harness
  * serves, and the five core tools every harness serves through it —
  * `run_snippet`, `recent_events`, `state_summary`, `write_scratchpad` and
- * `edit_scratchpad`. A harness adds its own tools as `ToolSpec`s and lists the
+ * `edit_scratchpad`. Beside them, for a sandbox that hosts a program,
+ * `programTools`: the four file tools, the two routine tools and the
+ * one-off `run_snippet`. A harness adds its own tools as `ToolSpec`s and lists the
  * whole set in the order it serves them; the dispatcher owns everything a
  * call goes through whichever tool it is: lenient argument parsing, alias
  * keys, strict validation with a prose restatement of the parameters, the
@@ -71,6 +73,13 @@ export interface CoreToolContext {
    * ones), plus how many ambient events (movement, party frames) were folded out of that span.
    */
   onEventsServed?: (events: unknown[], folded?: number) => void;
+  /**
+   * Called with the action hints a result carries, as it is built: a
+   * snippet's own and the ones drained onto any other result. What the model
+   * was told, by signature, so a harness can tell a fact it has delivered
+   * from one it has not.
+   */
+  onHintsDelivered?: (hints: readonly ActionHintNote[]) => void;
   /**
    * The secret registry every result passes through (`redact.ts`'s
    * `SecretRedactor`, or a harness's own): each result `ToolSet.call` and
@@ -287,7 +296,22 @@ const HINT_ORIGINS_SHOWN = 3;
 function collapseOrigins(hints: readonly ActionHintNote[]): HintRow[] {
   const rows: HintRow[] = [];
   const byKey = new Map<string, HintRow & { froms: string[] }>();
+  const byRoutine = new Map<string, HintRow>();
   for (const h of hints) {
+    // A routine of the model's program: one row per routine, so the line names its owner.
+    if (h.routine !== undefined) {
+      const key = `${h.character ?? ""}\n${h.routine}\n${h.action}\n${h.status}\n${h.hint}`;
+      const row = byRoutine.get(key);
+      if (row === undefined) {
+        const first = { ...h };
+        byRoutine.set(key, first);
+        rows.push(first);
+      } else {
+        row.count += h.count;
+        if (h.ts > row.ts) row.ts = h.ts;
+      }
+      continue;
+    }
     if (h.from === undefined) {
       rows.push({ ...h });
       continue;
@@ -339,7 +363,7 @@ const HINT_CHARACTERS_SHOWN = 4;
 function groupHintsByCharacter(hints: readonly HintRow[]): HintRow[] {
   const groups = new Map<string, { note: HintRow; names: string[] }>();
   for (const h of hints) {
-    const key = `${h.action}\n${h.status}\n${h.hint}\n${h.froms === undefined ? "\u0000" : h.froms.join("\u0001")}`;
+    const key = `${h.action}\n${h.status}\n${h.hint}\n${h.froms === undefined ? "\u0000" : h.froms.join("\u0001")}${h.routine === undefined ? "" : `\n${h.routine}`}`;
     const g = groups.get(key);
     const name = h.character ?? "?";
     if (g === undefined) {
@@ -365,6 +389,7 @@ function groupHintsByCharacter(hints: readonly HintRow[]): HintRow[] {
  * current snippet's own hints.
  */
 function fromLabel(row: HintRow): string {
+  if (row.routine !== undefined) return ` (routine ${row.routine})`;
   const froms = row.froms ?? (row.from === undefined ? undefined : [row.from]);
   if (froms === undefined) return "";
   // `""` is a routine nothing names any more: counted, never listed.
@@ -418,6 +443,7 @@ export async function appendPendingActionHints(ctx: CoreToolContext, result: Too
     return scrubResult(ctx, result);
   }
   const block = renderActionHints(hints);
+  if (hints.length > 0) ctx.onHintsDelivered?.(hints);
   return scrubResult(ctx, block === undefined ? result : { ...result, text: `${result.text}\n${block}` });
 }
 
@@ -581,12 +607,34 @@ const RECENT_EVENTS_SCAN_MAX = 500;
  * rest"). Two matches have two readings, so the harness refuses rather than
  * picking one.
  */
+const EDIT_SCRATCHPAD_NOT_FOUND =
+  "edit_scratchpad: old was not found in the scratchpad; copy the text exactly, whitespace included. The scratchpad as last written is in this turn's context.";
+
+/**
+ * The same refusal as a harness serving a program says it: a scaffold's
+ * program loop sends the pad only when the conversation does not already
+ * hold it as it stands, so the pad as last written may be in an earlier
+ * message rather than this turn's (`programEditScratchpad`).
+ */
+export const PROGRAM_EDIT_SCRATCHPAD_NOT_FOUND =
+  "edit_scratchpad: old was not found in the scratchpad; copy the text exactly, whitespace included. The scratchpad as last written is in this turn's context or earlier in this conversation.";
+
+/** `edit_scratchpad` as a harness serving a program serves it: its not-found refusal says where the pad as last written may be. */
+export function programEditScratchpad<C extends CoreToolContext>(spec: ToolSpec<C>): ToolSpec<C> {
+  return {
+    ...spec,
+    run: async (ctx, args, origin) => {
+      const res = await spec.run(ctx, args, origin);
+      return res.isError === true && res.text === EDIT_SCRATCHPAD_NOT_FOUND ? { ...res, text: PROGRAM_EDIT_SCRATCHPAD_NOT_FOUND } : res;
+    },
+  };
+}
+
 const EDIT_SCRATCHPAD_HINTS: Record<"empty_old" | "identical" | "not_found" | "ambiguous", (matches: number) => string> = {
   empty_old: () =>
     "edit_scratchpad: old was empty. There is nothing to match — use write_scratchpad to start a pad, then edit it.",
   identical: () => "edit_scratchpad: old and new are the same text, so this edit would change nothing.",
-  not_found: () =>
-    "edit_scratchpad: old was not found in the scratchpad; copy the text exactly, whitespace included. The scratchpad as last written is in this turn's context.",
+  not_found: () => EDIT_SCRATCHPAD_NOT_FOUND,
   ambiguous: (matches) =>
     `edit_scratchpad: old matches ${matches} places; include more surrounding text or set replaceAll.`,
 };
@@ -602,6 +650,7 @@ export async function snippetToolResult<C extends CoreToolContext>(ctx: C, res: 
   lines.push(res.ok ? `ok (${res.durationMs}ms)` : `error (${res.durationMs}ms)`);
   if (res.value !== undefined) lines.push(`=> ${res.value}`);
   if (res.hint !== undefined) lines.push(res.hint);
+  for (const note of res.notes ?? []) lines.push(note);
   if (res.error !== undefined) lines.push(res.error);
   if (res.logs.length > 0) {
     lines.push("--- console ---");
@@ -611,6 +660,7 @@ export async function snippetToolResult<C extends CoreToolContext>(ctx: C, res: 
   // while swallowing 41 hints, so this is the main case, not the edge.
   const hints = renderActionHints(res.actionHints ?? []);
   if (hints !== undefined) lines.push(hints);
+  if ((res.actionHints ?? []).length > 0) ctx.onHintsDelivered?.(res.actionHints!);
   // After the hint block and carrying no action outcome, so nothing a
   // background routine did is said twice; before the result is marked,
   // so it is still the one `EVALUATED` holds.
@@ -862,6 +912,218 @@ export function coreTools<C extends CoreToolContext>(render: CoreToolRender<C>):
         }
         const where = res.replaced === 1 ? "1 replacement" : `${res.replaced} replacements`;
         return { text: `edited (${where}; ${res.chars} chars, ${res.lines} lines)` };
+      },
+    },
+  };
+}
+
+// ---------------------------------------------------------- program tools
+
+/**
+ * What the program tools need of the sandbox: the program its host holds
+ * (`SandboxHost.program`), or a stand-in. Each call answers with the text its
+ * tool result carries.
+ */
+export interface ToolProgram {
+  readFile(path: unknown, range?: { offset?: number | undefined; limit?: number | undefined }): ProgramToolAnswer;
+  writeFile(path: unknown, content: unknown, link?: { callTs?: number | undefined; turn?: number | undefined }): Promise<ProgramToolAnswer>;
+  editFile(path: unknown, oldText: unknown, newText: unknown, replaceAll: unknown, link?: { callTs?: number | undefined; turn?: number | undefined }): Promise<ProgramToolAnswer>;
+  deleteFile(path: unknown, link?: { callTs?: number | undefined; turn?: number | undefined }): Promise<ProgramToolAnswer>;
+  startRoutine(o: { name: string; args?: unknown; character?: string | undefined }, link?: { callTs?: number | undefined; turn?: number | undefined }): Promise<ProgramToolAnswer>;
+  stopRoutine(o: { name: string; character?: string | undefined }): Promise<ProgramToolAnswer>;
+}
+
+export interface ProgramToolAnswer {
+  ok: boolean;
+  text: string;
+}
+
+/** The context of a dispatcher that serves the program tools. */
+export interface ProgramToolContext extends CoreToolContext {
+  program: ToolProgram;
+}
+
+export type ProgramToolName = "run_snippet" | "read_file" | "write_file" | "edit_file" | "delete_file" | "start_routine" | "stop_routine";
+
+/** The file limits as the descriptions state them (`workspace.ts` holds the rule). */
+const PROGRAM_FILE_MAX_CHARS = 32_000;
+const PROGRAM_WORKSPACE_MAX_BYTES = 1_048_576;
+
+/** `run_snippet` as a sandbox that hosts a program describes it: a one-off. */
+export const PROGRAM_RUN_SNIPPET_DESCRIPTION =
+  "Run a TypeScript snippet once in the game sandbox. `sdk`, `state`, `events`, `connect()`, `sleep(ms)`, `scratchpad` (its read(), write() and append() each return a Promise: `await scratchpad.read()`), `memory` and `signal` (aborted when this snippet returns or is abandoned) are ambient, and your workspace files import by relative path. A single expression returns its value. Nothing a snippet declares or starts outlives it; what must keep running is a routine (start_routine).";
+
+const answer = (a: ProgramToolAnswer): ToolResult => (a.ok ? { text: a.text } : { text: a.text, isError: true });
+
+/**
+ * The tools of a sandbox that hosts a program, rendered the harness's way: a
+ * harness serves them in place of the core `run_snippet` and beside the other
+ * four core tools, in the order it chooses. With `characters` (fan-out above
+ * 1) the routine tools take the character a routine runs for.
+ */
+export function programTools<C extends ProgramToolContext>(render: CoreToolRender<C>, o: { characters?: boolean } = {}): Record<ProgramToolName, ToolSpec<C>> {
+  const core = coreTools(render);
+  const character = o.characters === true;
+  const characterProp = character
+    ? { character: { type: "string", description: "The character the routine runs for: its `sdk`, `state` and `events` are that character's. Omit for a routine that drives several through `chars`." } }
+    : {};
+  const routineSchema = (extra: Record<string, z.ZodType>): z.ZodType => z.strictObject({ name: z.string().min(1), ...extra, ...(character ? { character: z.string().min(1).optional() } : {}) });
+  const link = (ctx: C, origin: CallOrigin): { callTs?: number | undefined; turn?: number | undefined } => ({ callTs: origin.dispatchTs, turn: ctx.turn() });
+  return {
+    run_snippet: { ...core.run_snippet, def: { ...core.run_snippet.def, description: PROGRAM_RUN_SNIPPET_DESCRIPTION } },
+    read_file: {
+      def: {
+        name: "read_file",
+        description:
+          "Return one file from your workspace, its text exactly as stored. The path is relative to the workspace, e.g. main.ts or lib/combat.ts. " +
+          "offset and limit, both optional, return part of it instead: limit lines from line offset (counted from 1), under one line saying which lines of how many they are.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Workspace-relative path, e.g. main.ts or lib/combat.ts." },
+            offset: { type: "integer", minimum: 1, description: "The first line to return, counted from 1. Omit to start at the first line." },
+            limit: { type: "integer", minimum: 1, description: "How many lines to return. Omit to read to the last line." },
+          },
+          required: ["path"],
+          additionalProperties: false,
+        },
+      },
+      schema: z.strictObject({ path: z.string(), offset: z.coerce.number().int().min(1).optional(), limit: z.coerce.number().int().min(1).optional() }),
+      help: "read_file expects { path: string, offset?: number, limit?: number } — a workspace-relative path such as main.ts or lib/combat.ts, and optionally the first line (from 1) and how many lines.",
+      aliases: { file: "path", file_path: "path", filePath: "path", start: "offset", from: "offset", line: "offset", lines: "limit", count: "limit" },
+      run: async (ctx, args) => {
+        const a = args as { path: string; offset?: number; limit?: number };
+        return answer(ctx.program.readFile(a.path, a.offset === undefined && a.limit === undefined ? undefined : { offset: a.offset, limit: a.limit }));
+      },
+    },
+    write_file: {
+      def: {
+        name: "write_file",
+        description:
+          "Create a file in your workspace, or replace a file's whole content. Paths are relative to the workspace (main.ts, lib/combat.ts); parent directories are created as needed, and .. or an absolute path is refused. " +
+          `Each file holds at most ${PROGRAM_FILE_MAX_CHARS} characters and the workspace at most ${PROGRAM_WORKSPACE_MAX_BYTES} bytes: a write past a limit is refused and nothing is written. ` +
+          "A write that changes main.ts or a file it imports loads your program at once; the result says whether it loaded and which running routines were restarted.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Workspace-relative path, e.g. main.ts or lib/combat.ts." },
+            content: { type: "string", description: "The file's whole new content. May be empty." },
+          },
+          required: ["path", "content"],
+          additionalProperties: false,
+        },
+      },
+      schema: z.strictObject({ path: z.string(), content: z.string() }),
+      help: "write_file expects { path: string, content: string } — a workspace-relative path and the file's whole new content.",
+      aliases: { file: "path", file_path: "path", filePath: "path", text: "content", code: "content" },
+      run: async (ctx, args, origin) => {
+        const { path, content } = args as { path: string; content: string };
+        return answer(await ctx.program.writeFile(path, content, link(ctx, origin)));
+      },
+    },
+    edit_file: {
+      def: {
+        name: "edit_file",
+        description:
+          "Replace exact text in a workspace file: `old` with `new`. `old` must match the file exactly, whitespace included, and appear exactly once unless replaceAll is set; a miss or a second match is refused and nothing changes. " +
+          "An empty `new` deletes the text. Held to write_file's limits, and it loads your program as write_file does.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Workspace-relative path of the file to edit." },
+            old: { type: "string", description: "The exact existing text to replace, copied from the file." },
+            new: { type: "string", description: "What to put in its place. Empty string deletes the text." },
+            replaceAll: { type: "boolean", description: "Replace every occurrence instead of requiring a unique one. Default false." },
+          },
+          required: ["path", "old", "new"],
+          additionalProperties: false,
+        },
+      },
+      // `old` is not `.min(1)`, as in `edit_scratchpad`: an empty `old` is a
+      // refusal with its own sentence, which a schema error would replace.
+      schema: z.strictObject({ path: z.string(), old: z.string(), new: z.string(), replaceAll: booleanish.default(false) }),
+      help:
+        "edit_file expects { path: string, old: string, new: string, replaceAll?: boolean } — the file, the exact existing text to " +
+        "replace, what to put there, and whether to replace every occurrence (default false, which requires old to appear exactly once).",
+      aliases: {
+        file: "path",
+        file_path: "path",
+        filePath: "path",
+        old_string: "old",
+        oldString: "old",
+        old_text: "old",
+        search: "old",
+        new_string: "new",
+        newString: "new",
+        new_text: "new",
+        replace: "new",
+        replace_all: "replaceAll",
+        replaceall: "replaceAll",
+      },
+      run: async (ctx, args, origin) => {
+        const a = args as { path: string; old: string; new: string; replaceAll: boolean };
+        return answer(await ctx.program.editFile(a.path, a.old, a.new, a.replaceAll, link(ctx, origin)));
+      },
+    },
+    delete_file: {
+      def: {
+        name: "delete_file",
+        description:
+          "Delete one file from your workspace. Refused when the file does not exist. Deleting main.ts or a file it imports is a load that fails: the code already running keeps running.",
+        inputSchema: {
+          type: "object",
+          properties: { path: { type: "string", description: "Workspace-relative path of the file to delete." } },
+          required: ["path"],
+          additionalProperties: false,
+        },
+      },
+      schema: z.strictObject({ path: z.string() }),
+      help: "delete_file expects { path: string } — the workspace-relative path of the file to delete.",
+      aliases: { file: "path", file_path: "path", filePath: "path" },
+      run: async (ctx, args, origin) => answer(await ctx.program.deleteFile((args as { path: string }).path, link(ctx, origin))),
+    },
+    start_routine: {
+      def: {
+        name: "start_routine",
+        description:
+          "Run one exported async function of main.ts as a routine. It runs in the sandbox until it returns, throws or is stopped, with no time limit, whether or not you are awake. `args` is passed as its one argument. A name that is already running is refused and says since when. The result lists the state of every routine.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "The export of main.ts to run, e.g. grind." },
+            args: { description: "Passed to the function as its one argument. Any JSON value; omit for none." },
+            ...characterProp,
+          },
+          required: ["name"],
+          additionalProperties: false,
+        },
+      },
+      schema: routineSchema({ args: z.unknown().optional() }),
+      help: `start_routine expects { name: string, args?: any${character ? ", character?: string" : ""} } — the export of main.ts to run, and the one argument it is called with.`,
+      aliases: { routine: "name", function: "name", fn: "name", arguments: "args", arg: "args", params: "args" },
+      run: async (ctx, args, origin) => {
+        const a = args as { name: string; args?: unknown; character?: string };
+        return answer(await ctx.program.startRoutine({ name: a.name, ...(a.args !== undefined ? { args: a.args } : {}), character: a.character }, link(ctx, origin)));
+      },
+    },
+    stop_routine: {
+      def: {
+        name: "stop_routine",
+        description:
+          "Stop a running routine: its signal is aborted, so its pending sdk waits reject and a move it has in flight is stopped. The result lists the state of every routine.",
+        inputSchema: {
+          type: "object",
+          properties: { name: { type: "string", description: "The routine to stop, by the name it was started under." }, ...characterProp },
+          required: ["name"],
+          additionalProperties: false,
+        },
+      },
+      schema: routineSchema({}),
+      help: `stop_routine expects { name: string${character ? ", character?: string" : ""} } — the routine to stop.`,
+      aliases: { routine: "name", function: "name", fn: "name" },
+      run: async (ctx, args) => {
+        const a = args as { name: string; character?: string };
+        return answer(await ctx.program.stopRoutine({ name: a.name, character: a.character }));
       },
     },
   };
