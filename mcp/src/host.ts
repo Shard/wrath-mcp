@@ -149,6 +149,8 @@ export interface HostOptions {
   owner?: string | undefined;
   /** How leases are taken and given back; absent, with the port secret in the environment. */
   leaser?: Leaser;
+  /** Mints each new character's token at fan-out; absent, random. A hosted worker mints hosted tokens (`hosted/tokens.ts`). */
+  newToken?: () => string;
   /** Where the host's own lines go (stderr for the standalone server). */
   log: (line: string) => void;
   /** A snippet's output, which the standalone server writes to stderr. */
@@ -337,6 +339,7 @@ async function openFanoutHost(o: HostOptions, grant: FanoutGrant): Promise<Opene
     sandbox,
     secrets,
     known,
+    ...(o.newToken !== undefined ? { newToken: o.newToken } : {}),
     ...(o.leaser !== undefined ? { leaser: o.leaser } : {}),
     onChange: (entries) => writeRoster(rosterPath, entries),
     ...(store !== null

@@ -36,6 +36,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { z } from "zod";
 import { openHost, type OpenedHost } from "../host";
 import type { Leaser, LeaseOutcome } from "../module-auth";
+import { newHostedToken } from "./tokens";
 import { RpcPeer } from "./worker-rpc";
 
 export const WORKER_SECRET_ENV = "WRATH_MCP_WORKER_SECRET";
@@ -60,6 +61,8 @@ export const WorkerOpenSchema = z.strictObject({
   owner: z.string().optional(),
   snippetTimeoutMs: z.number().positive().optional(),
   module: z.strictObject({ build: z.string().nullable(), protocol: z.number().nullable() }).nullable().optional(),
+  /** Mint each new character's token as a hosted one (`tokens.ts`), which the gateway's leaser requires. */
+  hostedTokens: z.boolean().optional(),
 });
 export type WorkerOpen = z.infer<typeof WorkerOpenSchema>;
 
@@ -211,11 +214,12 @@ export async function serveWorker(o: ServeWorkerOptions): Promise<ServedWorker> 
       "open",
       greet(async (params) => {
         if (host !== undefined) return { ok: true, already: true };
-        const opts = WorkerOpenSchema.parse(params);
+        const { hostedTokens, ...opts } = WorkerOpenSchema.parse(params);
         unlock = await lockState(opts.dir);
         try {
           host = await (o.openHost ?? openHost)({
             ...opts,
+            ...(hostedTokens === true ? { newToken: () => newHostedToken() } : {}),
             leaser,
             log: (line) => p.notify("log", { line }),
             logSink: () => {},

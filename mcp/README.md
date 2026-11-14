@@ -242,6 +242,16 @@ connects with its key as `Authorization: Bearer <key>`:
 - `<state>/audit/<person>/<day>.jsonl` records who called what: keys tried,
   each request and tool call (by its call id, with the arguments as a size
   and a hash), leases by token fingerprint, refusals and stops. Kept 30 days.
+- Every token a hosted session runs under has a fingerprint starting `0000`
+  (`src/hosted/tokens.ts`), and the gateway refuses a lease for any other, so
+  a deployment can keep those sessions' module audit files (named by
+  fingerprint) as long as the person audit that points at them, without
+  keeping its own sessions' as long.
+- Each credential's session records are pruned past the record retention on
+  a schedule (hourly), not only when its worker next opens. A credential
+  whose grant is removed, disabled or left with no key, and that has had no
+  host for 30 days, loses its whole directory; a live grant keeps its
+  workspace however long it is idle.
 - Both eras of the protocol are served: 2026-07-28's per-request metadata
   and `server/discover`, and the `initialize` handshake of 2025-03-26 to
   2025-11-25, answered without a session.
