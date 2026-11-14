@@ -6,7 +6,7 @@
  * `Unauthorized` the page answers with its sign-in.
  */
 
-import type { NearbyWindow, PositionTrace, RowWire, RowsResponse, SessionListResponse, SessionSummary, StreamNameWire, TraceIndexResponse, TraceSegment } from "../wire";
+import type { MeResponse, NearbyWindow, PositionTrace, RowWire, RowsResponse, SessionListResponse, SessionSummary, StreamNameWire, TraceIndexResponse, TraceSegment } from "../wire";
 
 /** The API refused the request for want of a credential. */
 export class Unauthorized extends Error {
@@ -30,8 +30,16 @@ export interface InspectorClient {
    * closes it. The browser reconnects on its own and resumes where it stopped.
    */
   tail(id: string, stream: StreamNameWire, onRows: (rows: RowWire[]) => void, o?: { fromStart?: boolean }): () => void;
-  /** Present the bearer secret; the bin answers with the cookie every later request carries. */
-  signIn(secret: string): Promise<boolean>;
+  /**
+   * Present a credential, the operator's secret or a hosted grant's key, in
+   * the body; the bin answers with an opaque cookie every later request
+   * carries.
+   */
+  signIn(credential: string): Promise<boolean>;
+  /** Forget the sign-in and its cookie. */
+  signOut(): Promise<void>;
+  /** Who the page is signed in as. */
+  me(): Promise<MeResponse>;
 }
 
 /** A client for the API at `base` (the bin's is `/api`; a host that mounts it elsewhere passes its own). */
@@ -73,9 +81,13 @@ export function createInspectorClient(base = "/api"): InspectorClient {
       };
       return () => es.close();
     },
-    async signIn(secret) {
-      const res = await fetch(`${base}/sign-in`, { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: JSON.stringify({ secret }) });
+    async signIn(credential) {
+      const res = await fetch(`${base}/sign-in`, { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: JSON.stringify({ key: credential }) });
       return res.ok;
     },
+    async signOut() {
+      await fetch(`${base}/sign-out`, { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: "{}" });
+    },
+    me: () => get<MeResponse>(`${base}/me`),
   };
 }

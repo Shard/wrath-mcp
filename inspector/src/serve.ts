@@ -8,9 +8,11 @@
 
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, normalize, resolve, sep } from "node:path";
+import type { GrantSet, GrantSource } from "@wrathbench/mcp/hosted/grants-read";
 import { createInspectorApi } from "./api";
-import { SESSION_COOKIE, bearerScope, bindRefusal, isLoopbackHost, isSecret } from "./auth";
+import { bindRefusal, inspectorAuth, isLoopbackHost } from "./auth";
 import type { SessionSource } from "./source";
+import type { MeResponse } from "./wire";
 
 /** Where the page is built to, beside this package's sources. */
 export const PAGE_DIR = resolve(import.meta.dir, "..", "dist");
@@ -19,8 +21,14 @@ export interface InspectorServerOptions {
   source: SessionSource;
   host?: string;
   port?: number;
-  /** The bearer secret; required unless `host` is loopback. */
+  /** The operator's bearer secret; required unless `host` is loopback or there are grants. */
   secret?: string;
+  /**
+   * The hosted grants (`@wrathbench/mcp/hosted/grants-read`): a person signs
+   * in with their key and sees their credentials' sessions. Given grants, no
+   * request is anonymous, on loopback too.
+   */
+  grants?: GrantSource & { fresh?(): GrantSet };
   /** The built page; defaults to `PAGE_DIR`. */
   pageDir?: string;
   /**
@@ -59,8 +67,14 @@ function staticFile(root: string, path: string): Response | null {
 
 /** The request handler, without a socket: what `serveInspector` binds, and what a test calls. */
 export function inspectorHandler(o: Omit<InspectorServerOptions, "port">): (req: Request) => Promise<Response> {
-  const secure = o.host !== undefined && !isLoopbackHost(o.host);
-  const scope = bearerScope(o.secret);
+  // Secure over TLS, and off loopback, where a proxy in front may be what speaks TLS.
+  const offLoopback = o.host !== undefined && !isLoopbackHost(o.host);
+  const auth = inspectorAuth({
+    ...(o.secret === undefined ? {} : { secret: o.secret }),
+    ...(o.grants === undefined ? {} : { grants: o.grants }),
+    secureCookie: (url) => offLoopback || url.protocol === "https:",
+  });
+  const scope = auth.scope;
   const api = createInspectorApi(o.source, { base: "/api", scope });
   const tilesDir = o.tilesDir === undefined ? undefined : resolve(o.tilesDir);
   const pageDir = resolve(o.pageDir ?? PAGE_DIR);
@@ -69,24 +83,17 @@ export function inspectorHandler(o: Omit<InspectorServerOptions, "port">): (req:
     const url = new URL(req.url);
 
     /*
-     * The page's sign-in: the secret in a JSON body, answered with an
-     * HttpOnly cookie that carries it, because a browser's EventSource sends
-     * cookies and no header. JSON only, so a form on another site cannot post
-     * it without a preflight this server never grants.
+     * The page's sign-in and sign-out (`auth.ts`): a credential in, an opaque
+     * HttpOnly cookie out, because a browser's EventSource sends cookies and
+     * no header. `me` is who the page is signed in as.
      */
-    if (url.pathname === "/api/sign-in") {
-      if (req.method !== "POST") return new Response("POST only", { status: 405, headers: { allow: "POST" } });
-      if (!(req.headers.get("content-type") ?? "").toLowerCase().startsWith("application/json")) return new Response("JSON only", { status: 415 });
-      let candidate: unknown;
-      try {
-        candidate = ((await req.json()) as { secret?: unknown }).secret;
-      } catch {
-        return new Response("bad body", { status: 400 });
-      }
-      if (o.secret === undefined || o.secret.length === 0) return new Response(null, { status: 204 });
-      if (typeof candidate !== "string" || !isSecret(o.secret, candidate)) return new Response("refused", { status: 401 });
-      const cookie = `${SESSION_COOKIE}=${encodeURIComponent(o.secret)}; HttpOnly; SameSite=Strict; Path=/${secure && url.protocol === "https:" ? "; Secure" : ""}`;
-      return new Response(null, { status: 204, headers: { "set-cookie": cookie } });
+    if (url.pathname === "/api/sign-in") return auth.signIn(req);
+    if (url.pathname === "/api/sign-out") return auth.signOut(req);
+    if (url.pathname === "/api/me") {
+      const who = auth.caller(req);
+      if (who === null) return Response.json({ error: "a bearer credential is required" }, { status: 401, headers: { "www-authenticate": "Bearer", "cache-control": "no-store" } });
+      const body: MeResponse = who.scope.kind === "operator" ? { kind: "operator", signedIn: who.signedIn } : { kind: "user", person: who.scope.person, credentials: [...who.scope.credentials].sort(), signedIn: who.signedIn };
+      return Response.json(body, { headers: { "cache-control": "no-store" } });
     }
 
     const answered = await api(req);
@@ -116,7 +123,7 @@ export function inspectorHandler(o: Omit<InspectorServerOptions, "port">): (req:
 /** Start the inspector. Throws, binding nothing, when the bind needs a secret it was not given. */
 export function serveInspector(o: InspectorServerOptions): ReturnType<typeof Bun.serve> {
   const host = o.host ?? "127.0.0.1";
-  const refusal = bindRefusal(host, o.secret);
+  const refusal = bindRefusal(host, o.secret, { grants: o.grants !== undefined });
   if (refusal !== null) throw new Error(refusal);
   const handler = inspectorHandler({ ...o, host });
   // An SSE tail stays open; the idle timeout must not cut it between frames.

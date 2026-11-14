@@ -96,13 +96,13 @@ describe("the stack boundary", () => {
     expect(checkStackBoundary(root)).toEqual([]);
   });
 
-  test("the inspector takes only the record's read side from the stack, and never the SDK", () => {
+  test("the inspector takes only the read sides of the record and the grants from the stack, and never the SDK", () => {
     const root = tree({
       "inspector/src/bad.ts": 'import { SessionWriter } from "@wrathbench/mcp/record";\nimport { McpServer } from "@wrathbench/mcp";\nimport { connect } from "@wrathbench/sdk";\n',
     });
     expect(checkStackBoundary(root).sort()).toEqual([
-      "inspector/src/bad.ts: imports @wrathbench/mcp/record; the inspector takes only @wrathbench/mcp/record/read from the stack",
-      "inspector/src/bad.ts: imports @wrathbench/mcp; the inspector takes only @wrathbench/mcp/record/read from the stack",
+      "inspector/src/bad.ts: imports @wrathbench/mcp/record; the inspector takes only @wrathbench/mcp/record/read, @wrathbench/mcp/hosted/grants-read from the stack",
+      "inspector/src/bad.ts: imports @wrathbench/mcp; the inspector takes only @wrathbench/mcp/record/read, @wrathbench/mcp/hosted/grants-read from the stack",
       "inspector/src/bad.ts: imports @wrathbench/sdk, which inspector/package.json does not declare",
     ]);
   });
@@ -146,10 +146,28 @@ describe("the stack boundary", () => {
       "inspector/test/fixtures.ts": 'import { writeFileSync } from "node:fs";\nwriteFileSync("x", "");\n',
     });
     expect(checkStackBoundary(root).sort()).toEqual([
-      "inspector/src/cache.ts: calls Bun.write, on the record's read side",
-      "inspector/src/cache.ts: calls fs.writeFile, on the record's read side",
-      "inspector/src/cache.ts: calls fsSync.unlinkSync, on the record's read side",
-      "mcp/src/record/retention.ts: calls rmSync, on the record's read side",
+      "inspector/src/cache.ts: calls Bun.write, on the read side",
+      "inspector/src/cache.ts: calls fs.writeFile, on the read side",
+      "inspector/src/cache.ts: calls fsSync.unlinkSync, on the read side",
+      "mcp/src/record/retention.ts: calls rmSync, on the read side",
+    ]);
+  });
+
+  test("the grants' read side writes nothing either: an entry that loads the writer is caught", () => {
+    const root = tree({
+      "mcp/package.json": JSON.stringify({
+        name: "@wrathbench/mcp",
+        dependencies: { "@wrathbench/sdk": "workspace:*", zod: "4.4.3" },
+        exports: { ".": "./src/index.ts", "./record/read": "./src/record/read.ts", "./hosted/grants-read": "./src/hosted/grants-read.ts" },
+      }),
+      "mcp/src/record/read.ts": "export const SESSION_FORMAT = 1;\n",
+      "mcp/src/hosted/grants-read.ts": 'import { readFileSync } from "node:fs";\nexport { writeGrantsFile } from "./grants";\nexport const read = () => readFileSync("g");\n',
+      "mcp/src/hosted/grants.ts": 'import { renameSync, writeFileSync } from "node:fs";\nexport function writeGrantsFile() { writeFileSync("g.tmp", ""); renameSync("g.tmp", "g"); }\n',
+      "inspector/src/signin.ts": 'import { GrantSet } from "@wrathbench/mcp/hosted/grants-read";\nexport const s = GrantSet;\n',
+    });
+    expect(checkStackBoundary(root).sort()).toEqual([
+      "mcp/src/hosted/grants.ts: calls renameSync, on the read side",
+      "mcp/src/hosted/grants.ts: calls writeFileSync, on the read side",
     ]);
   });
 });

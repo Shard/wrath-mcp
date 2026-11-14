@@ -183,7 +183,13 @@ bun run grants list
   create on an account takes it from whoever holds it. The file is refused
   otherwise, and refused if a grant names `allowGm`: GM use is never hosted.
 - A key is 32 random bytes, printed once; the file keeps its SHA-256 and an
-  id. It is read from `Authorization: Bearer` and nowhere else.
+  id. It is read from `Authorization: Bearer`, or the inspector's sign-in
+  body, and never from a URL. The same key signs its person in to
+  wrath-inspector (`inspector/README.md`, "Hosted: a person's own sessions").
+- The file's reader and `authenticate` are `src/hosted/grants-read.ts`
+  (`@wrathbench/mcp/hosted/grants-read`), which writes nothing, so the
+  inspector can import it; `grants.ts` re-exports it and adds what mints keys
+  and writes the file.
 - The file is written whole, mode 0600, by rename. A gateway reloads it when
   it changes, and a file that does not validate grants nothing until it does.
 - Per-grant `limits` override the defaults (5 requests a second with a burst
@@ -218,7 +224,10 @@ connects with its key as `Authorization: Bearer <key>`:
   it refuses to start without it. Each
   credential gets a host of its own, opened at its first tool call, with its
   state in `<state>/tenants/<credential>/` and its own session store there;
-  its records carry the person as `owner`.
+  its records carry the person as `owner`, for display.
+  `wrath-inspector --hosted-state <state> --grants <file>` reads those
+  stores, a person seeing their own credentials' by where they are, never by
+  `owner`.
 - Every lease is held to the grant by the gateway: the credential's
   accounts, its character count and the file's `globalMaxCharacters`, the
   hourly logins, and never the GM opt-in. Leases are kept in

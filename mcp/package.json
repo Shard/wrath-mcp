@@ -17,6 +17,7 @@
     "./paths": "./src/paths.ts",
     "./tools": "./src/tools.ts",
     "./fanout": "./src/fanout.ts",
+    "./hosted/grants-read": "./src/hosted/grants-read.ts",
     "./record": "./src/record/index.ts",
     "./record/read": "./src/record/read.ts",
     "./record/recorder": "./src/record/recorder.ts"

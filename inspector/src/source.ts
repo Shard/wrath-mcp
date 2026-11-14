@@ -11,29 +11,59 @@
  * those in `readout.ts`, so an implementation never encodes anything.
  *
  * Every read is asynchronous, because a source may be a network away. Every
- * read is also scoped: the operator sees every session and a user sees the
- * sessions they own (wrath-mcp#29, decision 11). Nothing grants a user scope
- * yet, so today every caller is the operator, but a source filters by the
- * scope it is handed, on the listing and on every open, and the API asks a
- * hook for the scope of each request. A session out of scope is not there:
- * it is never listed and never opens.
+ * read is also scoped (wrath-mcp#29): the operator sees every session, and a
+ * user, a person signed in with a hosted grant's key, sees the sessions in
+ * the stores of the credentials they hold. A source filters by the scope it
+ * is handed, on the listing and on every open, and the API asks a hook for
+ * the scope of each request. A session out of scope is not there: it is
+ * never listed and never opens.
+ *
+ * A user is scoped by where a session is, never by what it says. `owner` in
+ * `session.json` is written by the credential's host, which runs the
+ * tenant's code, so a record could claim anyone; it is shown, and grants
+ * nothing. A source that cannot place a session under a credential (a plain
+ * store, a harness's runs) shows a user nothing.
  */
 
 import type { LiveFile, SessionFile, StreamName, StreamRows } from "@wrathbench/mcp/record/read";
 
 /**
- * Who is asking. The operator sees every session; a user, only the sessions
- * whose `owner` (the deployment label a host sets in `session.json`) is theirs.
+ * Who is asking. The operator sees every session. A user is a person signed
+ * in with a hosted grant's key, and sees only the sessions in the stores of
+ * `credentials`, the grant ids they hold now (a gateway keeps each one's at
+ * `<state>/tenants/<credential>/sessions`).
  */
-export type SessionScope = { readonly kind: "operator" } | { readonly kind: "user"; readonly owner: string };
+export type SessionScope = { readonly kind: "operator" } | UserScope;
+
+/** A person's scope: the credentials (grant ids) whose session stores they may read. */
+export interface UserScope {
+  readonly kind: "user";
+  /** Who they are, as the grants name them. For display: it grants nothing. */
+  readonly person: string;
+  readonly credentials: ReadonlySet<string>;
+}
 
 /** The operator's scope: every session. */
 export const OPERATOR: SessionScope = Object.freeze({ kind: "operator" });
 
-/** Whether `scope` may see a session with this `session.json`. A user never sees a session with no owner. */
-export function inScope(session: Pick<SessionFile, "owner"> | null, scope: SessionScope): boolean {
+/**
+ * Whether `scope` may see a session a source knows only by its record: the
+ * operator's alone. A record's labels (`owner`, `group`) are written by
+ * whoever wrote the session and never grant a user anything; a source that
+ * can place a session under a credential asks `credentialInScope`.
+ */
+export function inScope(_session: Pick<SessionFile, "owner"> | null, scope: SessionScope): boolean {
+  return scope.kind === "operator";
+}
+
+/**
+ * Whether `scope` may see a session that lives in `credential`'s store, by
+ * where it is: the operator always, a user when they hold that credential.
+ * Null is a session in no credential's store, the operator's alone.
+ */
+export function credentialInScope(credential: string | null, scope: SessionScope): boolean {
   if (scope.kind === "operator") return true;
-  return session !== null && session.owner !== undefined && session.owner === scope.owner;
+  return credential !== null && scope.credentials.has(credential);
 }
 
 /** One session as a listing names it. */

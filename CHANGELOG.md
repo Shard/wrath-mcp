@@ -26,7 +26,16 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   in `rbac_account_permissions`. A deployment whose sessions send commands on
   purpose opts in; one that never does changes nothing.
 
+- **A browser off loopback signs in to the inspector over TLS.** Its
+  sign-in cookie is now `Secure` whenever the bin is bound off loopback,
+  where it was only over `https:`, so a browser reaching it over plain HTTP
+  (a LAN with no TLS or proxy) drops the cookie and stays at the sign-in.
+  Put TLS in front, directly or by a proxy; a bearer header still works
+  without it.
+
 ### Added
+
+- **The hosted gateway.**### Added
 
 - **The hosted gateway.** `bun run gateway --grants <file> --state <dir>`
   serves the tools over Streamable HTTP (both 2026-07-28 and the
@@ -81,6 +90,22 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   refuses a grant naming `allowGm`, an account in two grants or reserved for
   the operator, and more than 5 characters at once (`mcp/README.md`,
   "Hosted grants").
+- **The inspector's user scope for hosted tenants** (wrath-mcp#29).
+  `wrath-inspector --hosted-state <dir> --grants <file>` reads every
+  credential's session store under a gateway's `tenants/`
+  (`hostedSource(stateDir)`). The operator, with the bearer secret, sees all
+  of it; a person signs in with the same `wmk_…` key their MCP client holds
+  and sees the stores of every credential they hold, by where a session is
+  and never by its record's `owner`, which the credential's host writes. A
+  sign-in is an opaque cookie re-checked against the grants on every
+  request, so a revoked key or a disabled or removed grant loses access at
+  the next one, an open tail included; `POST /api/sign-out` and `GET /api/me`
+  join it. Given grants, no request is anonymous, on loopback too. The
+  grants' read side is a new entry point,
+  `@wrathbench/mcp/hosted/grants-read` (`grants.ts` re-exports it), which the
+  boundary lets the inspector import and holds to writing nothing. A test
+  keeps the inspector's browser code free of HTML sinks (`innerHTML` and its
+  kin), since tenant records are hostile strings.
 - **Several characters for one client (fan-out).** Off unless the operator
   grants it: `--max-characters <n> --accounts <a,b,…>` on the standalone
   server, `SandboxHostOptions.fanout` with a `CharacterRoster` and
@@ -394,6 +419,16 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Changed
 
+- **The inspector's sign-in cookie is an opaque id, not the secret.** It
+  stands for a sign-in the bin holds in memory for at most twelve hours, so
+  a restart signs browsers out, and a browser holding the old cookie signs in
+  once more. It is `Secure` off loopback as well as over TLS. For an
+  embedder: `SessionScope`'s user is `{ kind: "user", person, credentials }`
+  (the grant ids it may read) where it was `{ owner }`; `inScope(session,
+  scope)` keeps its signature and grants a user nothing, since a record's
+  labels are its writer's; `credentialInScope(credential, scope)` is the
+  check a source that places sessions under credentials makes; and
+  `bearerScope` is replaced by `inspectorAuth({ secret, grants })`.
 - **A stun is told apart from a root.** While the unit the client moves
   carries `UNIT_FLAG_STUNNED` (`state.self.stunned` for the character), a
   `move_to` is refused, and a walk ends, with the new status `stunned` where

@@ -93,8 +93,9 @@ scripts/       Repository checks (the stack boundary)
 - The stack imports nothing outside itself but declared dependencies
   (`scripts/boundary.ts`). sdk/ never imports mcp/, and mcp/ reaches the SDK
   through `@wrathbench/sdk` at an exported entry point. inspector/ takes only
-  `@wrathbench/mcp/record/read` from the stack, sdk/ and mcp/ never import it,
-  and the UI's dependencies are declared in inspector/ alone.
+  `@wrathbench/mcp/record/read` and `@wrathbench/mcp/hosted/grants-read` from
+  the stack, sdk/ and mcp/ never import it, and the UI's dependencies are
+  declared in inspector/ alone.
 - A `module/` change cannot be verified here: it ships through a WrathBench
   pin bump and is proven by WrathBench's smoke suite
   ([`infra/smoke/`](https://github.com/Shard/WrathBench/tree/master/infra/smoke))
