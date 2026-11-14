@@ -70,14 +70,21 @@ export interface RoutineRow extends RoutineNote {
 }
 
 /**
+ * What a load was for: a save of the model's, the program brought back
+ * after a restart, or files a harness carried into a new workspace loaded at
+ * its first start (`carried`), when nothing restarted.
+ */
+export type LoadCause = "save" | "restart" | "carried";
+
+/**
  * Something that happened to the model's program. The child's own events
  * (`ProgramEvent`) plus the host's: a successful or failed load, and a
  * restart with what came back.
  */
 export type ProgramFact =
   | ProgramEvent
-  | { kind: "loaded"; ts: number; deploy: number; routines: string[]; restarted: string[]; dropped: string[]; by: "save" | "restart" }
-  | { kind: "load_failed"; ts: number; error: string; running: number | null; by: "save" | "restart" }
+  | { kind: "loaded"; ts: number; deploy: number; routines: string[]; restarted: string[]; dropped: string[]; by: LoadCause }
+  | { kind: "load_failed"; ts: number; error: string; running: number | null; by: LoadCause }
   | {
       kind: "restart";
       ts: number;
@@ -383,7 +390,7 @@ export class ProgramHost {
   }
 
   /** Load version `version` as the program and say what happened. */
-  private async load(version: number, by: "save" | "restart", link?: { callTs?: number | undefined; turn?: number | undefined }): Promise<ProgramAnswer> {
+  private async load(version: number, by: LoadCause, link?: { callTs?: number | undefined; turn?: number | undefined }): Promise<ProgramAnswer> {
     if (by === "save") this.attempted = version;
     let answer: ProgramLoadAnswer;
     try {
@@ -581,7 +588,7 @@ export class ProgramHost {
     const version = this.workspace.snapshot();
     this.attempted = version;
     this.lastGraph = this.workspace.graph();
-    await this.load(version, "restart");
+    await this.load(version, "carried");
   }
 
   /**

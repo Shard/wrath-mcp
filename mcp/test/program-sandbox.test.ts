@@ -4,7 +4,7 @@
  * restart brings back, and who is told what.
  */
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { leaseSessionSecret } from "../src/module-auth";
@@ -500,7 +500,7 @@ describe("what a restart brings back", () => {
     cpSync(join(first.dir, "program", "files"), join(dir, "program", "files"), { recursive: true });
     const next = await rig({ dir, stub: first.stub });
     await next.host.start();
-    expect(next.facts.find((f) => f.kind === "loaded")).toMatchObject({ deploy: 1, by: "restart", routines: ["idle"], restarted: [] });
+    expect(next.facts.find((f) => f.kind === "loaded")).toMatchObject({ deploy: 1, by: "carried", routines: ["idle"], restarted: [] });
     expect(next.facts.some((f) => f.kind === "restart")).toBe(false);
     expect(next.host.program!.routines()).toEqual([]);
     expect((await next.host.evalSnippet("memory.started")).value).toBe("1");
@@ -512,6 +512,18 @@ describe("what a restart brings back", () => {
     await again.host.start();
     expect(again.facts.filter((f) => f.kind === "loaded")).toMatchObject([{ deploy: 1, by: "restart" }]);
   }, 40_000);
+
+  test("carried files that do not load say so as carried, not as a restart, and start nothing", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wrathbench-mcp-program-carried-bad-"));
+    dirs.push(dir);
+    mkdirSync(join(dir, "program", "files"), { recursive: true });
+    writeFileSync(join(dir, "program", "files", "main.ts"), "export async function idle( {\n");
+    const r = await rig({ dir });
+    await r.host.start();
+    expect(r.facts.find((f) => f.kind === "load_failed")).toMatchObject({ by: "carried", running: null });
+    expect(r.facts.some((f) => f.kind === "restart" || f.kind === "loaded")).toBe(false);
+    expect(r.host.program!.deploy).toBeNull();
+  }, 30_000);
 
   test("an empty workspace's first start loads nothing", async () => {
     const r = await rig();

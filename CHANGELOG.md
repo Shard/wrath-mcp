@@ -47,7 +47,8 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   program"). Without the option nothing a model is served changes. A
   workspace a harness filled before the first start (files carried over from
   another run, `memory.json` among them) is loaded at that start, starting no
-  routine.
+  routine; its `loaded` or `load_failed` fact says `by: "carried"`, since
+  nothing restarted.
 - **A program at fan-out.** One workspace and one program for a client
   granted several characters, with routines per character:
   `programTools(render, { characters: true })` beside
