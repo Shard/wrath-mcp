@@ -28,6 +28,27 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Added
 
+- **The module limits what a caller can make the worldserver hold.** Ahead of
+  callers that hold only a lease secret and are not trusted (wrath-mcp#43,
+  wrath-mcp#29). Per lease: a request rate (`429 rate_limited`;
+  `WrathBench.ActionRate`, off by default, 20 a second with
+  `WrathBench.ActionBurst` 40 for a hosted world) over
+  `POST /action`, `POST /session`, `DELETE /session` and the `/events`
+  upgrade, and concurrent `/events` subscribers (`429 subscriber_limit`;
+  `WrathBench.EventsSubscribersPerToken` 4); the port secret is exempt from
+  both. On the module: leases held (`429 lease_limit`; `WrathBench.MaxLeases`
+  1024), connections (`WrathBench.MaxConnections` 4096,
+  `WrathBench.MaxConnectionsPerPeer` off), a request head over 8 KiB (`431
+  header_too_large`) or body over 64 KiB (`413 body_too_large`, was a silent
+  close at 1 MiB), a 30-second deadline on a reply, a subscriber left more
+  than `WrathBench.EventsBacklogBytes` (16 MiB) behind or sending a frame
+  over 4 KiB (closed), and TCP keepalive on subscriber sockets. A `move_to`
+  or `face` field that is NaN is `400 invalid_position`. The loopback
+  `GET /health` adds `leases` and `limits`. Nothing a session observes or an
+  action does changes. The request rate ships off; the other defaults are
+  several times what a client sends: a deployment running more than 1024 characters at once, or more
+  than 4 lease-secret subscribers on one token, raises the setting
+  (`module/PROTOCOL.md`, "Limits").
 - **Leasing through an interface.** `Leaser` (`@wrathbench/mcp`): the
   roster (`CharacterRosterOptions.leaser`) and the standalone server's
   shutdown take, end and give back leases through it, so a host that must

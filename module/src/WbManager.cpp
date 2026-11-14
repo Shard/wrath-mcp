@@ -226,6 +226,17 @@ namespace WrathBench
         std::string secret = sConfigMgr->GetOption<std::string>("WrathBench.Secret", "");
         _auditDir = sConfigMgr->GetOption<std::string>("WrathBench.AuditDir", "/azerothcore/env/dist/logs/wrathbench");
 
+        // The module's own protection (mod_wrathbench.conf.dist): the three
+        // the server takes at Start(), and the per-lease caps, which a
+        // `.reload config` re-applies.
+        _httpLimits.maxConnections = sConfigMgr->GetOption<uint32>("WrathBench.MaxConnections", 4096);
+        _httpLimits.maxConnectionsPerPeer = sConfigMgr->GetOption<uint32>("WrathBench.MaxConnectionsPerPeer", 0);
+        _httpLimits.eventsBacklogBytes = sConfigMgr->GetOption<uint32>("WrathBench.EventsBacklogBytes", 16u * 1024 * 1024);
+        _actionRate = sConfigMgr->GetOption<uint32>("WrathBench.ActionRate", 0);
+        _actionBurst = sConfigMgr->GetOption<uint32>("WrathBench.ActionBurst", 40);
+        _eventsSubscribersMax = sConfigMgr->GetOption<uint32>("WrathBench.EventsSubscribersPerToken", 4);
+        _leasesMax = sConfigMgr->GetOption<uint32>("WrathBench.MaxLeases", 1024);
+
         // Account allowlist: the accounts this module serves at all. Comma
         // separated; defaults to the single default account, so an unset
         // option behaves as before. Built into a local first: Configure()
@@ -340,7 +351,7 @@ namespace WrathBench
             return;
         }
 
-        _http = std::make_unique<HttpServer>(_bindAddress, _port, this, _threads);
+        _http = std::make_unique<HttpServer>(_bindAddress, _port, this, _threads, _httpLimits);
         try
         {
             _http->Start();
@@ -355,10 +366,18 @@ namespace WrathBench
     void Manager::Stop()
     {
         if (_http)
-        {
             _http->Stop();
-            _http.reset();
+        {
+            // The subscriber connections go before the server does: each
+            // owns a socket of the server's io_context, and a socket must
+            // not outlive its context. Stop() has joined the workers, so
+            // nothing else holds or touches them.
+            std::lock_guard<std::mutex> lock(_sessMutex);
+            _wsByToken.clear();
+            for (auto& [token, s] : _byToken)
+                s->replayWaiters.clear();
         }
+        _http.reset();
         // Best-effort teardown of any live parked sockets.
         std::lock_guard<std::mutex> lock(_sessMutex);
         for (auto& [token, s] : _byToken)
@@ -366,7 +385,6 @@ namespace WrathBench
                 s->socket->CloseSocket();
         _byToken.clear();
         _byWs.clear();
-        _wsByToken.clear();
     }
 
     // --------------------------------------------------------- task queue
@@ -383,8 +401,20 @@ namespace WrathBench
             std::lock_guard<std::mutex> lock(_taskMutex);
             tasks.swap(_tasks);
         }
+        // A task that throws must not take the worldserver with it: every
+        // one of them runs a request a caller shaped. The request it was
+        // serving times out on its io thread (504); the rest run.
         for (auto& t : tasks)
-            t();
+        {
+            try
+            {
+                t();
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("module", "wrathbench: a world-thread task threw: {}", e.what());
+            }
+        }
 
         int64_t const nowMs = NowMs();
 
@@ -486,15 +516,88 @@ namespace WrathBench
         return Cred::None;
     }
 
-    bool Manager::AuthorizeWs(std::string const& token, std::string const& authorization)
+    bool Manager::TakeRequestToken(std::string const& leaseToken)
+    {
+        uint32_t const rate = _actionRate.load();
+        if (!rate)
+            return true;
+        // A burst below one request would refuse everything.
+        double const burst = std::max<uint32_t>(1, _actionBurst.load());
+        // A steady clock: the wall clock stepping must neither refill a
+        // bucket nor freeze one.
+        int64_t const nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+
+        uint32_t refused = 0;
+        {
+            std::lock_guard<std::mutex> lock(_leaseMutex);
+            auto it = _leases.find(leaseToken);
+            if (it == _leases.end())
+                return true;    // released since it authenticated; the route decides
+            Lease& l = it->second;
+            if (l.bucket < 0.0)
+                l.bucket = burst;
+            else
+                l.bucket = std::min(burst, l.bucket + double(nowMs - l.bucketAtMs) * rate / 1000.0);
+            l.bucketAtMs = nowMs;
+            if (l.bucket >= 1.0)
+            {
+                l.bucket -= 1.0;
+                return true;
+            }
+            // Said at most once in ten seconds per lease, with the count
+            // since: the caller sets the rate of refusals, not of log lines.
+            ++l.limitedSinceLog;
+            if (nowMs - l.limitedLogAtMs < 10000 && l.limitedLogAtMs != 0)
+                return false;
+            refused = l.limitedSinceLog;
+            l.limitedSinceLog = 0;
+            l.limitedLogAtMs = nowMs;
+        }
+        LOG_WARN("module", "wrathbench: {} is over its request rate, {} refused 429 rate_limited "
+            "(WrathBench.ActionRate {}/s, WrathBench.ActionBurst {})", TokenTag(leaseToken), refused, rate, uint32_t(burst));
+        return false;
+    }
+
+    WsAdmit Manager::AuthorizeWs(std::string const& token, std::string const& authorization)
     {
         std::string leaseToken;
         switch (Authenticate(authorization, &leaseToken, nullptr))
         {
-            case Cred::Operator: return true;
-            case Cred::Session:  return !token.empty() && token == leaseToken;
-            default:             return false;
+            case Cred::Operator: return {};
+            case Cred::Session:  break;
+            default:             return {401, "unauthorized"};
         }
+        if (token.empty() || token != leaseToken)
+            return {401, "unauthorized"};
+        // A subscribe by a session that is in world costs the world thread a
+        // state frame (OnWsOpen), so a subscribe draws from the lease's
+        // bucket as an action does: a caller looping on connects is refused
+        // here and not served at the rate it can open sockets.
+        if (!TakeRequestToken(leaseToken))
+            return {429, "rate_limited"};
+        // The token's subscriber cap. Every event is copied to every
+        // subscriber on the world and map threads, so the count is what one
+        // lease can multiply that work and its backlog by.
+        uint32_t const max = _eventsSubscribersMax.load();
+        std::lock_guard<std::mutex> lock(_wsSlotMutex);
+        uint32_t& held = _wsSlots[token];
+        if (max && held >= max)
+        {
+            if (held == 0)
+                _wsSlots.erase(token);
+            return {429, "subscriber_limit"};
+        }
+        ++held;
+        return {0, "", true};
+    }
+
+    void Manager::ReleaseWsSlot(std::string const& token)
+    {
+        std::lock_guard<std::mutex> lock(_wsSlotMutex);
+        auto it = _wsSlots.find(token);
+        if (it != _wsSlots.end() && --it->second == 0)
+            _wsSlots.erase(it);
     }
 
     static HttpReply ErrorReply(int status, char const* code)
@@ -551,6 +654,12 @@ namespace WrathBench
                 Json::Value req = Json::Parse(body);
                 if (req.GetString("token") != leaseToken)
                     return ErrorReply(403, "token_mismatch");
+                // Every one of these routes is work for the world thread, so
+                // each draws from the lease's bucket, `raw` and a request the
+                // route would go on to refuse included; an empty bucket is
+                // refused here, with nothing queued, dispatched or audited.
+                if (!TakeRequestToken(leaseToken))
+                    return ErrorReply(429, "rate_limited");
                 if (method == "POST" && target == "/session")
                 {
                     // Token-to-account and token-to-character binding. The
@@ -623,6 +732,12 @@ namespace WrathBench
         std::string character;
         {
             std::lock_guard<std::mutex> lock(_leaseMutex);
+            // The module never forgets a lease on its own (whoever leases
+            // also releases), so the count is bounded here: a new token past
+            // the cap is refused, a re-lease of a held one never is.
+            uint32_t const max = _leasesMax.load();
+            if (max && _leases.size() >= max && _leases.find(token) == _leases.end())
+                return {429, Json::Writer().Add("ok", false).Add("error", "lease_limit").Add("limit", max).Str()};
             Lease& l = _leases[token];
             if (strcasecmp(l.account.c_str(), account.c_str()) != 0)
                 l.character.clear(); // a token re-leased onto another account starts unbound
@@ -713,6 +828,11 @@ namespace WrathBench
             return {status, w.Str()};
         }
 
+        uint64_t leases;
+        {
+            std::lock_guard<std::mutex> lock(_leaseMutex);
+            leases = _leases.size();
+        }
         uint64_t sessions;
         uint64_t liveDrops = 0;
         {
@@ -738,6 +858,12 @@ namespace WrathBench
         Json::Writer w;
         head(w);
         w.Add("sessions", sessions);
+        w.Add("leases", leases);
+        w.Raw("limits", Json::Writer()
+            .Add("actionRate", _actionRate.load()).Add("actionBurst", _actionBurst.load())
+            .Add("eventsSubscribersPerToken", _eventsSubscribersMax.load()).Add("leases", _leasesMax.load())
+            .Add("connections", _httpLimits.maxConnections).Add("connectionsPerPeer", _httpLimits.maxConnectionsPerPeer)
+            .Add("eventsBacklogBytes", _httpLimits.eventsBacklogBytes).Str());
         w.Add("droppedPackets", _totalDrops.load()); // lifetime
         w.Add("droppedPacketsLive", liveDrops);      // across current sessions
         w.Raw("droppedByOpcode", byOpcode.Str());    // lifetime, top 30 by count
@@ -1195,6 +1321,11 @@ namespace WrathBench
                 return MissingParam(action, "missing_position",
                     !req.Has("x") ? "x" : (!req.Has("y") ? "y" : "z"));
             float x = (float)req.GetDouble("x"), y = (float)req.GetDouble("y"), z = (float)req.GetDouble("z");
+            // Not a number is not a place. No JSON number parses to one, so
+            // only a hand-built body carries it, and it would pass every
+            // range test the planner makes (each compares false).
+            if (std::isnan(x) || std::isnan(y) || std::isnan(z))
+                return MissingParam(action, "invalid_position", std::isnan(x) ? "x" : (std::isnan(y) ? "y" : "z"));
             // Optional: the guid of the unit the point was read from. Only a
             // planning hint (the z of a patrolling NPC is resolved to the
             // ground under it before pathing, see ResolvePath); never a
@@ -1228,6 +1359,9 @@ namespace WrathBench
                 return MissingParam(action, "missing_face_target", "orientation or x,y");
             float o = (float)req.GetDouble("orientation");
             float x = (float)req.GetDouble("x"), y = (float)req.GetDouble("y");
+            if ((hasO && std::isnan(o)) || (hasXY && (std::isnan(x) || std::isnan(y))))
+                return MissingParam(action, "invalid_position",
+                    hasO && std::isnan(o) ? "orientation" : (std::isnan(x) ? "x" : "y"));
             PushTask([this, token, hasO, o, hasXY, x, y, ack]() { DoFace(token, hasO, o, hasXY, x, y, ack); });
         }
         else if (action == "jump")

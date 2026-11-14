@@ -10,6 +10,11 @@
 // hand-rolled builder plus a minimal parser is less total risk than wiring a
 // Boost.JSON link mode into AzerothCore's module build. Not a
 // general JSON library: enough for module/PROTOCOL.md and nothing more.
+//
+// The reader runs on bodies any caller shapes, so it never throws and never
+// recurses: a nested value is skipped by a counting loop and kept as text,
+// whatever its depth, and the server caps a body's size before it gets here
+// (WbHttpServer.cpp).
 
 #ifndef MOD_WRATHBENCH_WBJSON_H
 #define MOD_WRATHBENCH_WBJSON_H
@@ -159,7 +164,20 @@ namespace WrathBench::Json
                             {
                                 // Minimal: decode BMP codepoint to UTF-8. Adequate
                                 // for the ASCII the SDK sends; not a full decoder.
-                                unsigned cp = std::stoul(s.substr(i, 4), nullptr, 16);
+                                // Read digit by digit: std::stoul throws on
+                                // four characters that are not hex, and the
+                                // body is a caller's to shape.
+                                unsigned cp = 0;
+                                for (size_t k = 0; k < 4; ++k)
+                                {
+                                    char const h = s[i + k];
+                                    unsigned d;
+                                    if (h >= '0' && h <= '9') d = unsigned(h - '0');
+                                    else if (h >= 'a' && h <= 'f') d = unsigned(h - 'a') + 10;
+                                    else if (h >= 'A' && h <= 'F') d = unsigned(h - 'A') + 10;
+                                    else return false;
+                                    cp = (cp << 4) | d;
+                                }
                                 i += 4;
                                 if (cp < 0x80) out += char(cp);
                                 else if (cp < 0x800) { out += char(0xC0 | (cp >> 6)); out += char(0x80 | (cp & 0x3F)); }
