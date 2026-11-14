@@ -33,6 +33,11 @@ export interface ActionHintNote {
    * name. Absent at fan-out 1, where there is one client and nothing to tell apart.
    */
   character?: string;
+  /**
+   * Raised by a routine of the model's program (`program.ts`): the routine's
+   * name. Only in a sandbox that hosts a program; `from` is then absent.
+   */
+  routine?: string;
 }
 
 /**
@@ -208,7 +213,131 @@ export type HostToChild =
    * any snippet or event reaches it.
    */
   | { t: "client_cache_seed"; frames: ClientCacheFrame[] }
+  /**
+   * A sandbox that hosts a program (`program.ts`), sent before the host counts
+   * the child ready: the saved memory's JSON (null when none was saved) and
+   * the newest version of the workspace files, which snippets import from.
+   */
+  | { t: "program_init"; memory: string | null; version: number }
+  /** A newer version of the workspace files exists; snippets import from it from now on. */
+  | { t: "program_version"; version: number }
+  /**
+   * Load `main.ts` of version `version` as the program. Answered with an
+   * `rpc_result` whose value is `ProgramLoadAnswer`. On success the routines
+   * that were running are stopped and started again from the top with the
+   * arguments they had, under this message's id.
+   */
+  | { t: "program_load"; id: number; version: number }
+  /**
+   * Run the export `name` of the loaded program as a routine, for `seat` at
+   * fan-out above 1. Its dispatches are logged under this message's id.
+   * `resumed` marks a start the host makes itself after a restart: the
+   * character's stream is reopened first. Answered with an `rpc_result`
+   * whose value is `RoutineAnswer`.
+   */
+  | { t: "routine_start"; id: number; name: string; args?: unknown; seat?: string; resumed?: boolean }
+  /** Stop a running routine. Answered with an `rpc_result` whose value is `RoutineAnswer`. */
+  | { t: "routine_stop"; id: number; name: string; seat?: string }
   | { t: "shutdown" };
+
+// --------------------------------------------------------------- the program
+
+/** How a routine run stands. `interrupted` is the host's: the sandbox went away under it. */
+export type RoutineState = "running" | "returned" | "threw" | "stopped" | "interrupted";
+
+/** A routine's error as the model reads it: the message, and the frames of its own files. */
+export interface ProgramErrorNote {
+  /** The error's name, `TypeError`. */
+  name: string;
+  /** Name and message, rendered as a snippet's error is. */
+  text: string;
+  /** The stack frames in the model's files, innermost first: `at pickTarget (lib/combat.ts:14:22)`. */
+  frames: string[];
+  /** Routine, error name and first workspace frame: what makes two errors the same. */
+  signature: string;
+}
+
+/** One routine run as the child holds it. */
+export interface RoutineNote {
+  name: string;
+  /** The character it runs for, at fan-out above 1. */
+  character?: string;
+  args?: unknown;
+  /** The version of the files it runs. */
+  deploy: number;
+  startedAt: number;
+  state: RoutineState;
+  endedAt?: number;
+  /** The last action it dispatched, and when. */
+  lastAction?: { action: string; ts: number };
+  /** A returned routine's value, rendered and cut short. */
+  value?: string;
+  error?: ProgramErrorNote;
+}
+
+/** Who dispatched a move: a routine by name, or a snippet. */
+export type MoveOwner = { routine: string } | { snippet: true };
+
+/**
+ * A fact about the model's program, pushed to the host as it happens
+ * (`ChildToHost` `program`). `fresh` on an error or a refusal marks the first
+ * occurrence of its signature since the program was last loaded; repeats are
+ * counted and ride the next beat (`ProgramBeat.repeats`).
+ */
+export type ProgramEvent =
+  | { kind: "ended"; ts: number; routine: RoutineNote; fresh?: boolean }
+  | { kind: "restarted"; ts: number; routine: RoutineNote }
+  | { kind: "error"; ts: number; routine?: string; character?: string; deploy: number; error: ProgramErrorNote; fresh: true }
+  | { kind: "refusal"; ts: number; routine: string; character?: string; deploy: number; action: string; status: string; hint: string; signature: string; fresh: true }
+  | { kind: "wake"; ts: number; reason: string; routine?: string; character?: string }
+  | { kind: "preempted"; ts: number; character?: string; by: MoveOwner; of: MoveOwner; to: { x: number; y: number; z: number } };
+
+/** What `program_load` answers. */
+export type ProgramLoadAnswer =
+  | {
+      ok: true;
+      version: number;
+      /** The functions `main.ts` exports, by name: its routines. */
+      routines: string[];
+      /** The routines that were running and were started again on this version. */
+      restarted: RoutineNote[];
+      /** The routines that were running and are no longer exported: stopped. */
+      dropped: RoutineNote[];
+    }
+  | { ok: false; error: string };
+
+/** What `routine_start` and `routine_stop` answer: the refusal, or the routine as it now stands. */
+/**
+ * A routine call's answer. `restartedBy` on a start: the routine was already
+ * running, restarted from the top by the load of that deploy (a save), with
+ * the same arguments, so the start is that run. `ended` on a stop: the run
+ * had already ended by itself or been stopped, and `routine` is how it ended.
+ */
+export type RoutineAnswer = { ok: true; routine: RoutineNote; restartedBy?: number; ended?: true } | { ok: false; error: string };
+
+/** A line a routine printed. `count` above 1 folds consecutive repeats. */
+export interface ProgramLogLine {
+  ts: number;
+  level: LogEntry["level"];
+  routine: string;
+  character?: string;
+  text: string;
+  count: number;
+}
+
+/**
+ * The program's heartbeat (`rpc` `program_beat`): answered synchronously, so
+ * an answer is also proof the child's event loop turns. It drains what is too
+ * frequent to push: each running routine's last action, the repeats of error
+ * and refusal signatures since the last beat, and the routines' console.
+ */
+export interface ProgramBeat {
+  /** The loaded version, or null with no program loaded. */
+  deploy: number | null;
+  routines: RoutineNote[];
+  repeats: { signature: string; count: number; ts: number }[];
+  console: { lines: ProgramLogLine[]; dropped: number };
+}
 
 /** What `seat_open` answers: the character as the server named it. */
 export interface SeatOpened {
@@ -229,6 +358,12 @@ export interface EvalResultMsg {
   value?: string;
   /** Error rendering when ok is false. */
   error?: string;
+  /**
+   * Sentences about what this snippet did to the model's program, in a
+   * sandbox that hosts one: a move of its own that replaced the move a
+   * routine had in flight. Absent everywhere else.
+   */
+  notes?: string[];
   /**
    * A note about the completion value itself, rendered under it. Today the one
    * case is a snippet whose value is a function it never called (the harness
@@ -294,6 +429,10 @@ export type ChildToHost =
    * only: the model reads these answers through its own cache and nowhere else.
    */
   | { t: "client_cache"; frames: ClientCacheFrame[] }
+  /** Facts about the model's program, as they happen (`ProgramEvent`). */
+  | { t: "program"; events: ProgramEvent[] }
+  /** The program's memory changed: its JSON, for the host to save as memory.json. */
+  | { t: "memory"; json: string }
   | { t: "fatal"; error: string };
 
 // host -> child, reply to hostcall

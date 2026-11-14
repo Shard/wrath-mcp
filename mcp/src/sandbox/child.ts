@@ -64,6 +64,25 @@
  * At fan-out 1 none of this exists: there is no `chars`, and the surface above
  * is the whole of it.
  *
+ * ### A program (a host started with `program`)
+ *
+ * The model keeps code in a file workspace rooted at `main.ts`, and every
+ * function `main.ts` exports is a routine the host starts and stops by name
+ * (`program.ts`, `program-host.ts`). This process may read the versions of
+ * those files and nothing else of the workspace; it writes none of it. What
+ * a snippet and a routine see then:
+ *
+ *   memory      one plain-JSON object the host saves as memory.json and hands
+ *               back to a new child
+ *   wake(reason)  a fact for the harness: the model's code asking for it
+ *   signal      a routine's is aborted when it is stopped or restarted, a
+ *               snippet's when it returns as well as when it is abandoned
+ *   import      a snippet may import the workspace's files by relative path
+ *
+ * and the persistence above is gone: a snippet's declarations are its own,
+ * and the timers and listeners a snippet or a routine starts end with it
+ * (`owners.ts`). Without `program` none of this exists.
+ *
  * ### Network posture — stated honestly
  *
  * The module is reachable only through the ambient client's own transport
@@ -109,9 +128,11 @@ import { API_MD_PATH as SDK_API_MD_PATH, isGroupOrWhisperChat, WrathClient, type
 import { callSiteLabel, SNIPPET_URL } from "./call-site";
 import { keepsAnswer, reparseFrame } from "./client-cache";
 import { toJsonSafe } from "../jsonsafe";
-import { compileSnippet } from "./rewrite";
+import { compileOneOff, compileSnippet } from "./rewrite";
+import { HarnessStop, installOwnership, isHarnessStop, Owner, type OwnableEvents, type Ownership } from "./owners";
+import { ENDED_REJECT_DELAY_MS, ProgramRuntime, type RoutineRun } from "./program";
 import { REATTACH_REPLAY_WAIT_MS, REATTACH_STATE_WAIT_MS } from "./reattach-waits";
-import type { ActionBatch, ActionHintNote, ActionNote, ChildToHost, EventSummary, HostToChild, HostcallResult, LogEntry, MoveIntentNote, SeatClosed, SeatOpened } from "./ipc";
+import type { ActionBatch, ActionHintNote, ActionNote, ChildToHost, EventSummary, HostToChild, HostcallResult, LogEntry, MoveIntentNote, MoveOwner, SeatClosed, SeatOpened } from "./ipc";
 
 import { SessionRecorder, type RecordedMove } from "../record/recorder";
 
@@ -139,6 +160,14 @@ const RECORD = process.env["WRATHBENCH_RECORD"] === "1";
 // always was; above 1 every client is built at `seat_open` and none from here.
 const MAX_CHARACTERS = Number(process.env["WRATHBENCH_MAX_CHARACTERS"] ?? "1");
 const MULTI = Number.isInteger(MAX_CHARACTERS) && MAX_CHARACTERS > 1;
+// A sandbox that hosts a program (`program.ts`): the directory the versions of
+// the model's files live in, set by the host only when it was asked for a
+// program and absent otherwise, where everything below that reads it is off
+// and this child is the snippet sandbox it always was. Held here and struck
+// from the environment before any snippet runs: the path names the run.
+const PROGRAM_ENV = process.env["WRATHBENCH_PROGRAM"];
+const PROGRAM_ROOT = PROGRAM_ENV !== undefined && PROGRAM_ENV.length > 0 ? PROGRAM_ENV.replace(/\/+$/, "") : undefined;
+delete process.env["WRATHBENCH_PROGRAM"];
 const SECRET_ENV = process.env["WRATHBENCH_SECRET"];
 const SECRET = SECRET_ENV !== undefined && SECRET_ENV.length > 0 ? SECRET_ENV : undefined;
 // Read once, above, into the one client this process will build — then struck
@@ -261,7 +290,12 @@ interface Seat {
   recorder: SessionRecorder | null;
   extensions: SandboxChildExtension[];
   clientCacheForwarded: boolean;
+  /** With a program: the SDK's hint tally as harvested once a second, until a tool result drains it (`harvestHints`). */
+  held?: SdkHint[];
 }
+
+/** A hint as the SDK's tally hands it over. */
+type SdkHint = ReturnType<WrathClient["drainActionHints"]>[number];
 
 /** The seats by character name, at fan-out above 1. */
 const seats = new Map<string, Seat>();
@@ -307,7 +341,38 @@ const EARLY_VERDICT_MAX = 8;
  * that dispatched it and the guid it was aimed at. Apart from the note, which
  * rides the state snapshot a tool renders, so nothing here reaches a model.
  */
-const moveRecord = new WeakMap<MoveIntentNote, { evalId: number | null; guid: string | null }>();
+const moveRecord = new WeakMap<MoveIntentNote, { evalId: number | null; guid: string | null; routine?: RoutineRun<Seat> }>();
+
+/**
+ * With a program: a move is about to replace one still in flight. When a
+ * routine is on either side and the two are not the same run, both sides are
+ * told which replaced which: the program's facts carry it for the next wake,
+ * and a snippet whose move did the replacing reads it in its own result. The
+ * harness reports the clash and holds neither caller.
+ */
+function notePreemption(seat: Seat, prev: MoveIntentNote, to: { x: number; y: number; z: number }): void {
+  if (program === null || prev.status !== null) return;
+  const was = moveRecord.get(prev);
+  const store = evalContext.getStore();
+  const wasRun = was?.routine;
+  const nowRun = store?.routine;
+  if (wasRun === nowRun || (wasRun === undefined && nowRun === undefined)) return;
+  if (wasRun !== undefined && wasRun.ended) return;
+  // The SDK's own traffic is neither a routine nor a snippet.
+  if ((wasRun === undefined && was?.evalId == null) || (nowRun === undefined && store === undefined)) return;
+  const who = (run: RoutineRun<Seat> | undefined): MoveOwner => (run === undefined ? { snippet: true } : { routine: run.note.name });
+  const character = MULTI ? seat.name : undefined;
+  program.preempted(character, who(nowRun), who(wasRun), to);
+  if (nowRun === undefined && wasRun !== undefined && store !== undefined && evalControllers.has(store.evalId)) {
+    const notes = evalNotes.get(store.evalId) ?? [];
+    const line = `this replaced the move routine ${wasRun.note.name} had in flight${character !== undefined ? ` for ${character}` : ""}`;
+    if (!notes.includes(line)) notes.push(line);
+    evalNotes.set(store.evalId, notes);
+  }
+}
+
+/** With a program: what a snippet in flight did to a routine, for its result (`EvalResultMsg.notes`). */
+const evalNotes = new Map<number, string[]>();
 
 /** Hand the session recorder a move as it stands now: at its dispatch, and again at its verdict. */
 function recordMove(seat: Seat, note: MoveIntentNote): void {
@@ -373,8 +438,10 @@ function noteMoveDispatch(seat: Seat, body: unknown): MoveIntentNote | null {
     ts: Date.now(),
     endedAt: null,
   };
+  if (seat.moveIntent !== null) notePreemption(seat, seat.moveIntent, { x, y, z });
   seat.moveIntent = note;
-  moveRecord.set(note, { evalId: evalContext.getStore()?.evalId ?? null, guid: guid ?? null });
+  const dispatcher = evalContext.getStore();
+  moveRecord.set(note, { evalId: dispatcher?.evalId ?? null, guid: guid ?? null, ...(dispatcher?.routine !== undefined ? { routine: dispatcher.routine } : {}) });
   return note;
 }
 
@@ -475,6 +542,8 @@ function beginAction(seat: Seat, body: Record<string, unknown>): { note: ActionN
   const names = actionNames(seat.client, body);
   if (names !== undefined) note.names = names;
   if (evalId === null && CLIENT_PARITY_ACTIONS.has(action)) note.auto = true;
+  const routine = evalContext.getStore()?.routine;
+  if (routine !== undefined) program?.noteAction(routine, action, note.ts);
   return { note, evalId };
 }
 
@@ -574,6 +643,9 @@ function isActionPost(input: FetchInput, init?: RequestInit): boolean {
  * every host — is not read here.
  */
 const watchedFetchFor = (seat: Seat): typeof fetch => ((input: FetchInput, init?: RequestInit): Promise<Response> => {
+  // With a program: a context that has ended sends nothing more (`endedContext`).
+  const ended = endedContext();
+  if (ended !== undefined) return rejectSlowly(ended) as Promise<Response>;
   let note: MoveIntentNote | null = null;
   let logged: { note: ActionNote; evalId: number | null } | null = null;
   try {
@@ -674,7 +746,12 @@ for (const level of ["log", "info", "warn", "error", "debug"] as const) {
     const text = args
       .map((a) => (typeof a === "string" ? a : Bun.inspect(a, { depth: 4 })))
       .join(" ");
-    pushLog(level, text);
+    // With a program: a routine's lines are its own console, never a snippet's
+    // result, and a line from something that has ended belongs to nobody.
+    const store = program === null ? undefined : evalContext.getStore();
+    if (store?.owner?.closed === true) return;
+    if (store?.routine !== undefined && program !== null) program.logLine(store.routine, level, text.slice(0, LOG_MAX_CHARS));
+    else pushLog(level, text);
     realConsole[level]?.(...args);
   };
 }
@@ -702,20 +779,46 @@ function drainLogs(): LogEntry[] {
 function drainHints(current?: number): ActionHintNote[] {
   const out: ActionHintNote[] = [];
   // Each client tallies its own; above fan-out 1 a line says whose it is.
+  if (program !== null) harvestHints();
   for (const seat of allSeats()) {
-    const mine = drainSeatHints(seat.client, current);
+    const mine = drainSeatHints(seat, current);
     out.push(...(MULTI ? mine.map((h) => ({ ...h, character: seat.name })) : mine));
   }
   return out;
 }
 
-function drainSeatHints(client: WrathClient, current?: number): ActionHintNote[] {
+/**
+ * With a program: move what the SDK tallied into each seat's `held`, and tell
+ * the program of each failure a routine's call earned, so the first of a
+ * signature can wake the model while no tool result is there to carry it.
+ * Run once a second and before every drain; a tool result still delivers
+ * every hint exactly as it does without a program.
+ */
+function harvestHints(): void {
+  for (const seat of allSeats()) {
+    const fresh = seat.client.drainActionHints();
+    if (fresh.length === 0) continue;
+    (seat.held ??= []).push(...fresh);
+    for (const h of fresh) {
+      const routine = h.origin === undefined ? undefined : callSites.get(h.origin)?.routine;
+      if (routine !== undefined) program?.noteRefusal(routine, h);
+    }
+  }
+}
+
+function drainSeatHints(seat: Seat, current?: number): ActionHintNote[] {
+  const client = seat.client;
   const out: ActionHintNote[] = [];
+  const tallied = seat.held !== undefined ? seat.held.splice(0, seat.held.length) : client.drainActionHints();
   // The current snippet's own lines, one per (action, status) as before: its
   // call sites are told apart only for an earlier snippet's code.
   const own = new Map<string, ActionHintNote>();
-  for (const { origin, ...h } of client.drainActionHints()) {
+  for (const { origin, ...h } of tallied) {
     const site = origin === undefined ? undefined : callSites.get(origin);
+    if (site?.routine !== undefined) {
+      out.push({ ...h, routine: site.routine.note.name });
+      continue;
+    }
     const evalId = site?.evalId ?? origin;
     if (evalId !== undefined && evalId !== current) {
       out.push({ ...h, from: site?.label ?? snippetHeads.get(evalId) ?? "" });
@@ -757,7 +860,7 @@ const snippetBodies = new Map<number, string>();
  * two routines one snippet started are tallied, and labelled, apart. Site ids
  * are negative, out of the host's eval-id range.
  */
-const callSites = new Map<number, { evalId: number; label: string }>();
+const callSites = new Map<number, { evalId: number; label: string; routine?: RoutineRun<Seat> }>();
 const callSiteIds = new Map<string, number>();
 const CALL_SITES_MAX = 2048;
 let nextCallSite = -1;
@@ -765,8 +868,18 @@ let nextCallSite = -1;
 const CALL_SITE_STACK_LIMIT = 64;
 
 function callOrigin(): number | undefined {
-  const evalId = evalContext.getStore()?.evalId;
+  const store = evalContext.getStore();
+  const evalId = store?.evalId;
   if (evalId === undefined) return undefined;
+  // A routine of the program is its own site, named as the model named it.
+  const routine = store?.routine;
+  if (routine !== undefined) {
+    if (routine.site === undefined) {
+      routine.site = nextCallSite--;
+      callSites.set(routine.site, { evalId, label: routine.note.name, routine });
+    }
+    return routine.site;
+  }
   const limit = Error.stackTraceLimit;
   Error.stackTraceLimit = CALL_SITE_STACK_LIMIT;
   const stack = new Error().stack ?? "";
@@ -797,7 +910,87 @@ function callOrigin(): number | undefined {
  * is the host's id for it, which the action log groups by: a routine a snippet
  * launched shares that snippet's context, and so its id.
  */
-const evalContext = new AsyncLocalStorage<{ evalId: number; signal: AbortSignal; deadline?: number; timeoutMs?: number; seat?: Seat }>();
+interface EvalStore {
+  evalId: number;
+  signal: AbortSignal;
+  deadline?: number;
+  timeoutMs?: number;
+  seat?: Seat;
+  /** With a program: who owns the timers and listeners started here (`owners.ts`). */
+  owner?: Owner;
+  /** With a program: the routine this context is a run of. */
+  routine?: RoutineRun<Seat>;
+}
+const evalContext = new AsyncLocalStorage<EvalStore>();
+
+// ------------------------------------------------------------ the program
+//
+// Everything a sandbox that hosts a program adds (`program.ts`), and nothing
+// otherwise: `program` and `ownership` are null in a snippet sandbox, and
+// every read of them below is then a branch not taken.
+
+/** A snippet returned: what it started is stopped, and its signal is aborted with this. */
+class SnippetEnded extends HarnessStop {
+  override name = "SnippetEnded";
+}
+
+const ownership: Ownership | null =
+  PROGRAM_ROOT === undefined
+    ? null
+    : installOwnership<EvalStore>({
+        store: () => evalContext.getStore(),
+        ownerOf: (s) => s.owner,
+        run: (s, fn) => evalContext.run(s, fn),
+        onHandlerError: (s, opcode, err) => {
+          if (isHarnessStop(err) || s.owner?.closed === true) return;
+          if (s.routine !== undefined) program?.noteError(s.routine, err);
+          else evalContext.run(s, () => pushLog("error", `[events.on(${JSON.stringify(opcode)}) handler] ${renderError(err)}`));
+        },
+        fallback: () => {
+          const loading = program?.loadingOwner();
+          return loading === undefined ? undefined : { store: { evalId: 0, signal: NEVER_ABORTED, owner: loading.owner }, marker: loading.marker };
+        },
+      });
+const NEVER_ABORTED = new AbortController().signal;
+
+const program: ProgramRuntime<Seat> | null =
+  PROGRAM_ROOT === undefined || ownership === null
+    ? null
+    : new ProgramRuntime<Seat>({
+        root: PROGRAM_ROOT,
+        send: (msg) => send(msg),
+        run: (run, fn) =>
+          evalContext.run({ evalId: run.evalId, signal: run.controller.signal, owner: run.owner, routine: run, ...(run.seat !== null ? { seat: run.seat } : {}) }, fn),
+        ownership,
+        renderError: (err) => renderError(err),
+        seat: (name) => seats.get(name),
+        multi: MULTI,
+        // The socket and its timers are the session's plumbing, never a routine's.
+        connect: (seat) => evalContext.exit(async () => void (await Promise.all((seat !== null ? [seat] : allSeats()).map((s) => connectSeat(s.client))))),
+      });
+
+/**
+ * With a program: the abort reason of the context we are in when that
+ * context has ended and had its moment to unwind: a snippet that returned,
+ * a routine that was stopped, restarted or finished. A `sleep` or a
+ * dispatch from it rejects with the reason, after a pause.
+ */
+function endedContext(): { reason: unknown } | undefined {
+  if (program === null) return undefined;
+  const store = evalContext.getStore();
+  if (store?.routine !== undefined) return program.refused(store.routine) ? { reason: store.signal.reason } : undefined;
+  const ended = store?.owner === undefined ? undefined : endedSnippets.get(store.owner);
+  return ended !== undefined && Date.now() - ended > SNIPPET_UNWIND_GRACE_MS ? { reason: store?.signal.reason } : undefined;
+}
+/** When each finished snippet's owner closed. */
+const endedSnippets = new WeakMap<Owner, number>();
+const SNIPPET_UNWIND_GRACE_MS = 250;
+
+/** Reject after a pause, on a timer nobody owns: a loop that swallows the rejection yields rather than spins. */
+function rejectSlowly(ended: { reason: unknown }): Promise<never> {
+  const real = ownership?.real.setTimeout ?? setTimeout;
+  return new Promise<never>((_, reject) => real(() => reject(ended.reason), ENDED_REJECT_DELAY_MS));
+}
 const currentSignal = (): AbortSignal | undefined => evalContext.getStore()?.signal;
 /** When the host will abandon the snippet we are inside, if it said. */
 const currentDeadline = (): number | undefined => evalContext.getStore()?.deadline;
@@ -856,6 +1049,8 @@ function makeSeat(o: { name: string; token: string; secret: string | undefined; 
     events: { webSocketImpl: RealWebSocket },
   });
   seat.client = client;
+  // With a program: what a snippet or a routine registers on this stream is its own.
+  ownership?.adopt(client.events as unknown as OwnableEvents);
 
   // The module's verdict on a move, whoever issued it: an awaited `moveTo`
   // resolves from the same event, and this sees the ones nothing awaited.
@@ -1168,6 +1363,8 @@ function sleep(ms: number, options?: { wake?: boolean }): Promise<SleepReason> {
     throw new TypeError(`sleep(ms, { wake }) needs a boolean, got ${typeof wakeOpt} — { wake: false } is a pure timer`);
   }
 
+  const ended = endedContext();
+  if (ended !== undefined) return rejectSlowly(ended);
   return new Promise<SleepReason>((resolve, reject) => {
     const signal = currentSignal();
     if (signal?.aborted) {
@@ -1301,7 +1498,11 @@ const ambient: Record<string, unknown> = {
   connect: async (): Promise<void> => {
     // The snippet's character; with none (fan-out above 1), every seat's.
     const seat = currentSeat();
-    await Promise.all((seat !== null ? [seat] : allSeats()).map((s) => connectSeat(s.client)));
+    const open = (): Promise<void[]> => Promise.all((seat !== null ? [seat] : allSeats()).map((s) => connectSeat(s.client)));
+    // With a program the caller owns what it starts, and the socket with its
+    // handshake and reconnect timers is the session's, never the caller's.
+    if (program !== null) await evalContext.exit(open);
+    else await open();
   },
   sleep,
   scratchpad: {
@@ -1321,6 +1522,33 @@ Object.defineProperty(globalThis, "signal", {
   configurable: true,
   enumerable: true,
 });
+
+// With a program: `memory`, the one object the harness saves, as a getter so
+// a snippet can assign its fields or replace it whole; `wake(reason)`; and
+// the resolver a snippet's string-literal `import("./x")` is routed to.
+if (program !== null) {
+  const runtime = program;
+  Object.defineProperty(globalThis, "memory", {
+    get: () => runtime.memory,
+    set: (v: unknown) => {
+      runtime.memory = v;
+    },
+    configurable: true,
+    enumerable: true,
+  });
+  Object.defineProperty(globalThis, "wake", {
+    value: (reason?: unknown): void => runtime.wake(evalContext.getStore()?.routine, reason),
+    configurable: true,
+    enumerable: true,
+    writable: false,
+  });
+  Object.defineProperty(globalThis, "__wrathbench_import__", {
+    value: (specifier: string, options?: ImportCallOptions): Promise<unknown> => runtime.importModule(specifier, options),
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+}
 
 // `sdk`, `state` and `events` are getters over the one client, not values, so a
 // snippet cannot lose the session by overwriting them. A cleanup snippet that
@@ -1416,6 +1644,12 @@ const BIGINT_STRINGIFY_RE = /serialize\s+(a\s+)?BigInt/i;
  *   - JSON.stringify on a bigint — keep the TypeError but name the fix.
  */
 export function renderError(err: unknown): string {
+  const text = renderErrorText(err);
+  if (program === null) return text;
+  return `${program.relative(text)}${program.missingFileNote(err) ?? ""}`;
+}
+
+function renderErrorText(err: unknown): string {
   if (err instanceof AggregateError && Array.isArray(err.errors) && err.errors.length > 0) {
     const subs = err.errors.map((e) => renderBuildMessage(e as { message?: string; position?: BuildPosition }));
     return `${err.name}: ${err.message}\n${subs.map((s) => `  ${s}`).join("\n")}`;
@@ -1437,6 +1671,12 @@ export function renderError(err: unknown): string {
     }
     return `${err.name}: ${err.message}`;
   }
+  // With a program: Bun's resolver rejects a failed import with a
+  // ResolveMessage, which is no Error instance but carries the same two fields.
+  if (program !== null) {
+    const e = err as { name?: unknown; message?: unknown } | null;
+    if (typeof e?.name === "string" && typeof e.message === "string") return `${e.name}: ${e.message}`;
+  }
   return Bun.inspect(err).slice(0, 1_000);
 }
 
@@ -1456,8 +1696,12 @@ async function evaluate(id: number, code: string, deadline?: number, timeoutMs?:
   const controller = new AbortController();
   evalControllers.set(id, controller);
   noteSnippetHead(id, code);
+  // With a program a snippet is a one-off: it owns what it starts, its
+  // declarations are its own, and it may import the workspace's files.
+  const owner = program === null ? undefined : new Owner(`snippet ${id}`);
+  if (owner !== undefined) evalOwners.set(id, owner);
   try {
-    const compiled = compileSnippet(code);
+    const compiled = program === null ? compileSnippet(code) : compileOneOff(code, { root: program.importRoot });
     // Tagged so a stack frame in this snippet's code names it (`callSiteLabel`).
     const tag = `\n//# sourceURL=${SNIPPET_URL}${id}`;
     let fn: ((...args: unknown[]) => Promise<unknown>) | null = null;
@@ -1475,9 +1719,12 @@ async function evaluate(id: number, code: string, deadline?: number, timeoutMs?:
     snippetBodies.set(id, body);
     if (snippetBodies.size > SNIPPET_HEADS_MAX) snippetBodies.delete(snippetBodies.keys().next().value as number);
     const run = fn;
-    const value: unknown = await evalContext.run({ evalId: id, signal: controller.signal, deadline, timeoutMs, ...(seat !== undefined ? { seat } : {}) }, () =>
-      run.call(globalThis),
+    const value: unknown = await evalContext.run(
+      { evalId: id, signal: controller.signal, deadline, timeoutMs, ...(seat !== undefined ? { seat } : {}), ...(owner !== undefined ? { owner } : {}) },
+      () => run.call(globalThis),
     );
+    // What the snippet did to memory is saved before its result exists.
+    program?.saveMemory();
     // A scratchpad write the snippet did not await and the cap refused is this
     // snippet's error; its value still comes back beside it. Collected before
     // the logs are drained, so a log line written while waiting is not lost.
@@ -1497,6 +1744,8 @@ async function evaluate(id: number, code: string, deadline?: number, timeoutMs?:
       durationMs: Date.now() - started,
     };
     if (refused.length > 0) msg.error = refused.map(renderError).join("\n");
+    const notes = evalNotes.get(id);
+    if (notes !== undefined && !controller.signal.aborted) msg.notes = notes;
     if (value !== undefined) msg.value = Bun.inspect(value, { depth: 4 }).slice(0, VALUE_MAX_CHARS);
     // A snippet whose completion value is a function defined a wrapper and then
     // never invoked it, so nothing it wrote actually ran: `north-mini-code`
@@ -1533,6 +1782,7 @@ async function evaluate(id: number, code: string, deadline?: number, timeoutMs?:
     // Not for an abandoned eval: its result is discarded, so its refusals go
     // the background way (`releasePadCalls`, below) and ride the pong.
     const refused = controller.signal.aborted ? [] : await collectPadRefusals(id);
+    program?.saveMemory();
     flushActions(id);
     // An aborted eval's result is discarded host-side; its logs must not go
     // with it — leave them in the buffer for the liveness pong that follows.
@@ -1550,6 +1800,11 @@ async function evaluate(id: number, code: string, deadline?: number, timeoutMs?:
   } finally {
     releasePadCalls(id);
     evalControllers.delete(id);
+    evalNotes.delete(id);
+    evalOwners.delete(id);
+    // A snippet that returned or threw ends here; one the host abandoned is
+    // retired once the pong has carried home what its abort made it print.
+    if (owner !== undefined && !abandonedOwners.has(id)) retireSnippet(owner, controller);
     const settled = abandonUnwindSettled.get(id);
     if (settled !== undefined) {
       abandonUnwindSettled.delete(id);
@@ -1558,10 +1813,24 @@ async function evaluate(id: number, code: string, deadline?: number, timeoutMs?:
   }
 }
 
+/** With a program: the owner of each evaluation in flight, by id. */
+const evalOwners = new Map<number, Owner>();
+/** Owners of evaluations the host abandoned, retired once the pong has carried their last words home. */
+const abandonedOwners = new Map<number, { owner: Owner; controller: AbortController }>();
+
+/** End what a snippet started: abort its signal so its waits settle, then clear its timers and listeners. */
+function retireSnippet(owner: Owner, controller: AbortController): void {
+  if (!controller.signal.aborted) controller.abort(new SnippetEnded("the snippet returned; what it started was stopped"));
+  ownership?.close(owner);
+  endedSnippets.set(owner, Date.now());
+}
+
 /** Host abandoned this eval: fire its signal. Idempotent; unknown ids are ignored. */
 function abortEval(id: number): void {
   const controller = evalControllers.get(id);
   if (controller === undefined) return;
+  const owner = evalOwners.get(id);
+  if (owner !== undefined) abandonedOwners.set(id, { owner, controller });
   evalControllers.delete(id);
   releasePadCalls(id);
   abandonedEval = id;
@@ -1757,6 +2026,11 @@ function stateSnapshot(seat: Seat): unknown {
 /** An rpc by name: the core's three, else an extension's, else the snapshot. */
 function answerRpc(method: string, params: { limit?: number }, seatName?: string): unknown {
   if (method === "action_hints") return drainHints();
+  if (method === "program_beat") {
+    if (program === null) throw new Error("this sandbox hosts no program");
+    harvestHints();
+    return program.beat();
+  }
   if (MULTI && seatName === undefined) return answerForEverySeat(method, params);
   const seat = seatName === undefined ? primary : seats.get(seatName);
   if (seat === null || seat === undefined) throw new Error(`unknown character: ${seatName ?? ""}`);
@@ -1923,11 +2197,36 @@ function handle(msg: HostToChild | HostcallResult): void {
             hints: drainHints(abandoned),
             ...(note !== undefined ? { note } : {}),
           });
+          for (const [abandonedId, a] of abandonedOwners) {
+            abandonedOwners.delete(abandonedId);
+            retireSnippet(a.owner, a.controller);
+          }
         };
         if (unwinding === undefined) pong();
         else void Promise.race([unwinding, Bun.sleep(ABANDON_UNWIND_GRACE_MS)]).then(pong);
       }
       return;
+    case "program_init":
+      program?.init(msg.memory, msg.version);
+      return;
+    case "program_version":
+      if (program !== null && msg.version > program.version) program.version = msg.version;
+      return;
+    case "program_load":
+    case "routine_start":
+    case "routine_stop": {
+      const answer = async (): Promise<unknown> => {
+        if (program === null) throw new Error("this sandbox hosts no program");
+        if (msg.t === "program_load") return program.load(msg.version, msg.id);
+        if (msg.t === "routine_start") return program.start(msg);
+        return program.stop(msg.name, msg.seat);
+      };
+      answer().then(
+        (value) => send({ t: "rpc_result", id: msg.id, ok: true, value }),
+        (err: unknown) => send({ t: "rpc_result", id: msg.id, ok: false, error: err instanceof Error ? err.message : String(err) }),
+      );
+      return;
+    }
     case "rpc": {
       try {
         const value = answerRpc(msg.method, msg.params, msg.seat);
@@ -2077,7 +2376,7 @@ function reportBackgroundError(kind: string, reason: unknown): void {
   if (stat.count === 1 && immediateReports < FAULT_IMMEDIATE_CAP) {
     immediateReports++;
     realConsole.error?.(`[sandbox] ${kind}:`, text);
-    send({ t: "fatal", error: `${kind} (sandbox survived; bindings and routines intact): ${text}` });
+    send({ t: "fatal", error: program !== null ? `${kind} (sandbox survived): ${text}` : `${kind} (sandbox survived; bindings and routines intact): ${text}` });
     lastFaultNoticeAt = now;
     return;
   }
@@ -2087,8 +2386,10 @@ function reportBackgroundError(kind: string, reason: unknown): void {
     stat.escalated = true;
     rollupPending.delete(signature); // the escalation covers the backlog
     const secs = Math.max(1, Math.round((now - stat.windowStart) / 1000));
-    const escalation =
-      `background routine broken: ${signature} has faulted ${stat.count} times in the last ${secs}s. ` +
+    const escalation = program !== null
+      ? `repeated fault: ${signature} has faulted ${stat.count} times in the last ${secs}s. The sandbox is alive; ` +
+        `code a snippet left behind is failing in a tight loop. Further identical faults will only be reported as periodic rollups.`
+      : `background routine broken: ${signature} has faulted ${stat.count} times in the last ${secs}s. ` +
       `The sandbox is alive and your bindings are intact, but a background routine is failing in a tight ` +
       `loop — from your next snippet, stop it: clearInterval any timers you started, set the flags your ` +
       `loops check so they exit, then restart the routine with a try/catch inside it. ` +
@@ -2113,12 +2414,28 @@ function reportBackgroundError(kind: string, reason: unknown): void {
 
 process.on("unhandledRejection", (reason) => {
   if (isHarnessAbandonment(reason)) return;
+  // With a program: the echo of a stop the harness made is the stop working,
+  // and a rejection out of the model's files is one of its program's errors.
+  if (program !== null && (isHarnessStop(reason) || program.claimBackgroundError(reason))) return;
   reportBackgroundError("unhandled promise rejection", reason);
 });
 
 process.on("uncaughtException", (err) => {
+  if (program !== null && (isHarnessStop(err) || program.claimBackgroundError(err))) return;
   reportBackgroundError("uncaught exception", err);
 });
+
+// With a program: once a second, the SDK's hint tally is harvested for new
+// refusal signatures and the memory is saved if it changed.
+if (program !== null && ownership !== null) {
+  const runtime = program;
+  ownership.real
+    .setInterval(() => {
+      harvestHints();
+      runtime.saveMemory();
+    }, 1_000)
+    .unref();
+}
 
 /**
  * Install a harness's extensions (`SandboxChildExtension`), in order, and tell

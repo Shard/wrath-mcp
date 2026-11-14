@@ -111,6 +111,15 @@ and `fanoutTools` (`src/fanout.ts`; `docs/ARCHITECTURE.md`, "Several
 characters"), and words the roll-up and the merged feed its own way through
 `FanoutRender`.
 
+## A program
+
+Off by default. A harness that sets `SandboxHostOptions.program` to a
+`Workspace` gets a sandbox that also runs the model's program: files rooted at
+`main.ts`, routines started and stopped by name, a save that loads at once,
+and a registry that survives a restart (`docs/ARCHITECTURE.md`, "A program").
+It serves `programTools` beside the core tools and reads what happened from
+`SandboxHost.program`. The standalone server does not offer it.
+
 ## GM accounts
 
 Off by default: the module then refuses a GM account (`gm_account`) and any
@@ -149,6 +158,10 @@ the module confirmed it. The SDK's equivalent is
   (`confine.ts`), the IPC shapes, the snippet rewrite and the client cache.
 - `src/tools.ts` — `ToolSet`, the core tools, and the hooks a harness renders
   them with (`CoreToolRender`).
+- `src/workspace.ts`, `src/sandbox/program.ts`, `src/sandbox/program-host.ts`,
+  `src/sandbox/owners.ts` — a program: its files and their versions, the
+  routine runtime in the child, the registry and heartbeat in the host, and
+  who owns what a snippet or a routine starts.
 - `src/fanout.ts` — several characters for one client: the grant, the roster
   of seats, the fan-out tool list and the summaries it serves.
 - `src/record/` — the session record: the format's types, the recorders the

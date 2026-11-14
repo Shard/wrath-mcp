@@ -38,6 +38,13 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   character has its own token, lease and session record, and the inspector
   lists one client's sessions together. Ungranted, nothing a model is served
   changes (`mcp/README.md`, "Several characters").
+- **A program.** Off unless a host asks (`SandboxHostOptions.program` with a
+  `Workspace`, `@wrathbench/mcp/workspace`): a file workspace rooted at
+  `main.ts` whose exported async functions are routines the model starts and
+  stops by name, loaded on save, tracked in a registry that survives a
+  restart, with facts handed to the harness. `programTools` serves the file
+  and routine tools beside the core tools (`docs/ARCHITECTURE.md`, "A
+  program"). Without the option nothing a model is served changes.
 - **Jump.** `sdk.jump()` (in place) and `sdk.jump({ forward: true })` (at the
   run speed along the facing), the `jump` action: `MSG_MOVE_JUMP` with the
   stock client's launch, the arc flown as a client's physics fly it, and
