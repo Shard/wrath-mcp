@@ -121,6 +121,7 @@ exhausted.
 | `stack` | object | `version`, the stack's release, and `commit` when the host knew which commit it ran. |
 | `module` | object or null | `build` and `protocol` from the module's `GET /health`; null when it did not answer. |
 | `owner`, `group` | string, optional | Deployment labels the operator's host sets. Never a harness's ids or configuration. The standalone server sets `group` on every session of a client granted several characters, to one value for that client: the first 16 hex characters of the SHA-256 of the client's own state token, which is no session's. |
+| `world` | string, optional | The world the session played on, for a host that runs more than one worldserver, each over its own characters database. A label, like `owner`: a guid is only unique within one world, so a reader matches characters across sessions only when their `world` is the same. Absent is the host's one world. |
 | `started` | integer | When the session was first opened. |
 | `opened` | integer | When the process now (or last) writing it opened it. |
 | `ended` | integer or null | When it closed. Null while a writer holds it, and left null by a writer that died. |

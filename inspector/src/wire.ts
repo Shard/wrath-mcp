@@ -32,6 +32,7 @@ export interface SessionFileWire {
   module: { build: string | null; protocol: number | null } | null;
   owner?: string;
   group?: string;
+  world?: string;
   started: number;
   opened: number;
   ended: number | null;

@@ -87,6 +87,14 @@ const valid = (dir: string): void => {
 };
 
 describe("a session on disk", () => {
+  test("a host's world label is stated beside its owner, validated, and absent unless set", () => {
+    const labelled = rig({ world: "wabcdefghij" });
+    expect(json<SessionFile>(join(labelled.dir, SESSION_FILE)).world).toBe("wabcdefghij");
+    expect(validateSession(labelled.dir).errors).toEqual([]);
+    const plain = rig({});
+    expect(json<SessionFile>(join(plain.dir, SESSION_FILE))).not.toHaveProperty("world");
+  });
+
   test("opening states the session, and the first drain names its character and writes live.json", () => {
     const { dir, writer, clock } = rig({ owner: "ops", group: "g1" });
     const s = json<SessionFile>(join(dir, SESSION_FILE));
