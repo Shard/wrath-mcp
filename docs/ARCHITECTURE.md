@@ -369,7 +369,9 @@ the code is still the model's.
   child killed for a blocked event loop while no snippet was in flight is the
   exception: the program is to blame, which routine is not knowable, and none
   is started. A heartbeat is what notices that, since no snippet's timeout is
-  there to.
+  there to. A workspace with no registry whose files the harness put there
+  before the first start, carried over from another run with its
+  `memory.json`, is loaded at that start and nothing is started.
 - **Facts, not wording.** Routine ends, the first error or refusal of each
   signature since a load, `wake(reason)`, a move of the model's that replaced
   another of its own, loads and restarts reach a harness as data

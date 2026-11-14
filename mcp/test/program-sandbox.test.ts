@@ -4,7 +4,7 @@
  * restart brings back, and who is told what.
  */
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { leaseSessionSecret } from "../src/module-auth";
@@ -486,6 +486,39 @@ describe("what a restart brings back", () => {
     // The stream was reopened for it: the routine reads a whole cache without a connect() of its own.
     expect((await next.host.evalSnippet("state.self.name")).value).toContain("Thalvorn");
   }, 40_000);
+
+  test("files a harness carried into a new workspace are loaded at the first start, memory.json with them, and nothing is started", async () => {
+    const first = await rig();
+    await first.host.evalSnippet(LOGIN);
+    await first.host.program!.writeFile("main.ts", IDLE);
+    await first.host.program!.startRoutine({ name: "idle" });
+    await until("the first run", async () => (await first.host.evalSnippet("memory.started")).value === "1");
+    await first.host.stop();
+    // A new run's workspace holds the old one's files and memory, and no registry.
+    const dir = mkdtempSync(join(tmpdir(), "wrathbench-mcp-program-carried-"));
+    dirs.push(dir);
+    cpSync(join(first.dir, "program", "files"), join(dir, "program", "files"), { recursive: true });
+    const next = await rig({ dir, stub: first.stub });
+    await next.host.start();
+    expect(next.facts.find((f) => f.kind === "loaded")).toMatchObject({ deploy: 1, by: "restart", routines: ["idle"], restarted: [] });
+    expect(next.facts.some((f) => f.kind === "restart")).toBe(false);
+    expect(next.host.program!.routines()).toEqual([]);
+    expect((await next.host.evalSnippet("memory.started")).value).toBe("1");
+    const started = await next.host.program!.startRoutine({ name: "idle" });
+    expect(started.text).toStartWith("started idle on deploy 1");
+    // A second start in the same process loads nothing more.
+    await next.host.stop();
+    const again = await next.again();
+    await again.host.start();
+    expect(again.facts.filter((f) => f.kind === "loaded")).toMatchObject([{ deploy: 1, by: "restart" }]);
+  }, 40_000);
+
+  test("an empty workspace's first start loads nothing", async () => {
+    const r = await rig();
+    await r.host.start();
+    expect(r.facts.some((f) => f.kind === "loaded" || f.kind === "load_failed")).toBe(false);
+    expect(r.host.program!.deploy).toBeNull();
+  }, 30_000);
 
   test("a child killed for a blocked loop while no snippet ran is the program's: no routine is restarted, and they are named", async () => {
     const { host, facts } = await rig({ beatMs: 150, beatGraceMs: 700 });
