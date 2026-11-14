@@ -53,7 +53,8 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   `programTools(render, { characters: true })` beside
   `fanoutTools(render, fan, { program: true })`, whose `run_snippet` is the
   program's one-off with a `character`. Logging a character out stops the
-  routines started for it. What a routine dispatches is recorded with a
+  routines started for it; in a new process a character's routines start
+  again when its seat opens. What a routine dispatches is recorded with a
   `program` origin naming the routine and its character
   (`docs/SESSION-FORMAT.md`, `calls`).
 - **Jump.** `sdk.jump()` (in place) and `sdk.jump({ forward: true })` (at the

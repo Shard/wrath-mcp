@@ -217,3 +217,71 @@ export async function bare() {
     for (const s of r.store.list()) expect(validateSession(s.dir).errors).toEqual([]);
   }, 40_000);
 });
+
+describe("a program at fan-out across a pause", () => {
+  test("a new process over the same workspace starts each character's routines again once its roster logs it back in", async () => {
+    const root = mkdtempSync(join(tmpdir(), "wrathbench-mcp-program-fanout-resume-"));
+    dirs.push(root);
+    const stub = startStubModule();
+    stubs.push(stub);
+    const open = (facts: ProgramFact[], known?: ReturnType<CharacterRoster["snapshot"]>) => {
+      const host = new SandboxHost({
+        moduleUrl: stub.baseUrl,
+        token: "",
+        scratchpad: new Scratchpad(join(root, "scratchpad.md")),
+        snippetTimeoutMs: 5_000,
+        pingGraceMs: 1_000,
+        fanout: { maxCharacters: 3 },
+        logSink: () => {},
+        program: { workspace: new Workspace(join(root, "program")), onFact: (f) => facts.push(f), beatMs: 200 },
+      });
+      hosts.push(host);
+      const roster = new CharacterRoster({
+        grant: { maxCharacters: 3, accounts: ["ACCA", "ACCB", "ACCC"] },
+        moduleUrl: stub.baseUrl,
+        sandbox: host,
+        secrets: new SecretRedactor(),
+        env: { WRATHBENCH_MODULE_SECRET: STUB_PORT_SECRET },
+        ...(known !== undefined ? { known } : {}),
+      });
+      return { host, roster };
+    };
+    const a = open([]);
+    expect((await a.roster.login({ name: "alfa", race: 1, class: 1 })).ok).toBe(true);
+    expect((await a.roster.login({ name: "bravo", race: 1, class: 1 })).ok).toBe(true);
+    const p = a.host.program!;
+    await p.writeFile(
+      "main.ts",
+      `export async function idle(args) {
+  memory[args.slot] = (memory[args.slot] ?? 0) + 1;
+  while (!signal.aborted) await sleep(50, { wake: false });
+}
+`,
+    );
+    await p.startRoutine({ name: "idle", args: { slot: "a" }, character: "Alfa" });
+    await p.startRoutine({ name: "idle", args: { slot: "b" }, character: "Bravo" });
+    await p.startRoutine({ name: "idle", args: { slot: "none" } });
+    await until("every run", async () => (await a.host.evalSnippet("memory.a + memory.b + memory.none")).value === "3");
+    // The pause: the sandbox stops, then the roster gives its seats back and keeps them for a resume.
+    await a.host.stop();
+    await a.roster.shutdown({ logout: false });
+    expect(p.routines().map((r) => r.state)).toEqual(["running", "running", "running"]);
+
+    const facts: ProgramFact[] = [];
+    const b = open(facts, a.roster.snapshot());
+    expect((await b.roster.resume())).toEqual([]);
+    const q = b.host.program!;
+    expect(q.routines().map((r) => [r.character ?? null, r.state])).toEqual([
+      ["Alfa", "running"],
+      ["Bravo", "running"],
+      [null, "running"],
+    ]);
+    await until("every run again", async () => (await b.host.evalSnippet("memory.a + memory.b + memory.none")).value === "6");
+    // Each character's routines are named as they come back; none is said to be interrupted.
+    const restarts = facts.filter((f): f is Extract<ProgramFact, { kind: "restart" }> => f.kind === "restart");
+    expect(restarts.flatMap((f) => f.restarted.map((r) => `${r.name}${r.character !== undefined ? ` (${r.character})` : ""}`)).sort()).toEqual(["idle", "idle (Alfa)", "idle (Bravo)"]);
+    expect(restarts.flatMap((f) => f.interrupted)).toEqual([]);
+    await b.roster.shutdown({ logout: true });
+  }, 40_000);
+});
+

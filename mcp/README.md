@@ -118,7 +118,10 @@ Off by default. A harness that sets `SandboxHostOptions.program` to a
 `main.ts`, routines started and stopped by name, a save that loads at once,
 and a registry that survives a restart (`docs/ARCHITECTURE.md`, "A program").
 It serves `programTools` beside the core tools and reads what happened from
-`SandboxHost.program`. The standalone server does not offer it.
+`SandboxHost.program`. At fan-out a client has one workspace and one program
+with routines per character: `programTools(render, { characters: true })`
+beside `fanoutTools(render, fan, { program: true })`. The standalone server
+does not offer it.
 
 ## GM accounts
 

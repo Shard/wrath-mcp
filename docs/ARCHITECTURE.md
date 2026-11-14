@@ -392,7 +392,9 @@ the code is still the model's.
   through `chars`. Rows, facts and lines name the character. A harness serves
   them beside `fanoutTools(render, fan, { program: true })`, whose
   `run_snippet` is the one-off with a `character`. Logging a character out
-  stops the routines started for it. What a routine dispatches is recorded
+  stops the routines started for it. In a new process over the same
+  workspace a character's routines start again once its roster logs it back
+  in and its seat opens, not before. What a routine dispatches is recorded
   in the dispatching seat's record under a `program` origin that names the
   routine and its character, so a routine acting through another
   character's client is still known by name.

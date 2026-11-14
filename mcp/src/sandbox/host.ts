@@ -455,7 +455,7 @@ export class SandboxHost {
         isTimeout: (err) => err instanceof SandboxTimeoutError,
         snippetsInFlight: () => this.evalsInFlight.size,
         restartStalled: () => this.restart("its event loop was blocked while no snippet was running, so a routine blocked it"),
-        attached: (character) => character === undefined || this.seats.get(character)?.attached === true,
+        attached: (character) => (character === undefined ? true : this.seats.get(character)?.attached),
         now: () => (this.opts.now ?? Date.now)(),
       });
     }
@@ -730,6 +730,8 @@ export class SandboxHost {
       other.writer?.noteOwn(opened.guid);
       seat.writer?.noteOwn(other.guid);
     }
+    // A new process's routines for this character start once it is in the world again.
+    await this.program?.seatAttached(opened.character);
     return opened;
   }
 
