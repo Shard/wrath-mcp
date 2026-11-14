@@ -35,6 +35,11 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Added
 
+- **Hosted mode for a deployment's own tooling.** Exports
+  `@wrathbench/mcp/hosted/gateway` (`runGateway`, `gatewayMain`),
+  `/hosted/workers`, `/hosted/worker` (`workerMain`, with `--hello-wait-ms`),
+  `/hosted/grants` and `/hosted/grants-cli`, so a deployment can run the
+  gateway with a worker provider of its own.
 - **The hosted gateway.**### Added
 
 - **The hosted gateway.** `bun run gateway --grants <file> --state <dir>`
