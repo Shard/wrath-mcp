@@ -1,0 +1,237 @@
+{
+  "tools": [
+    {
+      "def": {
+        "name": "run_snippet",
+        "description": "Run a TypeScript snippet once in the game sandbox. `sdk`, `state`, `events`, `connect()`, `sleep(ms)`, `scratchpad` (its read(), write() and append() each return a Promise: `await scratchpad.read()`), `memory` and `signal` (aborted when this snippet returns or is abandoned) are ambient, and your workspace files import by relative path. A single expression returns its value. Nothing a snippet declares or starts outlives it; what must keep running is a routine (start_routine).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string",
+              "description": "TypeScript source to evaluate."
+            }
+          },
+          "required": [
+            "code"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "help": "run_snippet expects { code: string } — the TypeScript source to evaluate.",
+      "aliases": {
+        "cmd": "code",
+        "snippet": "code",
+        "source": "code",
+        "script": "code",
+        "ts": "code"
+      }
+    },
+    {
+      "def": {
+        "name": "read_file",
+        "description": "Return one file from your workspace, its text exactly as stored. The path is relative to the workspace, e.g. main.ts or lib/combat.ts. offset and limit, both optional, return part of it instead: limit lines from line offset (counted from 1), under one line saying which lines of how many they are.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Workspace-relative path, e.g. main.ts or lib/combat.ts."
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "The first line to return, counted from 1. Omit to start at the first line."
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "How many lines to return. Omit to read to the last line."
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "help": "read_file expects { path: string, offset?: number, limit?: number } — a workspace-relative path such as main.ts or lib/combat.ts, and optionally the first line (from 1) and how many lines.",
+      "aliases": {
+        "file": "path",
+        "file_path": "path",
+        "filePath": "path",
+        "start": "offset",
+        "from": "offset",
+        "line": "offset",
+        "lines": "limit",
+        "count": "limit"
+      }
+    },
+    {
+      "def": {
+        "name": "write_file",
+        "description": "Create a file in your workspace, or replace a file's whole content. Paths are relative to the workspace (main.ts, lib/combat.ts); parent directories are created as needed, and .. or an absolute path is refused. Each file holds at most 32000 characters and the workspace at most 1048576 bytes: a write past a limit is refused and nothing is written. A write that changes main.ts or a file it imports loads your program at once; the result says whether it loaded and which running routines were restarted.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Workspace-relative path, e.g. main.ts or lib/combat.ts."
+            },
+            "content": {
+              "type": "string",
+              "description": "The file's whole new content. May be empty."
+            }
+          },
+          "required": [
+            "path",
+            "content"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "help": "write_file expects { path: string, content: string } — a workspace-relative path and the file's whole new content.",
+      "aliases": {
+        "file": "path",
+        "file_path": "path",
+        "filePath": "path",
+        "text": "content",
+        "code": "content"
+      }
+    },
+    {
+      "def": {
+        "name": "edit_file",
+        "description": "Replace exact text in a workspace file: `old` with `new`. `old` must match the file exactly, whitespace included, and appear exactly once unless replaceAll is set; a miss or a second match is refused and nothing changes. An empty `new` deletes the text. Held to write_file's limits, and it loads your program as write_file does.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Workspace-relative path of the file to edit."
+            },
+            "old": {
+              "type": "string",
+              "description": "The exact existing text to replace, copied from the file."
+            },
+            "new": {
+              "type": "string",
+              "description": "What to put in its place. Empty string deletes the text."
+            },
+            "replaceAll": {
+              "type": "boolean",
+              "description": "Replace every occurrence instead of requiring a unique one. Default false."
+            }
+          },
+          "required": [
+            "path",
+            "old",
+            "new"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "help": "edit_file expects { path: string, old: string, new: string, replaceAll?: boolean } — the file, the exact existing text to replace, what to put there, and whether to replace every occurrence (default false, which requires old to appear exactly once).",
+      "aliases": {
+        "file": "path",
+        "file_path": "path",
+        "filePath": "path",
+        "old_string": "old",
+        "oldString": "old",
+        "old_text": "old",
+        "search": "old",
+        "new_string": "new",
+        "newString": "new",
+        "new_text": "new",
+        "replace": "new",
+        "replace_all": "replaceAll",
+        "replaceall": "replaceAll"
+      }
+    },
+    {
+      "def": {
+        "name": "delete_file",
+        "description": "Delete one file from your workspace. Refused when the file does not exist. Deleting main.ts or a file it imports is a load that fails: the code already running keeps running.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Workspace-relative path of the file to delete."
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "help": "delete_file expects { path: string } — the workspace-relative path of the file to delete.",
+      "aliases": {
+        "file": "path",
+        "file_path": "path",
+        "filePath": "path"
+      }
+    },
+    {
+      "def": {
+        "name": "start_routine",
+        "description": "Run one exported async function of main.ts as a routine. It runs in the sandbox until it returns, throws or is stopped, with no time limit, whether or not you are awake. `args` is passed as its one argument. A name that is already running is refused and says since when. The result lists the state of every routine.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "The export of main.ts to run, e.g. grind."
+            },
+            "args": {
+              "description": "Passed to the function as its one argument. Any JSON value; omit for none."
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "help": "start_routine expects { name: string, args?: any } — the export of main.ts to run, and the one argument it is called with.",
+      "aliases": {
+        "routine": "name",
+        "function": "name",
+        "fn": "name",
+        "arguments": "args",
+        "arg": "args",
+        "params": "args"
+      }
+    },
+    {
+      "def": {
+        "name": "stop_routine",
+        "description": "Stop a running routine: its signal is aborted, so its pending sdk waits reject and a move it has in flight is stopped. The result lists the state of every routine.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "The routine to stop, by the name it was started under."
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "help": "stop_routine expects { name: string } — the routine to stop.",
+      "aliases": {
+        "routine": "name",
+        "function": "name",
+        "fn": "name"
+      }
+    }
+  ],
+  "routines": "routines:\ngrind running 12m, deploy 7, last action 3s ago\nidle running 1s, deploy 7, no action yet\ntrip returned 1m ago: \"done\"\nheal threw 1h05m ago: TypeError: x is undefined at heal (main.ts:9:3)\nscout interrupted 30s ago: the sandbox was restarted for a blocked event loop while no snippet was running\nwalk stopped 2s ago",
+  "routinesShown": "routines:\ngrind running 12m, deploy 7, last action 3s ago\nidle running 1s, deploy 7, no action yet\ntrip returned 1m ago (value shown before)\nheal threw 1h05m ago: TypeError (shown before)\nscout interrupted 30s ago: the sandbox was restarted for a blocked event loop while no snippet was running\nwalk stopped 2s ago",
+  "noRoutines": "routines: none started",
+  "stateLossRecovery": "The game session was not lost, and your character is where it was. Your files, memory and scratchpad are as they were, and the routines that were running are started again from the top; when a routine was what blocked the sandbox none is, and they are named. In a snippet, run `await connect()` before reading `state`: resubscribing replays your own state and everything in view, and `connect()` returns once that replay has landed."
+}

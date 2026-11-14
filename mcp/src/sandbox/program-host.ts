@@ -126,8 +126,12 @@ export interface ProgramPort {
   snippetsInFlight(): number;
   /** Kill and restart a child whose event loop is blocked. */
   restartStalled(): Promise<void>;
-  /** Whether a character is attached, at fan-out above 1; always true at fan-out 1. */
-  attached(character: string | undefined): boolean;
+  /**
+   * Whether a character is attached, at fan-out above 1; always true at
+   * fan-out 1. Undefined when this host holds no seat for it at all: a new
+   * process whose roster has not logged it back in yet (`seatAttached`).
+   */
+  attached(character: string | undefined): boolean | undefined;
   now(): number;
 }
 
@@ -213,6 +217,8 @@ export class ProgramHost {
   private blame = false;
   /** Whether the child now running has had the program brought back. */
   private stopped = false;
+  /** Routines a resume found running for a character with no seat yet, by character: started when its seat opens (`seatAttached`). */
+  private readonly awaitingSeat = new Map<string, RoutineRow[]>();
 
   constructor(
     private readonly opts: ProgramOptions,
@@ -530,7 +536,15 @@ export class ProgramHost {
         interrupted.push(interrupt(r, "the sandbox was restarted for a blocked event loop while no snippet was running"));
         continue;
       }
-      if (!this.port.attached(r.character)) {
+      const attached = this.port.attached(r.character);
+      if (attached === undefined && r.character !== undefined) {
+        // A new process: the character's seat opens when the roster logs it
+        // back in, and its routines start then. Until then the row says so.
+        this.rows.set(rowKey(r.name, r.character), { ...r, state: "interrupted", endedAt: ts, note: `${r.character} is not logged in` });
+        this.awaitingSeat.set(r.character, [...(this.awaitingSeat.get(r.character) ?? []), r]);
+        continue;
+      }
+      if (attached !== true) {
         interrupted.push(interrupt(r, `${r.character} is not attached`));
         continue;
       }
@@ -550,7 +564,8 @@ export class ProgramHost {
       }
     }
     this.persist();
-    if (wasRunning.length > 0 || blamed) this.fact({ kind: "restart", ts, blamed, restarted, interrupted });
+    // Routines waiting for their character's seat are named when it opens (`seatAttached`).
+    if (restarted.length > 0 || interrupted.length > 0 || blamed) this.fact({ kind: "restart", ts, blamed, restarted, interrupted });
     this.ensureBeat();
   }
 
@@ -567,6 +582,48 @@ export class ProgramHost {
     this.attempted = version;
     this.lastGraph = this.workspace.graph();
     await this.load(version, "restart");
+  }
+
+  /**
+   * A character's seat opened. The routines a resume found running for it
+   * before it had a seat (a new process, its roster logging it back in) are
+   * started again from the top, unless the model has started or stopped
+   * them meanwhile; the restart fact names them. Never throws.
+   */
+  seatAttached(character: string): Promise<void> {
+    const waiting = this.awaitingSeat.get(character);
+    if (waiting === undefined || this.stopped) return Promise.resolve();
+    this.awaitingSeat.delete(character);
+    return this.serial(async () => {
+      const restarted: RoutineRow[] = [];
+      const interrupted: RoutineRow[] = [];
+      for (const r of waiting) {
+        const k = rowKey(r.name, r.character);
+        const now = this.rows.get(k);
+        if (now === undefined || now.state !== "interrupted" || now.startedAt !== r.startedAt) continue;
+        try {
+          const answer = (await this.port.request(
+            { t: "routine_start", name: r.name, ...(r.args !== undefined ? { args: r.args } : {}), seat: character, resumed: true },
+            ROUTINE_RESUME_MS,
+          )) as RoutineAnswer;
+          if (!answer.ok) {
+            const row: RoutineRow = { ...now, note: answer.error };
+            this.rows.set(k, row);
+            interrupted.push(row);
+            continue;
+          }
+          this.rows.set(k, { ...answer.routine });
+          restarted.push({ ...answer.routine });
+        } catch (err) {
+          const row: RoutineRow = { ...now, note: err instanceof Error ? err.message : String(err) };
+          this.rows.set(k, row);
+          interrupted.push(row);
+        }
+      }
+      this.persist();
+      if (restarted.length > 0 || interrupted.length > 0) this.fact({ kind: "restart", ts: this.port.now(), blamed: false, restarted, interrupted });
+      this.ensureBeat();
+    }).catch(() => undefined);
   }
 
   // ------------------------------------------------------------------- beat

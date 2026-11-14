@@ -264,9 +264,13 @@ What the agent asked for and what was sent on its behalf.
 `origin` says what sent something and is left open: an object with a `type`
 string and, when a call launched it, that call's `id` as `call`. The types
 written today are `tool` (a tool call, or what it sent while it ran),
-`routine` (code a call left running after it returned) and `client` (the
-SDK's own traffic outside every call). A reader ignores a type it does not
-know; `program` is reserved.
+`routine` (code a call left running after it returned), `program` (a routine
+of the model's program, in a sandbox that hosts one) and `client` (the SDK's
+own traffic outside every call). A `program` origin also names the routine,
+`routine`, and the character it was started for, `character`, when it was
+started for one; its `call` is the call that started it, or the save that
+restarted it from the top, and is absent for a routine a sandbox restart
+brought back. A reader ignores a type it does not know.
 
 A `result` always has its `call` in the same segment or restated in that
 segment's key. A call whose process died has no result.
@@ -275,10 +279,12 @@ At fan-out a tool call is written to the record of every character it
 concerns, under one `id`: the character it named, or, when it named none (a
 roll-up, the scratchpad, a snippet that reaches several), every character
 logged in at the time. So each session's `calls` holds every call its
-character could have acted under, and an `actions` or `move` row's `call` is
-always a `call` row of the same session. A `call` whose `args` name another
-character is never in this session; one whose `args` name none may be in
-several. An `events` row holds what was served from this character's own
+character could have acted under. An `actions` or `move` row's `call` is a
+`call` row of the same session, except for code run for one character that
+acted through another's client (`chars`): a snippet run for one character,
+or a routine started for one, that dispatched for this one names a call that
+is in the other's session. A `call` whose `args` name another character is
+never in this session; one whose `args` name none may be in several. An `events` row holds what was served from this character's own
 stream.
 
 The stack never learns what drove it, so no row carries a turn number, a run

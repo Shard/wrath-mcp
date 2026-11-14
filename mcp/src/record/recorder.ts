@@ -14,6 +14,7 @@
 import type { EventStream, StateCache } from "@wrathbench/sdk";
 import { EventsRecorder, type EventsDrain } from "./events-recorder";
 import type { NearbyDrain, SessionCharacter, TraceDrain } from "./format";
+import type { ProgramOrigin } from "../sandbox/ipc";
 import { NearbyRecorder } from "./nearby-recorder";
 import { TraceRecorder } from "./trace-recorder";
 
@@ -39,6 +40,8 @@ export interface RecordedMove {
   evalId: number | null;
   /** True when that eval had already returned. */
   routine?: true;
+  /** With a program: the routine of the model's program that dispatched it. */
+  program?: ProgramOrigin;
   moveId: number | null;
   map: number | null;
   x: number;

@@ -23,7 +23,7 @@ import type { Subprocess } from "bun";
 import { ScrubbedStream, SecretRedactor } from "../redact";
 import { overCapText, type Scratchpad } from "../scratchpad";
 import type { ClientCacheStore } from "./client-cache";
-import type { ActionHintNote, ActionNote, ChildToHost, EventSummary, EvalResultMsg, HostToChild, HostcallResult, LogEntry, SeatClosed, SeatOpened } from "./ipc";
+import type { ActionHintNote, ActionNote, ChildToHost, EventSummary, EvalResultMsg, HostToChild, HostcallResult, LogEntry, ProgramOrigin, SeatClosed, SeatOpened } from "./ipc";
 import { RepeatFolder } from "./log-fold";
 import type { RecordDrain } from "../record/recorder";
 import type { DispatchLink, SessionWriter } from "../record/writer";
@@ -75,6 +75,8 @@ export interface ActionsFlush {
   /** Whose client dispatched them, at fan-out above 1: the character's name. */
   character?: string;
   routine?: true;
+  /** With a program: the routine of the model's program that dispatched them. */
+  program?: ProgramOrigin;
   actions: ActionNote[];
   dropped?: Record<string, number>;
 }
@@ -453,7 +455,7 @@ export class SandboxHost {
         isTimeout: (err) => err instanceof SandboxTimeoutError,
         snippetsInFlight: () => this.evalsInFlight.size,
         restartStalled: () => this.restart("its event loop was blocked while no snippet was running, so a routine blocked it"),
-        attached: (character) => character === undefined || this.seats.get(character)?.attached === true,
+        attached: (character) => (character === undefined ? true : this.seats.get(character)?.attached),
         now: () => (this.opts.now ?? Date.now)(),
       });
     }
@@ -728,6 +730,8 @@ export class SandboxHost {
       other.writer?.noteOwn(opened.guid);
       seat.writer?.noteOwn(other.guid);
     }
+    // A new process's routines for this character start once it is in the world again.
+    await this.program?.seatAttached(opened.character);
     return opened;
   }
 
@@ -747,7 +751,7 @@ export class SandboxHost {
         this.opts.pingGraceMs + (o.logout ? 6_000 : 0),
       );
       const drain = (res.value as SeatClosed | undefined)?.drain ?? null;
-      if (drain !== null) seat.writer?.ingest(drain as RecordDrain, (evalId, routine) => this.dispatchLink(evalId, routine));
+      if (drain !== null) seat.writer?.ingest(drain as RecordDrain, (evalId, routine, program) => this.dispatchLink(evalId, routine, program));
     } catch {
       // A child that cannot answer loses the last tick of this seat's record, no more.
     }
@@ -874,7 +878,7 @@ export class SandboxHost {
         for (const b of msg.batches) {
           // The dispatching client's own record: the seat's at fan-out above 1.
           const writer = b.seat !== undefined ? this.seats.get(b.seat)?.writer : this.opts.record?.writer;
-          writer?.actions(this.dispatchLink(b.evalId, b.routine === true), b.actions, b.dropped);
+          writer?.actions(this.dispatchLink(b.evalId, b.routine === true, b.program), b.actions, b.dropped);
           if (sink === undefined) continue;
           const link = b.evalId === null ? undefined : this.evalLinks.get(b.evalId);
           const flush: ActionsFlush = { actions: b.actions };
@@ -882,6 +886,7 @@ export class SandboxHost {
           if (link?.turn !== undefined) flush.turn = link.turn;
           if (link?.callTs !== undefined) flush.callTs = link.callTs;
           if (b.routine === true) flush.routine = true;
+          if (b.program !== undefined) flush.program = b.program;
           if (b.dropped !== undefined) flush.dropped = b.dropped;
           try {
             sink(flush);
@@ -914,9 +919,9 @@ export class SandboxHost {
   }
 
   /** Who dispatched something, for the session record: the call an eval was, when the host still knows. */
-  private dispatchLink(evalId: number | null, routine: boolean): DispatchLink {
+  private dispatchLink(evalId: number | null, routine: boolean, program?: ProgramOrigin): DispatchLink {
     if (evalId === null) return { inCall: false };
-    return { inCall: true, call: this.evalLinks.get(evalId)?.callTs, routine };
+    return { inCall: true, call: this.evalLinks.get(evalId)?.callTs, routine, ...(program !== undefined ? { program } : {}) };
   }
 
   private startRecordTick(): void {
@@ -946,7 +951,7 @@ export class SandboxHost {
         // A child that cannot answer now is drained on the next tick.
         return;
       }
-      writer.ingest(drained, (evalId, routine) => this.dispatchLink(evalId, routine));
+      writer.ingest(drained, (evalId, routine, program) => this.dispatchLink(evalId, routine, program));
     })().finally(() => {
       if (this.recordDraining === p) this.recordDraining = null;
     });
@@ -971,7 +976,7 @@ export class SandboxHost {
       // A seat the child did not answer for (none running, or mid-reattach) still beats its heartbeat.
       for (const seat of this.seats.values()) {
         if (players.length > 0) seat.writer?.notePlayers(players);
-        seat.writer?.ingest(drained[seat.character] ?? null, (evalId, routine) => this.dispatchLink(evalId, routine));
+        seat.writer?.ingest(drained[seat.character] ?? null, (evalId, routine, program) => this.dispatchLink(evalId, routine, program));
       }
     })().finally(() => {
       if (this.recordDraining === p) this.recordDraining = null;
