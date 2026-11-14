@@ -132,9 +132,7 @@ The floor that closes that (`module/PROTOCOL.md`
   succeeds under it binds the character; a later same-token create for another
   is refused, as is one made while a first create naming another is still in
   flight, so creates at once cannot bind the token to a character it does not
-  play (operator, 2026-11-15). A lease may also state its logins an hour, which
-  the module counts over every create its secret makes (PROTOCOL.md,
-  "Limits"). A snippet cannot delete any character — its own included — and
+  play (operator, 2026-11-15). A snippet cannot delete any character — its own included — and
   cannot open a session on any account or character but the one it was
   launched as.
 - **The snippet child can reach the module's port and nothing else it was

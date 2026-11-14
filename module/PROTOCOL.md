@@ -150,7 +150,9 @@ Per lease, refused with `429` and nothing dispatched, queued or audited:
 - **Logins** (`loginsPerHour` on `POST /lease`; no limit when absent or
   `0`). Every `POST /session` the lease's secret makes that passes the
   binding check is a login flow on the world thread, whatever the core then
-  answers, and is counted; one past the limit is
+  answers, and is counted, but for a create of the character the token
+  already has in the world, which is answered from that session (the
+  idempotent create a reattaching consumer makes); one past the limit is
   `429 {"ok":false,"error":"login_limit","limit":<n>}`. Counted in windows
   of an hour from the first login of each. A re-lease keeps the count and
   takes the limit it states. Set by the holder of the port secret, never by

@@ -733,6 +733,16 @@ namespace WrathBench
                     // pass the unbound check (WbLease.h).
                     bool reserved = false;
                     uint64_t epoch = 0;
+                    // A create of the character the token already has in the
+                    // world is answered from that session (DoCreateSession's
+                    // idempotent create, which a reattaching consumer makes):
+                    // no login flow, so no login. The name and account are
+                    // published before the phase, so reading them after it is
+                    // safe here; _sessMutex is let go before _leaseMutex.
+                    bool inWorld = false;
+                    if (auto live = FindByToken(leaseToken))
+                        inWorld = !live->tearingDown.load() && live->phase.load() == BenchSession::P_INWORLD
+                            && strcasecmp(live->charName.c_str(), character.c_str()) == 0;
                     {
                         std::lock_guard<std::mutex> lock(_leaseMutex);
                         auto it = _leases.find(leaseToken);
@@ -744,12 +754,12 @@ namespace WrathBench
                         if (std::string const* bound = l.binding.Conflict(character))
                             return {409, Json::Writer().Add("ok", false).Add("error", "character_bound")
                                 .Add("bound", *bound).Str()};
-                        // Every create admitted is a login flow on the world
-                        // thread, whatever the core then answers, so each
-                        // counts; the operator class is never counted.
+                        // Every other create admitted is a login flow on the
+                        // world thread, whatever the core then answers, so
+                        // each counts; the operator class is never counted.
                         int64_t const nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now().time_since_epoch()).count();
-                        if (!l.logins.Take(nowMs))
+                        if (!inWorld && !l.logins.Take(nowMs))
                             return {429, Json::Writer().Add("ok", false).Add("error", "login_limit")
                                 .Add("limit", l.logins.perHour).Str()};
                         // A create with no name is refused before the world

@@ -102,8 +102,9 @@ namespace WrathBench::LeaseRules
 
     // Logins under one lease, against the per-hour limit its POST /lease
     // stated (0 is off). Every create the lease admits is one, whatever the
-    // core then answers: each is a login flow on the world thread. Counted in
-    // windows of an hour from the first login of each.
+    // core then answers: each is a login flow on the world thread. The caller
+    // does not count a create the module answers from the session already in
+    // the world. Counted in windows of an hour from the first login of each.
     struct LoginCount
     {
         static constexpr int64_t kWindowMs = 3600 * 1000;
