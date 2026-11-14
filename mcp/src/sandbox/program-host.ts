@@ -19,7 +19,9 @@
  *    are started again from the top. The one exception is a child killed for
  *    a blocked event loop while no snippet was in flight: the program is then
  *    to blame, which routine cannot be known, and none is started; their rows
- *    read `interrupted` and the restart fact names them.
+ *    read `interrupted` and the restart fact names them. A workspace with no
+ *    registry whose files a harness put there before the first start (carried
+ *    over from another run) is loaded at that start, and nothing is started.
  *  - The heartbeat. While a routine runs the child is asked for a beat every
  *    few seconds. The answer carries what is too frequent to push (last
  *    actions, repeat counts, the routines' console); no answer means the
@@ -506,7 +508,10 @@ export class ProgramHost {
     const blamed = this.blame;
     this.blame = false;
     const wasRunning = [...this.rows.values()].filter((r) => r.state === "running");
-    if (this.loadedVersion === null) return;
+    if (this.loadedVersion === null) {
+      await this.loadCarried();
+      return;
+    }
     const ts = this.port.now();
     const interrupt = (r: RoutineRow, note: string): RoutineRow => {
       const row: RoutineRow = { ...r, state: "interrupted", endedAt: ts, note };
@@ -547,6 +552,21 @@ export class ProgramHost {
     this.persist();
     if (wasRunning.length > 0 || blamed) this.fact({ kind: "restart", ts, blamed, restarted, interrupted });
     this.ensureBeat();
+  }
+
+  /**
+   * A workspace a harness filled before its first start (files carried over
+   * from another run, `memory.json` among them) and that has never been
+   * loaded: keep its files as a version and load it, starting nothing. A
+   * workspace the model has saved into, or that has a registry, is never
+   * this: its first save to `main.ts` already loaded or tried to.
+   */
+  private async loadCarried(): Promise<void> {
+    if (this.attempted !== 0 || !this.workspace.list().some((f) => f.path === MAIN_PATH)) return;
+    const version = this.workspace.snapshot();
+    this.attempted = version;
+    this.lastGraph = this.workspace.graph();
+    await this.load(version, "restart");
   }
 
   // ------------------------------------------------------------------- beat
