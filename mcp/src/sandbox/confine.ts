@@ -58,13 +58,15 @@
  * filter, as is any syscall of another ABI (x32, i386) than the filter's.
  *
  * Resource limits (`SandboxLimits`, set with `setrlimit` and inherited by the
- * exec): an address-space cap, an optional CPU-time cap, a file-size cap, and
- * no core dumps. The address-space cap is generous because the runtime
- * reserves several GiB of address space it never touches; it bounds a
- * runaway allocation, not the child's ordinary use. The CPU cap is off by
- * default: `RLIMIT_CPU` counts the process's whole life, and a session with
- * no end would reach any finite cap however idle it is. A CPU rate is the
- * deployment's (a container's CPU limit).
+ * exec): a file-size cap and no core dumps always, and an address-space cap
+ * and a CPU-time cap when a host sets them. Both of those are off by default
+ * because either can reach the model: a snippet past the address-space cap
+ * gets an allocation error or a restart where it got memory before, and
+ * `RLIMIT_CPU` counts the process's whole life, so a session with no end
+ * would reach any finite cap however idle it is. An address-space cap must
+ * sit well above the runtime's own reservation (about 6 GiB, 10 GiB at its
+ * peak while starting) or no child starts. Resident memory and a CPU rate are
+ * the deployment's (a container's limits).
  *
  * What none of this covers and this wrapper therefore does not claim: which
  * hosts the allowed TCP port is reached on, and, with a module host to
@@ -321,7 +323,11 @@ export function moduleNeedsDns(moduleUrl: string): boolean {
  * wrapper already inherited. `null` leaves that limit as inherited.
  */
 export interface SandboxLimits {
-  /** `RLIMIT_AS`: the address space, in bytes. Bun reserves about 6.5 GiB at start and peaks near 10 GiB while starting. */
+  /**
+   * `RLIMIT_AS`: the address space, in bytes. Off by default (see the
+   * header). Bun reserves about 6.1 GiB at start and peaks at 10.1 GiB while
+   * starting, so a cap below about 12 GiB stops every child from starting.
+   */
   addressSpaceBytes: number | null;
   /** `RLIMIT_CPU`: CPU seconds over the child's whole life, every thread counted. Off by default (see the header). */
   cpuSeconds: number | null;
@@ -332,13 +338,15 @@ export interface SandboxLimits {
 const GiB = 1024 ** 3;
 
 /**
- * The defaults: far above what a long run uses. A child at fan-out 40 under
- * a synthetic 8,000 frames a second (`test/fixtures/fanout-load.ts`) held
- * 7.1 GiB of address space and 170 MiB resident; a bare one, 6.1 GiB, with a
- * 10.1 GiB peak while starting.
+ * The defaults: only what never reaches a session. The file-size cap is
+ * inert while the ruleset grants no writable file; address space and CPU
+ * time are off. For sizing an address-space cap: a child at fan-out 40
+ * under a synthetic 8,000 frames a second (`test/fixtures/fanout-load.ts`)
+ * held 7.1 GiB of address space and 168 MiB resident; a bare one 6.1 GiB,
+ * with a 10.1 GiB peak while starting.
  */
 export const DEFAULT_SANDBOX_LIMITS: Readonly<SandboxLimits> = Object.freeze({
-  addressSpaceBytes: 16 * GiB,
+  addressSpaceBytes: null,
   cpuSeconds: null,
   fileBytes: 1 * GiB,
 });

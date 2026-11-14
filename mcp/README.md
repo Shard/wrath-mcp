@@ -205,7 +205,10 @@ file names (`src/hosted/gateway-main.ts`; `docs/ARCHITECTURE.md`,
 "Hosted"). `--trusted-local-workers` says every grant is the operator's own
 (below); without it, or a deployment's own worker provider through
 `runGateway`, the entry does not start. `--limit-as`, `--limit-cpu` and
-`--limit-fsize` set each credential's sandbox child's resource limits. A client
+`--limit-fsize` set each credential's sandbox child's resource limits
+(address space and CPU are off by default; an address-space cap below about
+12 GiB stops every child from starting, since Bun reserves 10 GiB while
+starting). A client
 connects with its key as `Authorization: Bearer <key>`:
 
 ```json

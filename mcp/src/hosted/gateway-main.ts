@@ -24,7 +24,9 @@
  * deployment for anyone else calls `runGateway` with its own provider.
  * `--limit-as`, `--limit-cpu` and `--limit-fsize` set every credential's
  * sandbox child's resource limits (`SandboxLimits`; a number, or
- * `unlimited`), each replacing its default.
+ * `unlimited`), each replacing its default; an address-space cap below about
+ * 12 GiB stops every child from starting (the runtime reserves 10 GiB while
+ * it starts).
  *
  * SIGINT or SIGTERM stops every credential's host, logging its characters
  * out and giving their leases back.

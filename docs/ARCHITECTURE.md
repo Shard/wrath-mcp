@@ -343,15 +343,18 @@ operations bypass the filter, is `ENOSYS`. The IPC channel to the host is an
 inherited descriptor and needs none of it.
 
 The wrapper also sets the child's resource limits (`SandboxLimits`,
-`SandboxHostOptions.limits`): an address-space cap of 16 GiB, far above the
-7 GiB a child holds at fan-out 40 (the runtime reserves about 6 GiB it never
-touches, so the cap stops a runaway allocation rather than bounding resident
-memory), a 1 GiB file-size cap (the child can write no file anyway), and no
-core dumps, which would hold the lease secret. A CPU-time cap is available
-and off: it counts the child's whole life, so a session with no end would
-reach any value. A child that reaches a limit dies and restarts as any crash
-does. A CPU rate and resident memory are the deployment's to bound, with a
-container's limits.
+`SandboxHostOptions.limits`): a 1 GiB file-size cap (the child can write no
+file anyway) and no core dumps, which would hold the lease secret. An
+address-space cap and a CPU-time cap are available and off, because either
+could reach the model: a snippet past an address-space cap gets an
+allocation error or a restart where it had memory before, and a CPU-time
+cap counts the child's whole life, so a session with no end would reach any
+value. An address-space cap has to sit well above the runtime's own
+reservation, about 6 GiB and 10 GiB at its peak while starting (a child at
+fan-out 40 holds 7 GiB and under 200 MiB resident), or no child starts. A
+child that reaches a limit dies and restarts as any crash does. Resident
+memory and a CPU rate are the deployment's to bound, with a container's
+limits.
 
 It fails closed: without Landlock TCP rules (Linux 6.7+), on an architecture
 the filter is not written for (x86-64 and arm64 are), or when the kernel

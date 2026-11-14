@@ -155,11 +155,11 @@ describe("seccompProgram", () => {
 });
 
 describe("limits", () => {
-  test("defaults: a generous address space, no CPU cap, a file-size cap; core dumps always off", () => {
-    expect(DEFAULT_SANDBOX_LIMITS).toEqual({ addressSpaceBytes: 16 * 1024 ** 3, cpuSeconds: null, fileBytes: 1024 ** 3 });
+  test("defaults: only what never reaches a session, a file-size cap and no core dumps; address space and CPU off", () => {
+    expect(DEFAULT_SANDBOX_LIMITS).toEqual({ addressSpaceBytes: null, cpuSeconds: null, fileBytes: 1024 ** 3 });
     expect(rlimitPlan(DEFAULT_SANDBOX_LIMITS)).toEqual([
       { resource: RLIMIT.CORE, value: 0 },
-      { resource: RLIMIT.AS, value: 16 * 1024 ** 3 },
+      { resource: RLIMIT.AS, value: null },
       { resource: RLIMIT.CPU, value: null },
       { resource: RLIMIT.FSIZE, value: 1024 ** 3 },
     ]);
@@ -300,16 +300,38 @@ describe("the confined child, module by address", () => {
     });
   });
 
+  test("the only sockets the child holds are the host's three connected stream pairs: stdout, stderr and the IPC channel", async () => {
+    const host = makeHost(moduleUrl);
+    const r = await host.evalSnippet(
+      `const fs = await import("node:fs"); return JSON.stringify(fs.readdirSync("/proc/self/fd").map((fd) => { try { return [Number(fd), fs.readlinkSync("/proc/self/fd/" + fd)]; } catch { return [Number(fd), null]; } }).filter(([, l]) => l !== null));`,
+    );
+    const fds = JSON.parse(unquote(r.value)) as [number, string][];
+    const sockets = fds.filter(([, l]) => l.startsWith("socket:")).map(([fd]) => fd);
+    expect(sockets).toEqual([1, 2, 3]);
+    expect(fds.find(([fd]) => fd === 0)?.[1]).toBe("/dev/null");
+    // Everything else is the runtime's own event loop.
+    for (const [fd, l] of fds) if (fd > 3) expect(l).toMatch(/^anon_inode:|^\/proc\//);
+    // Connected stream sockets: none of them can be pointed at a listener outside.
+    const path = join(tempDir(), "outside.sock");
+    let accepted = 0;
+    const server: Server = createServer(() => accepted++);
+    await new Promise<void>((r) => server.listen(path, r));
+    servers.push(server);
+    const again = await host.evalSnippet(
+      `${LIBC_PROBE} const c = dlopen("libc.so.6", { connect: { args: ["i32", "ptr", "u32"], returns: "i32" } }); const addr = new Uint8Array(110); addr[0] = 1; addr.set(new TextEncoder().encode(${JSON.stringify(path)}), 2); return JSON.stringify([1, 2, 3].map((fd) => c.symbols.connect(fd, addr, 110) === 0 ? "connected" : "errno " + errno()));`,
+    );
+    expect(JSON.parse(unquote(again.value))).toEqual(["errno 106", "errno 106", "errno 106"]); // EISCONN
+    await Bun.sleep(50);
+    expect(accepted).toBe(0);
+  });
+
   test("the limits are the child's own, as set and not raisable; core dumps off", async () => {
     const read = `return (await Bun.file("/proc/self/limits").text()).split("\\n").filter((l) => /^Max (cpu time|file size|core file size|address space)/.test(l)).map((l) => l.trim().split(/\\s{2,}/).slice(0, 3).join("|")).join("\\n");`;
+    // Address space and CPU as the test process has them (unset here, and inherited when unset anywhere).
+    const own = (await Bun.file("/proc/self/limits").text()).split("\n").filter((l) => /^Max (cpu time|address space)/.test(l)).map((l) => l.trim().split(/\s{2,}/).slice(0, 3).join("|"));
     const byDefault = await makeHost(moduleUrl).evalSnippet(read);
-    expect(unquote(byDefault.value).split("\n")).toEqual([
-      "Max cpu time|unlimited|unlimited",
-      `Max file size|${1024 ** 3}|${1024 ** 3}`,
-      "Max core file size|0|0",
-      `Max address space|${16 * 1024 ** 3}|${16 * 1024 ** 3}`,
-    ]);
-    const set = await makeHost(moduleUrl, { limits: { cpuSeconds: 86_400, fileBytes: 4096 } }).evalSnippet(read);
+    expect(unquote(byDefault.value).split("\n")).toEqual([own[0]!, `Max file size|${1024 ** 3}|${1024 ** 3}`, "Max core file size|0|0", own[1]!]);
+    const set = await makeHost(moduleUrl, { limits: { addressSpaceBytes: 16 * 1024 ** 3, cpuSeconds: 86_400, fileBytes: 4096 } }).evalSnippet(read);
     expect(unquote(set.value).split("\n")).toEqual([
       "Max cpu time|86400|86400",
       "Max file size|4096|4096",

@@ -442,10 +442,11 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   (pathname and abstract unix sockets, netlink, raw, packet), SCTP and MPTCP
   are `EACCES`, and io_uring is `ENOSYS`. It also sets resource limits
   (`SandboxLimits`, `SandboxHostOptions.limits`, the gateway's
-  `sandboxLimits` and `--limit-as`/`--limit-cpu`/`--limit-fsize`): 16 GiB of
-  address space, a 1 GiB file size and no core dumps by default, and a CPU
-  cap that is off unless set. Nothing a session legitimately does reaches
-  them. The sandbox now also needs x86-64 or arm64 and a container that
+  `sandboxLimits` and `--limit-as`/`--limit-cpu`/`--limit-fsize`): a 1 GiB
+  file size and no core dumps by default, and address-space and CPU caps that
+  are off unless set (an address-space cap below about 12 GiB stops every
+  child from starting: Bun reserves 6 GiB, 10 GiB while starting). Nothing a
+  session legitimately does reaches the defaults. The sandbox now also needs x86-64 or arm64 and a container that
   permits `prctl(PR_SET_SECCOMP)` (the default profiles do), and refuses to
   start otherwise.
 - **The inspector's sign-in cookie is an opaque id, not the secret.** It
