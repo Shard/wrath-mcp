@@ -515,7 +515,7 @@ namespace WrathBench
         return cred;
     }
 
-    Cred Manager::Authenticate(std::string const& authorization, std::string* leaseToken, Lease* lease) const
+    Cred Manager::Authenticate(std::string const& authorization, std::string* leaseToken) const
     {
         std::string const cred = BearerOf(authorization);
         if (cred.empty())
@@ -531,7 +531,6 @@ namespace WrathBench
             if (SecretEquals(cred, l.secret))
             {
                 if (leaseToken) *leaseToken = token;
-                if (lease) *lease = l;
                 return Cred::Session;
             }
         }
@@ -584,7 +583,7 @@ namespace WrathBench
     WsAdmit Manager::AuthorizeWs(std::string const& token, std::string const& authorization, IHttpPeer& peer)
     {
         std::string leaseToken;
-        switch (Authenticate(authorization, &leaseToken, nullptr))
+        switch (Authenticate(authorization, &leaseToken))
         {
             case Cred::Operator: peer.Admit(""); return {};
             case Cred::Session:  break;
@@ -655,8 +654,7 @@ namespace WrathBench
             // The port secret is the operator class and may do anything; a lease
             // secret is the session class and may only act as its own token.
             std::string leaseToken;
-            Lease lease;
-            Cred const cred = Authenticate(authorization, &leaseToken, &lease);
+            Cred const cred = Authenticate(authorization, &leaseToken);
             if (cred == Cred::None)
             {
                 // And the connection goes: it has no caller behind it that
@@ -676,8 +674,11 @@ namespace WrathBench
                 return refusal;
             }
 
+            // The operator view is the port secret's, wherever it comes
+            // from; a lease secret gets liveness whatever its peer, since on
+            // one host every lease holder is a loopback peer too.
             if (method == "GET" && target == "/health")
-                return HttpHealth(peer.Loopback());
+                return HttpHealth(cred == Cred::Operator);
 
             // Operator-only surfaces: leasing itself, and the character-select
             // utilities that act on an account rather than a session.
@@ -723,41 +724,67 @@ namespace WrathBench
                     // account is the lease's, full stop; the character is bound
                     // by the first create that succeeds and fixed thereafter.
                     std::string const account = req.GetString("account");
-                    if (!account.empty() && strcasecmp(account.c_str(), lease.account.c_str()) != 0)
-                        return ErrorReply(403, "account_not_leased");
                     std::string const character = req.GetString("character");
-                    if (!lease.character.empty() && strcasecmp(character.c_str(), lease.character.c_str()) != 0)
-                        return {409, Json::Writer().Add("ok", false).Add("error", "character_bound")
-                            .Add("bound", lease.character).Str()};
-                    forcedAccount = lease.account;
-                    // The GM opt-in likewise: the lease's, whatever the body
-                    // says. Only the port secret's holder sets it, so the
-                    // snippet a lease secret is handed to can never raise it.
-                    forcedAllowGm = lease.allowGm;
+                    // The character check, the login count and the hold on
+                    // the name are one step under the lease's lock, on the
+                    // lease as it is now rather than the copy authentication
+                    // took: two creates that overlap see each other, so two
+                    // first creates naming different characters cannot both
+                    // pass the unbound check (WbLease.h).
+                    bool reserved = false;
+                    uint64_t epoch = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(_leaseMutex);
+                        auto it = _leases.find(leaseToken);
+                        if (it == _leases.end())
+                            return ErrorReply(401, "unauthorized");    // released since it authenticated
+                        Lease& l = it->second;
+                        if (!account.empty() && strcasecmp(account.c_str(), l.account.c_str()) != 0)
+                            return ErrorReply(403, "account_not_leased");
+                        if (std::string const* bound = l.binding.Conflict(character))
+                            return {409, Json::Writer().Add("ok", false).Add("error", "character_bound")
+                                .Add("bound", *bound).Str()};
+                        // Every create admitted is a login flow on the world
+                        // thread, whatever the core then answers, so each
+                        // counts; the operator class is never counted.
+                        int64_t const nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+                        if (!l.logins.Take(nowMs))
+                            return {429, Json::Writer().Add("ok", false).Add("error", "login_limit")
+                                .Add("limit", l.logins.perHour).Str()};
+                        // A create with no name is refused before the world
+                        // thread (missing_character) and holds nothing.
+                        reserved = !character.empty() && l.binding.Reserve(character);
+                        epoch = l.binding.epoch;
+                        forcedAccount = l.account;
+                        // The GM opt-in likewise: the lease's, whatever the
+                        // body says. Only the port secret's holder sets it, so
+                        // the snippet a lease secret is handed to can never
+                        // raise it.
+                        forcedAllowGm = l.allowGm;
+                    }
+                    if (reserved)
+                    {
+                        // Bind on success only: a create the core refused
+                        // (name taken, bad race/class) must not pin the token
+                        // to a character that never existed. The reply is the
+                        // world thread's and comes later, so settling is a
+                        // step it passes through on its way out (an io
+                        // thread), whichever reply that is: the world's, a
+                        // refusal made before it, or 504 timeout.
+                        ack->Then([this, leaseToken, epoch](HttpReply const& reply)
+                        {
+                            std::lock_guard<std::mutex> lock(_leaseMutex);
+                            auto it = _leases.find(leaseToken);
+                            if (it != _leases.end())
+                                it->second.binding.Settle(epoch, reply.status == 200);
+                        });
+                    }
                 }
             }
 
             if (method == "POST" && target == "/session")
-            {
-                if (cred == Cred::Session && lease.character.empty())
-                {
-                    // Bind on success only: a create the core refused (name
-                    // taken, bad race/class) must not pin the token to a
-                    // character that never existed. The reply is the world
-                    // thread's and comes later, so the binding is a step it
-                    // passes through on its way out (an io thread).
-                    ack->Then([this, leaseToken, character = Json::Parse(body).GetString("character")](HttpReply const& reply)
-                    {
-                        if (reply.status != 200)
-                            return;
-                        std::lock_guard<std::mutex> lock(_leaseMutex);
-                        auto it = _leases.find(leaseToken);
-                        if (it != _leases.end() && it->second.character.empty())
-                            it->second.character = character;
-                    });
-                }
                 return HttpCreateSession(body, forcedAccount, forcedAllowGm, ack);
-            }
             if (method == "POST" && target == "/action")
                 return HttpAction(body, ack);
             return HttpDeleteSession(body, ack);
@@ -788,6 +815,12 @@ namespace WrathBench
         // The GM opt-in the token's session-class creates inherit. Each
         // lease says it afresh, so re-leasing without it turns it off.
         bool const allowGm = req.GetBool("allowGm");
+        // Logins an hour under this lease (session-class creates; 0 or absent
+        // is no limit). Each lease states it afresh, as it does the opt-in;
+        // the count so far is the token's and stays.
+        int64_t const loginsPerHour = req.GetInt("loginsPerHour", 0);
+        if (loginsPerHour < 0 || loginsPerHour > int64_t(0xFFFFFFFF))
+            return ErrorReply(400, "invalid_logins_per_hour");
 
         std::array<uint8, 32> const bytes = Acore::Crypto::GetRandomBytes<32>();
         std::string secret = ByteArrayToHexStr(bytes);
@@ -800,13 +833,17 @@ namespace WrathBench
             uint32_t const max = _leasesMax.load();
             if (max && _leases.size() >= max && _leases.find(token) == _leases.end())
                 return {429, Json::Writer().Add("ok", false).Add("error", "lease_limit").Add("limit", max).Str()};
-            Lease& l = _leases[token];
-            if (strcasecmp(l.account.c_str(), account.c_str()) != 0)
-                l.character.clear(); // a token re-leased onto another account starts unbound
+            auto [it, made] = _leases.try_emplace(token);
+            Lease& l = it->second;
+            if (made)
+                l.binding.epoch = ++_leaseEpochs;
+            else if (strcasecmp(l.account.c_str(), account.c_str()) != 0)
+                l.binding.Reset(++_leaseEpochs); // a token re-leased onto another account starts unbound
             l.account = account;
             l.secret = secret;
             l.allowGm = allowGm;
-            character = l.character;
+            l.logins.perHour = uint32_t(loginsPerHour);
+            character = l.binding.character;
         }
         // A live session under the token takes the lease's opt-in now, not at
         // its next create: a re-lease without it must turn it off for the
@@ -819,7 +856,8 @@ namespace WrathBench
         });
         LOG_INFO("module", "wrathbench: leased {} to account {}{}", TokenTag(token), account, allowGm ? " (GM opt-in)" : "");
         Json::Writer w;
-        w.Add("ok", true).Add("token", token).Add("account", account).Add("secret", secret).Add("allowGm", allowGm);
+        w.Add("ok", true).Add("token", token).Add("account", account).Add("secret", secret).Add("allowGm", allowGm)
+            .Add("loginsPerHour", uint32_t(loginsPerHour));
         if (!character.empty())
             w.Add("character", character);
         return {200, w.Str()};
@@ -872,13 +910,12 @@ namespace WrathBench
             w.Add("worldLoaded", loaded);
         };
 
-        // Non-loopback callers (runner, snippet sandbox) get liveness only:
-        // the global session count and the drop census describe module
+        // A lease secret gets liveness only: the global session count, the
+        // lease count, the limits and the drop census describe module
         // internals and other runs' sessions, which the observation contract
         // never serves to a snippet. The counter fields stay present, zeroed,
-        // so the SDK's health schema keeps parsing; the census is read
-        // by operators via loopback curl inside the worldserver container.
-        // The world-load counts are the same kind of internal: loopback only.
+        // so the SDK's health schema keeps parsing. The world-load counts are
+        // the same kind of internal: the port secret's only.
         if (!operatorView)
         {
             Json::Writer w;

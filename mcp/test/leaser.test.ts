@@ -123,6 +123,19 @@ describe("the port-secret leaser", () => {
     await leaser.release("t1");
     expect(calls).toEqual(["POST /lease Bearer port-secret", "DELETE /session Bearer port-secret", "DELETE /lease Bearer port-secret"]);
   });
+
+  test("carries logins an hour on the lease when it is given one, and nothing otherwise", async () => {
+    const bodies: unknown[] = [];
+    const f = (async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ ok: true, secret: "leased-secret-0123456789abcdef", account: "ACCA" }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const leaser = portSecretLeaser({ moduleUrl: "http://module.invalid", env: { WRATHBENCH_MODULE_SECRET: "port-secret" }, fetch: f });
+    await leaser.lease({ token: "t1", account: "ACCA", loginsPerHour: 20 });
+    await leaser.lease({ token: "t2", account: "ACCA" });
+    await leaser.lease({ token: "t3", account: "ACCA", loginsPerHour: 0 });
+    expect(bodies).toEqual([{ token: "t1", account: "ACCA", loginsPerHour: 20 }, { token: "t2", account: "ACCA" }, { token: "t3", account: "ACCA" }]);
+  });
 });
 
 describe("the single-character shutdown", () => {

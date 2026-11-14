@@ -49,6 +49,14 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Added
 
+- **Logins an hour, per lease.** `POST /lease` takes `loginsPerHour`, set
+  only by the port secret's holder and stated afresh by each lease; the
+  module then counts every `POST /session` the lease's secret makes and
+  refuses one past it in the hour `429 login_limit`, with `limit`. Absent or
+  `0` is no limit, as before. The hosted gateway passes its grant's
+  `loginsPerHour`, so a session that logs out and in again under its own
+  lease is held to it, where only the request rate held it before.
+
 - **Hosted retention.** Hosted sessions' tokens have fingerprints starting
   `0000` (`mcp/src/hosted/tokens.ts`) and the gateway leases no other, so a
   deployment can keep their module audit as long as the person audit. The
@@ -464,6 +472,15 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Changed
 
+- **The full `GET /health` view is the port secret's.** Which view a caller
+  gets is decided by its credential, no longer by its address: a lease
+  secret gets the liveness view even from loopback, where on one host every
+  lease holder is, and the port secret gets the session and lease counts,
+  the limits, the drop census and the world-load counts from anywhere. A
+  tool that passes a port-secret `/health` body on whole now passes those
+  too; the stack's own readers take `build`, `protocol` and `startedAtMs`
+  alone.
+
 - **The sandbox child's sockets and resources are confined too.** Beside
   the Landlock ruleset, `confine.ts` installs a seccomp filter: the child may
   open IPv4 and IPv6 TCP sockets, unix stream socketpairs, and UDP sockets
@@ -484,8 +501,7 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   minute and a `refused-summary` count for the rest; lease caps are checked
   and reserved before the module is asked, so concurrent asks cannot all
   pass them; a host that fails to open tells the person a reference, and
-  the detail goes to the gateway's log and audit. `loginsPerHour` is
-  documented as what it counts: leases of new sessions.
+  the detail goes to the gateway's log and audit.
 - **A session record's `call` rows are cut past what a real call carries**
   (`docs/SESSION-FORMAT.md`, "calls"): a string at 32,768 characters, a
   call's strings at 98,304 together, the tool name at 128.
@@ -569,6 +585,13 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 - `sdk/API.md` is headed "SDK reference"; it was "WrathBench SDK reference".
 
 ### Fixed
+
+- Two first creates under one lease naming different characters, made at
+  once, could both pass the check that the lease was unbound, leaving its
+  token playing one character and bound to the other. The check, and a hold
+  on the name while the create is in flight, are now one step under the
+  lease's lock: the second is `409 character_bound`, naming the first, until
+  the first is answered; a refused create lets the name go.
 
 - A session writer that reopens a session a killed process left continues the
   torn segment of its window, as `docs/SESSION-FORMAT.md` ("Tears") says. Its

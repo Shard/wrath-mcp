@@ -240,7 +240,9 @@ connects with its key as `Authorization: Bearer <key>`:
   `owner`.
 - Every lease is held to the grant by the gateway: the credential's
   accounts, its character count and the file's `globalMaxCharacters`, the
-  hourly logins, and never the GM opt-in. Leases are kept in
+  hourly logins, and never the GM opt-in. The hourly logins are passed to
+  the module with each lease as well, which counts the creates a session
+  makes under it, logging out and in again included. Leases are kept in
   `<state>/ledger.json` (0600) and released on the next start if the
   process died with them.
 - Requests past the grant's rate are `429`; tool calls of one credential run

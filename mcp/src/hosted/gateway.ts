@@ -36,7 +36,8 @@
  *
  * Limits (`HostedLimits`, per grant): a token bucket on requests (`429`), a
  * cap on tool calls running or waiting (calls of one credential run one at a
- * time, as the stdio server runs them), logins an hour, and an idle stop:
+ * time, as the stdio server runs them), logins an hour (new characters here,
+ * every create under each lease in the module), and an idle stop:
  * with no authenticated request for `idleMinutes`, the host is shut and its
  * characters logged out. A program's routines run between requests, which
  * is the point of them; idle is measured from the person, not the game.
@@ -776,8 +777,11 @@ export class Gateway {
         if (login !== undefined) t.logins.push(login);
         let granted = false;
         try {
-          // Never with the GM opt-in, whatever was asked.
-          const lease = await this.base.lease({ token: o.token, account: account! });
+          // Never with the GM opt-in, whatever was asked. The grant's logins an
+          // hour go to the module too, which counts every create the lease's
+          // secret makes: a session that logs out and in again under its own
+          // lease is never seen here.
+          const lease = await this.base.lease({ token: o.token, account: account!, loginsPerHour: t.limits.loginsPerHour });
           if (lease.secret !== undefined) {
             granted = true;
             const seat: Seat = { credential: t.id, person: t.person, account: lease.account, token: o.token, fingerprint: tokenFingerprint(o.token), leasedAt: this.now() };
