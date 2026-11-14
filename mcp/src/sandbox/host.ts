@@ -23,6 +23,7 @@ import type { Subprocess } from "bun";
 import { ScrubbedStream, SecretRedactor } from "../redact";
 import { overCapText, type Scratchpad } from "../scratchpad";
 import type { ClientCacheStore } from "./client-cache";
+import { DEFAULT_SANDBOX_LIMITS, limitFlags, type SandboxLimits } from "./confine";
 import type { ActionHintNote, ActionNote, ChildToHost, EventSummary, EvalResultMsg, HostToChild, HostcallResult, LogEntry, ProgramOrigin, SeatClosed, SeatOpened } from "./ipc";
 import { RepeatFolder } from "./log-fold";
 import type { RecordDrain } from "../record/recorder";
@@ -137,6 +138,14 @@ export interface SandboxHostOptions {
    * its extension live. Read-only.
    */
   readDirs?: readonly string[];
+  /**
+   * The child's resource limits (`confine.ts`, `SandboxLimits`), each one
+   * given replacing its default (`DEFAULT_SANDBOX_LIMITS`): an address-space
+   * cap, a CPU-time cap (off by default) and a file-size cap. A child that
+   * reaches one dies, and that is a restart like any other crash: the notice
+   * names the signal.
+   */
+  limits?: Partial<SandboxLimits>;
   /** Called for every notice, so the loop can log it as it happens. */
   onNotice?: (notice: HarnessNotice) => void;
   /**
@@ -552,7 +561,8 @@ export class SandboxHost {
     // the child may read; it is written by this process alone.
     const program = this.program;
     const readFlags = [...(this.opts.readDirs ?? []), ...(program !== undefined ? [program.workspace.deploysDir] : [])].map((d) => `--read=${d}`);
-    this.proc = Bun.spawn(["bun", "--env-file=/dev/null", this.confinePath, ...readFlags, "bun", "--env-file=/dev/null", this.entryPath], {
+    const limits = limitFlags({ ...DEFAULT_SANDBOX_LIMITS, ...this.opts.limits });
+    this.proc = Bun.spawn(["bun", "--env-file=/dev/null", this.confinePath, ...readFlags, ...limits, "bun", "--env-file=/dev/null", this.entryPath], {
       env: sandboxChildEnv(process.env, {
         WRATHBENCH_MODULE_URL: this.opts.moduleUrl,
         WRATHBENCH_TOKEN: this.opts.token,

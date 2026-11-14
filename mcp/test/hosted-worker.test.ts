@@ -40,7 +40,7 @@ describe("the local provider", () => {
     expect(localWorkerEnv("s".repeat(64), { PATH: "/bin", WRATHBENCH_MODULE_SECRET: "port", WRATH_MCP_GRANTS_FILE: "/g", HOME: "/h" })).toEqual({ [WORKER_SECRET_ENV]: "s".repeat(64), PATH: "/bin", HOME: "/h" });
     const dir = mkdtempSync(join(tmpdir(), "wm-worker-"));
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-    const handle = await localWorkers({ env: { ...process.env, WRATHBENCH_MODULE_SECRET: "port-secret-that-must-not-travel" } }).start({ credential: "a", secret: newWorkerSecret(), dir });
+    const handle = await localWorkers({ trusted: true, env: { ...process.env, WRATHBENCH_MODULE_SECRET: "port-secret-that-must-not-travel" } }).start({ credential: "a", secret: newWorkerSecret(), dir });
     cleanups.push(() => handle.stop());
     const environ = readFileSync(`/proc/${handle.pid}/environ`, "utf8").split("\0");
     expect(environ.some((e) => e.startsWith("WRATHBENCH_MODULE_SECRET="))).toBe(false);
@@ -140,7 +140,7 @@ describe("a worker, from the inside", () => {
     // A .env and a bunfig beside the worker, as a container image or a careless cwd could leave them.
     writeFileSync(join(dir, ".env"), `WRATHBENCH_MODULE_SECRET=${STUB_PORT_SECRET}\n`);
     const secret = newWorkerSecret();
-    const handle = await localWorkers({ cwd: dir }).start({ credential: "a", secret, dir });
+    const handle = await localWorkers({ trusted: true, cwd: dir }).start({ credential: "a", secret, dir });
     cleanups.push(() => handle.stop());
     const leaser = portSecretLeaser({ moduleUrl: stub.baseUrl, env: { WRATHBENCH_MODULE_SECRET: STUB_PORT_SECRET } });
     const host = await connectWorker({

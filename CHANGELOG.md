@@ -32,6 +32,12 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   (a LAN with no TLS or proxy) drops the cookie and stays at the sign-in.
   Put TLS in front, directly or by a proxy; a bearer header still works
   without it.
+- **Local workers serve only trusted grants.** `localWorkers` runs each
+  credential's worker as the gateway's own user, beside the port secret, and
+  now refuses to start one unless told the grants are the operator's own:
+  `localWorkers({ trusted: true })`, or `--trusted-local-workers` on
+  `bun run gateway`, which otherwise does not start. `GatewayOptions.workers`
+  is required. A deployment for people outside it passes its own provider.
 
 ### Added
 
@@ -450,6 +456,20 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Changed
 
+- **The sandbox child's sockets and resources are confined too.** Beside
+  the Landlock ruleset, `confine.ts` installs a seccomp filter: the child may
+  open IPv4 and IPv6 TCP sockets, unix stream socketpairs, and UDP sockets
+  only when the module URL names a host to resolve; every other family
+  (pathname and abstract unix sockets, netlink, raw, packet), SCTP and MPTCP
+  are `EACCES`, and io_uring is `ENOSYS`. It also sets resource limits
+  (`SandboxLimits`, `SandboxHostOptions.limits`, the gateway's
+  `sandboxLimits` and `--limit-as`/`--limit-cpu`/`--limit-fsize`): a 1 GiB
+  file size and no core dumps by default, and address-space and CPU caps that
+  are off unless set (an address-space cap below about 12 GiB stops every
+  child from starting: Bun reserves 6 GiB, 10 GiB while starting). Nothing a
+  session legitimately does reaches the defaults. The sandbox now also needs x86-64 or arm64 and a container that
+  permits `prctl(PR_SET_SECCOMP)` (the default profiles do), and refuses to
+  start otherwise.
 - **The inspector's sign-in cookie is an opaque id, not the secret.** It
   stands for a sign-in the bin holds in memory for at most twelve hours, so
   a restart signs browsers out, and a browser holding the old cookie signs in

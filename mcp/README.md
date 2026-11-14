@@ -43,8 +43,9 @@ character is logged out (`DELETE /session`) and the lease released, each with
 the port secret and each bounded, and a second signal exits at once. A process
 killed outright leaves the character in the world until a create on its
 account reclaims it (`module/PROTOCOL.md`, "DELETE /session"). The sandbox needs Linux 6.7 or later — Landlock with TCP
-rules — and refuses to start without it; what it confines and what it leaves
-to the deployment's network policy is `docs/ARCHITECTURE.md` ("The sandbox").
+rules — on x86-64 or arm64, and refuses to start without it; what it confines
+and what it leaves to the deployment's network policy is
+`docs/ARCHITECTURE.md` ("The sandbox").
 
 ## The session record
 
@@ -198,9 +199,16 @@ bun run grants list
 
 ## The hosted gateway
 
-`bun run gateway --grants <file> --state <dir>` serves the tools over
-Streamable HTTP at `/mcp` to the people the grants file names
-(`src/hosted/gateway-main.ts`; `docs/ARCHITECTURE.md`, "Hosted"). A client
+`bun run gateway --grants <file> --state <dir> --trusted-local-workers`
+serves the tools over Streamable HTTP at `/mcp` to the people the grants
+file names (`src/hosted/gateway-main.ts`; `docs/ARCHITECTURE.md`,
+"Hosted"). `--trusted-local-workers` says every grant is the operator's own
+(below); without it, or a deployment's own worker provider through
+`runGateway`, the entry does not start. `--limit-as`, `--limit-cpu` and
+`--limit-fsize` set each credential's sandbox child's resource limits
+(address space and CPU are off by default; an address-space cap below about
+12 GiB stops every child from starting, since Bun reserves 10 GiB while
+starting). A client
 connects with its key as `Authorization: Bearer <key>`:
 
 ```json
@@ -212,12 +220,14 @@ connects with its key as `Authorization: Bearer <key>`:
   secret: every lease, logout and release it needs, it asks the gateway for
   over the channel the gateway opens to it, greeted with that worker's own
   secret. A worker whose gateway is gone shuts down and exits.
-- Workers start through a `WorkerProvider`. The default, `localWorkers`, is
-  a process per credential on the gateway's machine, started with no port
+- Workers start through a `WorkerProvider`. The stack's own, `localWorkers`,
+  is a process per credential on the gateway's machine, started with no port
   secret in its environment. Its boundary is the kernel's alone: a worker
   runs as the gateway's user, so code that escaped a sandbox child into its
   worker could reach the gateway's process. **It serves the operator's own
-  tests, not people outside the deployment**; for them a deployment runs a
+  grants and tests, not people outside the deployment**, and refuses to start
+  a worker unless told the grants are trusted (`localWorkers({ trusted: true })`,
+  the entry's `--trusted-local-workers`); for anyone else a deployment runs a
   worker per pod or container through a provider of its own, with no route
   to anything but the module's port.
 - Only the gateway holds the port secret (`WRATHBENCH_MODULE_SECRET`), and
@@ -271,8 +281,8 @@ builds on the exports: `runGateway` or `gatewayMain` from
 ## Pieces
 
 - `src/sandbox/` — the host (`SandboxHost`), the child runtime (`child.ts`,
-  whose header documents everything a snippet can reach), the Landlock wrapper
-  (`confine.ts`), the IPC shapes, the snippet rewrite and the client cache.
+  whose header documents everything a snippet can reach), the confinement
+  wrapper (`confine.ts`: Landlock, the socket filter and the resource limits), the IPC shapes, the snippet rewrite and the client cache.
 - `src/tools.ts` — `ToolSet`, the core tools, and the hooks a harness renders
   them with (`CoreToolRender`).
 - `src/workspace.ts`, `src/sandbox/program.ts`, `src/sandbox/program-host.ts`,

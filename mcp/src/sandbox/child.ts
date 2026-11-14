@@ -99,10 +99,11 @@
  * The kernel holds the boundary under that: this process runs under the
  * Landlock ruleset `confine.ts` applied before exec, which allows TCP
  * connections to the module URL's port and no other, no bind, no exec of any
- * binary but bun, and no signal outside its domain. Those rules are per port,
- * not per host: which hosts the port is reached on, and anything that is not
- * TCP (UDP, raw sockets), is the deployment's network policy — docs/CONTRACTS.md
- * says what that leaves. `node:net`/`Bun.connect`/`Bun.fetch` can still open
+ * binary but bun, and no signal outside its domain, and under its seccomp
+ * filter, which allows no socket but TCP, unix stream pairs and, to resolve
+ * a module host name, UDP. Those rules are per port, not per host: which
+ * hosts the port is reached on, and where UDP goes, is the deployment's
+ * network policy — docs/CONTRACTS.md says what that leaves. `node:net`/`Bun.connect`/`Bun.fetch` can still open
  * the module's port there, but with no credential to read they authenticate
  * nothing. The in-process guard is the readable layer, not the boundary.
  *

@@ -24,6 +24,7 @@ import { SessionWriter } from "./record/writer";
 import { SecretRedactor } from "./redact";
 import { CLIENT_CACHE_FILE, ClientCacheStore } from "./sandbox/client-cache";
 import { SandboxHost } from "./sandbox/host";
+import type { SandboxLimits } from "./sandbox/confine";
 import type { EventSummary } from "./sandbox/ipc";
 import { Scratchpad } from "./scratchpad";
 import type { ToolHost } from "./server";
@@ -156,6 +157,8 @@ export interface HostOptions {
   /** A snippet's output, which the standalone server writes to stderr. */
   logSink?: (stream: "stdout" | "stderr", text: string) => void;
   snippetTimeoutMs?: number;
+  /** The sandbox child's resource limits, each replacing its default (`SandboxHostOptions.limits`). */
+  sandboxLimits?: Partial<SandboxLimits>;
   /**
    * What the module says of itself, for `session.json`'s `module`, when the
    * host must not ask: a hosted worker has no port secret for `/health`, so
@@ -242,6 +245,7 @@ async function openSingleHost(o: HostOptions): Promise<OpenedHost> {
     snippetTimeoutMs: o.snippetTimeoutMs ?? 30_000,
     pingGraceMs: 5_000,
     clientCache,
+    ...(o.sandboxLimits !== undefined ? { limits: o.sandboxLimits } : {}),
     ...(record !== undefined ? { record: { writer: record } } : {}),
     ...programOption(o),
     // Scrubbed like everything else the host writes: a crash notice quotes the child's stderr, and the child holds the lease secret.
@@ -327,6 +331,7 @@ async function openFanoutHost(o: HostOptions, grant: FanoutGrant): Promise<Opene
     snippetTimeoutMs: o.snippetTimeoutMs ?? 30_000,
     pingGraceMs: 5_000,
     clientCache,
+    ...(o.sandboxLimits !== undefined ? { limits: o.sandboxLimits } : {}),
     fanout: { maxCharacters: grant.maxCharacters },
     ...(store !== null ? { record: {} } : {}),
     ...programOption(o),

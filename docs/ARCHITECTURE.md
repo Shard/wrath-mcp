@@ -331,12 +331,39 @@ snippet reaches for the filesystem or the network:
 - Where the kernel has Landlock scopes (Linux 6.12+), no signal to a process
   outside the sandbox.
 
-It fails closed: without Landlock TCP rules (Linux 6.7+) the sandbox refuses to
-start rather than run unconfined. What the kernel rules do not cover is stated
-plainly: TCP rules are per port, not per host, and UDP, raw sockets and other
-socket families are outside Landlock. Closing those is the deployment's network
-policy; the child's only legitimate destinations are the module's port on the
-module's host, and DNS.
+A seccomp filter, installed by the same wrapper, rules the socket families,
+which Landlock on these kernels does not. The child was traced doing three
+things with sockets: TCP to the module, unix stream socketpairs (Bun's own
+pipes for a spawn the ruleset then refuses), and, when the module URL names a
+host rather than an address, UDP for name resolution. So those are what it may
+open: IPv4 and IPv6 TCP sockets, UDP ones only when there is a name to
+resolve, and unix stream pairs. Any other unix socket (pathname or abstract),
+netlink, packet, raw, SCTP and MPTCP are `EACCES`; io_uring, whose socket
+operations bypass the filter, is `ENOSYS`. The IPC channel to the host is an
+inherited descriptor and needs none of it.
+
+The wrapper also sets the child's resource limits (`SandboxLimits`,
+`SandboxHostOptions.limits`): a 1 GiB file-size cap (the child can write no
+file anyway) and no core dumps, which would hold the lease secret. An
+address-space cap and a CPU-time cap are available and off, because either
+could reach the model: a snippet past an address-space cap gets an
+allocation error or a restart where it had memory before, and a CPU-time
+cap counts the child's whole life, so a session with no end would reach any
+value. An address-space cap has to sit well above the runtime's own
+reservation, about 6 GiB and 10 GiB at its peak while starting (a child at
+fan-out 40 holds 7 GiB and under 200 MiB resident), or no child starts. A
+child that reaches a limit dies and restarts as any crash does. Resident
+memory and a CPU rate are the deployment's to bound, with a container's
+limits.
+
+It fails closed: without Landlock TCP rules (Linux 6.7+), on an architecture
+the filter is not written for (x86-64 and arm64 are), or when the kernel
+refuses the filter or a limit, the sandbox refuses to start rather than run
+unconfined. What it does not cover is stated plainly: TCP rules are per port,
+not per host, and with a module host to resolve, UDP reaches any host. Closing
+those is the deployment's network policy (or, for UDP, a module URL by
+address); the child's only legitimate destinations are the module's port on
+the module's host, and DNS.
 
 ### A program
 
@@ -506,8 +533,10 @@ gone exits. The gateway's ledger lives outside the credentials' directories
 and is never read back from them, and on a restart it releases every seat:
 its workers have exited or will. The local provider, a process per
 credential, shares the gateway's machine and user, which suits an
-operator's own tests; people outside the deployment get a worker per pod,
-which a deployment's own provider starts. The module's part is to protect itself:
+operator's own grants and tests, and it starts a worker only when told the
+grants are trusted with that user (`--trusted-local-workers`); people
+outside the deployment get a worker per pod, which a deployment's own
+provider starts. The module's part is to protect itself:
 per-lease caps on the action rate, the `/events` subscribers and the number
 of leases. `docs/CONTRACTS.md`, "Control-surface authentication", states what
 each side holds.
