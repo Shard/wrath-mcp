@@ -155,6 +155,29 @@ The floor that closes that (`module/PROTOCOL.md`
   network policy — the sandbox child's egress is the module's port on the
   module's host and DNS, and nothing else is a legitimate destination.
 
+- **A hosted tier: the port secret where no tenant code runs.** A deployment
+  that serves the tools to people other than its operator, each driving their
+  own agent (hosted mode, `docs/ARCHITECTURE.md`, "Hosted"), splits the
+  sandbox host in two. A gateway authenticates each person by a key of their
+  own and is the only holder of the port secret: it takes and releases every
+  lease, on accounts the operator assigned to that person's credential and
+  never with the GM opt-in, logs their characters out with it, and writes the
+  audit of who called what. A worker per credential runs the sandbox host,
+  the snippet child and the recorder, and holds only the lease secrets the
+  gateway hands it for that credential's own tokens, over a channel internal
+  to the deployment. A worker can log its own characters out (`DELETE
+  /session` is session-class), and cannot lease, list or delete characters;
+  nothing it holds is honoured for another credential's token. The person holds no module credential at
+  all — no port secret, token, lease secret or game account password — and
+  reaches the game only through the tools; the module, authserver and world
+  ports are not published to them. One credential's accounts are disjoint
+  from every other's and from every account the operator's own sessions
+  lease on that world, because a create on an account reclaims it from
+  whatever session holds it. Inside a worker everything above holds
+  unchanged: one ambient client per character, the child's Landlock ruleset,
+  and a network policy that lets the worker reach the module's port and DNS
+  and nothing else.
+
 The account allowlist (`WrathBench.Accounts`) gates only which accounts the
 module serves; it is not caller authentication. What this does not do: it does
 not authenticate the operator's own tooling to anything finer than "holds the
