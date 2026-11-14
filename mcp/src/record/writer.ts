@@ -64,6 +64,21 @@ import { WriteGate, type OwnGuid } from "./gate";
 import type { RecordDrain, RecordedMove } from "./recorder";
 import { compressSegment } from "./compress";
 import { listSegments } from "./segments";
+import { clipString, clipStrings, type ClipOptions } from "../clip";
+
+/** The longest tool name a `call` row keeps: every tool's name is a few words. */
+export const CALL_TOOL_MAX = 128;
+
+/**
+ * How much of a call's arguments a `call` row keeps. They are recorded as
+ * the client sent them, before any tool checked them, so a client could
+ * otherwise make every row as large as its request. The largest a real call
+ * carries is a whole program file (32,000 characters), and an edit's old and
+ * new text beside its path, so a string keeps 32,768 characters and a call's
+ * strings 98,304 together; past either it is cut, with a marker naming how
+ * long it was (`docs/SESSION-FORMAT.md`, "calls").
+ */
+export const CALL_ARG_LIMITS: Readonly<ClipOptions> = Object.freeze({ max: 32_768, budget: 98_304 });
 
 export interface SessionWriterOptions {
   /** The session directory itself: `<store>/<session-id>`, or a directory a harness keeps inside its run. */
@@ -723,7 +738,15 @@ export class SessionWriter {
     const at = dispatchTs ?? this.now();
     const id = at > this.lastCallId ? at : this.lastCallId + 1;
     this.lastCallId = id;
-    const row: Extract<CallRow, { kind: "call" }> = { ts: id, kind: "call", id, origin: { type: "tool" }, tool, args: args ?? null };
+    // As the client sent them, before any tool checked them: cut to what a real call could carry (`CALL_ARG_LIMITS`).
+    const row: Extract<CallRow, { kind: "call" }> = {
+      ts: id,
+      kind: "call",
+      id,
+      origin: { type: "tool" },
+      tool: clipString(tool, CALL_TOOL_MAX),
+      args: args === undefined || args === null ? null : clipStrings(args, CALL_ARG_LIMITS),
+    };
     // Open before it is written, so a key this very row forces does not need it; closed again by its result.
     this.writeCall(row);
     this.openCalls.set(id, row);

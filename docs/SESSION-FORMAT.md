@@ -256,7 +256,7 @@ What the agent asked for and what was sent on its behalf.
 | Kind | Fields | Meaning |
 |---|---|---|
 | `key` | `open` | Every `call` row still without a `result`, whole. |
-| `call` | `id`, `origin`, `tool`, `args` | A tool call as dispatched. `id` is its dispatch stamp in epoch ms, strictly increasing per host; `ts` equals it. |
+| `call` | `id`, `origin`, `tool`, `args` | A tool call as dispatched. `id` is its dispatch stamp in epoch ms, strictly increasing per host; `ts` equals it. `tool` and `args` are as the client sent them, cut where they run past what any real call carries (a string at 32,768 characters, a call's strings at 98,304 together, `tool` at 128), each cut string ending `…[cut, <n> chars]`. |
 | `result` | `id`, `text`, `error`, `durationMs` | The answer as the caller was handed it. |
 | `actions` | `origin`, `actions`, `dropped?` | What one origin put on the wire since the last flush: each action's `ts`, `action`, `args?`, HTTP `status`, `ms`, and the module's `error`, `hint` and `moveId` where it gave them. Consecutive identical dispatches fold into one with `count` and `lastTs`. |
 | `move` | `origin`, `at`, `moveId`, `map`, `x`, `y`, `z`, `target`, `name?`, `status` | A movement intention: one row when dispatched (`status` null) and one with the module's verdict. Both carry the same `at`, the dispatch time. `target` is the guid it was aimed at, or null. |

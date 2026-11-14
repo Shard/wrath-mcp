@@ -13,7 +13,7 @@ import { OPERATOR, createInspectorApi, hostedSessionId, hostedSource, inspectorA
 import { CLOSED_ID, FIXTURE_T0, LIVE_ID, plant, tempDir } from "./fixtures";
 
 const tmp = tempDir();
-const SECRET = "an-inspector-secret-of-length";
+const SECRET = "an-inspector-secret-of-at-least-32-characters";
 const KEYS = { a1: "wmk_alice-one-key-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", a2: "wmk_alice-two-key-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", b1: "wmk_bob-one-key-ccccccccccccccccccccccccccccccccc" };
 /** A session directory in bob's store whose record claims to be alice's closed session. */
 const FORGED = "0123456789abcdef";

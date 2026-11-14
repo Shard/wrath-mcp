@@ -499,7 +499,11 @@ with that worker's own secret and opens the host with its own decisions
 (the directories, the accounts, the owner); the worker asks back over the
 same channel for every lease, which the gateway's leaser holds to the grant
 (the account, the character count, the token's owner, never GM) since the
-worker is not trusted. Everything the worker sends is checked for its shape,
+worker is not trusted. The channel is plain TCP, and only the gateway proves
+itself on it (`hello`, with the worker's secret): it is meant to stay inside
+the deployment, on loopback or the pod network, where nothing else can
+reach the worker's port. A provider whose workers are reached across any
+other network brings its own transport security. Everything the worker sends is checked for its shape,
 and a line past the channel's limit closes it. A worker that dies has its
 seats released and is started again at the next call; one whose gateway is
 gone exits. The gateway's ledger lives outside the credentials' directories

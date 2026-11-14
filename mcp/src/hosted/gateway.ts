@@ -42,9 +42,11 @@
  * is the point of them; idle is measured from the person, not the game.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import { clipStrings } from "../clip";
 import { hostToolDefs, type HostSurface } from "../host";
 import { MODULE_SECRET_ENV, moduleAuthHeaders, moduleIdentity, moduleSecret, portSecretLeaser, tokenFingerprint, type Leaser, type LeaseOutcome } from "../module-auth";
 import type { ToolResult } from "../tools";
@@ -65,6 +67,23 @@ export const AUDIT_RETENTION_DAYS = 30;
 /** The largest request body the gateway reads. A file the program writes is at most 32,000 characters. */
 export const MAX_BODY_BYTES = 256 * 1024;
 
+/**
+ * The most characters any string in a person audit line keeps (a tool name,
+ * a character, an `Origin`, an error), cut with a marker past it: every
+ * line's size is the gateway's, whatever a client sends.
+ */
+export const AUDIT_STRING_MAX = 256;
+
+/**
+ * Refused requests (no key, a wrong or disabled key, a foreign `Origin`) are
+ * audited a line per kind and address per window, not a line each: the first
+ * is written whole and the rest counted into one `refused-summary` line.
+ */
+export const REFUSAL_WINDOW_MS = 60_000;
+
+/** The most kinds and addresses a refusal window tells apart; past it, the rest share one count. */
+export const REFUSAL_KEYS_MAX = 1_000;
+
 // ------------------------------------------------------------------ audit
 
 /** The per-person audit: one JSON object a line, a file a person a day. */
@@ -77,16 +96,44 @@ export class PersonAudit {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
 
-  write(person: string | null, line: Record<string, unknown>): void {
+  private queue: Promise<void> = Promise.resolve();
+
+  /** One line, every string in it cut to `AUDIT_STRING_MAX`, and where it goes. */
+  private place(person: string | null, line: Record<string, unknown>): { dir: string; file: string; text: string } {
     const ts = this.now();
     const day = new Date(ts).toISOString().slice(0, 10);
     const dir = join(this.dir, person ?? UNAUTHENTICATED);
+    return { dir, file: join(dir, `${day}.jsonl`), text: `${JSON.stringify(clipStrings({ ts, ...line }, { max: AUDIT_STRING_MAX }))}\n` };
+  }
+
+  write(person: string | null, line: Record<string, unknown>): void {
+    const { dir, file, text } = this.place(person, line);
     try {
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
-      appendFileSync(join(dir, `${day}.jsonl`), `${JSON.stringify({ ts, ...line })}\n`, { mode: 0o600 });
+      appendFileSync(file, text, { mode: 0o600 });
     } catch {
       // An audit that cannot be written must not take a person's call down with it; the gateway's own log says so.
     }
+  }
+
+  /**
+   * The same line, written off the event loop: for what an unauthenticated
+   * caller can cause, so a flood of them never waits on the disk. Lines
+   * written this way keep their order among themselves.
+   */
+  writeAsync(person: string | null, line: Record<string, unknown>): void {
+    const { dir, file, text } = this.place(person, line);
+    this.queue = this.queue
+      .then(async () => {
+        await mkdir(dir, { recursive: true, mode: 0o700 });
+        await appendFile(file, text, { mode: 0o600 });
+      })
+      .catch(() => {});
+  }
+
+  /** Settles once every line `writeAsync` was given is written. */
+  settled(): Promise<void> {
+    return this.queue;
   }
 
   /** Remove day files older than the retention. Returns how many went. */
@@ -110,6 +157,56 @@ export class PersonAudit {
       }
     }
     return n;
+  }
+}
+
+/**
+ * Refusals, audited cheaply: per window, the first refusal of each kind from
+ * each address (and, for a key that named one, each person) is written
+ * whole, the rest are counted, and the count is written as one
+ * `refused-summary` line when the window has passed and the next refusal of
+ * that kind arrives, at the sweep, or at stop. Nothing here waits on disk.
+ */
+export class RefusalAudit {
+  private readonly windows = new Map<string, { person: string | null; line: Record<string, unknown>; first: number; count: number }>();
+
+  constructor(
+    private readonly audit: PersonAudit,
+    private readonly now: () => number = Date.now,
+  ) {}
+
+  note(person: string | null, line: Record<string, unknown>): void {
+    const now = this.now();
+    let key = JSON.stringify([person, line["kind"], line["why"] ?? line["reason"], line["remote"]]);
+    if (!this.windows.has(key) && this.windows.size >= REFUSAL_KEYS_MAX) {
+      key = "overflow";
+      person = null;
+      line = { kind: "refused", why: "many kinds and addresses" };
+    }
+    const w = this.windows.get(key);
+    if (w !== undefined && now - w.first < REFUSAL_WINDOW_MS) {
+      w.count++;
+      return;
+    }
+    if (w !== undefined) this.summarize(w, now);
+    this.windows.set(key, { person, line, first: now, count: 0 });
+    this.audit.writeAsync(person, line);
+  }
+
+  /** Write the count of every window that has passed (all of them with `all`), and forget them. */
+  flush(all = false): void {
+    const now = this.now();
+    for (const [key, w] of this.windows) {
+      if (!all && now - w.first < REFUSAL_WINDOW_MS) continue;
+      this.summarize(w, now);
+      this.windows.delete(key);
+    }
+  }
+
+  private summarize(w: { person: string | null; line: Record<string, unknown>; first: number; count: number }, now: number): void {
+    if (w.count === 0) return;
+    const { kind: _kind, ...rest } = w.line;
+    this.audit.writeAsync(w.person, { kind: "refused-summary", ...rest, more: w.count, since: w.first, until: now });
   }
 }
 
@@ -230,6 +327,7 @@ export class LeaseRefused extends Error {}
 
 export class Gateway {
   readonly audit: PersonAudit;
+  readonly refusals: RefusalAudit;
   readonly ledger: Ledger;
   private readonly tenants = new Map<string, Tenant>();
   private readonly base: Leaser;
@@ -240,6 +338,14 @@ export class Gateway {
   private worldStartedAt: number | undefined;
   private sweeping = false;
   private lastStorePrune = 0;
+  /** The last lease refusal of each credential's host while it opens: what the person is told when the open fails. */
+  private readonly refused = new Map<string, string>();
+  /**
+   * Leases asked for and not yet answered, by token, with their credential:
+   * counted against every cap as if held, so concurrent asks cannot all pass
+   * a check made before any of them is answered.
+   */
+  private readonly leasing = new Map<string, string>();
   private defaultWorkers: WorkerProvider | undefined;
 
   constructor(private readonly o: GatewayOptions) {
@@ -248,6 +354,7 @@ export class Gateway {
     mkdirSync(o.stateDir, { recursive: true, mode: 0o700 });
     mkdirSync(join(o.stateDir, "tenants"), { recursive: true, mode: 0o700 });
     this.audit = new PersonAudit(join(o.stateDir, "audit"), this.now);
+    this.refusals = new RefusalAudit(this.audit, this.now);
     this.ledger = new Ledger(join(o.stateDir, "ledger.json"));
     if (moduleSecret(o.env ?? process.env) === undefined) {
       // Without it no lease is taken, no seat is recorded, and every limit that counts seats counts nothing.
@@ -281,6 +388,8 @@ export class Gateway {
   async stop(): Promise<void> {
     if (this.timer !== undefined) clearInterval(this.timer);
     await Promise.all([...this.tenants.values()].map((t) => this.stopHost(t, "gateway stopping")));
+    this.refusals.flush(true);
+    await this.audit.settled();
   }
 
   /**
@@ -314,6 +423,7 @@ export class Gateway {
         for (const t of this.tenants.values()) if (t.host !== undefined) await this.stopHost(t, "world restarted");
       }
       if (started !== undefined) this.worldStartedAt = started;
+      this.refusals.flush();
       this.audit.prune();
       if (now - this.lastStorePrune >= (this.o.storePruneMs ?? 3_600_000)) {
         this.lastStorePrune = now;
@@ -350,14 +460,14 @@ export class Gateway {
     if (req.method !== "POST") return new Response(null, { status: 405, headers: { allow: "POST" } });
     const origin = req.headers.get("origin");
     if (origin !== null && !(this.o.allowedOrigins ?? []).includes(origin)) {
-      this.audit.write(null, { kind: "refused", why: "origin", origin, remote });
+      this.refusals.note(null, { kind: "refused", why: "origin", origin, remote });
       return Response.json({ jsonrpc: "2.0", error: { code: -32600, message: "origin not allowed" } }, { status: 403 });
     }
     const length = Number(req.headers.get("content-length") ?? "0");
     if (length > MAX_BODY_BYTES) return Response.json({ jsonrpc: "2.0", id: null, error: { code: -32600, message: `request body over ${MAX_BODY_BYTES} bytes` } }, { status: 413 });
     const auth = authenticate(req, this.o.grants);
     if (!auth.ok) {
-      this.audit.write(auth.person ?? null, { kind: "auth", ok: false, reason: auth.reason, ...(auth.keyId !== undefined ? { keyId: auth.keyId } : {}), remote });
+      this.refusals.note(auth.person ?? null, { kind: "auth", ok: false, reason: auth.reason, ...(auth.keyId !== undefined ? { keyId: auth.keyId } : {}), remote });
       return Response.json(
         { jsonrpc: "2.0", id: null, error: { code: -32001, message: auth.reason === "disabled" ? "this key's grant is disabled" : "a valid key is required: Authorization: Bearer <key>" } },
         { status: 401, headers: { "www-authenticate": 'Bearer realm="wrath-mcp"' } },
@@ -429,13 +539,22 @@ export class Gateway {
         const line = { kind: "call", credential: t.id, keyId, remote, tool: name, callId: dispatchTs, ...(typeof target === "string" ? { character: target } : {}), argBytes: Buffer.byteLength(text), argSha256: createHash("sha256").update(text).digest("hex") };
         let host: CredentialHost;
         try {
+          this.refused.delete(t.id);
           host = await this.hostFor(t);
         } catch (err) {
           const why = err instanceof Error ? err.message : String(err);
           // A host that leased and then failed to open holds nothing that will give the lease back.
           await this.releaseSeats(t, "host failed to open");
-          this.audit.write(t.person, { ...line, outcome: "error", durationMs: this.now() - started, error: `host: ${why}` });
-          return { text: `${name} failed: your session could not be opened: ${why}`, isError: true };
+          // The detail can name the module's address and this machine's paths:
+          // it goes to the operator's log and audit under a reference, and the
+          // person is told only that reference, or the gateway's own refusal
+          // of a lease, which is theirs to know.
+          const ref = randomBytes(4).toString("hex");
+          const refusal = this.refused.get(t.id);
+          this.refused.delete(t.id);
+          this.log(`[${t.id}] host failed to open (ref ${ref}): ${why}`);
+          this.audit.write(t.person, { ...line, outcome: "error", durationMs: this.now() - started, error: `host: ${why}`, ref });
+          return { text: `${name} failed: your session could not be opened: ${refusal ?? `the server could not start it (ref ${ref}); try again shortly`}`, isError: true };
         }
         let result: ToolResult;
         try {
@@ -621,6 +740,7 @@ export class Gateway {
     return {
       lease: async (o): Promise<LeaseOutcome> => {
         const refuse = (why: string): never => {
+          this.refused.set(t.id, why);
           this.audit.write(t.person, { kind: "refused", why: `lease: ${why}`, credential: t.id, ...(o.account !== undefined ? { account: o.account } : {}) });
           throw new LeaseRefused(why);
         };
@@ -628,25 +748,42 @@ export class Gateway {
         if (account === undefined || !t.grant.accounts.some((a) => a.toUpperCase() === account.toUpperCase())) refuse(`account ${account ?? "(none)"} is not one this key was granted`);
         // Its module audit must be kept as long as the person audit that points at it (tokens.ts).
         if (!isHostedToken(o.token)) refuse("that session's token is not one the gateway issues");
+        if (this.leasing.has(o.token)) refuse("that session is already being leased");
         const held = this.ledger.get(o.token);
         if (held !== undefined && held.credential !== t.id) refuse("that session belongs to another key");
-        const mine = this.ledger.of(t.id).filter((s) => s.token !== o.token);
-        if (mine.length >= t.grant.maxCharacters) refuse(`${mine.length} of ${t.grant.maxCharacters} characters are already in the world for this key`);
-        const all = this.ledger.seats().filter((s) => s.token !== o.token).length;
+        // Seats held and seats being taken alike: every check and its
+        // reservation happen before the first await, so concurrent asks see
+        // each other.
+        const others = [...this.ledger.seats().map((s) => ({ token: s.token, credential: s.credential })), ...[...this.leasing].map(([token, credential]) => ({ token, credential }))].filter((s) => s.token !== o.token);
+        const mine = others.filter((s) => s.credential === t.id).length;
+        if (mine >= t.grant.maxCharacters) refuse(`${mine} of ${t.grant.maxCharacters} characters are already in the world for this key`);
         const global = this.o.grants.current().file.globalMaxCharacters;
-        if (all >= global) refuse(`the server has ${all} characters in the world, its most; try again later`);
+        if (others.length >= global) refuse(`the server has ${others.length} characters in the world, its most; try again later`);
         const hourAgo = this.now() - 3_600_000;
         while (t.logins.length > 0 && t.logins[0]! < hourAgo) t.logins.shift();
         if (held === undefined && t.logins.length >= t.limits.loginsPerHour) refuse(`${t.limits.loginsPerHour} logins in the last hour, this key's most; try again later`);
-        // Never with the GM opt-in, whatever was asked.
-        const lease = await this.base.lease({ token: o.token, account: account! });
-        if (lease.secret !== undefined) {
-          if (held === undefined) t.logins.push(this.now());
-          const seat: Seat = { credential: t.id, person: t.person, account: lease.account, token: o.token, fingerprint: tokenFingerprint(o.token), leasedAt: this.now() };
-          this.ledger.add(seat);
-          this.audit.write(t.person, { kind: "lease", credential: t.id, account: seat.account, fingerprint: seat.fingerprint });
+        this.leasing.set(o.token, t.id);
+        const login = held === undefined ? this.now() : undefined;
+        if (login !== undefined) t.logins.push(login);
+        let granted = false;
+        try {
+          // Never with the GM opt-in, whatever was asked.
+          const lease = await this.base.lease({ token: o.token, account: account! });
+          if (lease.secret !== undefined) {
+            granted = true;
+            const seat: Seat = { credential: t.id, person: t.person, account: lease.account, token: o.token, fingerprint: tokenFingerprint(o.token), leasedAt: this.now() };
+            this.ledger.add(seat);
+            this.audit.write(t.person, { kind: "lease", credential: t.id, account: seat.account, fingerprint: seat.fingerprint });
+          }
+          return lease;
+        } finally {
+          this.leasing.delete(o.token);
+          // A login that never happened gives its place in the hour back.
+          if (!granted && login !== undefined) {
+            const i = t.logins.lastIndexOf(login);
+            if (i >= 0) t.logins.splice(i, 1);
+          }
         }
-        return lease;
       },
       logout: async (token) => {
         if (this.ledger.get(token)?.credential !== t.id) return;

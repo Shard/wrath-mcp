@@ -193,7 +193,7 @@ bun run grants list
 - The file is written whole, mode 0600, by rename. A gateway reloads it when
   it changes, and a file that does not validate grants nothing until it does.
 - Per-grant `limits` override the defaults (5 requests a second with a burst
-  of 20, 4 calls at once, 20 logins an hour, logged out after 30 idle
+  of 20, 4 calls at once, 20 new sessions leased an hour (what a session does under its own lease is the module's action rate to bound), logged out after 30 idle
   minutes), each at most the file's `ceiling`.
 
 ## The hosted gateway
@@ -242,6 +242,16 @@ connects with its key as `Authorization: Bearer <key>`:
 - `<state>/audit/<person>/<day>.jsonl` records who called what: keys tried,
   each request and tool call (by its call id, with the arguments as a size
   and a hash), leases by token fingerprint, refusals and stops. Kept 30 days.
+  Every string in a line (a tool name, a character, an `Origin`) is cut at
+  256 characters. A refused request (no key, a wrong or disabled key, a
+  foreign `Origin`) is written off the event loop, one line per kind and
+  address a minute, the rest counted into a `refused-summary` line.
+- A host that fails to open tells the person only a reference (or the
+  gateway's own refusal of a lease, such as a full key); the detail, which
+  can name the module's address and the machine's paths, goes to the
+  gateway's log and the person audit under that reference.
+- Lease caps are checked and reserved before the module is asked, so
+  concurrent asks cannot all pass them.
 - Every token a hosted session runs under has a fingerprint starting `0000`
   (`src/hosted/tokens.ts`), and the gateway refuses a lease for any other, so
   a deployment can keep those sessions' module audit files (named by

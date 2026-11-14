@@ -178,6 +178,7 @@ describe("the protocol", () => {
     expect((await fetch(r.url)).status).toBe(405);
     expect((await fetch(r.url, { method: "DELETE" })).status).toBe(405);
     expect((await r.modern(KEY.a, "tools/list", {}, { origin: "https://evil.example" })).status).toBe(403);
+    await r.gateway.audit.settled();
     expect(r.audit(UNAUTHENTICATED).map((l) => l["reason"] ?? l["why"])).toEqual(["no_key", "unknown_key", "origin"]);
   });
 
@@ -277,6 +278,94 @@ describe("one key never reaches another's", () => {
   }, 30_000);
 });
 
+describe("bounded audit and leases", () => {
+  const LIMITS = { requestsPerSecond: 5, burst: 20, inFlight: 4, loginsPerHour: 20, idleMinutes: 30 };
+
+  test("concurrent lease asks cannot all pass the caps: each is counted from before its await", async () => {
+    const r = await rig({ grants: [grant("a", { accounts: ["A1", "A2", "A3"], maxCharacters: 2 }), grant("b")] });
+    const a = { id: "a", person: "p-a", grant: grant("a", { accounts: ["A1", "A2", "A3"], maxCharacters: 2 }), limits: { ...LIMITS }, logins: [] as number[] };
+    const asks = await Promise.allSettled(Array.from({ length: 40 }, (_, i) => r.gateway.leaserFor(a).lease({ token: newHostedToken(), account: `A${(i % 3) + 1}` })));
+    const granted = asks.filter((x) => x.status === "fulfilled" && x.value.secret !== undefined);
+    expect(granted).toHaveLength(2);
+    expect(asks.filter((x) => x.status === "rejected").every((x) => (x as PromiseRejectedResult).reason instanceof LeaseRefused)).toBe(true);
+    expect(r.gateway.ledger.of("a")).toHaveLength(2);
+    // Only the logins that happened count against the hour.
+    expect(a.logins).toHaveLength(2);
+    // The hourly limit holds the same way.
+    const c = { id: "b", person: "p-b", grant: grant("b", { accounts: ["B1"], maxCharacters: 1 }), limits: { ...LIMITS, loginsPerHour: 1 }, logins: [] as number[] };
+    const hour = await Promise.allSettled(Array.from({ length: 10 }, () => r.gateway.leaserFor(c).lease({ token: newHostedToken(), account: "B1" })));
+    expect(hour.filter((x) => x.status === "fulfilled")).toHaveLength(1);
+  }, 30_000);
+
+  test("a lease the module does not grant gives its reservation and its login back", async () => {
+    const r = await rig({ grants: [grant("a")] });
+    const a = { id: "a", person: "p-a", grant: grant("a"), limits: { ...LIMITS, loginsPerHour: 1 }, logins: [] as number[] };
+    const base = (r.gateway as unknown as { base: { lease: (o: unknown) => Promise<unknown> } }).base;
+    const real = base.lease;
+    base.lease = async () => ({ note: "the module said no" });
+    expect(await r.gateway.leaserFor(a).lease({ token: newHostedToken(), account: "A1" })).toEqual({ note: "the module said no" } as never);
+    base.lease = async () => {
+      throw new Error("module unreachable");
+    };
+    await expect(r.gateway.leaserFor(a).lease({ token: newHostedToken(), account: "A1" })).rejects.toThrow("unreachable");
+    expect(a.logins).toHaveLength(0);
+    // Neither held a place: the one login of the hour is still there to take.
+    base.lease = real;
+    expect((await r.gateway.leaserFor(a).lease({ token: newHostedToken(), account: "A1" })).secret).toBeDefined();
+  }, 30_000);
+
+  test("audit strings are cut: a huge tool name or character costs a bounded line", async () => {
+    const r = await rig({ grants: [grant("a")] });
+    // The legacy revision: the name rides the body alone, not a header.
+    expect((await r.legacy(KEY.a, "tools/call", { name: "x".repeat(150_000), arguments: { character: "y".repeat(100_000), code: "1" } })).status).toBe(200);
+    const line = r.audit("p-a").find((l) => l["kind"] === "call")!;
+    expect(String(line["tool"]).length).toBeLessThan(400);
+    expect(String(line["tool"])).toEndWith("…[cut, 150000 chars]");
+    expect(String(line["character"])).toEndWith("…[cut, 100000 chars]");
+    expect(line["argBytes"]).toBeGreaterThan(100_000);
+    const dir = join(r.state, "audit", "p-a");
+    const bytes = readdirSync(dir).reduce((n, f) => n + readFileSync(join(dir, f)).length, 0);
+    expect(bytes).toBeLessThan(8_000);
+  }, 30_000);
+
+  test("unauthenticated refusals: one line per kind and address a window, the rest counted; a long Origin cut", async () => {
+    const r = await rig();
+    for (let i = 0; i < 50; i++) expect((await r.modern(null, "tools/list")).status).toBe(401);
+    for (let i = 0; i < 5; i++) expect((await r.modern(KEY.a, "tools/list", {}, { origin: `https://${"e".repeat(8_000)}.example` })).status).toBe(403);
+    await r.gateway.audit.settled();
+    let lines = r.audit(UNAUTHENTICATED);
+    expect(lines.map((l) => l["reason"] ?? l["why"])).toEqual(["no_key", "origin"]);
+    expect(String(lines[1]!["origin"]).length).toBeLessThan(400);
+    // The window passes: the next refusal writes the count of the last and starts another.
+    r.clock.now += 61_000;
+    await r.modern(null, "tools/list");
+    r.gateway.refusals.flush(true);
+    await r.gateway.audit.settled();
+    lines = r.audit(UNAUTHENTICATED);
+    const summaries = lines.filter((l) => l["kind"] === "refused-summary");
+    expect(summaries.map((l) => [l["reason"] ?? l["why"], l["more"]])).toEqual([
+      ["no_key", 49],
+      ["origin", 4],
+    ]);
+    expect(lines.filter((l) => l["kind"] === "auth")).toHaveLength(2);
+  });
+
+  test("the session record keeps a call's arguments, cut past what a real call carries", async () => {
+    const { clipStrings } = await import("../src/clip");
+    const { CALL_ARG_LIMITS, CALL_TOOL_MAX } = await import("../src/record/writer");
+    const file = "f".repeat(32_000);
+    expect(clipStrings({ path: "main.ts", content: file }, CALL_ARG_LIMITS)).toEqual({ path: "main.ts", content: file });
+    const cut = clipStrings({ code: "c".repeat(40_000), more: ["d".repeat(40_000), "e".repeat(40_000)] }, CALL_ARG_LIMITS) as { code: string; more: string[] };
+    expect(cut.code).toEndWith("…[cut, 40000 chars]");
+    expect(cut.code.length).toBeLessThan(32_800);
+    expect(cut.more[0]).toEndWith("…[cut, 40000 chars]");
+    // The budget runs out across strings.
+    expect(cut.more[1]!.startsWith("e".repeat(32_768))).toBe(true);
+    expect(clipStrings({ a: "x".repeat(70_000), b: "y".repeat(70_000), c: "z".repeat(70_000), d: "w" }, CALL_ARG_LIMITS)).toMatchObject({ d: "…[cut, 1 chars]" });
+    expect(CALL_TOOL_MAX).toBe(128);
+  });
+});
+
 describe("limits", () => {
   test("a request burst past the bucket is 429 with Retry-After", async () => {
     const r = await rig({ grants: [grant("a", { limits: { burst: 2, requestsPerSecond: 1 } })] });
@@ -332,6 +421,7 @@ describe("stops", () => {
     await r.gateway.sweep();
     expect(r.gateway.ledger.seats()).toHaveLength(0);
     expect((await r.modern(KEY.a, "tools/list")).status).toBe(401);
+    await r.gateway.audit.settled();
     expect(r.audit("p-a").some((l) => l["kind"] === "auth" && l["reason"] === "disabled")).toBe(true);
   }, 30_000);
 
@@ -416,7 +506,12 @@ describe("hardening", () => {
     });
     const first = await r.call(KEY.a, "run_snippet", { code: "1" });
     expect(first.body.result!.isError).toBe(true);
-    expect(first.body.result!.content[0]!.text).toContain("could not be opened: disk full");
+    // The person is told a reference, never the detail; the operator's audit has both.
+    const text = first.body.result!.content[0]!.text;
+    expect(text).toMatch(/could not be opened: the server could not start it \(ref [0-9a-f]{8}\)/);
+    expect(text).not.toContain("disk full");
+    const ref = /ref ([0-9a-f]{8})/.exec(text)![1];
+    expect(r.audit("p-a").some((l) => l["kind"] === "call" && l["ref"] === ref && String(l["error"]).includes("disk full"))).toBe(true);
     expect(r.gateway.ledger.seats()).toHaveLength(0);
     expect((await r.call(KEY.a, "run_snippet", { code: "5" })).body.result!.content[0]!.text).toContain("5");
   }, 30_000);

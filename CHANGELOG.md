@@ -32,6 +32,14 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   (a LAN with no TLS or proxy) drops the cookie and stays at the sign-in.
   Put TLS in front, directly or by a proxy; a bearer header still works
   without it.
+- **The inspector's bearer secret is at least 32 characters**, where it was
+  16, the floor the module asks of its port secret. An inspector started
+  with a shorter one refuses to start; make a longer one.
+- **An inspector over a hosted state needs a credential on loopback too.**
+  `--hosted-state` with neither `--grants` nor a secret now refuses to start
+  whatever the bind, since a proxy on the same machine brings every visitor
+  in from loopback. Give it grants or a secret, or `--allow-anonymous` to
+  serve every tenant's sessions to whoever reaches the port.
 
 ### Added
 
@@ -429,6 +437,23 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Changed
 
+- **The hosted gateway's audit and leases are bounded.** Every string in a
+  person audit line is cut at 256 characters with a marker; refused
+  requests are written off the event loop, one line per kind and address a
+  minute and a `refused-summary` count for the rest; lease caps are checked
+  and reserved before the module is asked, so concurrent asks cannot all
+  pass them; a host that fails to open tells the person a reference, and
+  the detail goes to the gateway's log and audit. `loginsPerHour` is
+  documented as what it counts: leases of new sessions.
+- **A session record's `call` rows are cut past what a real call carries**
+  (`docs/SESSION-FORMAT.md`, "calls"): a string at 32,768 characters, a
+  call's strings at 98,304 together, the tool name at 128.
+- **The inspector is hardened.** `--secure-cookie` marks the sign-in cookie
+  `Secure` behind a TLS proxy on loopback; sign-in bodies are capped, an
+  address is refused after ten failed sign-ins a minute, and one credential
+  holds at most 32 sign-ins; every response carries a content security
+  policy, `nosniff` and no framing; the bin caps request bodies at 64 KiB
+  and closes idle connections after 30 seconds, event-stream tails apart.
 - **The inspector's sign-in cookie is an opaque id, not the secret.** It
   stands for a sign-in the bin holds in memory for at most twelve hours, so
   a restart signs browsers out, and a browser holding the old cookie signs in

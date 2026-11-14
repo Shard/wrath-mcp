@@ -62,7 +62,12 @@ export interface HostedLimits {
   burst: number;
   /** Tool calls running at once. */
   inFlight: number;
-  /** Logins (a character entering the world, a create included) per hour. */
+  /**
+   * Leases of new sessions per hour: each character the gateway lets into
+   * the world under a token it has not held. What a session does under its
+   * own lease (a snippet's `deleteSession` and `createSession` again) is not
+   * seen here; the module's per-lease action rate is what bounds that.
+   */
   loginsPerHour: number;
   /** Minutes with no authenticated request before the credential's characters are logged out and its worker stopped. */
   idleMinutes: number;

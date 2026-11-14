@@ -50,7 +50,7 @@ single session directory, such as the one a harness keeps inside a run. The
 inspector only reads it: a session being written is followed as it grows.
 
 Bound to loopback, the default, it needs no credential. Bound to any other
-address it refuses to start without a bearer secret of at least 16 characters,
+address it refuses to start without a bearer secret of at least 32 characters,
 from `WRATH_INSPECTOR_SECRET` or the first line of `--secret-file <path>`, and
 never from the command line. Every request must then carry
 `Authorization: Bearer <secret>`, or the cookie the sign-in sets for a
@@ -69,9 +69,11 @@ person holds now, and nobody else's. The file is the gateway's, mode 0600, so
 the inspector runs as a user that may read it. Given grants, no request is
 anonymous, on loopback too, since a loopback inspector behind a proxy for
 tenants must not give every visitor the operator's view; the secret is then
-optional, and without it nobody is the operator. Without grants,
-`--hosted-state` is as `--store` is: on loopback with no secret, whoever
-reaches it is the operator and sees every tenant.
+optional, and without it nobody is the operator. Without grants, a
+`--hosted-state` inspector needs the secret on loopback too, and refuses to
+start without either: a proxy on the same machine would bring every visitor
+in from loopback. `--allow-anonymous` overrides that, for an operator who
+means whoever reaches the port to see every tenant.
 
 A person is scoped by where a session is, never by what it says. A
 credential's directory is written by its host, which runs the tenant's
@@ -88,15 +90,26 @@ The sign-in, `POST /api/sign-in`, takes the secret or a key as
 `Authorization: Bearer …` or in a JSON body (`{ "key": … }`; `{ "secret": … }`
 is the same), never in a URL's query, and answers with a cookie,
 `wrath_inspector`: an opaque random id, never the credential, `HttpOnly`,
-`SameSite=Strict`, `Path=/`, `Secure` over TLS or off loopback, for twelve
-hours. Off loopback a browser therefore signs in only over TLS, the bin's
-own or a proxy's in front of it. The bin keeps what the id stands for in memory (a restart signs
+`SameSite=Strict`, `Path=/`, `Secure` over TLS, off loopback, or with
+`--secure-cookie` (for a TLS proxy on the same machine in front of a
+loopback bind, where neither says TLS), for twelve hours. Off loopback a
+browser therefore signs in only over TLS, the bin's own or a proxy's in
+front of it. Sign-in takes a body of a few kilobytes at most, refuses an
+address after ten failures in a minute until the minute passes (behind a
+proxy every visitor is the proxy's address, so the throttle is then
+shared), and keeps at most 32 sign-ins per credential, so signing in over
+and over evicts only one's own. The bin keeps what the id stands for in memory (a restart signs
 everyone out), for a key only its digest, and checks it against the grants
 file on every request: a key revoked, a grant disabled or removed, ends that
 cookie's access at the next request, and an open tail at its next poll.
 `POST /api/sign-out` forgets it, and `GET /api/me` says who the page is
 signed in as. A key also works as a bearer header on any request, as the
 MCP takes it.
+
+Every response carries a content security policy (the page's own scripts,
+and Wowhead's with `--wowhead`; no framing; no plugins), `nosniff` and no
+referrer. The bin reads request bodies up to 64 KiB, and closes a
+connection idle for 30 seconds, except an event-stream tail.
 
 Tenant records are hostile strings: the views only ever set text, and a
 test (`test/html-sinks.test.ts`) keeps `innerHTML`, `outerHTML`,
