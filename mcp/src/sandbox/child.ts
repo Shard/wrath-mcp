@@ -1677,6 +1677,15 @@ const BIGINT_STRINGIFY_RE = /serialize\s+(a\s+)?BigInt/i;
  *   - a single BuildMessage (one parse error) — same, without the wrapper.
  *   - JSON.stringify on a bigint — keep the TypeError but name the fix.
  */
+/**
+ * An array method called on something the code names as a bag (`state.bag()`,
+ * `bag`, `myBag`) that has none: `state.bag()` returns an object, and the
+ * bare "is not a function" says nothing of where its rows are. Only on the
+ * failure; the object is untouched.
+ */
+const BAG_ARRAY_METHOD_RE = /^[\w$.()[\]'"]*bag[\w$.()[\]'"]*\.(map|filter|find|forEach|some|every|reduce|flatMap|slice|sort)\b.* is not a function/i;
+const BAG_SHAPE_NOTE = "state.bag() returns { items, freeSlots, totalSlots, bags }; its rows are the items array";
+
 export function renderError(err: unknown): string {
   const text = renderErrorText(err);
   if (program === null) return text;
@@ -1703,6 +1712,7 @@ function renderErrorText(err: unknown): string {
         `String(x), template literals, or console.log directly`
       );
     }
+    if (err instanceof TypeError && BAG_ARRAY_METHOD_RE.test(err.message)) return `${err.name}: ${err.message} — ${BAG_SHAPE_NOTE}`;
     return `${err.name}: ${err.message}`;
   }
   // With a program: Bun's resolver rejects a failed import with a

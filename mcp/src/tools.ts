@@ -447,6 +447,9 @@ export async function appendPendingActionHints(ctx: CoreToolContext, result: Too
   return scrubResult(ctx, block === undefined ? result : { ...result, text: `${result.text}\n${block}` });
 }
 
+/** The tools whose results carry the model's own code's errors: a snippet's, and a routine's on its routine lines. Any other result (a file read back) is left as it is. */
+const CODE_RESULT_TOOLS: ReadonlySet<string> = new Set(["run_snippet", "start_routine", "stop_routine"]);
+
 /** A name the sandbox does not define, as its error reads. */
 const TOOL_AS_FUNCTION = /\bReferenceError: ([A-Za-z_$][\w$]*) is not defined\b/;
 
@@ -608,7 +611,8 @@ export class ToolSet<C extends CoreToolContext> {
           isError: true,
         };
       }
-      return this.withToolNameHint(await spec.run(ctx, parsed.data, origin));
+      const result = await spec.run(ctx, parsed.data, origin);
+      return CODE_RESULT_TOOLS.has(name) ? this.withToolNameHint(result) : result;
     } catch (err) {
       return { text: `tool ${name} failed: ${err instanceof Error ? err.message : String(err)}`, isError: true };
     }

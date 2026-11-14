@@ -734,8 +734,16 @@ describe("the program tools", () => {
     const asFn = await call("run_snippet", { code: 'await stop_routine({ name: "walk" })' });
     expect(asFn.isError).toBe(true);
     expect(asFn.text).toContain("ReferenceError: stop_routine is not defined\n`stop_routine` is a tool, not a function in the sandbox; call it as a tool.");
-    // A name that is no tool gets no such line.
+    // An array method on what the code names a bag says where the rows are.
+    const bagMap = await call("run_snippet", { code: "state.bag().map((x) => x)" });
+    expect(bagMap.text).toContain("TypeError: state.bag().map is not a function. (In 'state.bag().map((x) => x)', 'state.bag().map' is undefined) — state.bag() returns { items, freeSlots, totalSlots, bags }; its rows are the items array");
+    expect((await call("run_snippet", { code: "const myBag = state.bag(); myBag.filter(Boolean)" })).text).toContain("myBag.filter is not a function");
+    expect((await call("run_snippet", { code: "const myBag = state.bag(); myBag.filter(Boolean)" })).text).toContain("— state.bag() returns { items, freeSlots, totalSlots, bags }");
+    expect((await call("run_snippet", { code: "const x = {}; x.map(1)" })).text).not.toContain("state.bag() returns");
+    // A name that is no tool gets no such line, and a file that holds such an error reads back exactly as stored.
     expect((await call("run_snippet", { code: "await walk_to_x()" })).text).not.toContain("is a tool");
+    await call("write_file", { path: "notes.txt", content: "ReferenceError: stop_routine is not defined\n" });
+    expect((await call("read_file", { path: "notes.txt" })).text).toBe("ReferenceError: stop_routine is not defined\n");
     // args is a JSON object: its JSON text instead is refused, and the hint says which.
     const text = await call("start_routine", { name: "walk", args: '{"to":{"x":1,"y":2,"z":3}}' });
     expect(text.isError).toBe(true);

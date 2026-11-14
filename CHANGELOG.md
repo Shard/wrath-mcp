@@ -480,12 +480,14 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   typed `object`, and a string there, the object's JSON text, is refused
   with "must be a JSON object, not a string"; any other value passes as
   before. A `ReferenceError` naming a tool (`stop_routine is
-  not defined`) gets a line saying it is a tool. `read_file` serves the SDK
+  not defined`) in a snippet's or a routine tool's result gets a line saying
+  it is a tool. `read_file` serves the SDK
   reference as `API.md`, whole or by line range, unless the workspace has a
   file of that name. The `moveTo` `superseded` hint states only that a newer
   move replaced this one, and the `character_bound` hint covers a create
   still in flight. `state.units()` and `closest()` take `reaction`, and an
-  array method on `state.bag()`'s result names its shape.
+  array method that fails on what the code names a bag (`state.bag().map`)
+  says `state.bag()`'s shape.
 - **A routine refusal at fan-out names the client's character.** Above
   fan-out 1, a refusal fact carries `seat`, the character whose client was
   refused, and its signature's character is that one, as the hint a tool

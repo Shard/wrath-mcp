@@ -909,7 +909,7 @@ const ERROR_CODE_HINTS: Record<string, string> = {
     "the account named is not the one this session was leased for — omit `account`; the run's account is fixed",
   character_bound:
     "this session's token is bound to the character in `bound` (one it already played, or one a create still in " +
-    "flight under it named) and cannot create another — continue with that character",
+    "flight under it named) and cannot create another — call createSession with that name, or deleteSession and continue with it",
   item_not_usable:
     "the module refused use_item for that bag/slot — the item there has no on-use spell, no quest to start and does not open for loot, " +
     "or the slot is empty or shifted (slots move after looting/selling); check state.bag()",

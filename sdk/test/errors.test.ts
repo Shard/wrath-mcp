@@ -152,7 +152,7 @@ describe("error-code hints", () => {
     const err = new WrathRequestError(409, { ok: false, error: "character_bound", bound: "Thalvorn" } as never);
     expect(err.message).toBe(
       "module rejected request: character_bound (this session's token is bound to the character in `bound` (one it already played, " +
-        "or one a create still in flight under it named) and cannot create another — continue with that character) (HTTP 409)",
+        "or one a create still in flight under it named) and cannot create another — call createSession with that name, or deleteSession and continue with it) (HTTP 409)",
     );
   });
 

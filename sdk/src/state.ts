@@ -1933,27 +1933,6 @@ export interface UnitView {
   readonly threat: ThreatList | undefined;
 }
 
-/** The array methods code reaches for on `state.bag()`'s result, which is an object. */
-const BAG_ARRAY_METHODS = ["map", "filter", "find", "forEach", "some", "every", "reduce", "flatMap"] as const;
-
-/**
- * `contents` with each array method, non-enumerable, throwing a `TypeError`
- * that names the shape: `state.bag()` returns an object, and `.map` on it
- * would otherwise fail as a bare "is not a function" that says nothing of
- * where the rows are. Nothing is added that JSON or inspection shows.
- */
-function withArrayMethodHints(contents: BagContents): BagContents {
-  for (const method of BAG_ARRAY_METHODS) {
-    Object.defineProperty(contents, method, {
-      enumerable: false,
-      value: () => {
-        throw new TypeError(`state.bag().${method} is not a function: state.bag() returns { items, freeSlots, totalSlots, bags }, and the rows are its items array`);
-      },
-    });
-  }
-  return contents;
-}
-
 /** How a unit regards this character (`UnitView.reaction`). */
 export type UnitReaction = "hostile" | "neutral" | "friendly";
 const UNIT_REACTIONS: readonly UnitReaction[] = ["hostile", "neutral", "friendly"];
@@ -2972,7 +2951,7 @@ export class StateCache {
       totalSlots += numSlots;
       for (const c of contents) items.push(this.bagRow(i.slot, c.slot, c.guid));
     }
-    return withArrayMethodHints({ items, freeSlots: totalSlots - items.length, totalSlots, bags });
+    return { items, freeSlots: totalSlots - items.length, totalSlots, bags };
   }
 
   /**
