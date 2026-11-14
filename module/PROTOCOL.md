@@ -163,6 +163,17 @@ On the module as a whole:
   (an idle kept-alive connection is closed the same way, as it always was).
   A connection has 10 seconds for its first request, and for each one until
   one has authenticated.
+- **Waiting on the world.** A request the game answers (`POST /action`,
+  `POST /session`, `DELETE /session`, `/characters`, `/character-delete`) is
+  queued for the world thread and answered when its work there is done, or
+  `504 timeout` after 10 seconds (20 for the three that log a session in);
+  the work itself still runs when the world thread reaches it. Nothing waits
+  on a thread meanwhile, so one caller's slow or many requests do not delay
+  another's, the event streams, or `/lease` and `/health`, which never touch
+  the world thread. A connection carries one request at a time, as before. A
+  world tick serves queued requests in the order they came for at most 20
+  milliseconds (always at least one) and leaves the rest for the next tick,
+  so a burst is spread over a few ticks.
 - **Numbers and text.** A position axis or a facing is a finite number within
   ±100000 (`400 invalid_position`, `invalid_dest` on a cast's ground target),
   judged before anything is planned. No planned line or route estimate takes
