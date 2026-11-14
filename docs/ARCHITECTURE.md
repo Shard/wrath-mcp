@@ -468,9 +468,10 @@ worst place for it when the code is a stranger's. So the host is split in two:
   SHA-256 and shown once, and resolves it to a grant: the person, the
   accounts and how many characters may be in the world at once, never the
   GM opt-in. It holds the port secret and runs no tenant code. It takes and
-  releases leases and keeps a ledger of them that outlives its own restart (a
-  seat whose worker is still live keeps its lease, since re-leasing would
-  rotate a secret the child still holds), routes each tool call to the
+  releases leases and keeps a ledger of them that outlives its own restart
+  (once workers are processes of their own, a seat whose worker is still live
+  keeps its lease, since re-leasing would rotate a secret the child still
+  holds; for now every seat is released at start), routes each tool call to the
   credential's worker, applies the rate and idle limits, and writes an audit
   per person that joins the module's by token fingerprint.
 - **A worker per credential** runs the sandbox host, the program host, the
@@ -488,9 +489,11 @@ A credential is served the tool list the stdio server serves for the same
 options, byte for byte at fan-out 1: both build it in `host.ts`.
 
 The gateway is `mcp/src/hosted/gateway.ts`. For now it opens each
-credential's host in its own process, each host's child confined as every
-sandbox is; the worker process per credential and the `WorkerProvider` hook
-are the next step, and the gateway's leaser already holds every lease to the
+credential's host in the gateway's process, beside the port secret, with
+only each host's child confined as every sandbox is: enough for an
+operator's own multi-user tests, and not for people outside the deployment.
+The worker process per credential and the `WorkerProvider` hook are the next
+step, and outsiders connect only after them, and the gateway's leaser already holds every lease to the
 grant (the account, the character count, the token's owner, never GM) as it
 must once the host is a process the gateway does not trust. Its ledger lives
 outside the credentials' directories and is never read back from them. The module's part is to protect itself:

@@ -46,7 +46,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { hostToolDefs, openHost, type HostSurface, type OpenedHost } from "../host";
-import { moduleAuthHeaders, portSecretLeaser, tokenFingerprint, type Leaser, type LeaseOutcome } from "../module-auth";
+import { MODULE_SECRET_ENV, moduleAuthHeaders, moduleSecret, portSecretLeaser, tokenFingerprint, type Leaser, type LeaseOutcome } from "../module-auth";
 import type { ToolResult } from "../tools";
 import { MCP_PACKAGE_VERSION } from "../version";
 import { authenticate, toFanoutGrant, type Authentication, type GrantSource, type HostedLimits, type TenantGrant } from "./grants";
@@ -241,6 +241,10 @@ export class Gateway {
     mkdirSync(join(o.stateDir, "tenants"), { recursive: true, mode: 0o700 });
     this.audit = new PersonAudit(join(o.stateDir, "audit"), this.now);
     this.ledger = new Ledger(join(o.stateDir, "ledger.json"));
+    if (moduleSecret(o.env ?? process.env) === undefined) {
+      // Without it no lease is taken, no seat is recorded, and every limit that counts seats counts nothing.
+      throw new Error(`${MODULE_SECRET_ENV} is not set: the gateway leases every character with the module's port secret and does not start without it`);
+    }
     this.base = portSecretLeaser({ moduleUrl: o.moduleUrl, ...(o.env !== undefined ? { env: o.env } : {}), ...(o.fetch !== undefined ? { fetch: o.fetch } : {}) });
   }
 
@@ -272,8 +276,8 @@ export class Gateway {
   }
 
   /**
-   * The checks the timer runs: grants removed, disabled or reshaped (their
-   * hosts stop), credentials idle past their limit (theirs too), the world
+   * The checks the timer runs: grants removed, disabled, left with no key or
+   * reshaped (their hosts stop), credentials idle past their limit (theirs too), the world
    * restarted (every host stops: the module forgot every lease), and the
    * audit's retention.
    */
@@ -285,8 +289,9 @@ export class Gateway {
       const now = this.now();
       for (const t of this.tenants.values()) {
         const g = set.grant(t.id);
-        if (g === undefined || g.disabled === true) {
-          if (t.host !== undefined) await this.stopHost(t, g === undefined ? "grant removed" : "grant disabled");
+        // A grant whose last key was revoked can never be called again: what its key left running stops too.
+        if (g === undefined || g.disabled === true || g.keyHashes.length === 0) {
+          if (t.host !== undefined) await this.stopHost(t, g === undefined ? "grant removed" : g.disabled === true ? "grant disabled" : "every key revoked");
           this.tenants.delete(t.id);
           continue;
         }
@@ -355,7 +360,7 @@ export class Gateway {
         { status: 429, headers: { "retry-after": String(retry) } },
       );
     }
-    return serveMcpPost(req, this.endpoint(t, auth.keyId), (n) => {
+    return serveMcpPost(req, this.endpoint(t, auth.keyId, remote), (n) => {
       if (n.method !== "tools/call" || n.status !== 200) this.audit.write(t.person, { kind: "request", credential: t.id, keyId: auth.keyId, remote, era: n.era, method: n.method, version: n.version, status: n.status, ...(n.error !== undefined ? { error: n.error } : {}) });
     });
   }
@@ -381,11 +386,11 @@ export class Gateway {
     return true;
   }
 
-  private endpoint(t: Tenant, keyId: string): McpEndpoint {
+  private endpoint(t: Tenant, keyId: string, remote: string | undefined): McpEndpoint {
     return {
       serverInfo: { name: "wrath-mcp", version: MCP_PACKAGE_VERSION },
       list: () => hostToolDefs(this.surfaceOf(t.grant)),
-      call: (name, args) => this.call(t, keyId, name, args),
+      call: (name, args) => this.call(t, keyId, remote, name, args),
     };
   }
 
@@ -395,9 +400,9 @@ export class Gateway {
     return run;
   }
 
-  private async call(t: Tenant, keyId: string, name: string, args: unknown): Promise<{ result: ToolResult } | { refused: CallRefusal }> {
+  private async call(t: Tenant, keyId: string, remote: string | undefined, name: string, args: unknown): Promise<{ result: ToolResult } | { refused: CallRefusal }> {
     if (t.pending >= t.limits.inFlight) {
-      this.audit.write(t.person, { kind: "refused", why: "calls in flight", credential: t.id, keyId, tool: name });
+      this.audit.write(t.person, { kind: "refused", why: "calls in flight", credential: t.id, keyId, remote, tool: name });
       return { refused: { status: 429, message: `${t.pending} calls are already running or waiting for this key (at most ${t.limits.inFlight}); wait for one to answer`, retryAfterS: 1 } };
     }
     t.pending++;
@@ -408,12 +413,14 @@ export class Gateway {
         t.lastDispatchTs = dispatchTs;
         const text = JSON.stringify(args ?? {});
         const target = args !== null && typeof args === "object" ? ((args as Record<string, unknown>)["character"] ?? (name === "login_character" ? (args as Record<string, unknown>)["name"] : undefined)) : undefined;
-        const line = { kind: "call", credential: t.id, keyId, tool: name, callId: dispatchTs, ...(typeof target === "string" ? { character: target } : {}), argBytes: Buffer.byteLength(text), argSha256: createHash("sha256").update(text).digest("hex") };
+        const line = { kind: "call", credential: t.id, keyId, remote, tool: name, callId: dispatchTs, ...(typeof target === "string" ? { character: target } : {}), argBytes: Buffer.byteLength(text), argSha256: createHash("sha256").update(text).digest("hex") };
         let host: OpenedHost;
         try {
           host = await this.hostFor(t);
         } catch (err) {
           const why = err instanceof Error ? err.message : String(err);
+          // A host that leased and then failed to open holds nothing that will give the lease back.
+          await this.releaseSeats(t, "host failed to open");
           this.audit.write(t.person, { ...line, outcome: "error", durationMs: this.now() - started, error: `host: ${why}` });
           return { text: `${name} failed: your session could not be opened: ${why}`, isError: true };
         }
@@ -465,15 +472,20 @@ export class Gateway {
       t.host = undefined;
       await host.shutdown({ logout: true });
       // Whatever the host did not give back, the gateway does.
-      for (const seat of this.ledger.of(t.id)) {
-        await this.base.logout(seat.token);
-        await this.base.release(seat.token);
-        this.ledger.remove(seat.token);
-        this.audit.write(seat.person, { kind: "release", why, credential: t.id, account: seat.account, fingerprint: seat.fingerprint });
-      }
+      await this.releaseSeats(t, why);
       this.audit.write(t.person, { kind: "host", event: "stop", why, credential: t.id });
       this.log(`[${t.id}] host stopped: ${why}`);
     });
+  }
+
+  /** Log out and release every seat the ledger holds for a credential. */
+  private async releaseSeats(t: Pick<Tenant, "id">, why: string): Promise<void> {
+    for (const seat of this.ledger.of(t.id)) {
+      await this.base.logout(seat.token);
+      await this.base.release(seat.token);
+      this.ledger.remove(seat.token);
+      this.audit.write(seat.person, { kind: "release", why, credential: t.id, account: seat.account, fingerprint: seat.fingerprint });
+    }
   }
 
   /**

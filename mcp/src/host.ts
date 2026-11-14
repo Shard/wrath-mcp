@@ -165,6 +165,8 @@ export interface OpenedHost {
   /** At fan-out, bring back the characters that were logged in when the state directory was last used; one that does not come back is logged. A single-character host has nothing to bring back. */
   resume(): Promise<void>;
   readonly sandbox: SandboxHost;
+  /** Write the client cache now (`shutdown` does too); for a process's own exit. */
+  flushCache(): void;
   /**
    * The clean exit, once however many ways it is asked for: stop the
    * sandbox and close every record, each bounded; with `logout`, log every
@@ -253,6 +255,7 @@ async function openSingleHost(o: HostOptions): Promise<OpenedHost> {
     tools: toolHost(new ToolSet(hostToolSpecs(surface)), ctx, sandbox, secrets),
     surface,
     sandbox,
+    flushCache: () => clientCache.flush(),
     recordedIn: record?.dir,
     resume: async () => {},
     shutdown: (s = { logout: true }) =>
@@ -358,6 +361,7 @@ async function openFanoutHost(o: HostOptions, grant: FanoutGrant): Promise<Opene
     tools: toolHost(new ToolSet(hostToolSpecs(surface)), ctx, sandbox, secrets),
     surface,
     sandbox,
+    flushCache: () => clientCache.flush(),
     recordedIn: o.record?.root,
     resume: async () => {
       for (const f of await roster.resume()) o.log(secrets.scrub(`${f.character} was not brought back: ${f.error}`));

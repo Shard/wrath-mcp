@@ -15,9 +15,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { hostToolDefs } from "../src/host";
+import { hostToolDefs, openHost } from "../src/host";
 import { Gateway, LeaseRefused, UNAUTHENTICATED } from "../src/hosted/gateway";
-import { emptyGrantsFile, FileGrantSource, keyDigest, writeGrantsFile, type TenantGrant } from "../src/hosted/grants";
+import { emptyGrantsFile, FileGrantSource, GrantSet, keyDigest, writeGrantsFile, type TenantGrant } from "../src/hosted/grants";
 import { ERR_GATEWAY, ERR_HEADER_MISMATCH, ERR_METHOD_NOT_FOUND, ERR_UNSUPPORTED_VERSION, LEGACY_VERSIONS } from "../src/hosted/http";
 import { McpServer } from "../src/server";
 import { startStubModule, STUB_PORT_SECRET, type StubModule } from "./fixtures/stub-module";
@@ -48,7 +48,7 @@ interface Rig {
   audit(person: string): Record<string, unknown>[];
 }
 
-async function rig(o: { grants: TenantGrant[]; program?: boolean; health?: () => number | undefined; start?: (state: string, stub: StubModule) => void } = { grants: [grant("a")] }): Promise<Rig> {
+async function rig(o: { grants: TenantGrant[]; program?: boolean; health?: () => number | undefined; start?: (state: string, stub: StubModule) => void; openHost?: typeof openHost } = { grants: [grant("a")] }): Promise<Rig> {
   const stub = startStubModule();
   const state = mkdtempSync(join(tmpdir(), "wm-gateway-"));
   const grantsPath = join(state, "..", `${state.split("/").pop()}-grants.json`);
@@ -72,6 +72,7 @@ async function rig(o: { grants: TenantGrant[]; program?: boolean; health?: () =>
     now: () => clock.now,
     log: () => {},
     snippetTimeoutMs: 5_000,
+    ...(o.openHost !== undefined ? { openHost: o.openHost } : {}),
   });
   await gateway.start();
   const server = Bun.serve({ port: 0, hostname: "127.0.0.1", idleTimeout: 60, fetch: (req) => gateway.fetch(req, "127.0.0.1") });
@@ -381,5 +382,50 @@ describe("the entry", () => {
     expect(() => parseGatewayArgs(["--state", "s"], {})).toThrow("usage");
     expect(parseGatewayArgs(["--state", "s"], { WRATH_MCP_GRANTS_FILE: "/x/g.json" }).grants).toBe("/x/g.json");
     expect(() => parseGatewayArgs(["--grants", "g", "--state", "s", "--allow-gm"], {})).toThrow("unknown argument --allow-gm");
+  });
+});
+
+describe("hardening", () => {
+  test("a host that leased and then failed to open gives the lease back, so the next call is not locked out", async () => {
+    let fail = true;
+    const r = await rig({
+      grants: [grant("a")],
+      openHost: async (h) => {
+        if (fail) {
+          fail = false;
+          await h.leaser!.lease({ token: "x".repeat(32), account: "A1" });
+          throw new Error("disk full");
+        }
+        return openHost(h);
+      },
+    });
+    const first = await r.call(KEY.a, "run_snippet", { code: "1" });
+    expect(first.body.result!.isError).toBe(true);
+    expect(first.body.result!.content[0]!.text).toContain("could not be opened: disk full");
+    expect(r.gateway.ledger.seats()).toHaveLength(0);
+    expect((await r.call(KEY.a, "run_snippet", { code: "5" })).body.result!.content[0]!.text).toContain("5");
+  }, 30_000);
+
+  test("revoking a grant's last key stops what it left running", async () => {
+    const r = await rig({ grants: [grant("a")] });
+    await r.call(KEY.a, "run_snippet", { code: "1" });
+    writeGrantsFile(r.grantsPath, { ...emptyGrantsFile(), grants: [grant("a", { keyHashes: [] })] });
+    r.grants.reload();
+    await r.gateway.sweep();
+    expect(r.gateway.ledger.seats()).toHaveLength(0);
+    expect(r.audit("p-a").some((l) => l["kind"] === "host" && l["why"] === "every key revoked")).toBe(true);
+  }, 30_000);
+
+  test("a call is audited with the address it came from", async () => {
+    const r = await rig({ grants: [grant("a")] });
+    await r.call(KEY.a, "state_summary", {});
+    expect(r.audit("p-a").find((l) => l["kind"] === "call")?.["remote"]).toBe("127.0.0.1");
+  }, 30_000);
+
+  test("the gateway does not start without the port secret", () => {
+    const state = mkdtempSync(join(tmpdir(), "wm-gateway-nosecret-"));
+    cleanups.push(() => rmSync(state, { recursive: true, force: true }));
+    const grants = { current: () => new GrantSet(emptyGrantsFile()), close: () => {} };
+    expect(() => new Gateway({ grants, stateDir: state, moduleUrl: "http://module.invalid", env: {} })).toThrow("WRATHBENCH_MODULE_SECRET is not set");
   });
 });

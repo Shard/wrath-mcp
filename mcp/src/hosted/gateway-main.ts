@@ -88,15 +88,21 @@ if (import.meta.main) {
   }
   const log = (line: string): void => console.error(`[wrath-mcp gateway] ${line}`);
   const grants = new FileGrantSource(args.grants, { onProblem: (p) => log(`grants file refused, granting nothing until it stands: ${p.join("; ")}`) });
-  const gateway = new Gateway({
-    grants,
-    stateDir: args.state,
-    moduleUrl: process.env["WRATHBENCH_MODULE_URL"] ?? "http://127.0.0.1:8086",
-    program: args.program,
-    allowedOrigins: args.allowedOrigins,
-    recordRetentionMs: args.recordRetentionMs,
-    log,
-  });
+  let gateway: Gateway;
+  try {
+    gateway = new Gateway({
+      grants,
+      stateDir: args.state,
+      moduleUrl: process.env["WRATHBENCH_MODULE_URL"] ?? "http://127.0.0.1:8086",
+      program: args.program,
+      allowedOrigins: args.allowedOrigins,
+      recordRetentionMs: args.recordRetentionMs,
+      log,
+    });
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(2);
+  }
   await gateway.start();
   const server = Bun.serve({
     hostname: args.host,

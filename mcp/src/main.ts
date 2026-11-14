@@ -232,6 +232,7 @@ async function main(): Promise<void> {
     // stdout is the MCP transport: what a snippet prints goes to stderr with the rest of this process's log.
     logSink: (_stream, text) => void process.stderr.write(text),
   });
+  process.on("exit", () => host.flushCache());
   const server = new McpServer(host.tools, { serverVersion: MCP_PACKAGE_VERSION });
   // A fan-out host's characters need the leases the roster holds, logged out with the port secret however the child answered.
   const timeoutMs = grant !== null ? 10_000 + 1_000 * grant.maxCharacters : 25_000;

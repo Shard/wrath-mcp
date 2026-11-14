@@ -201,7 +201,12 @@ connects with its key as `Authorization: Bearer <key>`:
 { "mcpServers": { "wrath": { "type": "http", "url": "https://wrath.example/mcp", "headers": { "Authorization": "Bearer wmk_…" } } } }
 ```
 
-- Only the gateway holds the port secret (`WRATHBENCH_MODULE_SECRET`). Each
+- **Not yet for people outside the deployment.** Each credential's host runs
+  in the gateway's own process, beside the port secret; only its sandbox
+  child is confined. Until each host is a worker process holding lease
+  secrets only, serve it to the operator's own tests alone.
+- Only the gateway holds the port secret (`WRATHBENCH_MODULE_SECRET`), and
+  it refuses to start without it. Each
   credential gets a host of its own, opened at its first tool call, with its
   state in `<state>/tenants/<credential>/` and its own session store there;
   its records carry the person as `owner`.
@@ -214,8 +219,8 @@ connects with its key as `Authorization: Bearer <key>`:
   one at a time, and past its in-flight cap are refused. With no
   authenticated request for the idle minutes, the credential's characters are
   logged out and its host stopped; the next call opens it again. A grant
-  disabled or removed stops its host at the next sweep, and so does a
-  worldserver restart.
+  disabled, removed or left with no key stops its host at the next sweep,
+  and so does a worldserver restart.
 - `<state>/audit/<person>/<day>.jsonl` records who called what: keys tried,
   each request and tool call (by its call id, with the arguments as a size
   and a hash), leases by token fingerprint, refusals and stops. Kept 30 days.
