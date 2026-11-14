@@ -409,6 +409,41 @@ describe("closing, resuming and dying", () => {
     expect(v.warnings).toEqual([`trace/${segmentFileName(T0 + SEGMENT_MS)}: 1 line(s) that are not a JSON object`]);
   });
 
+  test("the segment a dead writer left is held for its successor, however long the first row takes", async () => {
+    const { dir, writer, reopen, clock, reader } = rig();
+    writer.ingest(drain({ trace: [keyRow(T0 + SEGMENT_MS + 2000)] }));
+    appendFileSync(join(dir, "trace", segmentFileName(T0 + SEGMENT_MS)), '{"ts":17672259');
+    clock.now = T0 + SEGMENT_MS + 30_000;
+    const next = reopen();
+    next.open();
+    // Long enough for any compression the open started to land.
+    await Bun.sleep(50);
+    expect(files(dir, "trace")).toEqual([segmentFileName(T0 + SEGMENT_MS)]);
+    next.ingest(drain({ trace: [keyRow(T0 + SEGMENT_MS + 31_000, { hp: 55 })] }));
+    await next.close();
+    expect(files(dir, "trace")).toEqual([`${segmentFileName(T0 + SEGMENT_MS)}.zst`]);
+    expect(reader.rows("trace", T0 + SEGMENT_MS).map((r) => (r.data as { hp: number }).hp)).toEqual([100, 55]);
+    const v = validateSession(dir);
+    expect(v.errors).toEqual([]);
+    expect(v.warnings).toEqual([`trace/${segmentFileName(T0 + SEGMENT_MS)}: 1 line(s) that are not a JSON object`]);
+  });
+
+  test("a successor whose first row is windows later closes the torn segment with its tear ended", async () => {
+    const { dir, writer, reopen, clock, reader } = rig();
+    writer.ingest(drain({ trace: [keyRow(T0 + 2000)] }));
+    appendFileSync(join(dir, "trace", segmentFileName(T0)), '{"ts":17672259');
+    clock.now = T0 + 2 * SEGMENT_MS + 30_000;
+    const next = reopen();
+    next.open();
+    next.ingest(drain({ trace: [keyRow(T0 + 2 * SEGMENT_MS + 31_000, { hp: 55 })] }));
+    await next.close();
+    expect(files(dir, "trace")).toEqual([`${segmentFileName(T0)}.zst`, `${segmentFileName(T0 + 2 * SEGMENT_MS)}.zst`]);
+    expect(reader.rows("trace").map((r) => (r.data as { hp: number }).hp)).toEqual([100, 55]);
+    const v = validateSession(dir);
+    expect(v.errors).toEqual([]);
+    expect(v.warnings).toEqual([`trace/${segmentFileName(T0)}: 1 line(s) that are not a JSON object`]);
+  });
+
   test("a directory it cannot write costs the record and nothing else", async () => {
     const dir = join(mkdtempSync(join(tmpdir(), "wrath-writer-")), "file");
     tmp.push(dir);
