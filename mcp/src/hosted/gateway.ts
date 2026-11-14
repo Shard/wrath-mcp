@@ -42,15 +42,18 @@
  * is the point of them; idle is measured from the person, not the game.
  */
 
-import { createHash, randomBytes } from "node:crypto";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { hostToolDefs, type HostSurface } from "../host";
 import { MODULE_SECRET_ENV, moduleAuthHeaders, moduleIdentity, moduleSecret, portSecretLeaser, tokenFingerprint, type Leaser, type LeaseOutcome } from "../module-auth";
 import type { ToolResult } from "../tools";
+import { pruneSessions } from "../record/retention";
+import { SessionStore } from "../record/store";
 import { MCP_PACKAGE_VERSION } from "../version";
 import { authenticate, toFanoutGrant, type Authentication, type GrantSource, type HostedLimits, type TenantGrant } from "./grants";
 import { serveMcpPost, type CallRefusal, type McpEndpoint } from "./http";
+import { isHostedToken, newHostedToken } from "./tokens";
 import { connectWorker, localWorkers, newWorkerSecret, type CredentialHost, type WorkerProvider } from "./workers";
 
 /** The person audit's directory for a request no key named a person for. */
@@ -211,6 +214,8 @@ export interface GatewayOptions {
   allowedOrigins?: readonly string[];
   /** How long a credential's session records are kept. Default three days. */
   recordRetentionMs?: number;
+  /** How often credentials' directories are pruned (`pruneTenants`), at most. Default an hour. */
+  storePruneMs?: number;
   /** How often idle credentials, changed grants and the world's restarts are checked. Default 30 s; 0 never (call `sweep`). */
   sweepMs?: number;
   now?: () => number;
@@ -234,6 +239,7 @@ export class Gateway {
   /** The worldserver's start as `/health` last said it; a change means every lease is gone. */
   private worldStartedAt: number | undefined;
   private sweeping = false;
+  private lastStorePrune = 0;
   private defaultWorkers: WorkerProvider | undefined;
 
   constructor(private readonly o: GatewayOptions) {
@@ -280,8 +286,9 @@ export class Gateway {
   /**
    * The checks the timer runs: grants removed, disabled, left with no key or
    * reshaped (their hosts stop), credentials idle past their limit (theirs too), the world
-   * restarted (every host stops: the module forgot every lease), and the
-   * audit's retention.
+   * restarted (every host stops: the module forgot every lease), the
+   * audit's retention, and, at most every `storePruneMs`, the credentials'
+   * own directories (`pruneTenants`).
    */
   async sweep(): Promise<void> {
     if (this.sweeping) return;
@@ -308,6 +315,10 @@ export class Gateway {
       }
       if (started !== undefined) this.worldStartedAt = started;
       this.audit.prune();
+      if (now - this.lastStorePrune >= (this.o.storePruneMs ?? 3_600_000)) {
+        this.lastStorePrune = now;
+        this.pruneTenants(set);
+      }
     } finally {
       this.sweeping = false;
     }
@@ -465,7 +476,8 @@ export class Gateway {
         moduleUrl: this.o.moduleUrl,
         dir: handle.paths.state,
         // The single character's token is minted here; at fan-out it names the client's records (`group`) and is never leased.
-        token: surface.fanout ? `hosted-client-${t.id}` : randomBytes(16).toString("hex"),
+        token: surface.fanout ? `hosted-client-${t.id}` : newHostedToken(),
+        hostedTokens: true,
         account: grant.accounts[0],
         grant: surface.fanout ? { maxCharacters: grant.maxCharacters, accounts: [...toFanoutGrant(grant).accounts] } : null,
         program: surface.program,
@@ -479,6 +491,7 @@ export class Gateway {
       log: (line) => this.log(`[${t.id}] ${line}`),
     });
     t.host = host;
+    this.markUsed(t.id);
     void host.lost.then((why) => this.lostHost(t, host, why));
     this.audit.write(t.person, { kind: "host", event: "open", credential: t.id, fanout: surface.fanout, program: surface.program });
     await host.resume();
@@ -502,12 +515,92 @@ export class Gateway {
       const host = t.host;
       if (host === undefined) return;
       t.host = undefined;
+      this.markUsed(t.id);
       await host.shutdown();
       // Whatever the host did not give back, the gateway does.
       await this.releaseSeats(t, why);
       this.audit.write(t.person, { kind: "host", event: "stop", why, credential: t.id });
       this.log(`[${t.id}] host stopped: ${why}`);
     });
+  }
+
+  /**
+   * Each credential's directory, on a schedule rather than only when its
+   * worker next opens (which an idle or disabled credential never does):
+   *
+   * - every session record past the record retention goes, from every
+   *   credential's store; a live one beats and is kept;
+   * - a credential whose grant is removed, disabled or left with no key, and
+   *   which has had no host for the person audit's retention, loses its whole
+   *   directory (workspace, scratchpad, roster, records). A live grant keeps
+   *   its workspace however long it is idle: that is the person's program.
+   *
+   * When a credential was last used is the gateway's own record
+   * (`last-used.json` beside the ledger), never a time a credential's
+   * directory says of itself.
+   */
+  pruneTenants(set = this.o.grants.current()): { sessions: number; credentials: string[] } {
+    const root = join(this.o.stateDir, "tenants");
+    const now = this.now();
+    const used = this.lastUsed();
+    let sessions = 0;
+    const removed: string[] = [];
+    for (const id of existsSync(root) ? readdirSync(root) : []) {
+      const dir = join(root, id);
+      const sessionsDir = join(dir, "sessions");
+      if (existsSync(sessionsDir)) {
+        try {
+          sessions += pruneSessions(new SessionStore(sessionsDir), this.o.recordRetentionMs ?? 3 * 86_400_000, { now }).length;
+        } catch (err) {
+          this.log(`[${id}] pruning its session records: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      const g = set.grant(id);
+      const live = g !== undefined && g.disabled !== true && g.keyHashes.length > 0;
+      if (live || this.tenants.get(id)?.host !== undefined) continue;
+      let last = used[id];
+      if (last === undefined) {
+        try {
+          last = statSync(dir).mtimeMs;
+        } catch {
+          continue;
+        }
+      }
+      if (now - last < AUDIT_RETENTION_DAYS * 86_400_000) continue;
+      rmSync(dir, { recursive: true, force: true });
+      removed.push(id);
+      delete used[id];
+      this.audit.write(g?.person ?? null, { kind: "pruned", credential: id, why: g === undefined ? "grant removed" : "grant disabled", lastUsed: last });
+      this.log(`[${id}] removed its directory: no live grant and unused for ${AUDIT_RETENTION_DAYS} days`);
+    }
+    if (removed.length > 0) this.saveLastUsed(used);
+    return { sessions, credentials: removed };
+  }
+
+  private lastUsedPath(): string {
+    return join(this.o.stateDir, "last-used.json");
+  }
+
+  private lastUsed(): Record<string, number> {
+    try {
+      const raw = JSON.parse(readFileSync(this.lastUsedPath(), "utf8")) as unknown;
+      return raw !== null && typeof raw === "object" ? (raw as Record<string, number>) : {};
+    } catch {
+      return {};
+    }
+  }
+
+  private saveLastUsed(used: Record<string, number>): void {
+    const tmp = `${this.lastUsedPath()}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(used)}\n`, { mode: 0o600 });
+    renameSync(tmp, this.lastUsedPath());
+  }
+
+  /** Note that a credential's host was open now: what `pruneTenants` measures an unused credential from. */
+  private markUsed(id: string): void {
+    const used = this.lastUsed();
+    used[id] = this.now();
+    this.saveLastUsed(used);
   }
 
   /** Log out and release every seat the ledger holds for a credential. */
@@ -533,6 +626,8 @@ export class Gateway {
         };
         const account = o.account;
         if (account === undefined || !t.grant.accounts.some((a) => a.toUpperCase() === account.toUpperCase())) refuse(`account ${account ?? "(none)"} is not one this key was granted`);
+        // Its module audit must be kept as long as the person audit that points at it (tokens.ts).
+        if (!isHostedToken(o.token)) refuse("that session's token is not one the gateway issues");
         const held = this.ledger.get(o.token);
         if (held !== undefined && held.credential !== t.id) refuse("that session belongs to another key");
         const mine = this.ledger.of(t.id).filter((s) => s.token !== o.token);

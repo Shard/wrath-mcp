@@ -35,6 +35,11 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Added
 
+- **Hosted retention.** Hosted sessions' tokens have fingerprints starting
+  `0000` (`mcp/src/hosted/tokens.ts`) and the gateway leases no other, so a
+  deployment can keep their module audit as long as the person audit. The
+  gateway prunes each credential's session records hourly, and removes the
+  directory of a credential with no live grant after 30 days unused.
 - **Hosted mode for a deployment's own tooling.** Exports
   `@wrathbench/mcp/hosted/gateway` (`runGateway`, `gatewayMain`),
   `/hosted/workers`, `/hosted/worker` (`workerMain`, with `--hello-wait-ms`),

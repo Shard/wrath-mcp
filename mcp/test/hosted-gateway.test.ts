@@ -31,6 +31,7 @@ function inProcessWorkers(open: typeof openHost): WorkerProvider {
   };
 }
 import { Gateway, LeaseRefused, UNAUTHENTICATED } from "../src/hosted/gateway";
+import { HOSTED_FINGERPRINT_PREFIX, isHostedToken, newHostedToken } from "../src/hosted/tokens";
 import { emptyGrantsFile, FileGrantSource, GrantSet, keyDigest, writeGrantsFile, type TenantGrant } from "../src/hosted/grants";
 import { ERR_GATEWAY, ERR_HEADER_MISMATCH, ERR_METHOD_NOT_FOUND, ERR_UNSUPPORTED_VERSION, LEGACY_VERSIONS } from "../src/hosted/http";
 import { McpServer } from "../src/server";
@@ -264,14 +265,14 @@ describe("one key never reaches another's", () => {
     await r.call(KEY.a, "run_snippet", { code: "1" });
     const aToken = r.gateway.ledger.seats()[0]!.token;
     const b = { id: "b", person: "p-b", grant: grant("b"), limits: { requestsPerSecond: 5, burst: 20, inFlight: 4, loginsPerHour: 20, idleMinutes: 30 }, logins: [] as number[] };
-    await expect(r.gateway.leaserFor(b).lease({ token: "t".repeat(32), account: "A1" })).rejects.toBeInstanceOf(LeaseRefused);
+    await expect(r.gateway.leaserFor(b).lease({ token: newHostedToken(), account: "A1" })).rejects.toBeInstanceOf(LeaseRefused);
     await expect(r.gateway.leaserFor(b).lease({ token: aToken, account: "B1" })).rejects.toThrow("another key");
     // Nor can B log out or release A's session.
     await r.gateway.leaserFor(b).release(aToken);
     await r.gateway.leaserFor(b).logout(aToken);
     expect(r.gateway.ledger.get(aToken)?.credential).toBe("a");
     // And GM is never sent, whatever is asked.
-    await r.gateway.leaserFor(b).lease({ token: "u".repeat(32), account: "B1", allowGm: true });
+    await r.gateway.leaserFor(b).lease({ token: newHostedToken(), account: "B1", allowGm: true });
     expect(r.stub.calls.filter((c) => c.path === "/lease" && c.method === "POST").every((c) => c.body?.["allowGm"] === undefined)).toBe(true);
   }, 30_000);
 });
@@ -367,7 +368,7 @@ describe("stops", () => {
 
 describe("after a crash", () => {
   test("a character the roster still marks in comes back at the next call, on a fresh lease", async () => {
-    const token = "c".repeat(32);
+    const token = newHostedToken();
     const r = await rig({
       grants: [grant("a", { accounts: ["A1", "A2"], maxCharacters: 2 })],
       start: (state) => {
@@ -407,7 +408,7 @@ describe("hardening", () => {
       openHost: async (h) => {
         if (fail) {
           fail = false;
-          await h.leaser!.lease({ token: "x".repeat(32), account: "A1" });
+          await h.leaser!.lease({ token: newHostedToken(), account: "A1" });
           throw new Error("disk full");
         }
         return openHost(h);
@@ -476,7 +477,7 @@ describe("workers", () => {
     const r = await rig({
       grants: [grant("a"), grant("b")],
       openHost: async (h) => {
-        await h.leaser!.lease({ token: "z".repeat(32), account: "B1" });
+        await h.leaser!.lease({ token: newHostedToken(), account: "B1" });
         return openHost(h);
       },
     });
@@ -485,4 +486,42 @@ describe("workers", () => {
     expect(res.body.result!.content[0]!.text).toContain("not one this key was granted");
     expect(r.gateway.ledger.seats()).toHaveLength(0);
   }, 30_000);
+});
+
+describe("retention", () => {
+  test("every token a hosted session runs under carries the hosted fingerprint, and the leaser refuses any other", async () => {
+    expect(isHostedToken(newHostedToken())).toBe(true);
+    const r = await rig({ grants: [grant("a", { accounts: ["A1", "A2"], maxCharacters: 2 }), grant("b")] });
+    await r.call(KEY.a, "login_character", { name: "alfa", race: 1, class: 1 });
+    await r.call(KEY.b, "run_snippet", { code: "1" });
+    const seats = r.gateway.ledger.seats();
+    expect(seats).toHaveLength(2);
+    for (const s of seats) expect(s.fingerprint.startsWith(HOSTED_FINGERPRINT_PREFIX)).toBe(true);
+    const a = { id: "a", person: "p-a", grant: grant("a", { accounts: ["A1", "A2"], maxCharacters: 2 }), limits: { requestsPerSecond: 5, burst: 20, inFlight: 4, loginsPerHour: 20, idleMinutes: 30 }, logins: [] as number[] };
+    await expect(r.gateway.leaserFor(a).lease({ token: "f".repeat(32), account: "A2" })).rejects.toThrow("not one the gateway issues");
+  }, 60_000);
+
+  test("session records past retention go on a schedule; a gone grant's directory goes after the audit's retention, a live one's never", async () => {
+    const r = await rig({ grants: [grant("a"), grant("b")] });
+    await r.call(KEY.a, "run_snippet", { code: "1" });
+    await r.call(KEY.b, "run_snippet", { code: "1" });
+    await r.gateway.stop();
+    const sessions = join(r.state, "tenants", "a", "sessions");
+    expect(readdirSync(sessions)).toHaveLength(1);
+    // B's grant is removed; A's stays.
+    writeGrantsFile(r.grantsPath, { ...emptyGrantsFile(), grants: [grant("a")] });
+    r.grants.reload();
+    // Four days on: A's closed record is past the three-day retention, B's directory not yet past thirty.
+    r.clock.now += 4 * 86_400_000;
+    expect(r.gateway.pruneTenants()).toEqual({ sessions: 2, credentials: [] });
+    expect(readdirSync(sessions)).toHaveLength(0);
+    expect(existsSync(join(r.state, "tenants", "b"))).toBe(true);
+    // Thirty-one days on: B's directory goes; A's stays, its grant live.
+    r.clock.now += 27 * 86_400_000;
+    expect(r.gateway.pruneTenants().credentials).toEqual(["b"]);
+    expect(existsSync(join(r.state, "tenants", "b"))).toBe(false);
+    expect(existsSync(join(r.state, "tenants", "a", "state"))).toBe(true);
+    expect(r.audit("p-b").some((l) => l["kind"] === "pruned")).toBe(false);
+    expect(r.audit(UNAUTHENTICATED).some((l) => l["kind"] === "pruned" && l["credential"] === "b")).toBe(true);
+  }, 60_000);
 });
