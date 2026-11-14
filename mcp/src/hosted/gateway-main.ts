@@ -23,6 +23,10 @@
 import { resolve } from "node:path";
 import { DEFAULT_RETENTION_MS } from "../record/retention";
 import { Gateway, MAX_BODY_BYTES } from "./gateway";
+import type { WorkerProvider } from "./workers";
+
+export { Gateway, type GatewayOptions } from "./gateway";
+export type { CredentialHost, WorkerHandle, WorkerProvider } from "./workers";
 import { FileGrantSource, GRANTS_FILE_ENV } from "./grants";
 
 export const GATEWAY_USAGE =
@@ -78,31 +82,38 @@ export function parseGatewayArgs(argv: readonly string[], env: Record<string, st
   return { grants: resolve(grants), state: resolve(state), host: flags.get("host") ?? "127.0.0.1", port, program, allowedOrigins: origins, trustForwardedFor, recordRetentionMs };
 }
 
-if (import.meta.main) {
-  let args: GatewayArgs;
-  try {
-    args = parseGatewayArgs(process.argv.slice(2));
-  } catch (err) {
-    console.error(err instanceof Error ? err.message : String(err));
-    process.exit(2);
-  }
-  const log = (line: string): void => console.error(`[wrath-mcp gateway] ${line}`);
+export interface RunningGateway {
+  readonly gateway: Gateway;
+  readonly port: number;
+  /** Stop serving, then stop every credential's worker, logging its characters out. */
+  stop(): Promise<void>;
+}
+
+/**
+ * Run a gateway as this entry does: grants from the file, workers from
+ * `workers` (default a process per credential on this machine), MCP served
+ * at `/mcp`. A deployment that starts its workers its own way (a pod per
+ * credential) calls this with its own provider. Throws on a configuration
+ * the gateway refuses, such as no port secret.
+ */
+export async function runGateway(
+  args: GatewayArgs,
+  o: { workers?: WorkerProvider; env?: Record<string, string | undefined>; log?: (line: string) => void } = {},
+): Promise<RunningGateway> {
+  const env = o.env ?? process.env;
+  const log = o.log ?? ((line: string): void => console.error(`[wrath-mcp gateway] ${line}`));
   const grants = new FileGrantSource(args.grants, { onProblem: (p) => log(`grants file refused, granting nothing until it stands: ${p.join("; ")}`) });
-  let gateway: Gateway;
-  try {
-    gateway = new Gateway({
-      grants,
-      stateDir: args.state,
-      moduleUrl: process.env["WRATHBENCH_MODULE_URL"] ?? "http://127.0.0.1:8086",
-      program: args.program,
-      allowedOrigins: args.allowedOrigins,
-      recordRetentionMs: args.recordRetentionMs,
-      log,
-    });
-  } catch (err) {
-    console.error(err instanceof Error ? err.message : String(err));
-    process.exit(2);
-  }
+  const gateway = new Gateway({
+    grants,
+    stateDir: args.state,
+    moduleUrl: env["WRATHBENCH_MODULE_URL"] ?? "http://127.0.0.1:8086",
+    env,
+    program: args.program,
+    allowedOrigins: args.allowedOrigins,
+    recordRetentionMs: args.recordRetentionMs,
+    ...(o.workers !== undefined ? { workers: o.workers } : {}),
+    log,
+  });
   await gateway.start();
   const server = Bun.serve({
     hostname: args.host,
@@ -116,13 +127,38 @@ if (import.meta.main) {
     },
   });
   log(`serving MCP at http://${args.host}:${server.port}/mcp for ${grants.current().grants.length} grant(s), state in ${args.state}`);
+  let stopped: Promise<void> | undefined;
+  return {
+    gateway,
+    port: server.port ?? args.port,
+    stop: () =>
+      (stopped ??= (async () => {
+        void server.stop();
+        await gateway.stop();
+        grants.close();
+      })()),
+  };
+}
+
+/** Run the gateway until SIGINT or SIGTERM, as the entry does; a deployment's own entry calls this with its provider. */
+export async function gatewayMain(argv: readonly string[], o: { workers?: WorkerProvider } = {}): Promise<void> {
+  let running: RunningGateway;
+  try {
+    running = await runGateway(parseGatewayArgs(argv), o);
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(2);
+  }
   let stopping = false;
   const onSignal = (code: number) => () => {
     if (stopping) process.exit(code);
     stopping = true;
-    void server.stop();
-    void Promise.race([gateway.stop(), Bun.sleep(30_000)]).finally(() => process.exit(code));
+    void Promise.race([running.stop(), Bun.sleep(30_000)]).finally(() => process.exit(code));
   };
   process.on("SIGINT", onSignal(130));
   process.on("SIGTERM", onSignal(143));
+}
+
+if (import.meta.main) {
+  await gatewayMain(process.argv.slice(2));
 }

@@ -249,6 +249,14 @@ connects with its key as `Authorization: Bearer <key>`:
   `--allowed-origin` names browser origins it accepts; `--trust-forwarded-for`
   audits the proxy's `X-Forwarded-For` address.
 
+A deployment that starts its workers its own way (a pod per credential)
+builds on the exports: `runGateway` or `gatewayMain` from
+`@wrathbench/mcp/hosted/gateway` with its own `WorkerProvider`
+(`@wrathbench/mcp/hosted/workers`), `workerMain` from
+`@wrathbench/mcp/hosted/worker` as the worker's entry (`--host`, `--port`,
+`--hello-wait-ms`), and `runGrantsCommand` from
+`@wrathbench/mcp/hosted/grants-cli` for its own tooling over the grants file.
+
 ## Pieces
 
 - `src/sandbox/` — the host (`SandboxHost`), the child runtime (`child.ts`,

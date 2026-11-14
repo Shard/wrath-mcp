@@ -18,6 +18,11 @@
     "./tools": "./src/tools.ts",
     "./fanout": "./src/fanout.ts",
     "./hosted/grants-read": "./src/hosted/grants-read.ts",
+    "./hosted/grants": "./src/hosted/grants.ts",
+    "./hosted/grants-cli": "./src/hosted/grants-cli.ts",
+    "./hosted/gateway": "./src/hosted/gateway-main.ts",
+    "./hosted/workers": "./src/hosted/workers.ts",
+    "./hosted/worker": "./src/hosted/worker.ts",
     "./record": "./src/record/index.ts",
     "./record/read": "./src/record/read.ts",
     "./record/recorder": "./src/record/recorder.ts"

@@ -276,7 +276,14 @@ export async function serveWorker(o: ServeWorkerOptions): Promise<ServedWorker> 
   return { host: bind, port, stop: () => stop(true) };
 }
 
-if (import.meta.main) {
+/**
+ * Run a worker as this entry does: the secret from `WRATH_MCP_WORKER_SECRET`
+ * (struck from the environment once read), `--host` and `--port` to listen
+ * on, `--hello-wait-ms` for how long it waits for its gateway (a pod may be
+ * reached later than a local process), and an exit once its gateway is gone.
+ * A deployment's own worker entry calls this.
+ */
+export async function workerMain(argv: readonly string[]): Promise<void> {
   const secret = process.env[WORKER_SECRET_ENV];
   if (secret === undefined || secret.length < 32) {
     console.error(`${WORKER_SECRET_ENV} must hold this worker's secret (32 characters or more)`);
@@ -284,19 +291,24 @@ if (import.meta.main) {
   }
   // Read once and struck, as the sandbox child strikes its own: nothing this process starts inherits it.
   delete process.env[WORKER_SECRET_ENV];
-  const argv = process.argv.slice(2);
   const flag = (name: string): string | undefined => {
     const i = argv.indexOf(`--${name}`);
     return i >= 0 ? argv[i + 1] : undefined;
   };
+  const wait = flag("hello-wait-ms");
   const served = await serveWorker({
     secret,
     host: flag("host") ?? "127.0.0.1",
     port: Number(flag("port") ?? 0),
+    ...(wait !== undefined ? { helloWaitMs: Number(wait) } : {}),
     onExit: () => process.exit(0),
   });
   process.stdout.write(`${WORKER_READY_PREFIX}${served.host}:${served.port}\n`);
   const onSignal = () => void served.stop();
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
+}
+
+if (import.meta.main) {
+  await workerMain(process.argv.slice(2));
 }
