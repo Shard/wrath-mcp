@@ -908,8 +908,8 @@ const ERROR_CODE_HINTS: Record<string, string> = {
   account_not_leased:
     "the account named is not the one this session was leased for — omit `account`; the run's account is fixed",
   character_bound:
-    "this session already played a character (see `bound`) and cannot create another — call createSession " +
-    "with that name, or deleteSession and continue with it",
+    "this session's token is bound to the character in `bound` (one it already played, or one a create still in " +
+    "flight under it named) and cannot create another — continue with that character",
   item_not_usable:
     "the module refused use_item for that bag/slot — the item there has no on-use spell, no quest to start and does not open for loot, " +
     "or the slot is empty or shifted (slots move after looting/selling); check state.bag()",
@@ -1371,10 +1371,7 @@ export const MOVE_HINTS: Readonly<Record<string, (point: MovePoint, data: MoveRe
   // The client moves another unit (module/PROTOCOL.md, `controlling`): a
   // refusal carries no route, a walk the handover ended does.
   controlling: (_p, d) => (d.pathLength === undefined ? CONTROLLING_MOVE_HINT : CONTROLLING_WALK_HINT),
-  superseded: () =>
-    `a newer moveTo replaced this one and is the move walking now. It came from this run's own code: another ` +
-    `routine, a snippet, or a helper's walk (killTarget's approach). Retrying on superseded cancels that newer ` +
-    `move in turn, so two callers that both retry cancel each other forever. Let one caller own movement.`,
+  superseded: () => `a newer moveTo replaced this one and is the move walking now.`,
   // The module ends a move `stopped` only for a `stop` action while the move
   // is active (module/PROTOCOL.md, "stop"), and only this run's client sends
   // one: the caller's own `stop()`, the stop `moveTo` sends after a refusal

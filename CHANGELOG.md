@@ -472,6 +472,26 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Changed
 
+- **What a model is told, in a few places.** `run_snippet` states the
+  snippet time limit (`SNIPPET_TIME_LIMIT_MS`, 30 seconds, the hosts'
+  default), and an abandoned snippet that was awaiting an SDK wait whose
+  `timeout` was the limit or longer says so, as one awaiting such a `sleep`
+  already did (`EventAbortedError.timeoutMs`). `start_routine`'s `args` is
+  typed `object`, and a string there, the object's JSON text, is refused
+  with "must be a JSON object, not a string"; any other value passes as
+  before. A `ReferenceError` naming a tool (`stop_routine is
+  not defined`) gets a line saying it is a tool. `read_file` serves the SDK
+  reference as `API.md`, whole or by line range, unless the workspace has a
+  file of that name. The `moveTo` `superseded` hint states only that a newer
+  move replaced this one, and the `character_bound` hint covers a create
+  still in flight. `state.units()` and `closest()` take `reaction`, and an
+  array method on `state.bag()`'s result names its shape.
+- **A routine refusal at fan-out names the client's character.** Above
+  fan-out 1, a refusal fact carries `seat`, the character whose client was
+  refused, and its signature's character is that one, as the hint a tool
+  result carries is, so a routine started for no character no longer folds
+  every character's refusals into one signature.
+
 - **The full `GET /health` view is the port secret's.** Which view a caller
   gets is decided by its credential, no longer by its address: a lease
   secret gets the liveness view even from loopback, where on one host every
@@ -585,6 +605,12 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 - `sdk/API.md` is headed "SDK reference"; it was "WrathBench SDK reference".
 
 ### Fixed
+
+- A routine that ended before its `start_routine` answered (a throw before
+  its first await) was shown in that answer as running, and, when its name
+  had run before, held as running until the next beat: the end arrived
+  first and the start's answer overwrote it, or the end was dropped as an
+  older run's. The answer now shows the run ended, as a later listing does.
 
 - Two first creates under one lease naming different characters, made at
   once, could both pass the check that the lease was unbound, leaving its

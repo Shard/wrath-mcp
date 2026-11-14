@@ -853,6 +853,14 @@ describe("state cache: self progress, target and inventory", () => {
     expect(bag.freeSlots).toBe(15);
     // No inventory fields at all: nothing occupied has been observed.
     expect(withWorld([]).bag()).toEqual({ items: [], freeSlots: 16, totalSlots: 16, bags: [] });
+    // It is an object: an array method on it names the shape, and adds nothing JSON shows.
+    const empty = withWorld([]).bag();
+    expect(() => (empty as unknown as unknown[]).map((x) => x)).toThrow(
+      "state.bag().map is not a function: state.bag() returns { items, freeSlots, totalSlots, bags }, and the rows are its items array",
+    );
+    expect(() => (empty as unknown as unknown[]).filter(Boolean)).toThrow("state.bag().filter is not a function: ");
+    expect(JSON.stringify(empty)).toBe('{"items":[],"freeSlots":16,"totalSlots":16,"bags":[]}');
+    expect(Object.keys(empty)).toEqual(["items", "freeSlots", "totalSlots", "bags"]);
   });
 
   test("a zeroed slot is empty, not an item with guid 0", () => {

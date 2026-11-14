@@ -7,8 +7,10 @@ the public `WrathClient` and `StateCache`. Every method here exists; nothing
 else does. There is **no** `killNearest`, `goTo`, `navigate`, `trainSkill`, or
 skill-specific porcelain — do not invent methods. Gathering and talking to NPCs
 go through `interact`, `gossipHello`, `gossipSelect`, `useItem`, and
-`castSpell`. This file is larger than one snippet result, so read it in slices
-(one `## ` section, or lines filtered by name).
+`castSpell`. This file is larger than one snippet result, so read it in parts:
+with `read_file` where it is served, a range of lines at a time
+(`read_file({ path: "API.md", offset: 1, limit: 200 })`), or in a snippet one
+`## ` section or the lines filtered by name.
 
 **Guids** are opaque decimal strings. Compare with `===`, use them as Map keys
 and in template literals, and `JSON.stringify` them freely; get them from

@@ -417,13 +417,17 @@ the code is still the model's.
   never holds, backs off or stops the model's code for repeating itself.
 - **Tools.** `programTools` beside `coreTools`: `read_file`, `write_file`,
   `edit_file`, `delete_file`, `start_routine`, `stop_routine`, and a
-  `run_snippet` whose description says it is a one-off.
+  `run_snippet` whose description says it is a one-off. `read_file` also
+  serves the SDK reference as `API.md`, by line range, unless the workspace
+  holds a file of that name: the reference is larger than a snippet result.
 - **Several characters.** One workspace and one program per client,
   whatever its grant, and routines per character: `start_routine` and
   `stop_routine` take the character a routine runs for
   (`programTools(render, { characters: true })`), the routine's async context
   carries that seat, and a routine started for none reaches every character
-  through `chars`. Rows, facts and lines name the character. A harness serves
+  through `chars`. Rows, facts and lines name the character; a refusal fact
+  also names the character whose client was refused (`seat`), which keys its
+  signature. A harness serves
   them beside `fanoutTools(render, fan, { program: true })`, whose
   `run_snippet` is the one-off with a `character`. Logging a character out
   stops the routines started for it. In a new process over the same

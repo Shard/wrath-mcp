@@ -301,7 +301,25 @@ export type ProgramEvent =
   | { kind: "ended"; ts: number; routine: RoutineNote; fresh?: boolean }
   | { kind: "restarted"; ts: number; routine: RoutineNote }
   | { kind: "error"; ts: number; routine?: string; character?: string; deploy: number; error: ProgramErrorNote; fresh: true }
-  | { kind: "refusal"; ts: number; routine: string; character?: string; deploy: number; action: string; status: string; hint: string; signature: string; fresh: true }
+  | {
+      kind: "refusal";
+      ts: number;
+      routine: string;
+      /** The character the routine was started for, if any. */
+      character?: string;
+      /**
+       * At fan-out above 1, the character whose client was refused: a routine
+       * started for no character drives any of them. Its name is the
+       * signature's character, as on the hint line a tool result carries.
+       */
+      seat?: string;
+      deploy: number;
+      action: string;
+      status: string;
+      hint: string;
+      signature: string;
+      fresh: true;
+    }
   | { kind: "wake"; ts: number; reason: string; routine?: string; character?: string }
   | { kind: "preempted"; ts: number; character?: string; by: MoveOwner; of: MoveOwner; to: { x: number; y: number; z: number } };
 

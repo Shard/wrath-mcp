@@ -114,7 +114,7 @@ function rig() {
     const s = store.list().find((x) => x.session.character?.name === name);
     return s === undefined ? [] : (new SessionReader(s.dir).rows("calls") as CallRow[]).filter((x) => x.kind !== "key");
   };
-  return { host, roster, store, facts, call: (name: string, args: unknown) => tools.call(ctx, name, args), rows };
+  return { host, roster, store, stub, facts, call: (name: string, args: unknown) => tools.call(ctx, name, args), rows };
 }
 
 describe("the tools a program is served at fan-out", () => {
@@ -136,6 +136,39 @@ describe("the tools a program is served at fan-out", () => {
 });
 
 describe("a program at fan-out", () => {
+  test("a refusal earned through a character's client names that character, in its fact and its signature", async () => {
+    const r = rig();
+    expect((await r.call("login_character", { name: "alfa", race: 1, class: 1 })).text).toStartWith("logged in: Alfa ");
+    expect((await r.call("login_character", { name: "bravo", race: 1, class: 1 })).text).toStartWith("logged in: Bravo ");
+    // Every move answered too_far, on the token whose client sent it.
+    let answered = 0;
+    const timer = setInterval(() => {
+      const moves = r.stub.calls.filter((c) => c.path === "/action" && c.body?.["action"] === "move_to");
+      for (; answered < moves.length; answered++) {
+        const token = String(moves[answered]!.body?.["token"]);
+        const id = moves.slice(0, answered + 1).filter((m) => m.body?.["token"] === token).length;
+        r.stub.push(token, { opcode: "WB_MOVE_RESULT", data: { moveId: id, status: "too_far", pos: { x: 0, y: 0, z: 0, o: 0 } } });
+      }
+    }, 10);
+    try {
+      await r.call("write_file", {
+        path: "main.ts",
+        content: `export async function party() {
+  memory.moved = (await chars.Bravo.sdk.moveTo({ x: -1200, y: 990, z: 42 }, { timeout: 4000 })).status;
+}
+`,
+      });
+      expect((await r.call("start_routine", { name: "party" })).isError).toBeUndefined();
+      await until("the refusal", () => r.facts.some((f) => f.kind === "refusal"), 15_000);
+      const refusal = r.facts.find((f) => f.kind === "refusal")!;
+      expect(refusal).toMatchObject({ routine: "party", seat: "Bravo", action: "moveTo", status: "too_far", signature: "party|Bravo|moveTo|too_far" });
+      expect("character" in refusal).toBe(false);
+    } finally {
+      clearInterval(timer);
+      await r.roster.shutdown({ logout: true });
+    }
+  }, 40_000);
+
   test("one workspace, routines per character, and each character's record names the routine and character that dispatched", async () => {
     const r = rig();
     expect((await r.call("login_character", { name: "alfa", race: 1, class: 1 })).text).toStartWith("logged in: Alfa ");

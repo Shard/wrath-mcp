@@ -561,9 +561,13 @@ export class ProgramRuntime<S> {
     return true;
   }
 
-  /** A hint-bearing failure of a call a routine made, as the SDK tallied it. */
-  noteRefusal(run: RoutineRun<S>, h: { action: string; status: string; hint: string; count: number; ts: number }): void {
-    const signature = `${run.note.name}|${run.note.character ?? ""}|${h.action}|${h.status}`;
+  /**
+   * A hint-bearing failure of a call a routine made, as the SDK tallied it;
+   * `seat` is the client's character at fan-out above 1, the signature's
+   * character then (a routine started for no character drives any of them).
+   */
+  noteRefusal(run: RoutineRun<S>, h: { action: string; status: string; hint: string; count: number; ts: number }, seat?: string): void {
+    const signature = `${run.note.name}|${seat ?? run.note.character ?? ""}|${h.action}|${h.status}`;
     let count = h.count;
     if (!this.seen.has(signature) && this.seen.size < SIGNATURES_MAX) {
       this.seen.add(signature);
@@ -573,6 +577,7 @@ export class ProgramRuntime<S> {
         ts: h.ts,
         routine: run.note.name,
         ...(run.note.character !== undefined ? { character: run.note.character } : {}),
+        ...(seat !== undefined ? { seat } : {}),
         deploy: run.note.deploy,
         action: h.action,
         status: h.status,

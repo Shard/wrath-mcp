@@ -1933,8 +1933,30 @@ export interface UnitView {
   readonly threat: ThreatList | undefined;
 }
 
+/** The array methods code reaches for on `state.bag()`'s result, which is an object. */
+const BAG_ARRAY_METHODS = ["map", "filter", "find", "forEach", "some", "every", "reduce", "flatMap"] as const;
+
+/**
+ * `contents` with each array method, non-enumerable, throwing a `TypeError`
+ * that names the shape: `state.bag()` returns an object, and `.map` on it
+ * would otherwise fail as a bare "is not a function" that says nothing of
+ * where the rows are. Nothing is added that JSON or inspection shows.
+ */
+function withArrayMethodHints(contents: BagContents): BagContents {
+  for (const method of BAG_ARRAY_METHODS) {
+    Object.defineProperty(contents, method, {
+      enumerable: false,
+      value: () => {
+        throw new TypeError(`state.bag().${method} is not a function: state.bag() returns { items, freeSlots, totalSlots, bags }, and the rows are its items array`);
+      },
+    });
+  }
+  return contents;
+}
+
 /** How a unit regards this character (`UnitView.reaction`). */
 export type UnitReaction = "hostile" | "neutral" | "friendly";
+const UNIT_REACTIONS: readonly UnitReaction[] = ["hostile", "neutral", "friendly"];
 
 /**
  * One FactionTemplate.dbc row, as the module serves it beside a unit's
@@ -2231,6 +2253,12 @@ export interface UnitFilter {
    * `false` is rejected — "no marker" and "never observed" are two readings.
    */
   questGiver?: QuestGiverStatusName | QuestGiverStatusName[] | true;
+  /**
+   * How the unit regards you, as each row's `reaction` reads it: `"hostile"`,
+   * `"neutral"` or `"friendly"`, or a list. Rows whose reaction is not known
+   * yet (game objects among them) never match.
+   */
+  reaction?: UnitReaction | UnitReaction[];
 }
 
 /**
@@ -2944,7 +2972,7 @@ export class StateCache {
       totalSlots += numSlots;
       for (const c of contents) items.push(this.bagRow(i.slot, c.slot, c.guid));
     }
-    return { items, freeSlots: totalSlots - items.length, totalSlots, bags };
+    return withArrayMethodHints({ items, freeSlots: totalSlots - items.length, totalSlots, bags });
   }
 
   /**
@@ -6169,6 +6197,7 @@ function passesUnitFilter(view: UnitView, obj: NearbyObject, f: NormalizedUnitFi
     if (isNpc !== f.npc) return false;
   }
   if (f.role !== undefined && !view.roles.some((r) => f.role!.has(r))) return false;
+  if (f.reaction !== undefined && (view.reaction === undefined || !f.reaction.has(view.reaction))) return false;
   if (f.questGiver !== undefined) {
     if (view.questGiver === undefined) return false;
     if (f.questGiver === ANY_QUEST_GIVER) {
@@ -6188,7 +6217,7 @@ function passesUnitFilter(view: UnitView, obj: NearbyObject, f: NormalizedUnitFi
 // the forbidden outcome — it returns a wrong-but-plausible answer, which is the
 // very failure this helper exists to remove.
 
-const UNIT_FILTER_KEYS = ["entry", "name", "type", "alive", "maxDistance", "npc", "role", "questGiver"] as const;
+const UNIT_FILTER_KEYS = ["entry", "name", "type", "alive", "maxDistance", "npc", "role", "questGiver", "reaction"] as const;
 
 /** `questGiver: true` — any marker except `"none"`. Not a status name, so it cannot collide with one. */
 const ANY_QUEST_GIVER = "any" as const;
@@ -6208,7 +6237,7 @@ const UNIT_FILTER_KEY_HINTS: Readonly<Record<string, string>> = {
   id: "use entry (the creature/gameobject template id)",
   entryId: "use entry",
   level: "level is not a criterion — each returned row carries .level; filter the array yourself",
-  hostile: "hostility is not observed as a filter criterion; read each row's fields instead",
+  hostile: 'use reaction: "hostile"',
 };
 const UNIT_FILTER_TYPES = ["unit", "player", "gameObject", "corpse"] as const;
 
@@ -6228,6 +6257,7 @@ interface NormalizedUnitFilter {
   npc: boolean | undefined;
   role: Set<NpcRole> | undefined;
   questGiver: Set<QuestGiverStatusName> | typeof ANY_QUEST_GIVER | undefined;
+  reaction: Set<UnitReaction> | undefined;
 }
 
 const EMPTY_UNIT_FILTER: NormalizedUnitFilter = {
@@ -6239,6 +6269,7 @@ const EMPTY_UNIT_FILTER: NormalizedUnitFilter = {
   npc: undefined,
   role: undefined,
   questGiver: undefined,
+  reaction: undefined,
 };
 
 /** How a rejected value is quoted back to the caller. */
@@ -6471,6 +6502,19 @@ function normalizeUnitFilter(filter: UnitFilter | undefined): NormalizedUnitFilt
       }
       out.questGiver = names;
     }
+  }
+
+  if (filter.reaction !== undefined) {
+    const raw = Array.isArray(filter.reaction) ? filter.reaction : [filter.reaction];
+    if (raw.length === 0) throw filterError('reaction received an empty array; pass "hostile", "neutral" or "friendly", or omit reaction.');
+    const reactions = new Set<UnitReaction>();
+    for (const item of raw) {
+      if (typeof item !== "string" || !(UNIT_REACTIONS as readonly string[]).includes(item)) {
+        throw filterError(`reaction received ${showValue(item)}, expected one of ${UNIT_REACTIONS.map(showValue).join(", ")} (exact, case-sensitive) or an array of them.`);
+      }
+      reactions.add(item as UnitReaction);
+    }
+    out.reaction = reactions;
   }
 
   if (filter.maxDistance !== undefined) {

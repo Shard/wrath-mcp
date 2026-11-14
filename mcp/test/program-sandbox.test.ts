@@ -7,6 +7,7 @@ import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { API_MD_PATH } from "@wrathbench/sdk";
 import { leaseSessionSecret } from "../src/module-auth";
 import { Scratchpad } from "../src/scratchpad";
 import { programAbandonNote, programWalkText, SandboxHost, SDK_MOVE_ABANDON_ADVICE, SDK_WALK_BUDGET_ADVICE } from "../src/sandbox/host";
@@ -208,6 +209,25 @@ describe("routines", () => {
     expect(await p.stopRoutine({ name: "grind" })).toEqual({ ok: false, text: "grind is not running. No routine is running.\nroutines:\nidle stopped 0s ago" });
   }, 30_000);
 
+  test("a routine that ends before its start answers is shown ended in that answer, a first run and a run again alike", async () => {
+    const { host } = await rig();
+    const p = host.program!;
+    // A throw before the first await: the child sends the end before the start's answer.
+    await p.writeFile("main.ts", 'export async function boom(args) { return args.entries.join(","); }\n');
+    const first = await p.startRoutine({ name: "boom", args: "[6]" });
+    expect(first.ok).toBe(true);
+    expect(first.text).toMatch(/^started boom on deploy 1\nroutines:\nboom threw 0s ago: TypeError: .* at boom \(main\.ts:1:\d+\)$/);
+    // The next listing says the same, as a later routines listing would.
+    expect(p.routines()).toMatchObject([{ name: "boom", state: "threw" }]);
+    // Again, over the ended row of the run before: the new run's end replaces it.
+    const again = await p.startRoutine({ name: "boom", args: { entries: [6] } });
+    expect(again.text).toMatch(/^started boom on deploy 1\nroutines:\nboom returned 0s ago: "6"$/);
+    const rows = p.routines();
+    expect(rows).toMatchObject([{ name: "boom", state: "returned" }]);
+    await p.beat();
+    expect(p.routines()).toEqual(rows);
+  }, 30_000);
+
   test("a stop of a routine that ended before a restart is the same plain answer: the new child never ran it", async () => {
     const r = await rig();
     await r.host.program!.writeFile("main.ts", 'export async function trip() { return "done"; }\n');
@@ -225,7 +245,11 @@ describe("routines", () => {
   test("a routine's returned value and error are shown whole once; later lines refer to them", async () => {
     const { host } = await rig();
     const p = host.program!;
-    await p.writeFile("main.ts", 'export async function trip(args) { return args ?? "done"; }\nexport async function fail() { throw new TypeError("no target in view"); }\n');
+    // Each ends after an await, so the start's own answer shows it running and the stop is the first to show the end.
+    await p.writeFile(
+      "main.ts",
+      'export async function trip(args) { await sleep(30, { wake: false }); return args ?? "done"; }\nexport async function fail() { await sleep(30, { wake: false }); throw new TypeError("no target in view"); }\n',
+    );
     await p.startRoutine({ name: "trip" });
     await p.startRoutine({ name: "fail" });
     await until("both ended", () => p.routines().every((r) => r.state !== "running"));
@@ -338,6 +362,21 @@ describe("routines", () => {
 });
 
 describe("snippets beside a program", () => {
+  test("an abandoned SDK wait whose timeout is the snippet limit or longer is named, as a sleep is", async () => {
+    const { host } = await rig({ timeoutMs: 1_000 });
+    await host.evalSnippet(LOGIN);
+    const long = await host.evalSnippet('await sdk.waitForChat("never said", { timeout: 5000 })');
+    expect(long.timedOut).toBe(true);
+    expect(long.error).toContain(
+      "any move in flight was stopped. a wait for a chat line saying \"never said\" was still waiting when this was abandoned: its timeout was 5000ms " +
+        "and the snippet time limit is 1000ms, so a wait that long can never finish inside one snippet. The sandbox,",
+    );
+    // A wait that fits says nothing of itself.
+    const fits = await host.evalSnippet('await sleep(600, { wake: false }); await sdk.waitForChat("never said", { timeout: 900 })');
+    expect(fits.timedOut).toBe(true);
+    expect(fits.error).not.toContain("a wait for");
+  }, 30_000);
+
   test("a snippet keeps no bindings, leaves nothing running, and imports the files as they stand", async () => {
     const { host } = await rig();
     const p = host.program!;
@@ -645,6 +684,7 @@ describe("the program tools", () => {
     expect(specs.run_snippet.def.description).toContain("Nothing a snippet declares or starts outlives it");
     expect(core.run_snippet.def.description).toContain("Top-level bindings persist across snippets");
     expect(Object.keys(specs.start_routine.def.inputSchema["properties"] as object)).toEqual(["name", "args"]);
+    expect((specs.start_routine.def.inputSchema["properties"] as Record<string, unknown>)["args"]).toEqual({ type: "object", description: "Passed to the function as its one argument: a JSON object; omit for none." });
     expect(Object.keys(specs.edit_file.def.inputSchema["properties"] as object)).toEqual(["path", "old", "new", "replaceAll"]);
     // Above fan-out 1 the routine tools name a character, optionally.
     const many = programTools(render, { characters: true });
@@ -690,6 +730,19 @@ describe("the program tools", () => {
     // Stopping it again is a plain answer, not a tool error.
     expect(await call("stop_routine", { name: "walk" })).toEqual({ text: "walk had already ended: it was stopped 0s ago.\nroutines:\nwalk stopped 0s ago" });
     expect((await call("start_routine", {})).text).toStartWith("invalid arguments for start_routine: ");
+    // A tool called as a sandbox function: the line under the error says it is a tool.
+    const asFn = await call("run_snippet", { code: 'await stop_routine({ name: "walk" })' });
+    expect(asFn.isError).toBe(true);
+    expect(asFn.text).toContain("ReferenceError: stop_routine is not defined\n`stop_routine` is a tool, not a function in the sandbox; call it as a tool.");
+    // A name that is no tool gets no such line.
+    expect((await call("run_snippet", { code: "await walk_to_x()" })).text).not.toContain("is a tool");
+    // args is a JSON object: its JSON text instead is refused, and the hint says which.
+    const text = await call("start_routine", { name: "walk", args: '{"to":{"x":1,"y":2,"z":3}}' });
+    expect(text.isError).toBe(true);
+    expect(text.text).toStartWith("invalid arguments for start_routine: args: must be a JSON object, not a string. Received: ");
+    expect(text.text).toEndWith("start_routine expects { name: string, args?: object } — the export of main.ts to run, and the one argument it is called with.");
+    // Anything else is passed on as before: only the string is refused.
+    expect((await call("start_routine", { name: "walk", args: [1] })).text).toStartWith("started walk on deploy 4\n");
   }, 40_000);
 });
 
@@ -777,6 +830,16 @@ describe("saves, starts and what a result carries", () => {
     expect(await tools.call(ctx, "read_file", { path: "notes.txt", offset: 11 })).toEqual({ text: "notes.txt has 10 lines; offset 11 is past its end", isError: true });
     expect(specs.read_file.def.description).toContain("offset and limit, both optional, return part of it instead");
     expect(Object.keys(specs.read_file.def.inputSchema["properties"] as object)).toEqual(["path", "offset", "limit"]);
+
+    // API.md is the SDK reference, whole or by range, by its name or its path; a workspace file of that name is the model's own.
+    const reference = readFileSync(API_MD_PATH, "utf8");
+    const total = reference.split("\n").length - 1;
+    expect((await tools.call(ctx, "read_file", { path: "API.md" })).text).toBe(reference);
+    expect((await tools.call(ctx, "read_file", { path: "API.md", offset: 3, limit: 1 })).text).toBe(`API.md, lines 3-3 of ${total}:\n# SDK reference`);
+    expect((await tools.call(ctx, "read_file", { path: API_MD_PATH, limit: 1 })).text).toStartWith(`API.md, lines 1-1 of ${total}:\n<!-- AUTO-GENERATED`);
+    expect(specs.read_file.def.description).toEndWith("API.md is the SDK reference (API_MD_PATH) and reads the same way.");
+    await tools.call(ctx, "write_file", { path: "API.md", content: "mine\n" });
+    expect((await tools.call(ctx, "read_file", { path: "API.md" })).text).toBe("mine\n");
   }, 30_000);
 
   test("a snippet's read of a workspace file off the sandbox's disk says where the file is read instead", async () => {

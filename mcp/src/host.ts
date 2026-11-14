@@ -28,7 +28,7 @@ import type { SandboxLimits } from "./sandbox/confine";
 import type { EventSummary } from "./sandbox/ipc";
 import { Scratchpad } from "./scratchpad";
 import type { ToolHost } from "./server";
-import { coreTools, programTools, ToolSet, type CoreToolContext, type CoreToolRender, type ProgramToolContext, type ToolDef, type ToolResult, type ToolSpec } from "./tools";
+import { coreTools, programTools, SNIPPET_TIME_LIMIT_MS, ToolSet, type CoreToolContext, type CoreToolRender, type ProgramToolContext, type ToolDef, type ToolResult, type ToolSpec } from "./tools";
 import { MCP_PACKAGE_VERSION } from "./version";
 import { Workspace } from "./workspace";
 
@@ -242,7 +242,7 @@ async function openSingleHost(o: HostOptions): Promise<OpenedHost> {
     ...(lease.secret !== undefined ? { secret: lease.secret } : {}),
     ...(account !== undefined ? { account } : {}),
     scratchpad,
-    snippetTimeoutMs: o.snippetTimeoutMs ?? 30_000,
+    snippetTimeoutMs: o.snippetTimeoutMs ?? SNIPPET_TIME_LIMIT_MS,
     pingGraceMs: 5_000,
     clientCache,
     ...(o.sandboxLimits !== undefined ? { limits: o.sandboxLimits } : {}),
@@ -328,7 +328,7 @@ async function openFanoutHost(o: HostOptions, grant: FanoutGrant): Promise<Opene
     moduleUrl,
     token: "",
     scratchpad,
-    snippetTimeoutMs: o.snippetTimeoutMs ?? 30_000,
+    snippetTimeoutMs: o.snippetTimeoutMs ?? SNIPPET_TIME_LIMIT_MS,
     pingGraceMs: 5_000,
     clientCache,
     ...(o.sandboxLimits !== undefined ? { limits: o.sandboxLimits } : {}),

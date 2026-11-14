@@ -447,6 +447,12 @@ export async function appendPendingActionHints(ctx: CoreToolContext, result: Too
   return scrubResult(ctx, block === undefined ? result : { ...result, text: `${result.text}\n${block}` });
 }
 
+/** A name the sandbox does not define, as its error reads. */
+const TOOL_AS_FUNCTION = /\bReferenceError: ([A-Za-z_$][\w$]*) is not defined\b/;
+
+/** The line under an error that called the tool `name` as a sandbox function. */
+export const toolAsFunctionHint = (name: string): string => `\`${name}\` is a tool, not a function in the sandbox; call it as a tool.`;
+
 /** The dispatcher for one harness's tools, in the order it serves them. */
 export class ToolSet<C extends CoreToolContext> {
   /** Every tool's name, in serving order: the unknown-tool answer and the near-miss search read this. */
@@ -493,6 +499,26 @@ export class ToolSet<C extends CoreToolContext> {
     const spec = this.byName.get(name);
     const help = spec !== undefined ? ` ${spec.help}` : "";
     return { ok: false, error: `${parsed.error}.${help}` };
+  }
+
+  /**
+   * `result` with a line after the first error in it that names one of this
+   * set's tools as an undefined name (`ReferenceError: stop_routine is not
+   * defined`): the code called a tool as if it were a sandbox function.
+   * `result` itself when there is none.
+   */
+  private withToolNameHint(result: ToolResult): ToolResult {
+    const lines = result.text.split("\n");
+    const at = lines.findIndex((l) => {
+      const m = TOOL_AS_FUNCTION.exec(l);
+      return m !== null && this.byName.has(m[1]!);
+    });
+    if (at < 0) return result;
+    const name = TOOL_AS_FUNCTION.exec(lines[at]!)![1]!;
+    lines.splice(at + 1, 0, toolAsFunctionHint(name));
+    const out = { ...result, text: lines.join("\n") };
+    if (EVALUATED.has(result)) EVALUATED.add(out);
+    return out;
   }
 
   /** Nearest valid tool for a misspelled/mangled name, or undefined. */
@@ -582,7 +608,7 @@ export class ToolSet<C extends CoreToolContext> {
           isError: true,
         };
       }
-      return await spec.run(ctx, parsed.data, origin);
+      return this.withToolNameHint(await spec.run(ctx, parsed.data, origin));
     } catch (err) {
       return { text: `tool ${name} failed: ${err instanceof Error ? err.message : String(err)}`, isError: true };
     }
@@ -735,6 +761,16 @@ export interface CoreToolRender<C extends CoreToolContext> {
 
 export type CoreToolName = "run_snippet" | "recent_events" | "state_summary" | "write_scratchpad" | "edit_scratchpad";
 
+/**
+ * How long a snippet runs before the sandbox abandons it: the hosts' default
+ * `snippetTimeoutMs`, and the limit `run_snippet`'s description states, so a
+ * model knows it before its first timeout rather than from one.
+ */
+export const SNIPPET_TIME_LIMIT_MS = 30_000;
+
+/** The sentence `run_snippet`'s descriptions end with. */
+export const SNIPPET_TIME_LIMIT_SENTENCE = ` A snippet runs for at most ${SNIPPET_TIME_LIMIT_MS / 1000} seconds; one still running then is abandoned.`;
+
 /** The five core tools, rendered the harness's way. A harness orders them among its own. */
 export function coreTools<C extends CoreToolContext>(render: CoreToolRender<C>): Record<CoreToolName, ToolSpec<C>> {
   return {
@@ -742,7 +778,8 @@ export function coreTools<C extends CoreToolContext>(render: CoreToolRender<C>):
       def: {
         name: "run_snippet",
         description:
-          "Execute a TypeScript snippet in the persistent game sandbox. Top-level bindings persist across snippets; `sdk`, `state`, `events`, `connect()`, `sleep(ms)`, `scratchpad` (its read(), write() and append() each return a Promise: `await scratchpad.read()`) and `signal` (aborted if this snippet is abandoned) are ambient. A single expression returns its value. This is the only way to act in the world.",
+          "Execute a TypeScript snippet in the persistent game sandbox. Top-level bindings persist across snippets; `sdk`, `state`, `events`, `connect()`, `sleep(ms)`, `scratchpad` (its read(), write() and append() each return a Promise: `await scratchpad.read()`) and `signal` (aborted if this snippet is abandoned) are ambient. A single expression returns its value. This is the only way to act in the world." +
+          SNIPPET_TIME_LIMIT_SENTENCE,
         inputSchema: {
           type: "object",
           properties: {
@@ -951,7 +988,16 @@ const PROGRAM_WORKSPACE_MAX_BYTES = 1_048_576;
 
 /** `run_snippet` as a sandbox that hosts a program describes it: a one-off. */
 export const PROGRAM_RUN_SNIPPET_DESCRIPTION =
-  "Run a TypeScript snippet once in the game sandbox. `sdk`, `state`, `events`, `connect()`, `sleep(ms)`, `scratchpad` (its read(), write() and append() each return a Promise: `await scratchpad.read()`), `memory` and `signal` (aborted when this snippet returns or is abandoned) are ambient, and your workspace files import by relative path. A single expression returns its value. Nothing a snippet declares or starts outlives it; what must keep running is a routine (start_routine).";
+  "Run a TypeScript snippet once in the game sandbox. `sdk`, `state`, `events`, `connect()`, `sleep(ms)`, `scratchpad` (its read(), write() and append() each return a Promise: `await scratchpad.read()`), `memory` and `signal` (aborted when this snippet returns or is abandoned) are ambient, and your workspace files import by relative path. A single expression returns its value. Nothing a snippet declares or starts outlives it; what must keep running is a routine (start_routine)." +
+  SNIPPET_TIME_LIMIT_SENTENCE;
+
+/**
+ * `start_routine`'s `args`. Its schema says object; what is refused is a
+ * string, the object's JSON text sent in its place, which the routine would
+ * get as a string and fail on at its first field. Any other value is passed
+ * on as it always was.
+ */
+const ROUTINE_ARGS = z.unknown().refine((v) => typeof v !== "string", { message: "must be a JSON object, not a string" });
 
 const answer = (a: ProgramToolAnswer): ToolResult => (a.ok ? { text: a.text } : { text: a.text, isError: true });
 
@@ -976,7 +1022,8 @@ export function programTools<C extends ProgramToolContext>(render: CoreToolRende
         name: "read_file",
         description:
           "Return one file from your workspace, its text exactly as stored. The path is relative to the workspace, e.g. main.ts or lib/combat.ts. " +
-          "offset and limit, both optional, return part of it instead: limit lines from line offset (counted from 1), under one line saying which lines of how many they are.",
+          "offset and limit, both optional, return part of it instead: limit lines from line offset (counted from 1), under one line saying which lines of how many they are. " +
+          "API.md is the SDK reference (API_MD_PATH) and reads the same way.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1095,15 +1142,15 @@ export function programTools<C extends ProgramToolContext>(render: CoreToolRende
           type: "object",
           properties: {
             name: { type: "string", description: "The export of main.ts to run, e.g. grind." },
-            args: { description: "Passed to the function as its one argument. Any JSON value; omit for none." },
+            args: { type: "object", description: "Passed to the function as its one argument: a JSON object; omit for none." },
             ...characterProp,
           },
           required: ["name"],
           additionalProperties: false,
         },
       },
-      schema: routineSchema({ args: z.unknown().optional() }),
-      help: `start_routine expects { name: string, args?: any${character ? ", character?: string" : ""} } — the export of main.ts to run, and the one argument it is called with.`,
+      schema: routineSchema({ args: ROUTINE_ARGS.optional() }),
+      help: `start_routine expects { name: string, args?: object${character ? ", character?: string" : ""} } — the export of main.ts to run, and the one argument it is called with.`,
       aliases: { routine: "name", function: "name", fn: "name", arguments: "args", arg: "args", params: "args" },
       run: async (ctx, args, origin) => {
         const a = args as { name: string; args?: unknown; character?: string };

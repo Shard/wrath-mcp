@@ -608,9 +608,8 @@ describe("client: movement", () => {
   });
 
   test("a superseded moveTo carries a hint and is tallied with it", async () => {
-    // Two callers that both retry on `superseded` cancel each other's moves
-    // and spin (a DeepSeek probe, ~450 requests a second); with no hint on
-    // either channel nothing told the model its own code was doing it.
+    // With no hint on either channel nothing told the model its move had
+    // been replaced by a newer one.
     const stub = startStub({ onConnect: () => frames(loginSequence) });
     const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
     await client.createSession({ character: "Fenwick" });
@@ -621,8 +620,8 @@ describe("client: movement", () => {
     const result = await pending;
     if (result.ok) throw new Error("unreachable");
     expect(result.status).toBe("superseded");
-    expect(result.hint).toContain("a newer moveTo replaced this one");
-    expect(result.hint).toContain("Let one caller own movement.");
+    // The fact only: a follower re-sending moveTo toward a moving target is steering, not a fault.
+    expect(result.hint).toBe("a newer moveTo replaced this one and is the move walking now.");
     const drained = client.drainActionHints();
     expect(drained).toHaveLength(1);
     expect(drained[0]).toMatchObject({ action: "moveTo", status: "superseded", count: 1, point, hint: result.hint });
