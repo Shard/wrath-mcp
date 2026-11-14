@@ -455,6 +455,41 @@ forty servers would put forty copies of the tool list in a model's context.
   `recent_events` one merged feed in which an event several characters
   received is one line; hints are tallied per character and grouped.
 
+### Hosted
+
+Hosted mode, being built under wrath-mcp#43, serves the tools to people other
+than the operator, each driving their own agent from any MCP client on their
+own model spend, over Streamable HTTP. It changes the shape of one thing: the
+sandbox host as `main.ts` runs it holds the port secret beside the child that
+runs the agent's code, which is fine for an operator's own sessions and the
+worst place for it when the code is a stranger's. So the host is split in two:
+
+- **The gateway** authenticates a person by a bearer key, stored as its
+  SHA-256 and shown once, and resolves it to a grant: the person, the
+  accounts and how many characters may be in the world at once, never the
+  GM opt-in. It holds the port secret and runs no tenant code. It takes and
+  releases leases and keeps a ledger of them that outlives its own restart (a
+  seat whose worker is still live keeps its lease, since re-leasing would
+  rotate a secret the child still holds), routes each tool call to the
+  credential's worker, applies the rate and idle limits, and writes an audit
+  per person that joins the module's by token fingerprint.
+- **A worker per credential** runs the sandbox host, the program host, the
+  confined child and the recorder, with the lease secrets the gateway hands
+  it and nothing more. Its state (workspace, scratchpad, roster, session
+  store) lives in a directory of its own, and that directory, not what a
+  session says of itself, is what the inspector scopes a person's view by.
+- **How a worker starts is a hook** (`WorkerProvider`). The stack ships a
+  local one, a process per credential, for one machine and for tests; a
+  deployment that runs a worker per pod or container supplies its own, so
+  the stack stays free of any orchestrator, as the harness hooks keep it free
+  of runs.
+
+A credential is served the tool list the stdio server serves for the same
+options, byte for byte at fan-out 1. The module's part is to protect itself:
+per-lease caps on the action rate, the `/events` subscribers and the number
+of leases. `docs/CONTRACTS.md`, "Control-surface authentication", states what
+each side holds.
+
 ### Harness-delivered hints
 
 The SDK attaches a per-status recovery hint to a failed action result

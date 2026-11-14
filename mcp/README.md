@@ -155,6 +155,37 @@ inherits it and nothing a snippet sends can turn it on; stderr says whether
 the module confirmed it. The SDK's equivalent is
 `connect({ ..., allowGm: true })`.
 
+## Hosted grants
+
+Hosted mode (`docs/ARCHITECTURE.md`, "Hosted") serves the tools to people
+other than the operator, each with a key of their own. Who may connect, on
+which accounts and within which limits is a grants file the gateway reads
+and the operator edits with `bun run grants` (`src/hosted/grants-cli.ts`):
+
+```sh
+export WRATH_MCP_GRANTS_FILE=/srv/wrath-mcp/grants.json
+bun run grants reserve RUNNER1,RUNNER2          # accounts the operator's own sessions use
+bun run grants add pat-1 --person pat --accounts T_PAT1   # prints the key, once
+bun run grants key pat-1                        # a second key, to rotate
+bun run grants revoke <key-id>
+bun run grants disable pat-1
+bun run grants list
+```
+
+- A grant is one credential: one MCP client with its own accounts and at
+  most 5 characters in the world at once (default 1). A person who wants
+  two agents holds two grants.
+- No account is in two grants or reserved for the operator, because a
+  create on an account takes it from whoever holds it. The file is refused
+  otherwise, and refused if a grant names `allowGm`: GM use is never hosted.
+- A key is 32 random bytes, printed once; the file keeps its SHA-256 and an
+  id. It is read from `Authorization: Bearer` and nowhere else.
+- The file is written whole, mode 0600, by rename. A gateway reloads it when
+  it changes, and a file that does not validate grants nothing until it does.
+- Per-grant `limits` override the defaults (5 requests a second with a burst
+  of 20, 4 calls at once, 20 logins an hour, logged out after 30 idle
+  minutes), each at most the file's `ceiling`.
+
 ## Pieces
 
 - `src/sandbox/` — the host (`SandboxHost`), the child runtime (`child.ts`,
@@ -172,6 +203,7 @@ the module confirmed it. The SDK's equivalent is
   child runs, the writer, the reader, the store and the validator.
 - `src/server.ts`, `src/bridge.ts` — the MCP transport, and the stdio-to-TCP
   bridge a CLI is handed when the harness keeps its sandbox in-process.
+- `src/hosted/` — hosted mode: the grants file, keys and `authenticate`.
 - `src/main.ts` — the standalone server above.
 
 Entry points: the root, `./sandbox-child` (the child runtime, for a harness's

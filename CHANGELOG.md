@@ -33,6 +33,13 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   shutdown take, end and give back leases through it, so a host that must
   not hold the port secret can be handed one that asks whoever does.
   `portSecretLeaser` is the default and behaves as before.
+- **Grants for hosted mode.** `mcp/src/hosted/grants.ts`: a grants file
+  (one credential per grant: person, key hashes, accounts, characters at
+  once, limits), `authenticate` over `Authorization: Bearer`, and
+  `bun run grants` to add, rotate, revoke, disable and list. The loader
+  refuses a grant naming `allowGm`, an account in two grants or reserved for
+  the operator, and more than 5 characters at once (`mcp/README.md`,
+  "Hosted grants"). Nothing serves it yet.
 - **Several characters for one client (fan-out).** Off unless the operator
   grants it: `--max-characters <n> --accounts <a,b,…>` on the standalone
   server, `SandboxHostOptions.fanout` with a `CharacterRoster` and
