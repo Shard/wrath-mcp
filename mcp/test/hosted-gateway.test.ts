@@ -16,6 +16,20 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hostToolDefs, openHost } from "../src/host";
+import { serveWorker } from "../src/hosted/worker";
+import { localWorkers, type WorkerHandle, type WorkerProvider } from "../src/hosted/workers";
+
+/** Workers served in this process, around a stand-in host opener: for a host that must misbehave. */
+function inProcessWorkers(open: typeof openHost): WorkerProvider {
+  return {
+    async start({ secret, dir }) {
+      const w = await serveWorker({ secret, openHost: open, orphanMs: 1_000 });
+      let exit!: () => void;
+      const exited = new Promise<void>((r) => (exit = r));
+      return { host: w.host, port: w.port, paths: { state: join(dir, "state"), sessions: join(dir, "sessions") }, exited, stop: async () => (await w.stop(), exit()) };
+    },
+  };
+}
 import { Gateway, LeaseRefused, UNAUTHENTICATED } from "../src/hosted/gateway";
 import { emptyGrantsFile, FileGrantSource, GrantSet, keyDigest, writeGrantsFile, type TenantGrant } from "../src/hosted/grants";
 import { ERR_GATEWAY, ERR_HEADER_MISMATCH, ERR_METHOD_NOT_FOUND, ERR_UNSUPPORTED_VERSION, LEGACY_VERSIONS } from "../src/hosted/http";
@@ -48,7 +62,7 @@ interface Rig {
   audit(person: string): Record<string, unknown>[];
 }
 
-async function rig(o: { grants: TenantGrant[]; program?: boolean; health?: () => number | undefined; start?: (state: string, stub: StubModule) => void; openHost?: typeof openHost } = { grants: [grant("a")] }): Promise<Rig> {
+async function rig(o: { grants: TenantGrant[]; program?: boolean; health?: () => number | undefined; start?: (state: string, stub: StubModule) => void; openHost?: typeof openHost; workers?: WorkerProvider } = { grants: [grant("a")] }): Promise<Rig> {
   const stub = startStubModule();
   const state = mkdtempSync(join(tmpdir(), "wm-gateway-"));
   const grantsPath = join(state, "..", `${state.split("/").pop()}-grants.json`);
@@ -72,7 +86,7 @@ async function rig(o: { grants: TenantGrant[]; program?: boolean; health?: () =>
     now: () => clock.now,
     log: () => {},
     snippetTimeoutMs: 5_000,
-    ...(o.openHost !== undefined ? { openHost: o.openHost } : {}),
+    ...(o.openHost !== undefined ? { workers: inProcessWorkers(o.openHost) } : o.workers !== undefined ? { workers: o.workers } : {}),
   });
   await gateway.start();
   const server = Bun.serve({ port: 0, hostname: "127.0.0.1", idleTimeout: 60, fetch: (req) => gateway.fetch(req, "127.0.0.1") });
@@ -428,4 +442,47 @@ describe("hardening", () => {
     const grants = { current: () => new GrantSet(emptyGrantsFile()), close: () => {} };
     expect(() => new Gateway({ grants, stateDir: state, moduleUrl: "http://module.invalid", env: {} })).toThrow("WRATHBENCH_MODULE_SECRET is not set");
   });
+});
+
+describe("workers", () => {
+  test("each credential's host runs in a worker process of its own, which never holds the port secret", async () => {
+    const handles: WorkerHandle[] = [];
+    const local = localWorkers();
+    const r = await rig({ grants: [grant("a"), grant("b")], workers: { start: async (x) => { const h = await local.start(x); handles.push(h); return h; } } });
+    await r.call(KEY.a, "run_snippet", { code: "1" });
+    await r.call(KEY.b, "run_snippet", { code: "1" });
+    expect(handles).toHaveLength(2);
+    expect(new Set(handles.map((h) => h.pid)).size).toBe(2);
+    expect(handles.every((h) => h.pid !== process.pid)).toBe(true);
+    for (const h of handles) expect(readFileSync(`/proc/${h.pid}/environ`, "utf8")).not.toContain("WRATHBENCH_MODULE_SECRET");
+  }, 60_000);
+
+  test("a worker that dies: its seats are released, and the next call starts another", async () => {
+    const handles: WorkerHandle[] = [];
+    const local = localWorkers();
+    const r = await rig({ grants: [grant("a")], workers: { start: async (x) => { const h = await local.start(x); handles.push(h); return h; } } });
+    await r.call(KEY.a, "run_snippet", { code: "1" });
+    expect(r.gateway.ledger.seats()).toHaveLength(1);
+    process.kill(handles[0]!.pid!, "SIGKILL");
+    const until = Date.now() + 5_000;
+    while (r.gateway.ledger.seats().length > 0 && Date.now() < until) await Bun.sleep(20);
+    expect(r.gateway.ledger.seats()).toHaveLength(0);
+    expect(r.audit("p-a").some((l) => l["kind"] === "host" && l["event"] === "lost")).toBe(true);
+    expect((await r.call(KEY.a, "run_snippet", { code: "6" })).body.result!.content[0]!.text).toContain("6");
+    expect(handles).toHaveLength(2);
+  }, 60_000);
+
+  test("a worker asking for an account its credential was not granted is refused", async () => {
+    const r = await rig({
+      grants: [grant("a"), grant("b")],
+      openHost: async (h) => {
+        await h.leaser!.lease({ token: "z".repeat(32), account: "B1" });
+        return openHost(h);
+      },
+    });
+    const res = await r.call(KEY.a, "run_snippet", { code: "1" });
+    expect(res.body.result!.isError).toBe(true);
+    expect(res.body.result!.content[0]!.text).toContain("not one this key was granted");
+    expect(r.gateway.ledger.seats()).toHaveLength(0);
+  }, 30_000);
 });

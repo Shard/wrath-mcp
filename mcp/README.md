@@ -201,10 +201,19 @@ connects with its key as `Authorization: Bearer <key>`:
 { "mcpServers": { "wrath": { "type": "http", "url": "https://wrath.example/mcp", "headers": { "Authorization": "Bearer wmk_…" } } } }
 ```
 
-- **Not yet for people outside the deployment.** Each credential's host runs
-  in the gateway's own process, beside the port secret; only its sandbox
-  child is confined. Until each host is a worker process holding lease
-  secrets only, serve it to the operator's own tests alone.
+- Each credential's host runs in a **worker** of its own (`src/hosted/worker.ts`),
+  which holds the lease secrets the gateway hands it and never the port
+  secret: every lease, logout and release it needs, it asks the gateway for
+  over the channel the gateway opens to it, greeted with that worker's own
+  secret. A worker whose gateway is gone shuts down and exits.
+- Workers start through a `WorkerProvider`. The default, `localWorkers`, is
+  a process per credential on the gateway's machine, started with no port
+  secret in its environment. Its boundary is the kernel's alone: a worker
+  runs as the gateway's user, so code that escaped a sandbox child into its
+  worker could reach the gateway's process. **It serves the operator's own
+  tests, not people outside the deployment**; for them a deployment runs a
+  worker per pod or container through a provider of its own, with no route
+  to anything but the module's port.
 - Only the gateway holds the port secret (`WRATHBENCH_MODULE_SECRET`), and
   it refuses to start without it. Each
   credential gets a host of its own, opened at its first tool call, with its
@@ -252,7 +261,9 @@ connects with its key as `Authorization: Bearer <key>`:
   tool list, as `main.ts` serves it over stdio and the gateway per credential.
 - `src/hosted/` — hosted mode: the grants file, keys and `authenticate`; the
   Streamable HTTP transport (`http.ts`); the gateway (`gateway.ts`) and its
-  entry (`gateway-main.ts`).
+  entry (`gateway-main.ts`); a credential's worker (`worker.ts`), its channel
+  (`worker-rpc.ts`), and the provider hook with the local provider
+  (`workers.ts`).
 - `src/main.ts` — the standalone server above.
 
 Entry points: the root, `./sandbox-child` (the child runtime, for a harness's
