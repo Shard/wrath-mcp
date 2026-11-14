@@ -37,6 +37,11 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 - **`--program` on the standalone server**: the model's program beside the
   core tools. The host is now `src/host.ts`, shared by `main.ts` and the
   gateway; without `--program` the stdio server is unchanged.
+- **`session.json` names the session's world.** An optional `world` label
+  beside `owner` and `group` (`SessionWriterOptions.world`), for a host that
+  runs more than one worldserver, each over its own characters database: a
+  guid is unique within one world only. Additive to `wrath-session/1`;
+  absent is the host's one world. The inspector shows it.
 - **The module limits what a caller can make the worldserver hold.** Ahead of
   callers that hold only a lease secret and are not trusted (wrath-mcp#43,
   wrath-mcp#29). Per lease: a request rate (`429 rate_limited`;

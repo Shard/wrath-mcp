@@ -102,6 +102,11 @@ export interface SessionFile {
   /** Deployment labels the operator's host sets; absent unless it does. Never a harness's ids. */
   owner?: string;
   group?: string;
+  /**
+   * The world the session played on, when the host runs more than one: a
+   * deployment label beside `owner`, never a key. Absent is the host's one world.
+   */
+  world?: string;
   /** When the session was first opened, and when this process opened it. */
   started: number;
   opened: number;

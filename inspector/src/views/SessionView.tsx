@@ -50,6 +50,12 @@ export function SessionView(props: { client: InspectorClient; summary: SessionSu
             <div class="sub">{s()?.group ?? ""}</div>
           </div>
         </Show>
+        <Show when={s()?.world !== undefined}>
+          <div class="card">
+            <div class="k">world</div>
+            <div class="v mono">{s()?.world}</div>
+          </div>
+        </Show>
       </div>
       {/* The other characters the same client drives, each a link to its own session. */}
       <Show when={groupSiblings(props.sessions, props.summary).length > 0}>
