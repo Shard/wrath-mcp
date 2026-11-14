@@ -57,26 +57,35 @@ Two credential classes:
 - **Session** — the bearer is a *lease secret*, a 64-hex-character random value
   the module issued on `POST /lease` for exactly one token. It authenticates
   `POST /session`, `POST /action`, `DELETE /session` and the `/events` upgrade
-  for that token alone (`403 token_mismatch` for any other), plus `GET /health`.
+  for that token alone (`403 token_mismatch` for any other), plus `GET /health`
+  in its liveness view ("GET /health").
   Everything else — leasing, `/characters`, `/character-delete` — is
   `403 operator_only`. This is what the sandbox host hands the snippet child, so a
   snippet in run A holds no credential that reaches run B.
 
 The lease is what binds a token to an account and a character:
 
-- `POST /lease { token, account, allowGm? }` (operator) records `token →
-  account`, and the GM opt-in ("POST /session" below) when `allowGm` is
-  `true`, and returns the secret. Re-leasing a token rotates its secret (a
-  resumed run re-leases the token it stored) and keeps its character binding
-  unless the account changed; the opt-in is each lease's own, so a re-lease
-  without it turns it off, for a session already in world too.
+- `POST /lease { token, account, allowGm?, loginsPerHour? }` (operator)
+  records `token → account`, the GM opt-in ("POST /session" below) when
+  `allowGm` is `true` and the lease's logins an hour ("Limits"), and returns
+  the secret. Re-leasing a token rotates its secret (a resumed run re-leases
+  the token it stored) and keeps its character binding unless the account
+  changed, and its logins so far; the opt-in and the limit are each lease's
+  own, so a re-lease without the opt-in turns it off, for a session already
+  in world too.
 - A session-class `POST /session` lands on the lease's account whatever the body
   says (`403 account_not_leased` if the body names another), and takes the
   lease's GM opt-in whatever its body's `allowGm` says: only the port
   secret's holder can opt in, never the snippet a lease secret is handed to. The first create
   that succeeds binds the token to that character; a later same-token create
   naming a different one is `409 character_bound` with `bound: <name>`. A create
-  the core refused (name taken, bad race/class) binds nothing.
+  the core refused (name taken, bad race/class) binds nothing. While a first
+  create is in flight its name is held, so a same-token create naming
+  another character in the meantime is `409 character_bound` with `bound`
+  that name: two first creates at once cannot leave the token playing one
+  character and bound to the other. The check and the hold are one step
+  under the lease's lock; a create answered with anything but `200` (a
+  `504 timeout` included) lets the name go.
 - The secret exists before the session does, which is why a subscriber can open
   `/events` first — as the SDK does, to catch the login burst — and still be
   validated: the upgrade is checked against the lease, not against a live
@@ -108,8 +117,9 @@ rather than open.
 The module protects the worldserver it runs in, and only that: nothing here
 changes what a session observes or what an action does, and no limit is a rule
 about the game. Each is a setting in `mod_wrathbench.conf.dist`, where `0`
-turns it off. The request rate is off by default and is set where callers
-holding only a lease secret are not trusted (a hosted world); the other
+turns it off, but for the logins a lease states on `POST /lease`. The request
+rate and the logins are off by default and are set where callers holding only
+a lease secret are not trusted (a hosted world); the other
 defaults sit several times above what one character's client asks for, so a
 caller meets a refusal below only by asking for far more than a client would.
 
@@ -137,7 +147,20 @@ Per lease, refused with `429` and nothing dispatched, queued or audited:
   closed. A caller's concurrent requests each hold a connection, so the
   limit also bounds how many it has in flight.
 
-The operator class is exempt from all three: the port secret may already do
+- **Logins** (`loginsPerHour` on `POST /lease`; no limit when absent or
+  `0`). Every `POST /session` the lease's secret makes that passes the
+  binding check is a login flow on the world thread, whatever the core then
+  answers, and is counted, but for a create of the character the token
+  already has in the world, which is answered from that session (the
+  idempotent create a reattaching consumer makes); one past the limit is
+  `429 {"ok":false,"error":"login_limit","limit":<n>}`. Counted in windows
+  of an hour from the first login of each. A re-lease keeps the count and
+  takes the limit it states. Set by the holder of the port secret, never by
+  configuration: a deployment that hands a lease secret to someone it does
+  not trust (the hosted gateway, which passes its grant's `loginsPerHour`)
+  sets it, and one that does not leaves it off.
+
+The operator class is exempt from all four: the port secret may already do
 everything, so a limit on it would protect nothing, and its subscribers are
 neither counted nor refused.
 
@@ -216,21 +239,22 @@ serves no `protocol` predates the field and speaks `1`. The build identity
 
 Module and world status. Either credential class, no body.
 
-Two views. Callers on that network — the sandbox host and, through
-it, the snippet sandbox — get liveness plus build identity: `ok`, `module`,
-`worldStopped`, `worldLoaded`, `build`, `startedAtMs`, `uptimeMs`, `protocol`,
-with `sessions` / `droppedPackets` / `droppedPacketsLive` present but zeroed
-(kept so the SDK response schema parses) and no `droppedByOpcode` or
-`worldLoad`. The global
-session count and the drop census describe module internals and other runs'
-sessions, which the observation contract never serves to a snippet. The full
-view below is served only to loopback callers — an operator inside the
-worldserver container, with the port secret the container already holds (for
-example WrathBench's
+Two views, by credential. A lease secret — the snippet sandbox's — gets
+liveness plus build identity: `ok`, `module`, `worldStopped`, `worldLoaded`,
+`build`, `startedAtMs`, `uptimeMs`, `protocol`, with `sessions` /
+`droppedPackets` / `droppedPacketsLive` present but zeroed (kept so the SDK
+response schema parses) and no `leases`, `limits`, `droppedByOpcode` or
+`worldLoad`. The global session and lease counts and the drop census
+describe module internals and other runs' sessions, which the observation
+contract never serves to a snippet. The full view below is the port
+secret's, wherever it calls from: the sandbox host, the hosted gateway and
+operator tooling (for example WrathBench's
 [`infra/module-health.sh`](https://github.com/Shard/WrathBench/blob/master/infra/module-health.sh), a
 perl probe exec'd into the worldserver's container, whose image has no curl).
+The peer's address decides nothing: on one host every caller, a lease
+secret's holder included, is loopback.
 
-Operator (loopback) response `200`:
+Operator (port secret) response `200`:
 ```json
 {
   "ok": true,
@@ -377,6 +401,8 @@ reappears on the event stream in the self `SMSG_UPDATE_OBJECT` create block
 Errors:
 - `429 {"ok":false,"error":"rate_limited"}` — session class, over its lease's
   request rate ("Limits"); nothing was created.
+- `429 {"ok":false,"error":"login_limit","limit":<n>}` — session class, past
+  the logins an hour its lease states ("Limits"); nothing was created.
 - `400 {"ok":false,"error":"missing_token"}`
 - `400 {"ok":false,"error":"missing_character"}`
 - `400 {"ok":false,"error":"weak_token","received":<len>,"minimum":32,"hint":...}` —
@@ -393,7 +419,9 @@ Errors:
 - `403 {"ok":false,"error":"account_not_leased"}` — a session-class body named an
   account other than the lease's.
 - `409 {"ok":false,"error":"character_bound","bound":"<name>"}` — a session-class
-  create for a different character than the one this token already played.
+  create for a different character than the one this token already played, or
+  than the one a first create still in flight under it asked for
+  ("Authentication").
 - `400 {"ok":false,"error":"invalid_race_class"}` — the character
   does not exist and race/class are not both in [1,11] (see above; decided at
   char-enum time, before any char-create packet is synthesized).
@@ -1057,17 +1085,19 @@ rest have none yet, which is exactly the evidence the hatch exists to produce.
 
 ### POST /lease
 
-Operator only. `{ "token": <str>, "account"?: <str>, "allowGm"?: <bool> }` →
-`200 { "ok": true, "token", "account", "secret", "allowGm", "character"? }`.
+Operator only. `{ "token": <str>, "account"?: <str>, "allowGm"?: <bool>, "loginsPerHour"?: <u32> }` →
+`200 { "ok": true, "token", "account", "secret", "allowGm", "loginsPerHour", "character"? }`.
 Binds the token to the account (default `WrathBench.Account`) and issues — or,
 for a token already leased, rotates — its session secret; `allowGm` is the GM
 opt-in its session-class creates inherit ("POST /session"), echoed so the
 caller knows the module took it (a module that predates it echoes nothing);
-`character` is present when an earlier create under this token already bound
-one. Errors: `400
-missing_token`, `400 weak_token`, `403 account_not_permitted`, `403
-operator_only`, `429 lease_limit` (a new token past `WrathBench.MaxLeases`,
-with `limit`; "Limits"). See "Authentication".
+`loginsPerHour` is the logins an hour its secret may make ("Limits"; `0`, the
+default, is no limit), echoed the same way; `character` is present when an
+earlier create under this token already bound one. Errors: `400
+missing_token`, `400 weak_token`, `400 invalid_logins_per_hour` (negative or
+past 2^32−1), `403 account_not_permitted`, `403 operator_only`, `429
+lease_limit` (a new token past `WrathBench.MaxLeases`, with `limit`;
+"Limits"). See "Authentication".
 
 ### DELETE /lease
 

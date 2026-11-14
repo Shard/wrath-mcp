@@ -76,6 +76,13 @@ export interface LeaseOptions {
    * port secret, and never by the child. Absent or false is off.
    */
   allowGm?: boolean;
+  /**
+   * Logins an hour the module allows under this lease: session creates made
+   * with its secret (module/PROTOCOL.md, "POST /lease"). Absent or 0 is no
+   * limit. Set, like the opt-in, by the holder of the port secret; the hosted
+   * gateway passes its grant's `loginsPerHour`.
+   */
+  loginsPerHour?: number;
   fetch?: typeof fetch;
   env?: Record<string, string | undefined>;
   /** Waits between `/lease` attempts on an unreachable module; tests pass a no-op. */
@@ -131,6 +138,7 @@ export async function leaseSessionSecret(o: LeaseOptions): Promise<LeaseOutcome>
           token: o.token,
           ...(o.account === undefined ? {} : { account: o.account }),
           ...(o.allowGm === true ? { allowGm: true } : {}),
+          ...(o.loginsPerHour !== undefined && o.loginsPerHour > 0 ? { loginsPerHour: o.loginsPerHour } : {}),
         }),
         signal: AbortSignal.timeout(5_000),
       });
@@ -220,8 +228,12 @@ export async function releaseSessionSecret(o: Omit<LeaseOptions, "account">): Pr
  * single-character server lease through this and nothing else.
  */
 export interface Leaser {
-  /** Lease `token` on `account`: the session secret its child is built with. Throws as `leaseSessionSecret` does. */
-  lease(o: { token: string; account?: string; allowGm?: boolean }): Promise<LeaseOutcome>;
+  /**
+   * Lease `token` on `account`: the session secret its child is built with. Throws as `leaseSessionSecret` does.
+   * `allowGm` and `loginsPerHour` are the operator's (`LeaseOptions`): a leaser that answers for someone
+   * else's host, as the hosted gateway's does, sets them itself and ignores what it is asked.
+   */
+  lease(o: { token: string; account?: string; allowGm?: boolean; loginsPerHour?: number }): Promise<LeaseOutcome>;
   /** Best effort: log the token's character out, however its child answered. Never throws. */
   logout(token: string): Promise<void>;
   /** Best effort: give the token's lease back. Never throws. */

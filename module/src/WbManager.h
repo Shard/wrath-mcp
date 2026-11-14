@@ -11,6 +11,7 @@
 
 #include "WbHttpServer.h"
 #include "WbJson.h"
+#include "WbLease.h"
 
 #include <array>
 #include <atomic>
@@ -450,9 +451,16 @@ namespace WrathBench
     struct Lease
     {
         std::string account;
-        std::string character;      // empty until the first successful create
         std::string secret;         // 64 hex chars
         bool allowGm{false};        // the GM opt-in a session-class create inherits
+
+        // The character the token is bound to and the creates in flight on
+        // it, and its logins this hour against the limit its lease stated
+        // (WbLease.h). Under _leaseMutex, checked and recorded in one step
+        // when a session-class create is admitted (HandleHttp); a re-lease
+        // keeps both, so rotating a secret buys no logins.
+        LeaseRules::Binding binding;
+        LeaseRules::LoginCount logins;
 
         // The request bucket (Manager::TakeRequestToken): what is left of the
         // burst, and when it was last refilled. A negative count is a lease
@@ -507,9 +515,9 @@ namespace WrathBench
         // answer through the request's ack. No io thread waits for one.
         // Resolve the Authorization header to a credential class. Operator:
         // the bearer is the port secret (WrathBench.Secret). Session: it is a
-        // lease's secret, and *leaseToken/*lease name that lease. None
-        // otherwise. Constant-time compares; io threads.
-        Cred Authenticate(std::string const& authorization, std::string* leaseToken, Lease* lease) const;
+        // lease's secret, and *leaseToken names that lease. None otherwise.
+        // Constant-time compares; io threads.
+        Cred Authenticate(std::string const& authorization, std::string* leaseToken) const;
         // POST /lease and DELETE /lease (operator only).
         HttpReply HttpLease(std::string const& body);
         HttpReply HttpReleaseLease(std::string const& body);
@@ -535,9 +543,10 @@ namespace WrathBench
         HttpReply HttpDeleteSession(std::string const& body, std::shared_ptr<IHttpAck> const& ack);
         HttpReply HttpCharacterDelete(std::string const& body, std::shared_ptr<IHttpAck> const& ack);
         HttpReply HttpCharacterList(std::string const& body, std::shared_ptr<IHttpAck> const& ack);
-        // operatorView (loopback caller): include the session count and the
-        // packet-drop census. Network callers (runner, snippet sandbox) get a
-        // liveness-only view — the census is module-internal state no client
+        // operatorView (the port secret): include the session and lease
+        // counts, the limits, the packet-drop census and the world-load
+        // counts. A lease secret gets a liveness-only view — those are
+        // module-internal state and other runs' sessions, which no client
         // could observe (docs/CONTRACTS.md).
         HttpReply HttpHealth(bool operatorView);
 
@@ -928,6 +937,9 @@ namespace WrathBench
         // touched on io threads per request and never on the world thread.
         mutable std::mutex _leaseMutex;
         std::unordered_map<std::string, Lease> _leases;
+        // The last LeaseRules::Binding::epoch given out, under _leaseMutex:
+        // every lease made and every binding reset takes the next.
+        uint64_t _leaseEpochs{0};
 
         // Session-class /events subscribers per token, counted from the
         // moment an upgrade is admitted (before its handshake, so a burst of

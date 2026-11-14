@@ -131,7 +131,10 @@ export function startStubModule(options: StubModuleOptions = {}): StubModule {
       calls.push({ method: req.method, path: url.pathname, body, auth });
       if (url.pathname === "/health") {
         if (!operator && ![...leases.values()].some((l) => l.secret === bearer)) return json({ ok: false, error: "unauthorized" }, 401);
-        return json({ ok: true, module: "mod-wrathbench", protocol: 1, build: "stub", worldStopped: false, sessions: sessions.size, droppedPackets: 0, droppedPacketsLive: 0 });
+        // Two views, by credential: the port secret's carries the counts and limits, a lease secret's is liveness with the counters zeroed.
+        const head = { ok: true, module: "mod-wrathbench", protocol: 1, build: "stub", worldStopped: false };
+        if (!operator) return json({ ...head, sessions: 0, droppedPackets: 0, droppedPacketsLive: 0 });
+        return json({ ...head, sessions: sessions.size, leases: leases.size, limits: { leases: 1024 }, droppedPackets: 0, droppedPacketsLive: 0 });
       }
       if (auth === "none") return json({ ok: false, error: bearer === "" ? "unauthorized" : "token_mismatch" }, bearer === "" ? 401 : 403);
       if (url.pathname === "/lease") {

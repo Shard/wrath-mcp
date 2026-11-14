@@ -420,16 +420,15 @@ namespace WrathBench
     class HttpConnection : public IHttpPeer, public std::enable_shared_from_this<HttpConnection>
     {
     public:
-        HttpConnection(tcp::socket&& socket, IHttpSink* sink, std::shared_ptr<ConnSlot> slot, bool loopbackPeer,
+        HttpConnection(tcp::socket&& socket, IHttpSink* sink, std::shared_ptr<ConnSlot> slot,
             HttpLimits const& limits)
             : _stream(std::move(socket)), _strand(_stream.get_executor()), _deadline(_strand), _sink(sink),
               _slot(std::move(slot)),
-              _loopbackPeer(loopbackPeer), _maxPerLease(limits.maxConnectionsPerLease),
+              _maxPerLease(limits.maxConnectionsPerLease),
               _backlogLimit(limits.eventsBacklogBytes), _buffer(kHeaderLimit + kBodyLimit) { }
 
         // IHttpPeer: called by the sink from inside HandleHttp or
         // AuthorizeWs, on this connection's strand.
-        bool Loopback() const override { return _loopbackPeer; }
         bool Admit(std::string const& lease) override
         {
             if (!_slot->Admit(lease, _maxPerLease))
@@ -594,7 +593,6 @@ namespace WrathBench
         std::shared_ptr<RequestAck> _waiting;
         IHttpSink* _sink;
         std::shared_ptr<ConnSlot> _slot;
-        bool _loopbackPeer{false};
         std::uint32_t _maxPerLease{0};
         // A request has authenticated on this connection (Admit). Strand only.
         bool _admitted{false};
@@ -644,8 +642,7 @@ namespace WrathBench
                     if (!pec)
                     {
                         if (auto slot = ConnSlot::Take(table, limits, peer.address()))
-                            std::make_shared<HttpConnection>(std::move(socket), sink, std::move(slot),
-                                peer.address().is_loopback(), limits)->Run();
+                            std::make_shared<HttpConnection>(std::move(socket), sink, std::move(slot), limits)->Run();
                         else
                             NoteRefused(peer.address());
                     }

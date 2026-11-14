@@ -109,8 +109,6 @@ namespace WrathBench
     {
     public:
         virtual ~IHttpPeer() = default;
-        // The TCP peer is 127.0.0.1/::1.
-        virtual bool Loopback() const = 0;
         // The request on this connection authenticated: as the lease named
         // (a session token), or as the operator for "". False when that
         // lease already holds HttpLimits::maxConnectionsPerLease other
@@ -128,11 +126,9 @@ namespace WrathBench
     {
     public:
         virtual ~IHttpSink() = default;
-        // peer: the connection. A loopback peer is an operator inside the
-        // worldserver container, as opposed to a caller on the compose network
-        // (runner, snippet sandbox), which lets diagnostics endpoints serve
-        // their verbose view to operators only; and the sink says who
-        // authenticated on it (IHttpPeer::Admit).
+        // peer: the connection; the sink says who authenticated on it
+        // (IHttpPeer::Admit). Who may see what is the credential's to decide,
+        // never the peer address's: on one host every caller is loopback.
         // authorization: the request's Authorization header verbatim ("" when
         // absent). Every route authenticates on it (PROTOCOL.md,
         // "Authentication"); the server never interprets it itself.

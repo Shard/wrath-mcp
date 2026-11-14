@@ -57,6 +57,8 @@ interface Rig {
   state: string;
   url: string;
   clock: { now: number };
+  /** What the gateway itself fetched of the module (its workers' children fetch for themselves). */
+  fetches: { path: string; authorization: string | undefined }[];
   modern(key: string | null, method: string, params?: Record<string, unknown>, headers?: Record<string, string>): Promise<Response>;
   legacy(key: string | null, method: string, params?: Record<string, unknown>, headers?: Record<string, string>): Promise<Response>;
   call(key: string, name: string, args: Record<string, unknown>): Promise<{ status: number; body: { result?: { content: { text: string }[]; isError: boolean }; error?: { code: number; message: string } } }>;
@@ -72,7 +74,9 @@ async function rig(o: { grants: TenantGrant[]; program?: boolean; health?: () =>
   const clock = { now: Date.now() };
   o.start?.(state, stub);
   // The stub's /health has no start stamp; a test that restarts the world hands one.
+  const fetches: Rig["fetches"] = [];
   const f = (async (input: string | URL | Request, init?: RequestInit) => {
+    fetches.push({ path: new URL(String(input)).pathname, authorization: new Headers(init?.headers).get("authorization") ?? undefined });
     if (o.health !== undefined && new URL(String(input)).pathname === "/health") return Response.json({ ok: true, startedAtMs: o.health() });
     return fetch(input, init);
   }) as typeof fetch;
@@ -119,6 +123,7 @@ async function rig(o: { grants: TenantGrant[]; program?: boolean; health?: () =>
     state,
     url,
     clock,
+    fetches,
     modern,
     legacy,
     call: async (key, name, args) => {
@@ -233,6 +238,8 @@ describe("a call", () => {
     const seats = r.gateway.ledger.seats();
     expect(seats.map((s) => [s.credential, s.person, s.account])).toEqual([["a", "p-a", "A1"]]);
     expect(r.stub.calls.find((c) => c.path === "/lease" && c.method === "POST")?.body?.["allowGm"]).toBeUndefined();
+    // The grant's logins an hour ride the lease, for the module to count the creates made under it.
+    expect(r.stub.calls.find((c) => c.path === "/lease" && c.method === "POST")?.body?.["loginsPerHour"]).toBe(20);
     const kinds = r.audit("p-a").map((l) => l["kind"]);
     expect(kinds).toContain("lease");
     const call = r.audit("p-a").find((l) => l["kind"] === "call")!;
@@ -273,9 +280,10 @@ describe("one key never reaches another's", () => {
     await r.gateway.leaserFor(b).release(aToken);
     await r.gateway.leaserFor(b).logout(aToken);
     expect(r.gateway.ledger.get(aToken)?.credential).toBe("a");
-    // And GM is never sent, whatever is asked.
-    await r.gateway.leaserFor(b).lease({ token: newHostedToken(), account: "B1", allowGm: true });
+    // And GM is never sent, whatever is asked; the logins an hour are the grant's, whatever is asked.
+    await r.gateway.leaserFor(b).lease({ token: newHostedToken(), account: "B1", allowGm: true, loginsPerHour: 1000 });
     expect(r.stub.calls.filter((c) => c.path === "/lease" && c.method === "POST").every((c) => c.body?.["allowGm"] === undefined)).toBe(true);
+    expect(r.stub.calls.filter((c) => c.path === "/lease" && c.method === "POST").at(-1)?.body?.["loginsPerHour"]).toBe(20);
   }, 30_000);
 });
 
@@ -462,6 +470,16 @@ describe("stops", () => {
     expect(r.stub.calls.some((c) => c.path === "/lease" && c.method === "DELETE" && c.body?.["token"] === held)).toBe(true);
     expect(r.audit("p-a").some((l) => l["kind"] === "release" && l["why"] === "gateway restart")).toBe(true);
   });
+
+  test("the gateway asks /health with the port secret, which the module serves the full view", async () => {
+    const r = await rig();
+    await r.call(KEY.a, "run_snippet", { code: "1" });
+    await r.gateway.sweep();
+    // Two asks: the module's identity for the host it opens, and the world's start on the sweep.
+    const asks = r.fetches.filter((x) => x.path === "/health");
+    expect(asks.length).toBeGreaterThanOrEqual(2);
+    expect(asks.every((x) => x.authorization === `Bearer ${STUB_PORT_SECRET}`)).toBe(true);
+  }, 30_000);
 
   test("a restarted world: every host stops, and the next call opens a new one", async () => {
     let started = 1_000;

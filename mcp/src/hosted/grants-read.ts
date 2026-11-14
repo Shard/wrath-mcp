@@ -63,10 +63,14 @@ export interface HostedLimits {
   /** Tool calls running at once. */
   inFlight: number;
   /**
-   * Leases of new sessions per hour: each character the gateway lets into
-   * the world under a token it has not held. What a session does under its
-   * own lease (a snippet's `deleteSession` and `createSession` again) is not
-   * seen here; the module's per-lease action rate is what bounds that.
+   * Logins an hour, held at two places. The gateway counts leases of new
+   * sessions: each character it lets into the world under a token it has not
+   * held. What a session does under its own lease (a snippet's
+   * `deleteSession` and `createSession` again) is not seen there, so each
+   * lease is taken with the same number as its own limit, and the module
+   * counts every create made with that lease's secret against it
+   * (module/PROTOCOL.md, "POST /lease"). A credential with several characters
+   * has that many leases, each with its own count.
    */
   loginsPerHour: number;
   /** Minutes with no authenticated request before the credential's characters are logged out and its worker stopped. */
