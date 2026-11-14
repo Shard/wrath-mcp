@@ -103,6 +103,61 @@ no more, and the audit files are named by the first 16 ("Audit log" below).
 listen at all (logged at ERROR), so a mis-deployed worldserver is unreachable
 rather than open.
 
+## Limits
+
+The module protects the worldserver it runs in, and only that: nothing here
+changes what a session observes or what an action does, and no limit is a rule
+about the game. Each is a setting in `mod_wrathbench.conf.dist`, where `0`
+turns it off. The request rate is off by default and is set where callers
+holding only a lease secret are not trusted (a hosted world); the other
+defaults sit several times above what one character's client asks for, so a
+caller meets a refusal below only by asking for far more than a client would.
+
+Per lease, refused with `429` and nothing dispatched, queued or audited:
+
+- **Request rate** (`WrathBench.ActionRate`, `WrathBench.ActionBurst`; off
+  by default, 20 a second with a burst of 40 where it is set). A token bucket per lease over what a lease secret may ask
+  of the world thread: `POST /action` (`raw` and a request the action would
+  refuse included), `POST /session`, `DELETE /session` and the `/events`
+  upgrade. Over it: `429 {"ok":false,"error":"rate_limited"}`. The bucket
+  refills continuously, so the next request a moment later is served.
+  Re-leasing a token keeps its bucket.
+- **Subscribers** (`WrathBench.EventsSubscribersPerToken`; 4). Concurrent
+  `/events` sockets a lease secret holds on its token, counted from the
+  moment an upgrade is admitted until the server has seen the socket gone.
+  One past it: `429 {"ok":false,"error":"subscriber_limit"}` in place of the
+  handshake. One consumer holds one socket; the rest is room for a reconnect
+  that overlaps a socket whose loss the server has not yet seen.
+
+The operator class is exempt from both: the port secret may already do
+everything, so a limit on it would protect nothing, and its subscribers are
+neither counted nor refused.
+
+On the module as a whole:
+
+- **Leases** (`WrathBench.MaxLeases`; 1024). `POST /lease` for a new token
+  past it is `429 {"ok":false,"error":"lease_limit","limit":<n>}`; re-leasing a
+  token already held never is. The module forgets a lease only on
+  `DELETE /lease` and has no idle reaper, so whoever leases releases.
+- **Connections** (`WrathBench.MaxConnections`, 4096;
+  `WrathBench.MaxConnectionsPerPeer`, off). A connection past either is
+  closed at accept with no reply.
+- **Request size.** A request head over 8 KiB is
+  `431 {"ok":false,"error":"header_too_large"}` and a body over 64 KiB
+  `413 {"ok":false,"error":"body_too_large"}`, each before any credential is
+  read, and the connection is closed. Fixed, not settings.
+- **Time.** A request not complete within 60 seconds of the connection going
+  idle or starting it, or a reply not taken within 30, closes the connection
+  (an idle kept-alive connection is closed the same way, as it always was).
+- **A subscriber that does not read** (`WrathBench.EventsBacklogBytes`;
+  16 MiB). Events queue per socket while its reader is behind. A socket with
+  more than this queued and unsent is closed, which its consumer sees as any
+  connection loss ("/events", delivery guarantees). A text or binary frame
+  from a subscriber larger than 4 KiB closes its socket as well; the channel
+  carries nothing from the client. A peer that has vanished without closing
+  is found by TCP keepalive and dropped within about two minutes, so its
+  subscriber slot is not held by a dead socket.
+
 ## Versioning
 
 The protocol has a version of its own, an integer the module serves as
@@ -151,6 +206,9 @@ Operator (loopback) response `200`:
   "worldStopped": false,
   "worldLoaded": true,
   "sessions": 1,
+  "leases": 1,
+  "limits": { "actionRate": 20, "actionBurst": 40, "eventsSubscribersPerToken": 4, "leases": 1024,
+              "connections": 4096, "connectionsPerPeer": 0, "eventsBacklogBytes": 16777216 },
   "droppedPackets": 4213,
   "droppedPacketsLive": 37,
   "droppedByOpcode": { "SMSG_POWER_UPDATE": 1400, "SMSG_EMOTE": 220, "0x4F2": 3 },
@@ -185,6 +243,10 @@ Operator (loopback) response `200`:
 - `protocol` — the wire protocol version this build speaks, an integer (see
   "Versioning" below). Served to every caller; the SDK reads it on `connect`.
 - `sessions` — number of live bench sessions.
+- `leases`, `limits` (operator view only) — leases held, and the limits in
+  force ("Limits" above; `0` is off). The per-lease ones follow a
+  `.reload config`; `connections`, `connectionsPerPeer` and
+  `eventsBacklogBytes` are as read at startup.
 - `droppedPackets` — lifetime count of outbound packets suppressed because they
   were not on the event whitelist (survives session teardown). Whitelist tuning
   signal for later stages; see the whitelist section below.
@@ -280,6 +342,8 @@ reappears on the event stream in the self `SMSG_UPDATE_OBJECT` create block
 (`"self": true`), which additionally carries own health/power/position.
 
 Errors:
+- `429 {"ok":false,"error":"rate_limited"}` — session class, over its lease's
+  request rate ("Limits"); nothing was created.
 - `400 {"ok":false,"error":"missing_token"}`
 - `400 {"ok":false,"error":"missing_character"}`
 - `400 {"ok":false,"error":"weak_token","received":<len>,"minimum":32,"hint":...}` —
@@ -371,6 +435,8 @@ opcode was synthesized and queued; the game
 result (the chat echo, an arrival, or an error) arrives on the WebSocket.
 
 Common errors for every action:
+- `429 {"ok":false,"error":"rate_limited"}` — session class, over its lease's
+  request rate ("Limits"); nothing was dispatched.
 - `400 {"ok":false,"error":"missing_token"}`
 - `400 {"ok":false,"error":"unsupported_action","action":"<x>"}`
 - `404 {"ok":false,"error":"no_session"}`
@@ -548,7 +614,10 @@ read), the same figures every `WB_MOVE_PROGRESS` of the move repeats; a move
 refused at planning or as `too_far` acks with `moveId` alone, and its
 `WB_MOVE_RESULT` follows the ack.
 
-Additional error: `400 {"ok":false,"error":"missing_position","action":"move_to","param":"<first missing axis>"}`.
+Additional errors: `400 {"ok":false,"error":"missing_position","action":"move_to","param":"<first missing axis>"}`,
+and `400 {"ok":false,"error":"invalid_position","action":"move_to","param":"<axis>"}`
+for an axis that is not a number (NaN). No JSON number is one, so only a
+hand-built body meets it.
 
 The outcome arrives as a `WB_MOVE_RESULT` event carrying the same `moveId`
 (statuses below). A `move_to` issued while a previous one is still running
@@ -652,6 +721,7 @@ or `{ "token": "run-abc123", "action": "face", "x": -8900.0, "y": -130.0 }`
 
 Success `200`: `{ "ok": true, "action": "face", "orientation": 1.57 }`
 Additional errors: `400 {"ok":false,"error":"missing_face_target","action":"face","param":"orientation or x,y"}`,
+`400 {"ok":false,"error":"invalid_position","action":"face","param":"<field>"}` (a field that is not a number, as for `move_to`),
 `409 {"ok":false,"error":"stunned"}` (the unit the client moves is stunned:
 a stunned client cannot turn, Roots below; nothing sent; a root alone does
 not refuse it),
@@ -961,7 +1031,8 @@ caller knows the module took it (a module that predates it echoes nothing);
 `character` is present when an earlier create under this token already bound
 one. Errors: `400
 missing_token`, `400 weak_token`, `403 account_not_permitted`, `403
-operator_only`. See "Authentication".
+operator_only`, `429 lease_limit` (a new token past `WrathBench.MaxLeases`,
+with `limit`; "Limits"). See "Authentication".
 
 ### DELETE /lease
 
@@ -1031,7 +1102,8 @@ Request:
 ```
 
 Success `200`: `{ "ok": true }`
-Errors: `400 missing_token`, `404 no_session`, `401 unauthorized`, `403 token_mismatch`.
+Errors: `400 missing_token`, `404 no_session`, `401 unauthorized`, `403 token_mismatch`,
+`429 rate_limited` (session class, "Limits").
 
 What ends a session: this, a create that reclaims its account ("POST /session"
 above), and the worldserver stopping. Nothing else does. Closing every
@@ -1050,10 +1122,14 @@ the three ends it, and there is no idle reaper. The standalone MCP server
 Upgrade request to `/events` with the session token in the query string and
 the credential in the `Authorization` header ("Authentication": the port
 secret, or the lease secret issued for this token; anything else is refused
-with a plain `401` before the handshake and no subscriber is registered). The
+with a plain `401` before the handshake and no subscriber is registered). A
+lease secret's upgrade is refused the same way, as a plain reply in place of
+the handshake, with `429 subscriber_limit` when its token already has its cap
+of subscribers and `429 rate_limited` when its lease is over its request rate
+("Limits"). The
 server streams that session's whitelisted outbound packets as JSON text frames,
 one object per frame. The channel is send-only (server→client); frames the client
-sends are ignored. Multiple sockets may subscribe to the same token; each gets
+sends are ignored (and one over 4 KiB closes the socket). Multiple sockets may subscribe to the same token; each gets
 every event, except the frames of a reattach replay another socket asked for
 (below). `&replay=1` on the query asks for that replay.
 
@@ -1064,6 +1140,9 @@ Delivery guarantees:
   of a replay it did not ask for, which go to the socket that did and read as
   a gap on every other (one socket per consumer in practice, so a gap no
   consumer sees).
+- A subscriber that falls more than `WrathBench.EventsBacklogBytes` behind
+  is closed ("Limits") and loses what was queued for it, as a dropped socket
+  does below.
 - There is no buffered replay: events are fanned out live and never buffered
   for late or reconnecting subscribers. A dropped WS loses the observations
   emitted while it was down, irreversibly (they remain in the audit log, which

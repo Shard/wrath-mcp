@@ -453,6 +453,16 @@ namespace WrathBench
         std::string character;      // empty until the first successful create
         std::string secret;         // 64 hex chars
         bool allowGm{false};        // the GM opt-in a session-class create inherits
+
+        // The request bucket (Manager::TakeRequestToken): what is left of the
+        // burst, and when it was last refilled. A negative count is a lease
+        // that has not been asked yet and starts full. Under _leaseMutex, as
+        // the rest; a re-lease keeps it, so rotating a secret buys no burst.
+        double bucket{-1.0};
+        int64_t bucketAtMs{0};
+        // Refusals since the log last said so, and when it did.
+        uint32_t limitedSinceLog{0};
+        int64_t limitedLogAtMs{0};
     };
 
     // Which credential a request presented (PROTOCOL.md, "Authentication").
@@ -481,7 +491,8 @@ namespace WrathBench
         // IHttpSink (io_context threads).
         HttpReply HandleHttp(std::string const& method, std::string const& target, std::string const& body,
             std::string const& authorization, bool loopbackPeer) override;
-        bool AuthorizeWs(std::string const& token, std::string const& authorization) override;
+        WsAdmit AuthorizeWs(std::string const& token, std::string const& authorization) override;
+        void ReleaseWsSlot(std::string const& token) override;
         void OnWsOpen(std::string const& token, std::shared_ptr<IWsConn> conn, bool replay) override;
         void OnWsClose(std::string const& token, IWsConn* conn) override;
 
@@ -502,6 +513,12 @@ namespace WrathBench
         HttpReply HttpLease(std::string const& body);
         HttpReply HttpReleaseLease(std::string const& body);
         std::string PortSecret() const;
+        // Draw one request from a lease's bucket (WrathBench.ActionRate,
+        // WrathBench.ActionBurst): false when it is empty, and the request is
+        // then answered `429 rate_limited` with nothing handed to the world
+        // thread. Session class only: the port secret's holder can already do
+        // everything, a limit on it would protect nothing. io threads.
+        bool TakeRequestToken(std::string const& leaseToken);
 
         // forcedAccount: non-empty for a session-class create — the lease's
         // account, which overrides whatever the body says.
@@ -893,11 +910,29 @@ namespace WrathBench
         // listen when it is shorter than 32 characters.
         std::string _secret;
         std::string _auditDir;
+        // The server's own limits, consumed at Start() like the bind address.
+        HttpLimits _httpLimits;
+        // The per-lease caps (mod_wrathbench.conf.dist). Written by
+        // Configure() on the world thread, `.reload config` included, and
+        // read on io threads, hence atomic; 0 turns one off.
+        std::atomic<uint32_t> _actionRate{20};
+        std::atomic<uint32_t> _actionBurst{40};
+        std::atomic<uint32_t> _eventsSubscribersMax{4};
+        std::atomic<uint32_t> _leasesMax{1024};
 
         // Leases by token (PROTOCOL.md, "Authentication"). Their own mutex:
         // touched on io threads per request and never on the world thread.
         mutable std::mutex _leaseMutex;
         std::unordered_map<std::string, Lease> _leases;
+
+        // Session-class /events subscribers per token, counted from the
+        // moment an upgrade is admitted (before its handshake, so a burst of
+        // concurrent upgrades cannot all pass the check) until the connection
+        // object dies. A mutex of its own, held for the count alone and
+        // around nothing else: a connection can die wherever its last
+        // reference is dropped, under _sessMutex included.
+        std::mutex _wsSlotMutex;
+        std::unordered_map<std::string, uint32_t> _wsSlots;
 
         std::unique_ptr<HttpServer> _http;
 
