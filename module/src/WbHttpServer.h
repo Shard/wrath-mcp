@@ -9,7 +9,9 @@
 #ifndef MOD_WRATHBENCH_WBHTTPSERVER_H
 #define MOD_WRATHBENCH_WBHTTPSERVER_H
 
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -35,6 +37,34 @@ namespace WrathBench
         // connection with no caller behind it (a credential that did not
         // authenticate, a lease at its connection limit).
         bool close{false};
+    };
+
+    // The reply to one request, for a sink that cannot make it before
+    // HandleHttp returns: the game answers on the world thread, and an io
+    // thread that waited for it there would be a thread no other connection
+    // could use meanwhile. HandleHttp instead returns Defer()'s value, the io
+    // thread goes back to its other connections, and the reply is written
+    // when Answer() is called or the wait runs out, whichever is first.
+    class IHttpAck
+    {
+    public:
+        virtual ~IHttpAck() = default;
+        // The reply. Callable from any thread, any number of times: the
+        // first call answers the request and every later one is dropped, as
+        // is one that comes after the wait ran out or after the connection
+        // went away. Never blocks; the write happens on an io thread.
+        virtual void Answer(HttpReply reply) = 0;
+
+        // The rest is the sink's to call from inside HandleHttp only.
+
+        // Leave the reply to Answer(), for at most `wait`: after that the
+        // request is answered `expired`, and `onExpired` runs first (on an
+        // io thread) when given. Returns what HandleHttp must then return.
+        virtual HttpReply Defer(std::chrono::seconds wait, HttpReply expired, std::function<void()> onExpired = {}) = 0;
+        // A step the reply passes through on an io thread just before it is
+        // written, whichever of the three made it: HandleHttp's own return,
+        // Answer(), or the wait running out.
+        virtual void Then(std::function<void(HttpReply const&)> step) = 0;
     };
 
     // The answer to an /events upgrade (IHttpSink::AuthorizeWs).
@@ -92,7 +122,8 @@ namespace WrathBench
     // The game-facing surface the HTTP/WS server calls into. Implemented by the
     // Manager. All callbacks run on io_context threads, never the world thread;
     // the Manager is responsible for marshalling anything that touches game
-    // state onto the world thread (see WbManager).
+    // state onto the world thread (see WbManager), and none of them may wait
+    // for it there: the threads are few and every connection shares them.
     class IHttpSink
     {
     public:
@@ -105,8 +136,11 @@ namespace WrathBench
         // authorization: the request's Authorization header verbatim ("" when
         // absent). Every route authenticates on it (PROTOCOL.md,
         // "Authentication"); the server never interprets it itself.
+        // ack: how a reply the world thread makes is given (IHttpAck). The
+        // return value is the reply, written at once, unless it is
+        // ack->Defer()'s.
         virtual HttpReply HandleHttp(std::string const& method, std::string const& target, std::string const& body,
-            std::string const& authorization, IHttpPeer& peer) = 0;
+            std::string const& authorization, IHttpPeer& peer, std::shared_ptr<IHttpAck> const& ack) = 0;
         // Decide an /events upgrade before the handshake. A refusal (status
         // other than 0) is answered as a plain HTTP reply with that status
         // and error code, so a refused subscriber never registers: 401 for a

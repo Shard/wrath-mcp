@@ -67,6 +67,16 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   runs more than one worldserver, each over its own characters database: a
   guid is unique within one world only. Additive to `wrath-session/1`;
   absent is the host's one world. The inspector shows it.
+- **The module answers a request from the world thread instead of waiting
+  for it.** Its HTTP threads (`WrathBench.Threads`, 2) each waited, with the
+  connection, for the world thread's reply: at most two requests were in
+  flight on the whole module, one world tick apart at best, and one caller's
+  slow or many actions held up every other caller's requests, the `/events`
+  streams, and `/lease` and `/health`. A request is now queued and its reply
+  written when the world thread has it, with the same deadlines (`504
+  timeout` after 10 seconds, 20 for a create) and the same replies; a world
+  tick serves at most 20 ms of queued requests, in order, so a burst spreads
+  over a few ticks. No wire change.
 - **The module limits what a caller can make the worldserver hold.** Ahead of
   callers that hold only a lease secret and are not trusted (wrath-mcp#43,
   wrath-mcp#29). Per lease: a request rate (`429 rate_limited`;

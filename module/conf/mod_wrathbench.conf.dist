@@ -48,7 +48,10 @@ WrathBench.Port = 8086
 #    WrathBench.Threads
 #        Description: Worker threads for the HTTP/WebSocket io_context. These
 #                     threads never touch game state; all game work is marshalled
-#                     onto the world thread.
+#                     onto the world thread, which answers the request when it
+#                     has done it. No thread waits for that, so the count is
+#                     not how many requests can be in flight at once, and two
+#                     serve any number of characters.
 #        Default:     2
 #
 

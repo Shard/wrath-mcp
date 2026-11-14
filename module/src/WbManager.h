@@ -17,7 +17,6 @@
 #include <cstdint>
 #include <functional>
 #include <fstream>
-#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -223,10 +222,11 @@ namespace WrathBench
         // this is the wall-clock deadline for that wait, set on the first entry.
         int64_t createDeadlineMs{0};
 
-        // Ack for the in-flight /session request. Set exactly once, by whichever
-        // of the kickoff task (sync failure) or the tap (async completion) reaches
-        // the terminal state first.
-        std::shared_ptr<std::promise<HttpReply>> ack;
+        // Ack for the in-flight /session request. Answered exactly once, by
+        // whichever of the kickoff task (sync failure) or the tap (async
+        // completion) reaches the terminal state first. It holds no
+        // connection, so keeping it for the session's life keeps nothing open.
+        std::shared_ptr<IHttpAck> ack;
         std::atomic<bool> ackFired{false};
 
         std::atomic<uint64_t> dropCount{0};
@@ -490,7 +490,7 @@ namespace WrathBench
 
         // IHttpSink (io_context threads).
         HttpReply HandleHttp(std::string const& method, std::string const& target, std::string const& body,
-            std::string const& authorization, IHttpPeer& peer) override;
+            std::string const& authorization, IHttpPeer& peer, std::shared_ptr<IHttpAck> const& ack) override;
         WsAdmit AuthorizeWs(std::string const& token, std::string const& authorization, IHttpPeer& peer) override;
         void ReleaseWsSlot(std::string const& token) override;
         void OnWsOpen(std::string const& token, std::shared_ptr<IWsConn> conn, bool replay) override;
@@ -502,8 +502,9 @@ namespace WrathBench
         // World-thread task queue.
         void PushTask(std::function<void()> fn);
 
-        // Request handlers. The HandleHttp* run on io threads and marshal onto the
-        // world thread via PushTask; the Do* run on the world thread.
+        // Request handlers. The Http* run on io threads and marshal onto the
+        // world thread via PushTask; the Do* run on the world thread and
+        // answer through the request's ack. No io thread waits for one.
         // Resolve the Authorization header to a credential class. Operator:
         // the bearer is the port secret (WrathBench.Secret). Session: it is a
         // lease's secret, and *leaseToken/*lease name that lease. None
@@ -525,31 +526,34 @@ namespace WrathBench
         // A session-class caller's account and GM opt-in are its lease's
         // (forcedAccount non-empty, forcedAllowGm set); an operator's come
         // from the body.
-        HttpReply HttpCreateSession(std::string const& body, std::string const& forcedAccount = "",
-            std::optional<bool> forcedAllowGm = std::nullopt);
-        HttpReply HttpAction(std::string const& body);
-        HttpReply HttpDeleteSession(std::string const& body);
-        HttpReply HttpCharacterDelete(std::string const& body);
-        HttpReply HttpCharacterList(std::string const& body);
+        // These five are answered by the world thread: each returns a
+        // refusal it can make itself, or queues its task and returns
+        // ack->Defer(), never waiting (IHttpAck).
+        HttpReply HttpCreateSession(std::string const& body, std::string const& forcedAccount,
+            std::optional<bool> forcedAllowGm, std::shared_ptr<IHttpAck> const& ack);
+        HttpReply HttpAction(std::string const& body, std::shared_ptr<IHttpAck> const& ack);
+        HttpReply HttpDeleteSession(std::string const& body, std::shared_ptr<IHttpAck> const& ack);
+        HttpReply HttpCharacterDelete(std::string const& body, std::shared_ptr<IHttpAck> const& ack);
+        HttpReply HttpCharacterList(std::string const& body, std::shared_ptr<IHttpAck> const& ack);
         // operatorView (loopback caller): include the session count and the
         // packet-drop census. Network callers (runner, snippet sandbox) get a
         // liveness-only view — the census is module-internal state no client
         // could observe (docs/CONTRACTS.md).
         HttpReply HttpHealth(bool operatorView);
 
-        void DoCreateSession(std::shared_ptr<BenchSession> s, std::shared_ptr<std::promise<HttpReply>> ack);
-        void DoSay(std::string token, std::string text, std::shared_ptr<std::promise<HttpReply>> ack);
+        void DoCreateSession(std::shared_ptr<BenchSession> s, std::shared_ptr<IHttpAck> ack);
+        void DoSay(std::string token, std::string text, std::shared_ptr<IHttpAck> ack);
         // One handler for every action that is a single synthesized client
         // opcode (targeting, combat, interaction, quests, loot, vendor,
         // inventory, death). body is the raw request JSON, reparsed on the
         // world thread.
         void DoGameAction(std::string token, std::string action, std::string body,
-            std::shared_ptr<std::promise<HttpReply>> ack);
-        void DoDeleteSession(std::string token, std::shared_ptr<std::promise<HttpReply>> ack);
-        void DoMoveTo(std::string token, float x, float y, float z, std::string guid, bool force, bool fly, std::shared_ptr<std::promise<HttpReply>> ack);
-        void DoStop(std::string token, std::shared_ptr<std::promise<HttpReply>> ack);
-        void DoFace(std::string token, bool hasO, float o, bool hasXY, float x, float y, std::shared_ptr<std::promise<HttpReply>> ack);
-        void DoJump(std::string token, bool forward, std::shared_ptr<std::promise<HttpReply>> ack);
+            std::shared_ptr<IHttpAck> ack);
+        void DoDeleteSession(std::string token, std::shared_ptr<IHttpAck> ack);
+        void DoMoveTo(std::string token, float x, float y, float z, std::string guid, bool force, bool fly, std::shared_ptr<IHttpAck> ack);
+        void DoStop(std::string token, std::shared_ptr<IHttpAck> ack);
+        void DoFace(std::string token, bool hasO, float o, bool hasXY, float x, float y, std::shared_ptr<IHttpAck> ack);
+        void DoJump(std::string token, bool forward, std::shared_ptr<IHttpAck> ack);
 
         // Outcome of resolving a move_to against the navmesh (world thread).
         // status is nullptr on success, else one of the typed causes in
@@ -725,7 +729,7 @@ namespace WrathBench
         // The class talent tree as the client's talent frame renders it
         // (`talent_tree` action, WB_TALENT_TREE). World thread only.
         std::string TalentTreeJson(Player* player) const;
-        void DoTalentTree(std::string token, std::shared_ptr<std::promise<HttpReply>> ack);
+        void DoTalentTree(std::string token, std::shared_ptr<IHttpAck> ack);
         // One `{ achievementId, date, time, name?, points?, categoryId? }`
         // object; `date` is the wire's packed bitfield, `time` its reading.
         std::string AchievementJson(uint32 id, uint32 packedDate) const;
@@ -827,7 +831,7 @@ namespace WrathBench
         // In-world session guard for action handlers. Returns the player, or
         // nullptr after setting the error reply. World thread only.
         Player* CheckActionSession(std::shared_ptr<BenchSession> const& s,
-            std::shared_ptr<std::promise<HttpReply>>& ack);
+            std::shared_ptr<IHttpAck>& ack);
 
         // Update-object decoding (tap threads). Returns the event data JSON and
         // issues the creature/name queries a client cache miss would.
