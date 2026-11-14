@@ -658,7 +658,7 @@ describe("an abandoned walk's note with a program", () => {
   });
 });
 
-describe("round 3: saves, starts and what a result carries", () => {
+describe("saves, starts and what a result carries", () => {
   const render: CoreToolRender<ProgramToolContext> = { eventLine: (e) => e.opcode, isAmbient: () => false, stateSummary: () => "state" };
 
   test("only an async export is a routine; a sync one is named as not being one", async () => {
@@ -682,7 +682,7 @@ describe("round 3: saves, starts and what a result carries", () => {
   }, 30_000);
 
   test("a start after the save that restarted the routine is that run, said plainly; with other arguments it is refused truthfully", async () => {
-    // Sol's race: write_file then start_routine in one batch, the save restarting the running routine.
+    // write_file then start_routine in one batch, the save restarting the running routine.
     const { host } = await rig();
     const p = host.program!;
     await p.writeFile("main.ts", IDLE);
@@ -701,7 +701,7 @@ describe("round 3: saves, starts and what a result carries", () => {
   }, 30_000);
 
   test("two saves sent together restart a running routine once", async () => {
-    // Sol P t21/t23: two edit_file calls 7 ms apart, two loads, two restarts, a Holy Light interrupted.
+    // Two edit_file calls 7 ms apart once gave two loads and two restarts, interrupting a cast.
     const { host } = await rig();
     const p = host.program!;
     await p.writeFile("main.ts", IDLE);

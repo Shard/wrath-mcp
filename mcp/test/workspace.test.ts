@@ -203,7 +203,7 @@ describe("a one-off snippet", () => {
   });
 
   test("a bare builtin name is refused as what it is, once no workspace file answers to it", () => {
-    // DeepSeek round 3: `import "fs"` was refused as a missing fs.ts.
+    // `import "fs"` was once refused as a missing fs.ts.
     const refusal = 'import "fs": fs is a builtin module, not a file in your workspace; in a snippet a bare name imports a workspace file, so import the builtin as "node:fs"';
     expect(() => resolveWorkspaceImport("fs", root)).toThrow(refusal);
     expect(() => resolveWorkspaceImport("fs", undefined)).toThrow(refusal);
