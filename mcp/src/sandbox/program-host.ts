@@ -37,7 +37,8 @@ import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { durationWords, LOAD_TIMEOUT_MS, RESTART_SETTLE_MS } from "./program";
 import type { ProgramBeat, ProgramErrorNote, ProgramEvent, ProgramLoadAnswer, ProgramLogLine, RoutineAnswer, RoutineNote } from "./ipc";
-import { isImportable, MAIN_PATH, sameImportGraph, type LineRange, type Workspace, type WorkspaceResult } from "../workspace";
+import { API_MD_PATH } from "@wrathbench/sdk";
+import { isImportable, lineRange, MAIN_PATH, sameImportGraph, type LineRange, type Workspace, type WorkspaceResult } from "../workspace";
 
 /** How often a running program is asked for a beat. */
 export const PROGRAM_BEAT_MS = 5_000;
@@ -201,6 +202,9 @@ interface RegistryFile {
   routines: RoutineRow[];
 }
 
+/** The name `read_file` serves the SDK reference under (`ProgramHost.referenceRead`). */
+export const REFERENCE_PATH = "API.md";
+
 export class ProgramHost {
   readonly workspace: Workspace;
   private readonly rows = new Map<string, RoutineRow>();
@@ -345,7 +349,31 @@ export class ProgramHost {
   // ------------------------------------------------------------------ files
 
   readFile(path: unknown, range?: LineRange): ProgramAnswer {
+    const reference = this.referenceRead(path, range);
+    if (reference !== undefined) return reference;
     const r = this.workspace.read(path, range);
+    return r.ok ? { ok: true, text: r.text } : { ok: false, text: r.error };
+  }
+
+  /**
+   * `API.md`, the SDK reference, read as a workspace file is: whole, or a
+   * range of its lines under one saying which: it is larger than a snippet
+   * result, and a range at a time is the cheap way through it. A workspace
+   * file of that name is the model's own and reads as such. Undefined for
+   * any other path.
+   */
+  private referenceRead(path: unknown, range?: LineRange): ProgramAnswer | undefined {
+    if (path !== REFERENCE_PATH && path !== API_MD_PATH) return undefined;
+    const own = this.workspace.resolve(REFERENCE_PATH);
+    if (own.ok && existsSync(own.abs)) return undefined;
+    let text: string;
+    try {
+      text = readFileSync(API_MD_PATH, "utf8");
+    } catch (err) {
+      return { ok: false, text: `the SDK reference could not be read: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    if (range === undefined || (range.offset === undefined && range.limit === undefined)) return { ok: true, text };
+    const r = lineRange(REFERENCE_PATH, text, range);
     return r.ok ? { ok: true, text: r.text } : { ok: false, text: r.error };
   }
 
@@ -438,11 +466,25 @@ export class ProgramHost {
         const r = answer.routine;
         return { ok: true, text: `${label(r)} is running: your save restarted it from the top on deploy ${answer.restartedBy}, ${durationWords(this.port.now() - r.startedAt)} ago, with these arguments\n${this.routineLines()}` };
       }
-      this.rows.set(rowKey(answer.routine.name, answer.routine.character), { ...answer.routine });
+      this.placeStarted(answer.routine);
       this.persist();
       this.ensureBeat();
       return { ok: true, text: `started ${label(answer.routine)} on deploy ${answer.routine.deploy}\n${this.routineLines()}` };
     });
+  }
+
+  /**
+   * A run the child just started, as its start answered. The child sends a
+   * run's end the moment it happens, so a routine that ends at once (a throw
+   * before its first await) can have its end folded in (`onEvents`) before
+   * the start's answer lands: that row is the run as it stands, and the
+   * answer's "running" is older news. A newer run of the name is kept too.
+   */
+  private placeStarted(r: RoutineRow): void {
+    const k = rowKey(r.name, r.character);
+    const row = this.rows.get(k);
+    if (row !== undefined && (row.startedAt > r.startedAt || (row.startedAt === r.startedAt && row.state !== "running"))) return;
+    this.rows.set(k, { ...r });
   }
 
   stopRoutine(o: { name: string; character?: string | undefined }): Promise<ProgramAnswer> {
@@ -490,11 +532,13 @@ export class ProgramHost {
     let changed = false;
     for (const e of events) {
       if (e.kind === "ended") {
-        // A row is replaced only by the run it describes: a late end of a run
-        // that was already restarted must not overwrite its successor.
+        // A row is replaced only by the run it describes or a newer one: a
+        // late end of a run that was already restarted must not overwrite its
+        // successor, and the end of a run whose start has not answered yet
+        // (one that ended at once) replaces the name's previous run.
         const k = rowKey(e.routine.name, e.routine.character);
         const row = this.rows.get(k);
-        if (row === undefined || row.startedAt === e.routine.startedAt) {
+        if (row === undefined || row.startedAt <= e.routine.startedAt) {
           this.rows.set(k, { ...e.routine });
           changed = true;
         }
@@ -564,7 +608,7 @@ export class ProgramHost {
           interrupted.push(interrupt(r, answer.error));
           continue;
         }
-        this.rows.set(rowKey(r.name, r.character), { ...answer.routine });
+        this.placeStarted(answer.routine);
         restarted.push({ ...answer.routine });
       } catch (err) {
         interrupted.push(interrupt(r, err instanceof Error ? err.message : String(err)));
@@ -619,7 +663,7 @@ export class ProgramHost {
             interrupted.push(row);
             continue;
           }
-          this.rows.set(k, { ...answer.routine });
+          this.placeStarted(answer.routine);
           restarted.push({ ...answer.routine });
         } catch (err) {
           const row: RoutineRow = { ...now, note: err instanceof Error ? err.message : String(err) };

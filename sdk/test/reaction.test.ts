@@ -125,6 +125,21 @@ describe("unit reaction from the template relations", () => {
     expect(reactionOf(cache, listed.guid)).toBe("friendly");
   });
 
+  test("units() filters on reaction, one or a list; an unknown reaction never matches; a misspelt one is refused", () => {
+    const monster = unit(30, { template: 1, faction: 11, group: 8, enemyGroup: 1 | 2 | 4 });
+    const guard = unit(31, { template: 2, faction: 12, group: 2, friendGroup: 2, enemyGroup: 4 | 8 });
+    const critter = unit(32, { template: 3, faction: 13 });
+    const bare = unit(33, { faction: 3 });
+    const cache = world([monster.frame, guard.frame, critter.frame, bare.frame]);
+    expect(cache.units({ reaction: "hostile" }).map((u) => u.guid)).toEqual([monster.guid]);
+    expect(cache.units({ reaction: ["neutral", "friendly"] }).map((u) => u.guid).sort()).toEqual([guard.guid, critter.guid].sort());
+    expect(cache.closest({ reaction: "friendly" })?.guid).toBe(guard.guid);
+    expect(() => cache.units({ reaction: "enemy" } as never)).toThrow(
+      'state.units() filter: reaction received "enemy", expected one of "hostile", "neutral", "friendly" (exact, case-sensitive) or an array of them.',
+    );
+    expect(() => cache.units({ hostile: true } as never)).toThrow('(hostile: use reaction: "hostile".)');
+  });
+
   test("a row that describes another template, or no row, is unknown; a game object has none", () => {
     const stale = unit(30, { ...rowFields({ template: 1, faction: 11, enemyGroup: 1 }), faction: 2 });
     const bare = unit(31, { faction: 3 });

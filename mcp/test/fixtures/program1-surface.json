@@ -3,7 +3,7 @@
     {
       "def": {
         "name": "run_snippet",
-        "description": "Run a TypeScript snippet once in the game sandbox. `sdk`, `state`, `events`, `connect()`, `sleep(ms)`, `scratchpad` (its read(), write() and append() each return a Promise: `await scratchpad.read()`), `memory` and `signal` (aborted when this snippet returns or is abandoned) are ambient, and your workspace files import by relative path. A single expression returns its value. Nothing a snippet declares or starts outlives it; what must keep running is a routine (start_routine).",
+        "description": "Run a TypeScript snippet once in the game sandbox. `sdk`, `state`, `events`, `connect()`, `sleep(ms)`, `scratchpad` (its read(), write() and append() each return a Promise: `await scratchpad.read()`), `memory` and `signal` (aborted when this snippet returns or is abandoned) are ambient, and your workspace files import by relative path. A single expression returns its value. Nothing a snippet declares or starts outlives it; what must keep running is a routine (start_routine). A snippet runs for at most 30 seconds; one still running then is abandoned.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -30,7 +30,7 @@
     {
       "def": {
         "name": "read_file",
-        "description": "Return one file from your workspace, its text exactly as stored. The path is relative to the workspace, e.g. main.ts or lib/combat.ts. offset and limit, both optional, return part of it instead: limit lines from line offset (counted from 1), under one line saying which lines of how many they are.",
+        "description": "Return one file from your workspace, its text exactly as stored. The path is relative to the workspace, e.g. main.ts or lib/combat.ts. offset and limit, both optional, return part of it instead: limit lines from line offset (counted from 1), under one line saying which lines of how many they are. API.md is the SDK reference (API_MD_PATH) and reads the same way.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -185,7 +185,7 @@
               "description": "The export of main.ts to run, e.g. grind."
             },
             "args": {
-              "description": "Passed to the function as its one argument. Any JSON value; omit for none."
+              "description": "Passed to the function as its one argument: a JSON object; omit for none."
             }
           },
           "required": [
@@ -194,7 +194,7 @@
           "additionalProperties": false
         }
       },
-      "help": "start_routine expects { name: string, args?: any } — the export of main.ts to run, and the one argument it is called with.",
+      "help": "start_routine expects { name: string, args?: object } — the export of main.ts to run, and the one argument it is called with.",
       "aliases": {
         "routine": "name",
         "function": "name",

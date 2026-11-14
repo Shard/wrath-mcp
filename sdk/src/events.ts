@@ -231,13 +231,17 @@ export class EventTimeoutError extends Error {
 export class EventAbortedError extends Error {
   override readonly name = "EventAbortedError";
   readonly waitingFor: string | undefined;
+  /** The timeout the aborted wait was given, when it had one: a sandbox can say it outlasted the snippet. */
+  readonly timeoutMs: number | undefined;
   constructor(
     readonly reason: unknown,
     waitingFor?: string,
+    timeoutMs?: number,
   ) {
     const why = reason instanceof Error ? reason.message : reason === undefined ? "aborted" : String(reason);
     super(`aborted while waiting for ${waitingFor ?? "an event"}: ${why}`);
     this.waitingFor = waitingFor;
+    this.timeoutMs = timeoutMs;
   }
 }
 
@@ -804,7 +808,7 @@ export class EventStream implements AsyncIterable<StreamEvent> {
       );
       if (idx >= 0) return Promise.resolve(this.buffer[idx] as StreamEvent);
     }
-    if (signal?.aborted) return Promise.reject(new EventAbortedError(signal.reason, description));
+    if (signal?.aborted) return Promise.reject(new EventAbortedError(signal.reason, description, timeout));
 
     return new Promise<StreamEvent>((resolve, reject) => {
       const waiter: Waiter = { predicate: matches, resolve: () => {}, reject: () => {}, settled: false };
@@ -825,7 +829,7 @@ export class EventStream implements AsyncIterable<StreamEvent> {
       function onAbort() {
         if (waiter.settled) return;
         waiter.settled = true;
-        waiter.reject(new EventAbortedError(signal?.reason, description));
+        waiter.reject(new EventAbortedError(signal?.reason, description, timeout));
       }
       signal?.addEventListener("abort", onAbort, { once: true });
       timer = setTimeout(() => {

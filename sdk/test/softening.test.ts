@@ -83,7 +83,7 @@ describe("units() unknown keys point at the real thing", () => {
 
   test("a key with no hint still lists the valid keys", () => {
     expect(() => withWorld([]).units({ wobble: 1 } as never)).toThrow(
-      /unknown key "wobble"\. Valid keys are entry, name, type, alive, maxDistance, npc, role, questGiver\./,
+      /unknown key "wobble"\. Valid keys are entry, name, type, alive, maxDistance, npc, role, questGiver, reaction\./,
     );
   });
 });

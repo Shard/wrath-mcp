@@ -35,7 +35,8 @@
  *               scratchpad, bridged to the host process which owns the file,
  *               so each returns a Promise: `await scratchpad.read()` is the text
  *   API_MD_PATH absolute path to the generated SDK reference (sdk/API.md);
- *               read it with `await Bun.file(API_MD_PATH).text()`, in slices
+ *               read it with `await Bun.file(API_MD_PATH).text()`, in slices,
+ *               or by line range with the program's `read_file` ("API.md")
  *   setTimeout / setInterval / clearInterval / …  the normal timers; routines
  *               started here keep running between snippets
  *
@@ -126,7 +127,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
-import { API_MD_PATH as SDK_API_MD_PATH, isGroupOrWhisperChat, WrathClient, type StreamEvent } from "@wrathbench/sdk";
+import { API_MD_PATH as SDK_API_MD_PATH, EventAbortedError, isGroupOrWhisperChat, WrathClient, type StreamEvent } from "@wrathbench/sdk";
 import { callSiteLabel, SNIPPET_URL } from "./call-site";
 import { keepsAnswer, reparseFrame } from "./client-cache";
 import { toJsonSafe } from "../jsonsafe";
@@ -813,7 +814,7 @@ function harvestHints(): void {
     (seat.held ??= []).push(...fresh);
     for (const h of fresh) {
       const routine = h.origin === undefined ? undefined : callSites.get(h.origin)?.routine;
-      if (routine !== undefined) program?.noteRefusal(routine, h);
+      if (routine !== undefined) program?.noteRefusal(routine, h, MULTI ? seat.name : undefined);
     }
   }
 }
@@ -1240,7 +1241,8 @@ function releasePadCalls(id: number): void {
 
 // The generated SDK reference (sdk/API.md), at a stable absolute path a snippet
 // can read: `await Bun.file(API_MD_PATH).text()`. It is larger than one snippet
-// result, so read it in slices (one `## ` section, or lines filtered by name).
+// result, so read it in slices (one `## ` section, or lines filtered by name),
+// or, beside a program, by line range with `read_file` (`ProgramHost`).
 // The SDK names its own file (`API_MD_PATH` in @wrathbench/sdk), so the path
 // does not depend on the cwd, which the child does not control, nor on where
 // this package sits beside the SDK.
@@ -1279,6 +1281,21 @@ function sleepOverrunNote(ms: number): string | undefined {
   return ms >= store.timeoutMs
     ? `${head} and the snippet time limit is ${store.timeoutMs}ms, so a sleep that long can never finish inside one snippet.`
     : `${head} when this snippet had ${Math.round(left)}ms of its ${store.timeoutMs}ms time limit left, so it could never finish inside this snippet.`;
+}
+
+/**
+ * The abandon-note sentence for an SDK wait the snippet was awaiting when it
+ * was abandoned, when that wait was given a timeout of the snippet time limit
+ * or longer (`EventAbortedError.timeoutMs`): the SDK accepts any timeout, and
+ * one that long can never run out inside a snippet. The same fact the sleep's
+ * note states, for every other wait.
+ */
+export function longWaitNote(err: unknown, limitMs: number | undefined): string | undefined {
+  if (!(err instanceof EventAbortedError) || err.timeoutMs === undefined || limitMs === undefined || err.timeoutMs < limitMs) return undefined;
+  return (
+    `a wait for ${err.waitingFor ?? "an event"} was still waiting when this was abandoned: its timeout was ${err.timeoutMs}ms ` +
+    `and the snippet time limit is ${limitMs}ms, so a wait that long can never finish inside one snippet.`
+  );
 }
 
 /**
@@ -1660,6 +1677,15 @@ const BIGINT_STRINGIFY_RE = /serialize\s+(a\s+)?BigInt/i;
  *   - a single BuildMessage (one parse error) — same, without the wrapper.
  *   - JSON.stringify on a bigint — keep the TypeError but name the fix.
  */
+/**
+ * An array method called on something the code names as a bag (`state.bag()`,
+ * `bag`, `myBag`) that has none: `state.bag()` returns an object, and the
+ * bare "is not a function" says nothing of where its rows are. Only on the
+ * failure; the object is untouched.
+ */
+const BAG_ARRAY_METHOD_RE = /^[\w$.()[\]'"]*bag[\w$.()[\]'"]*\.(map|filter|find|forEach|some|every|reduce|flatMap|slice|sort)\b.* is not a function/i;
+const BAG_SHAPE_NOTE = "state.bag() returns { items, freeSlots, totalSlots, bags }; its rows are the items array";
+
 export function renderError(err: unknown): string {
   const text = renderErrorText(err);
   if (program === null) return text;
@@ -1686,6 +1712,7 @@ function renderErrorText(err: unknown): string {
         `String(x), template literals, or console.log directly`
       );
     }
+    if (err instanceof TypeError && BAG_ARRAY_METHOD_RE.test(err.message)) return `${err.name}: ${err.message} — ${BAG_SHAPE_NOTE}`;
     return `${err.name}: ${err.message}`;
   }
   // With a program: Bun's resolver rejects a failed import with a
@@ -1795,6 +1822,10 @@ async function evaluate(id: number, code: string, deadline?: number, timeoutMs?:
       const thrown = err as { moveAbandon?: unknown; waitAbandon?: unknown; sleepAbandon?: unknown } | null | undefined;
       const carried = [thrown?.moveAbandon, thrown?.waitAbandon, thrown?.sleepAbandon].find((n) => typeof n === "string");
       if (typeof carried === "string") abandonNote = carried;
+      else {
+        const long = longWaitNote(err, timeoutMs);
+        if (long !== undefined) abandonNote = long;
+      }
     }
     // Not for an abandoned eval: its result is discarded, so its refusals go
     // the background way (`releasePadCalls`, below) and ride the pong.

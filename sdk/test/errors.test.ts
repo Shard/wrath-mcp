@@ -148,6 +148,14 @@ describe("error-code hints", () => {
     }
   });
 
+  test("character_bound is true whether the bound character was played or is still being created", () => {
+    const err = new WrathRequestError(409, { ok: false, error: "character_bound", bound: "Thalvorn" } as never);
+    expect(err.message).toBe(
+      "module rejected request: character_bound (this session's token is bound to the character in `bound` (one it already played, " +
+        "or one a create still in flight under it named) and cannot create another — call createSession with that name, or deleteSession and continue with it) (HTTP 409)",
+    );
+  });
+
   test("an unknown code renders without a hint, unchanged", () => {
     const err = new WrathRequestError(400, { ok: false, error: "some_future_code" });
     expect(err.message).toBe("module rejected request: some_future_code (HTTP 400)");

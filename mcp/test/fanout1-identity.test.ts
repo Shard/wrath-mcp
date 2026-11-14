@@ -14,7 +14,8 @@
  * that result's error and its notice and nothing else; and `run_snippet`'s
  * description says that the `scratchpad` calls return Promises (operator,
  * 2026-11-12), which changed that description where it is served and
- * nothing else.
+ * nothing else; and that description states the snippet time limit
+ * (operator, 2026-11-15), likewise.
  */
 
 import { expect, test } from "bun:test";

@@ -188,6 +188,8 @@ export {
   recentEventsScan,
   renderActionHints,
   serveEvents,
+  SNIPPET_TIME_LIMIT_MS,
+  SNIPPET_TIME_LIMIT_SENTENCE,
   snippetToolResult,
   stripTrailingCommas,
   toolCallCount,
