@@ -521,8 +521,16 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   so a harness can fold one kind of an opcode's events out of
   `recent_events` and keep the rest. A render that reads only the opcode is
   unchanged.
+- `sdk/API.md` is headed "SDK reference"; it was "WrathBench SDK reference".
 
 ### Fixed
+
+- A session writer that reopens a session a killed process left continues the
+  torn segment of its window, as `docs/SESSION-FORMAT.md` ("Tears") says. Its
+  recovery compressed that segment as well, racing its own appends: rows it
+  wrote before the compression landed could be lost, and the closed segment
+  could end in the torn line, which the validator calls an error. A torn
+  segment the first row does not continue is closed with its tear ended.
 
 - `leaseSessionSecret` retries a module it cannot reach for about a minute
   (`LEASE_RETRY_DELAYS_MS`), then throws. It used to return without a secret,
