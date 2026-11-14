@@ -108,14 +108,15 @@ rather than open.
 The module protects the worldserver it runs in, and only that: nothing here
 changes what a session observes or what an action does, and no limit is a rule
 about the game. Each is a setting in `mod_wrathbench.conf.dist`, where `0`
-turns it off. The defaults sit several times above what one character's
-client asks for, so a caller meets a refusal below only by asking for far more
-than a client would.
+turns it off. The request rate is off by default and is set where callers
+holding only a lease secret are not trusted (a hosted world); the other
+defaults sit several times above what one character's client asks for, so a
+caller meets a refusal below only by asking for far more than a client would.
 
 Per lease, refused with `429` and nothing dispatched, queued or audited:
 
-- **Request rate** (`WrathBench.ActionRate`, `WrathBench.ActionBurst`; 20 a
-  second, burst 40). A token bucket per lease over what a lease secret may ask
+- **Request rate** (`WrathBench.ActionRate`, `WrathBench.ActionBurst`; off
+  by default, 20 a second with a burst of 40 where it is set). A token bucket per lease over what a lease secret may ask
   of the world thread: `POST /action` (`raw` and a request the action would
   refuse included), `POST /session`, `DELETE /session` and the `/events`
   upgrade. Over it: `429 {"ok":false,"error":"rate_limited"}`. The bucket

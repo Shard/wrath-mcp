@@ -232,7 +232,7 @@ namespace WrathBench
         _httpLimits.maxConnections = sConfigMgr->GetOption<uint32>("WrathBench.MaxConnections", 4096);
         _httpLimits.maxConnectionsPerPeer = sConfigMgr->GetOption<uint32>("WrathBench.MaxConnectionsPerPeer", 0);
         _httpLimits.eventsBacklogBytes = sConfigMgr->GetOption<uint32>("WrathBench.EventsBacklogBytes", 16u * 1024 * 1024);
-        _actionRate = sConfigMgr->GetOption<uint32>("WrathBench.ActionRate", 20);
+        _actionRate = sConfigMgr->GetOption<uint32>("WrathBench.ActionRate", 0);
         _actionBurst = sConfigMgr->GetOption<uint32>("WrathBench.ActionBurst", 40);
         _eventsSubscribersMax = sConfigMgr->GetOption<uint32>("WrathBench.EventsSubscribersPerToken", 4);
         _leasesMax = sConfigMgr->GetOption<uint32>("WrathBench.MaxLeases", 1024);

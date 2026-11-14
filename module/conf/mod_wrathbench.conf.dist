@@ -117,16 +117,20 @@ WrathBench.AuditDir = "/azerothcore/env/dist/logs/wrathbench"
 #                     world thread: POST /action (raw included), POST /session,
 #                     DELETE /session and the /events upgrade. A request over
 #                     it is answered 429 rate_limited and nothing is
-#                     dispatched. The port secret is exempt. The defaults are
-#                     several times what one character's client sends; they
-#                     are there so that a caller holding only a lease secret
+#                     dispatched. The port secret is exempt. Off by default:
+#                     a snippet's awaited actions one after another can
+#                     exceed any fixed rate, so a world whose callers are all
+#                     the operator's own changes nothing. Set it where a
+#                     caller holding only a lease secret is not trusted (a
+#                     hosted world); 20 and 40 are several times what one
+#                     character's client sends, there so that such a caller
 #                     cannot occupy the world thread, not to pace play.
 #                     Re-read on `.reload config`.
-#        Default:     20 and 40
-#                     0 (ActionRate) - No limit
+#        Default:     0 (no limit) and 40
+#                     Hosted:      20 and 40
 #
 
-WrathBench.ActionRate = 20
+WrathBench.ActionRate = 0
 WrathBench.ActionBurst = 40
 
 #
