@@ -500,6 +500,7 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   so a harness can fold one kind of an opcode's events out of
   `recent_events` and keep the rest. A render that reads only the opcode is
   unchanged.
+- `sdk/API.md` is headed "SDK reference"; it was "WrathBench SDK reference".
 
 ### Fixed
 
