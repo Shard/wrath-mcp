@@ -82,7 +82,18 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   close at 1 MiB), a 30-second deadline on a reply, a subscriber left more
   than `WrathBench.EventsBacklogBytes` (16 MiB) behind or sending a frame
   over 4 KiB (closed), and TCP keepalive on subscriber sockets. A `move_to`
-  or `face` field that is NaN is `400 invalid_position`. The loopback
+  or `face` field that is not a finite number within ±100000 is
+  `400 invalid_position`, and a cast's ground target likewise
+  `400 invalid_dest`. A flown `move_to` reaches 250 yards up or down as it
+  does across (`too_far` past it), the straight leg onto or off a transport
+  30, and no planned line or route estimate samples more than 256 points on
+  the world thread. A caller-written string in an audit record is cut to 255
+  bytes with its full length beside it, and `learn_preview_talents` is
+  audited as the pairs read. Connections: one that has not authenticated has
+  10 seconds for its first request and such connections hold at most half
+  the table, a `401` closes its connection, and
+  `WrathBench.MaxConnectionsPerLease` (off; `429 connection_limit`) bounds
+  what one lease secret holds open. The loopback
   `GET /health` adds `leases` and `limits`. Nothing a session observes or an
   action does changes. The request rate ships off; the other defaults are
   several times what a client sends: a deployment running more than 1024 characters at once, or more

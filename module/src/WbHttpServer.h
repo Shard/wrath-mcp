@@ -30,6 +30,11 @@ namespace WrathBench
     {
         int status{200};
         std::string body; // JSON
+        // Close the connection once the reply is written, whatever the
+        // request said about keeping it: set on a refusal that leaves the
+        // connection with no caller behind it (a credential that did not
+        // authenticate, a lease at its connection limit).
+        bool close{false};
     };
 
     // The answer to an /events upgrade (IHttpSink::AuthorizeWs).
@@ -50,6 +55,8 @@ namespace WrathBench
         uint32_t maxConnections{4096};
         // The same, from one peer address.
         uint32_t maxConnectionsPerPeer{0};
+        // The same, authenticated by one lease's secret (IHttpPeer::Admit).
+        uint32_t maxConnectionsPerLease{0};
         // Bytes one /events subscriber may have queued and unsent before it
         // is dropped as a reader that has stopped reading.
         uint64_t eventsBacklogBytes{16u * 1024 * 1024};
@@ -63,6 +70,25 @@ namespace WrathBench
     // logged (PROTOCOL.md, "Authentication").
     std::string TokenTag(std::string const& token);
 
+    // The connection a request arrived on, as the sink sees it. The server
+    // reads no credential itself, so the sink tells it whose connection this
+    // has turned out to be; until it does, the connection is one of the
+    // unauthenticated, which are held to a share of the connection table and
+    // to a short deadline for their first request (WbHttpServer.cpp).
+    class IHttpPeer
+    {
+    public:
+        virtual ~IHttpPeer() = default;
+        // The TCP peer is 127.0.0.1/::1.
+        virtual bool Loopback() const = 0;
+        // The request on this connection authenticated: as the lease named
+        // (a session token), or as the operator for "". False when that
+        // lease already holds HttpLimits::maxConnectionsPerLease other
+        // connections; the connection then stays unauthenticated, and the
+        // sink refuses the request. The operator is never refused.
+        virtual bool Admit(std::string const& lease) = 0;
+    };
+
     // The game-facing surface the HTTP/WS server calls into. Implemented by the
     // Manager. All callbacks run on io_context threads, never the world thread;
     // the Manager is responsible for marshalling anything that touches game
@@ -71,15 +97,16 @@ namespace WrathBench
     {
     public:
         virtual ~IHttpSink() = default;
-        // loopbackPeer: the TCP peer is 127.0.0.1/::1 — an operator inside the
+        // peer: the connection. A loopback peer is an operator inside the
         // worldserver container, as opposed to a caller on the compose network
-        // (runner, snippet sandbox). Lets diagnostics endpoints serve their
-        // verbose view to operators only.
+        // (runner, snippet sandbox), which lets diagnostics endpoints serve
+        // their verbose view to operators only; and the sink says who
+        // authenticated on it (IHttpPeer::Admit).
         // authorization: the request's Authorization header verbatim ("" when
         // absent). Every route authenticates on it (PROTOCOL.md,
         // "Authentication"); the server never interprets it itself.
         virtual HttpReply HandleHttp(std::string const& method, std::string const& target, std::string const& body,
-            std::string const& authorization, bool loopbackPeer) = 0;
+            std::string const& authorization, IHttpPeer& peer) = 0;
         // Decide an /events upgrade before the handshake. A refusal (status
         // other than 0) is answered as a plain HTTP reply with that status
         // and error code, so a refused subscriber never registers: 401 for a
@@ -88,7 +115,7 @@ namespace WrathBench
         // subscriber slots, which the server gives back through
         // ReleaseWsSlot exactly once, when the connection object dies,
         // whether or not its handshake ever completed.
-        virtual WsAdmit AuthorizeWs(std::string const& token, std::string const& authorization) = 0;
+        virtual WsAdmit AuthorizeWs(std::string const& token, std::string const& authorization, IHttpPeer& peer) = 0;
         virtual void ReleaseWsSlot(std::string const& token) = 0;
         // replay: the subscribe carried `replay=1`, asking for the reattach
         // replay on this connection (PROTOCOL.md, "/events").

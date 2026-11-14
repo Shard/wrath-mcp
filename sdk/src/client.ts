@@ -1271,6 +1271,9 @@ export type MoveResult =
       readonly hint?: string;
     };
 
+/** How far one move reaches, across and (flown) up or down: the module's bound (PROTOCOL.md, `too_far`). */
+const MOVE_REACH_YARDS = 250;
+
 /**
  * Per-status recovery recipes (what happened, what it means,
  * the next step), in the result rather than in a trajectory nobody reads twice.
@@ -1280,9 +1283,24 @@ export type MoveResult =
  * recovery that follows from it.
  */
 export const MOVE_HINTS: Readonly<Record<string, (point: MovePoint, data: MoveResultData) => string>> = {
-  too_far: (p, d) =>
-    `(${fmtXY(p)}) is ${Math.round(Math.hypot(p.x - d.pos.x, p.y - d.pos.y))}y from where you stand, in a straight line; ` +
-    `one move (moveTo or moveToAsync alike) covers ~250y. Walk to an intermediate point first.`,
+  too_far: (p, d) => {
+    // The module's reach is 250y across and, on a flown leg (the only one
+    // that goes to the z asked for), 250y up or down. A refusal for a point
+    // within reach across is the height's, and says so: the distance across
+    // would read as a point well inside one move.
+    const across = Math.hypot(p.x - d.pos.x, p.y - d.pos.y);
+    const dz = p.z - d.pos.z;
+    if (across <= MOVE_REACH_YARDS && Math.abs(dz) > MOVE_REACH_YARDS) {
+      return (
+        `(${fmtXY(p)}, z ${p.z.toFixed(1)}) is ${Math.round(Math.abs(dz))}y ${dz > 0 ? "above" : "below"} where you are; ` +
+        `one flown move (moveTo or moveToAsync alike) covers ~250y up or down. Fly to an intermediate height first.`
+      );
+    }
+    return (
+      `(${fmtXY(p)}) is ${Math.round(across)}y from where you stand, in a straight line; ` +
+      `one move (moveTo or moveToAsync alike) covers ~250y. Walk to an intermediate point first.`
+    );
+  },
   no_mesh: (p) =>
     `no navmesh is loaded under you or under (${fmtXY(p)}); this is a harness data limitation, not a route ` +
     `problem. Nothing to retry here — choose a destination in a mapped area.`,
