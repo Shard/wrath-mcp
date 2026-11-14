@@ -28,7 +28,7 @@
 
 import { randomBytes } from "node:crypto";
 import { z } from "zod";
-import { leaseRunSecret, logoutSession, releaseSessionSecret } from "./module-auth";
+import { leaseRedacted, portSecretLeaser, type Leaser } from "./module-auth";
 import { SecretRedactor } from "./redact";
 import type { SessionWriter } from "./record/writer";
 import type { EvalLink, SeatSpec, SeatView, SnippetResult } from "./sandbox/host";
@@ -148,6 +148,12 @@ export interface CharacterRosterOptions {
    * shuts down. Absent records nothing.
    */
   record?: (seat: { character: string; guid: string; token: string }) => SessionWriter | undefined;
+  /**
+   * How each seat's lease is taken, ended and given back. Absent, with the
+   * port secret from `env` (`portSecretLeaser`); a host that must not hold
+   * the port secret hands one that asks whoever does.
+   */
+  leaser?: Leaser;
   env?: Record<string, string | undefined>;
   fetch?: typeof fetch;
   newToken?: () => string;
@@ -165,6 +171,7 @@ export class CharacterRoster implements FanoutSurface {
   readonly calls: FanoutCalls;
   private readonly entries = new Map<string, RosterEntry>();
   private readonly writers = new Map<string, SessionWriter>();
+  private readonly leaser: Leaser;
   private queue: Promise<unknown> = Promise.resolve();
   /** Every token this roster has put on a seat, to strike from what is recorded. */
   private readonly tokens = new SecretRedactor();
@@ -174,6 +181,7 @@ export class CharacterRoster implements FanoutSurface {
     if (problem !== null) throw new Error(problem);
     this.maxCharacters = o.grant.maxCharacters;
     this.sandbox = o.sandbox;
+    this.leaser = o.leaser ?? portSecretLeaser({ moduleUrl: o.moduleUrl, ...(o.env !== undefined ? { env: o.env } : {}), ...(o.fetch !== undefined ? { fetch: o.fetch } : {}) });
     for (const e of o.known ?? []) {
       this.entries.set(e.character, { ...e });
       this.tokens.redact(e.token);
@@ -264,10 +272,9 @@ export class CharacterRoster implements FanoutSurface {
     if (account === undefined) return { ok: false, error: "every granted account has a character logged in; log one out first (logout_character)" };
     const token = known?.token ?? (this.o.newToken ?? (() => randomBytes(16).toString("hex")))();
     this.tokens.redact(token);
-    const call = { moduleUrl: this.o.moduleUrl, token, ...(this.o.env !== undefined ? { env: this.o.env } : {}), ...(this.o.fetch !== undefined ? { fetch: this.o.fetch } : {}) };
     let opened: SeatOpened;
     try {
-      const lease = await leaseRunSecret({ ...call, account, ...(this.o.grant.allowGm === true ? { allowGm: true } : {}) }, this.o.secrets);
+      const lease = await leaseRedacted(this.leaser, { token, account, ...(this.o.grant.allowGm === true ? { allowGm: true } : {}) }, this.o.secrets);
       const create = { ...(req.race !== undefined ? { race: req.race } : {}), ...(req.class !== undefined ? { class: req.class } : {}), ...(req.gender !== undefined ? { gender: req.gender } : {}) };
       opened = await this.sandbox.openSeat({
         character: known?.character ?? name,
@@ -285,7 +292,7 @@ export class CharacterRoster implements FanoutSurface {
       });
     } catch (err) {
       // A token nobody will present again gives its lease back.
-      if (known === undefined) await releaseSessionSecret(call);
+      if (known === undefined) await this.leaser.release(token);
       if (resuming && known !== undefined) {
         known.in = false;
         this.changed();
@@ -312,10 +319,9 @@ export class CharacterRoster implements FanoutSurface {
     await this.sandbox.closeSeat(character, { logout });
     const entry = this.entries.get(character);
     if (entry !== undefined && logout) {
-      const call = { moduleUrl: this.o.moduleUrl, token: entry.token, ...(this.o.env !== undefined ? { env: this.o.env } : {}), ...(this.o.fetch !== undefined ? { fetch: this.o.fetch } : {}) };
-      // With the port secret as well: it works however the child answered.
-      await logoutSession(call);
-      await releaseSessionSecret(call);
+      // Through the leaser as well: it works however the child answered.
+      await this.leaser.logout(entry.token);
+      await this.leaser.release(entry.token);
       entry.in = false;
       this.changed();
     }

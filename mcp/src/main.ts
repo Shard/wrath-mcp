@@ -51,7 +51,7 @@ import { dirname, join } from "node:path";
 import type { EventSummary } from "./sandbox/ipc";
 import { compactJson } from "./jsonsafe";
 import { CharacterRoster, FANOUT_TOOL_ORDER, fanoutGrantProblem, fanoutTools, MAX_CHARACTERS_LIMIT, type FanoutGrant, type FanoutToolContext, type RosterEntry } from "./fanout";
-import { leaseRunSecret, logoutSession, moduleAuthHeaders, moduleIdentity, releaseSessionSecret, tokenFingerprint, tokenTag } from "./module-auth";
+import { leaseRedacted, moduleAuthHeaders, moduleIdentity, portSecretLeaser, tokenFingerprint, tokenTag, type Leaser } from "./module-auth";
 import { ownGuidIndex } from "./record/gate";
 import { DEFAULT_RETENTION_MS, pruneSessions } from "./record/retention";
 import { SessionStore } from "./record/store";
@@ -238,25 +238,27 @@ export function recordOption(argv: readonly string[], stateDir: string): { root:
 /**
  * The clean exit, once however many ways it is asked for: stop the sandbox,
  * close the session record, log the character out and release the lease,
- * each bounded, with the port secret, so a wedged child cannot hold the
- * character in the world.
+ * each bounded, through the leaser (with the port secret, unless the host
+ * hands another), so a wedged child cannot hold the character in the world.
  */
 export function sessionShutdown(o: {
   sandbox: Pick<SandboxHost, "stop">;
   record?: Pick<SessionWriter, "close"> | undefined;
   moduleUrl: string;
   token: string;
+  /** Absent, `portSecretLeaser` over `moduleUrl`, `env` and `fetch`. */
+  leaser?: Leaser;
   env?: Record<string, string | undefined>;
   fetch?: typeof fetch;
 }): () => Promise<void> {
+  const leaser = o.leaser ?? portSecretLeaser({ moduleUrl: o.moduleUrl, ...(o.env !== undefined ? { env: o.env } : {}), ...(o.fetch !== undefined ? { fetch: o.fetch } : {}) });
   let done: Promise<void> | undefined;
   return () =>
     (done ??= (async () => {
       await Promise.race([o.sandbox.stop().catch(() => {}), Bun.sleep(5_000)]);
       if (o.record !== undefined) await Promise.race([o.record.close().catch(() => {}), Bun.sleep(5_000)]);
-      const call = { moduleUrl: o.moduleUrl, token: o.token, ...(o.env !== undefined ? { env: o.env } : {}), ...(o.fetch !== undefined ? { fetch: o.fetch } : {}) };
-      await logoutSession(call);
-      await releaseSessionSecret(call);
+      await leaser.logout(o.token);
+      await leaser.release(o.token);
     })());
 }
 
@@ -281,10 +283,12 @@ async function main(): Promise<void> {
   if (grant !== null) return mainFanout({ argv, grant, token, dir, tokenPath, moduleUrl });
 
   const secrets = new SecretRedactor();
+  const leaser = portSecretLeaser({ moduleUrl });
   // The opt-in rides the lease, which only this process can take: the child's
   // creates inherit it, and nothing a snippet sends can raise it.
-  const lease = await leaseRunSecret(
-    { moduleUrl, token, ...(account !== undefined ? { account } : {}), ...(allowGm ? { allowGm } : {}) },
+  const lease = await leaseRedacted(
+    leaser,
+    { token, ...(account !== undefined ? { account } : {}), ...(allowGm ? { allowGm } : {}) },
     secrets,
   );
   if (lease.secret === undefined) console.error(`[wrathbench-mcp] ${lease.note}`);
@@ -345,7 +349,7 @@ async function main(): Promise<void> {
     },
     { serverVersion: MCP_PACKAGE_VERSION },
   );
-  const shutdown = sessionShutdown({ sandbox, moduleUrl, token, record });
+  const shutdown = sessionShutdown({ sandbox, moduleUrl, token, record, leaser });
   let signalled = false;
   const onSignal = (code: number) => () => {
     // A second signal does not wait for the first one's logout.
