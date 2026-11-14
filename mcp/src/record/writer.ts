@@ -154,6 +154,11 @@ function endsWithNewline(path: string): boolean {
 /** One stream's files: which segment is live, and the closing of the one before it. */
 class StreamFiles {
   private live: { t0: number; path: string } | null = null;
+  /**
+   * The newest plain segment a dead process left, held back from `recover`:
+   * continued when the first row falls in its window, else closed then.
+   */
+  private left: string | null = null;
   private made = false;
   private failed = false;
   /** Lines waiting for the next flush, in order. */
@@ -183,13 +188,14 @@ class StreamFiles {
    */
   open(t0: number): boolean {
     if (this.live !== null && this.live.t0 >= t0) return false;
-    this.close();
     let part = 0;
     for (const seg of listSegments(this.sessionDir, this.stream)) {
       if (seg.t0 !== t0) continue;
       part = seg.compressed ? seg.part + 1 : seg.part;
     }
     const path = join(this.dir, segmentFileName(t0, part));
+    if (this.left === path) this.left = null;
+    this.close();
     try {
       if (!endsWithNewline(path)) this.pending.push("\n");
     } catch {
@@ -224,21 +230,37 @@ class StreamFiles {
     }
   }
 
-  /** Close the live segment: flush it, and compress it when this stream is captured. */
+  /** Close the live segment, and a left one this process did not continue: flush, and compress when this stream is captured. */
   close(): void {
     this.flush();
     const live = this.live;
     this.live = null;
-    if (live === null || !this.o.compress) return;
-    this.o.closed(compressSegment(live.path).catch((err: unknown) => this.o.log(`[record] could not compress ${live.path}: ${String(err)}`)));
+    if (live !== null && this.o.compress) this.o.closed(compressSegment(live.path).catch((err: unknown) => this.o.log(`[record] could not compress ${live.path}: ${String(err)}`)));
+    const left = this.left;
+    this.left = null;
+    if (left === null) return;
+    try {
+      // Its torn last line is ended before it is closed for good.
+      if (!endsWithNewline(left)) appendFileSync(left, "\n", "utf8");
+    } catch {
+      /* unreadable: so is the compress below, and the plain file stays */
+    }
+    this.o.closed(compressSegment(left).catch(() => null));
   }
 
-  /** Compress every plain segment but the live one: what a process that died left behind. */
+  /**
+   * What a process that died left behind: every plain segment compressed but
+   * the newest, which is held back for `open` to continue or `close` to close.
+   * Compressing it here would race the rows this process goes on to append to it.
+   */
   recover(): void {
     if (!this.o.compress) return;
-    for (const seg of listSegments(this.sessionDir, this.stream)) {
-      if (seg.compressed || seg.path === this.live?.path) continue;
-      this.o.closed(compressSegment(seg.path).catch(() => null));
+    const segs = listSegments(this.sessionDir, this.stream);
+    const newest = segs.at(-1);
+    for (const seg of segs) {
+      if (seg.compressed) continue;
+      if (seg === newest) this.left = seg.path;
+      else this.o.closed(compressSegment(seg.path).catch(() => null));
     }
   }
 }

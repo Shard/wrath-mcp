@@ -9,6 +9,7 @@
 #include "WbHttpServer.h"
 #include "Log.h"
 
+#include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/post.hpp>
@@ -19,6 +20,7 @@
 #include <boost/beast/version.hpp>
 #include <boost/beast/websocket.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <deque>
@@ -89,15 +91,29 @@ namespace WrathBench
     // a peer that trickles bytes does not extend them.
     static constexpr std::chrono::seconds kReadTimeout{60};
     static constexpr std::chrono::seconds kWriteTimeout{30};
+    // The same for a connection no request has authenticated on yet: a
+    // caller sends its first request as it connects, so one that has sent
+    // none this long after is holding a slot and nothing else.
+    static constexpr std::chrono::seconds kFirstReadTimeout{10};
 
-    // The connection count, total and per peer address. A connection holds a
-    // ConnSlot from accept until its object dies, the WebSocket it may have
-    // become included.
+    // The connection count: in total, per peer address, per lease, and those
+    // no request has authenticated on yet. A connection holds a ConnSlot from
+    // accept until its object dies, the WebSocket it may have become
+    // included.
+    //
+    // A slot costs nothing to take: the port answers anyone who can reach
+    // it, and where every caller shares one address (one host runs every
+    // sandbox) the per-peer count cannot tell them apart. So the
+    // unauthenticated may hold at most half the table, which leaves the rest
+    // for connections that have shown a credential, and a lease's secret
+    // authenticates only so many at once (IHttpPeer::Admit).
     struct ConnTable
     {
         std::mutex mutex;
         std::uint32_t total{0};
+        std::uint32_t unauthenticated{0};
         std::map<asio::ip::address, std::uint32_t> byPeer;
+        std::map<std::string, std::uint32_t> byLease;
     };
 
     class ConnSlot
@@ -114,6 +130,29 @@ namespace WrathBench
             auto it = _table->byPeer.find(_peer);
             if (it != _table->byPeer.end() && --it->second == 0)
                 _table->byPeer.erase(it);
+            Unbind();
+        }
+
+        // IHttpPeer::Admit for the connection holding this slot. A connection
+        // that authenticates as another lease later is counted as that one
+        // from then on; refused, it stays what it was.
+        bool Admit(std::string const& lease, std::uint32_t maxPerLease)
+        {
+            std::lock_guard<std::mutex> lock(_table->mutex);
+            if (_admitted && _lease == lease)
+                return true;
+            if (!lease.empty())
+            {
+                auto it = _table->byLease.find(lease);
+                if (maxPerLease && it != _table->byLease.end() && it->second >= maxPerLease)
+                    return false;
+            }
+            Unbind();
+            _admitted = true;
+            _lease = lease;
+            if (!lease.empty())
+                ++_table->byLease[lease];
+            return true;
         }
 
         // A slot for one more connection from this peer, or nullptr when a
@@ -125,6 +164,8 @@ namespace WrathBench
                 std::lock_guard<std::mutex> lock(table->mutex);
                 if (limits.maxConnections && table->total >= limits.maxConnections)
                     return nullptr;
+                if (limits.maxConnections && table->unauthenticated >= std::max<std::uint32_t>(1, limits.maxConnections / 2))
+                    return nullptr;
                 std::uint32_t& mine = table->byPeer[peer];
                 if (limits.maxConnectionsPerPeer && mine >= limits.maxConnectionsPerPeer)
                 {
@@ -134,13 +175,32 @@ namespace WrathBench
                 }
                 ++mine;
                 ++table->total;
+                ++table->unauthenticated;
             }
             return std::make_shared<ConnSlot>(table, peer);
         }
 
     private:
+        // Under the table's mutex: give back whichever count this slot holds.
+        void Unbind()
+        {
+            if (!_admitted)
+            {
+                --_table->unauthenticated;
+                return;
+            }
+            if (_lease.empty())
+                return;
+            auto it = _table->byLease.find(_lease);
+            if (it != _table->byLease.end() && --it->second == 0)
+                _table->byLease.erase(it);
+        }
+
         std::shared_ptr<ConnTable> _table;
         asio::ip::address _peer;
+        // Under the table's mutex.
+        bool _admitted{false};
+        std::string _lease;
     };
 
     // A subscriber's socket lives for hours and the server only ever writes
@@ -314,13 +374,69 @@ namespace WrathBench
     };
 
     // ----------------------------------------------------------- HTTP conn
-    class HttpConnection : public std::enable_shared_from_this<HttpConnection>
+    class HttpConnection;
+
+    // IHttpAck for one request of one connection. It holds the connection
+    // weakly and nothing of Asio's, so whoever keeps it (a session keeps its
+    // create's for as long as it lives) keeps no socket open and can let go
+    // of it on any thread, at any time, the server's own end included. What
+    // the sink asked for inside HandleHttp is read back by the connection
+    // once HandleHttp has returned, on the same strand.
+    class RequestAck : public IHttpAck, public std::enable_shared_from_this<RequestAck>
+    {
+    public:
+        explicit RequestAck(std::weak_ptr<HttpConnection> conn) : _conn(std::move(conn)) { }
+
+        void Answer(HttpReply reply) override;
+
+        HttpReply Defer(std::chrono::seconds wait, HttpReply expired, std::function<void()> onExpired) override
+        {
+            deferred = true;
+            this->wait = wait;
+            this->expired = std::move(expired);
+            this->onExpired = std::move(onExpired);
+            return HttpReply{0, ""};
+        }
+
+        void Then(std::function<void(HttpReply const&)> s) override { step = std::move(s); }
+
+        // Whether the request has its reply: set by the first of Answer()
+        // and the connection (HandleHttp's own return, the wait running
+        // out). Whoever sets it writes the reply; everyone else stands down.
+        bool Take() { return !_answered.exchange(true); }
+
+        // The connection's strand only.
+        bool deferred{false};
+        std::chrono::seconds wait{0};
+        HttpReply expired;
+        std::function<void()> onExpired;
+        std::function<void(HttpReply const&)> step;
+
+    private:
+        std::weak_ptr<HttpConnection> const _conn;
+        std::atomic<bool> _answered{false};
+    };
+
+    class HttpConnection : public IHttpPeer, public std::enable_shared_from_this<HttpConnection>
     {
     public:
         HttpConnection(tcp::socket&& socket, IHttpSink* sink, std::shared_ptr<ConnSlot> slot, bool loopbackPeer,
-            std::uint64_t backlogLimit)
-            : _stream(std::move(socket)), _sink(sink), _slot(std::move(slot)), _loopbackPeer(loopbackPeer),
-              _backlogLimit(backlogLimit), _buffer(kHeaderLimit + kBodyLimit) { }
+            HttpLimits const& limits)
+            : _stream(std::move(socket)), _strand(_stream.get_executor()), _deadline(_strand), _sink(sink),
+              _slot(std::move(slot)),
+              _loopbackPeer(loopbackPeer), _maxPerLease(limits.maxConnectionsPerLease),
+              _backlogLimit(limits.eventsBacklogBytes), _buffer(kHeaderLimit + kBodyLimit) { }
+
+        // IHttpPeer: called by the sink from inside HandleHttp or
+        // AuthorizeWs, on this connection's strand.
+        bool Loopback() const override { return _loopbackPeer; }
+        bool Admit(std::string const& lease) override
+        {
+            if (!_slot->Admit(lease, _maxPerLease))
+                return false;
+            _admitted = true;
+            return true;
+        }
 
         void Run()
         {
@@ -328,7 +444,33 @@ namespace WrathBench
                 beast::bind_front_handler(&HttpConnection::DoRead, shared_from_this()));
         }
 
+        // RequestAck::Answer, from any thread: the reply for `ack`'s request
+        // is written on the strand. The caller has taken the ack.
+        void PostReply(std::shared_ptr<RequestAck> ack, HttpReply reply)
+        {
+            asio::post(_strand,
+                [self = shared_from_this(), ack = std::move(ack), reply = std::move(reply)]() mutable
+                {
+                    self->Complete(ack, reply);
+                });
+        }
+
     private:
+        // On the strand: write the reply of the request this connection is
+        // waiting on. The ack is that request's own, so a reply can only ever
+        // go to the request it was made for: the next request of a
+        // kept-alive connection has an ack of its own.
+        void Complete(std::shared_ptr<RequestAck> const& ack, HttpReply& reply)
+        {
+            if (_waiting != ack)
+                return;
+            _waiting.reset();
+            _deadline.cancel();
+            if (ack->step)
+                ack->step(reply);
+            SendReply(reply, _req.keep_alive() && !reply.close);
+        }
+
         void DoRead()
         {
             // A parser of our own rather than the one async_read makes for a
@@ -336,7 +478,7 @@ namespace WrathBench
             _parser.emplace();
             _parser->header_limit(kHeaderLimit);
             _parser->body_limit(kBodyLimit);
-            _stream.expires_after(kReadTimeout);
+            _stream.expires_after(_admitted ? kReadTimeout : kFirstReadTimeout);
             http::async_read(_stream, _buffer, *_parser,
                 beast::bind_front_handler(&HttpConnection::OnRead, shared_from_this()));
         }
@@ -367,7 +509,7 @@ namespace WrathBench
             // not-yet-upgraded stream.
             if (websocket::is_upgrade(_req) && path == "/events")
             {
-                WsAdmit const admit = _sink->AuthorizeWs(token, authorization);
+                WsAdmit const admit = _sink->AuthorizeWs(token, authorization, *this);
                 if (admit.status != 0)
                 {
                     SendReply({admit.status, std::string(R"({"ok":false,"error":")") + admit.error + "\"}"}, false);
@@ -379,8 +521,38 @@ namespace WrathBench
             }
 
             std::string method(_req.method_string());
-            HttpReply reply = _sink->HandleHttp(method, path, _req.body(), authorization, _loopbackPeer);
-            SendReply(reply, _req.keep_alive());
+            auto ack = std::make_shared<RequestAck>(weak_from_this());
+            HttpReply reply = _sink->HandleHttp(method, path, _req.body(), authorization, *this, ack);
+            if (reply.status != 0 || !ack->deferred)
+            {
+                // Answered here and now. An Answer() that comes anyway finds
+                // the ack taken, or is not the request this connection waits
+                // on (Complete), and is dropped either way.
+                ack->Take();
+                if (reply.status == 0)
+                    reply = {500, R"({"ok":false,"error":"internal"})"};
+                if (ack->step)
+                    ack->step(reply);
+                return SendReply(reply, _req.keep_alive() && !reply.close);
+            }
+
+            // The reply is the world thread's (IHttpAck). This thread goes
+            // back to the other connections; this one reads nothing more
+            // until its reply is written, and is kept alive meanwhile by the
+            // wait below, which always ends. An Answer() already made is
+            // queued on this strand behind this handler, so it finds
+            // _waiting set.
+            _waiting = ack;
+            _deadline.expires_after(ack->wait);
+            _deadline.async_wait([self = shared_from_this(), ack](beast::error_code ec)
+            {
+                if (ec || !ack->Take())
+                    return;
+                if (ack->onExpired)
+                    ack->onExpired();
+                HttpReply reply = ack->expired;
+                self->Complete(ack, reply);
+            });
         }
 
         void SendReply(HttpReply const& reply, bool keepAlive)
@@ -393,8 +565,8 @@ namespace WrathBench
             res->body() = reply.body;
             res->prepare_payload();
 
-            // The read's deadline is spent by now (the handler may have
-            // waited on the world thread); the write gets its own, so a peer
+            // The read's deadline is spent by now (the reply may have been
+            // the world thread's, and waited for); the write gets its own, so a peer
             // that never reads its reply does not hold the connection.
             _stream.expires_after(kWriteTimeout);
             http::async_write(_stream, *res,
@@ -413,14 +585,34 @@ namespace WrathBench
         }
 
         beast::tcp_stream _stream;
+        // The stream's strand, kept apart from it: PostReply reads it from
+        // other threads, and it never changes.
+        asio::any_io_executor const _strand;
+        // The wait for a deferred reply, on that strand, and the request it
+        // is for. Strand only.
+        asio::steady_timer _deadline;
+        std::shared_ptr<RequestAck> _waiting;
         IHttpSink* _sink;
         std::shared_ptr<ConnSlot> _slot;
         bool _loopbackPeer{false};
+        std::uint32_t _maxPerLease{0};
+        // A request has authenticated on this connection (Admit). Strand only.
+        bool _admitted{false};
         std::uint64_t _backlogLimit{0};
         beast::flat_buffer _buffer;
         std::optional<http::request_parser<http::string_body>> _parser;
         http::request<http::string_body> _req;
     };
+
+    void RequestAck::Answer(HttpReply reply)
+    {
+        if (!Take())
+            return;
+        // A connection that is gone has nobody to answer. One that is still
+        // there is the server's, so the server (and its io_context) is too.
+        if (auto conn = _conn.lock())
+            conn->PostReply(shared_from_this(), std::move(reply));
+    }
 
     // ----------------------------------------------------------- acceptor
     struct HttpServer::Impl
@@ -453,7 +645,7 @@ namespace WrathBench
                     {
                         if (auto slot = ConnSlot::Take(table, limits, peer.address()))
                             std::make_shared<HttpConnection>(std::move(socket), sink, std::move(slot),
-                                peer.address().is_loopback(), limits.eventsBacklogBytes)->Run();
+                                peer.address().is_loopback(), limits)->Run();
                         else
                             NoteRefused(peer.address());
                     }
@@ -472,7 +664,8 @@ namespace WrathBench
             if (now - lastRefusedLog < std::chrono::seconds(10))
                 return;
             LOG_WARN("module", "wrathbench: refused {} connection(s) at a connection limit, the last from {} "
-                "(WrathBench.MaxConnections, WrathBench.MaxConnectionsPerPeer)", refusedSinceLog, peer.to_string());
+                "(WrathBench.MaxConnections, of which unauthenticated connections may hold half; "
+                "WrathBench.MaxConnectionsPerPeer)", refusedSinceLog, peer.to_string());
             lastRefusedLog = now;
             refusedSinceLog = 0;
         }

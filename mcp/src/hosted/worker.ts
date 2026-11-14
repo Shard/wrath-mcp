@@ -60,6 +60,14 @@ export const WorkerOpenSchema = z.strictObject({
   record: z.strictObject({ root: z.string().min(1), retentionMs: z.number().positive() }).nullable(),
   owner: z.string().optional(),
   snippetTimeoutMs: z.number().positive().optional(),
+  /** The sandbox child's resource limits (`SandboxLimits`), each replacing its default; `null` is no limit. */
+  sandboxLimits: z
+    .strictObject({
+      addressSpaceBytes: z.int().positive().nullable().optional(),
+      cpuSeconds: z.int().positive().nullable().optional(),
+      fileBytes: z.int().positive().nullable().optional(),
+    })
+    .optional(),
   module: z.strictObject({ build: z.string().nullable(), protocol: z.number().nullable() }).nullable().optional(),
   /** Mint each new character's token as a hosted one (`tokens.ts`), which the gateway's leaser requires. */
   hostedTokens: z.boolean().optional(),

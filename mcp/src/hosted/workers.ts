@@ -79,16 +79,30 @@ export function localWorkerEnv(secret: string, env: Record<string, string | unde
 /** The worker entry, beside this file. */
 export const WORKER_ENTRY = join(import.meta.dir, "worker.ts");
 
+/** Why `localWorkers` would not start a worker: it was not told the grants are trusted with the gateway's own user. */
+export class LocalWorkersRefused extends Error {}
+
 /**
  * A process per credential on this machine, listening on loopback. Its
  * child is confined as every sandbox is, and the process holds no port
- * secret; the only boundary between workers is the kernel's, so this
- * serves one machine and its tests. A deployment for people outside it runs
- * a worker per pod.
+ * secret; but it runs as the gateway's own user, beside the gateway's
+ * environment and state, with no memory or CPU bound of its own, so the
+ * only boundary between a tenant and the port secret is the kernel's
+ * confinement of the child. It serves the operator's own grants on one
+ * machine and the tests, and refuses every start unless told so
+ * (`trusted: true`; the gateway entry's `--trusted-local-workers`). A
+ * deployment for people outside it runs a worker per pod, through its own
+ * provider.
  */
-export function localWorkers(o: { entry?: string; startTimeoutMs?: number; env?: Record<string, string | undefined>; cwd?: string } = {}): WorkerProvider {
+export function localWorkers(o: { entry?: string; startTimeoutMs?: number; env?: Record<string, string | undefined>; cwd?: string; trusted?: boolean } = {}): WorkerProvider {
   return {
     async start({ secret, dir }) {
+      if (o.trusted !== true) {
+        throw new LocalWorkersRefused(
+          "local workers run as the gateway's own user, beside the module's port secret, so they serve only grants the operator trusts with that " +
+            "(localWorkers({ trusted: true }), or the gateway's --trusted-local-workers); people outside the deployment need a worker provider of its own",
+        );
+      }
       // No `.env` and no `bunfig.toml` is read from anywhere: a file there could carry the port secret, or preload code.
       const proc = Bun.spawn([process.execPath, "--no-env-file", o.entry ?? WORKER_ENTRY, "--host", "127.0.0.1", "--port", "0"], {
         env: localWorkerEnv(secret, o.env),

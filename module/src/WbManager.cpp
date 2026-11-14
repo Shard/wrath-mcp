@@ -7,6 +7,7 @@
  */
 
 #include "WbManager.h"
+#include "WbBounds.h"
 #include "WbJson.h"
 #include "WbNav.h"
 
@@ -226,11 +227,12 @@ namespace WrathBench
         std::string secret = sConfigMgr->GetOption<std::string>("WrathBench.Secret", "");
         _auditDir = sConfigMgr->GetOption<std::string>("WrathBench.AuditDir", "/azerothcore/env/dist/logs/wrathbench");
 
-        // The module's own protection (mod_wrathbench.conf.dist): the three
+        // The module's own protection (mod_wrathbench.conf.dist): those
         // the server takes at Start(), and the per-lease caps, which a
         // `.reload config` re-applies.
         _httpLimits.maxConnections = sConfigMgr->GetOption<uint32>("WrathBench.MaxConnections", 4096);
         _httpLimits.maxConnectionsPerPeer = sConfigMgr->GetOption<uint32>("WrathBench.MaxConnectionsPerPeer", 0);
+        _httpLimits.maxConnectionsPerLease = sConfigMgr->GetOption<uint32>("WrathBench.MaxConnectionsPerLease", 0);
         _httpLimits.eventsBacklogBytes = sConfigMgr->GetOption<uint32>("WrathBench.EventsBacklogBytes", 16u * 1024 * 1024);
         _actionRate = sConfigMgr->GetOption<uint32>("WrathBench.ActionRate", 0);
         _actionBurst = sConfigMgr->GetOption<uint32>("WrathBench.ActionBurst", 40);
@@ -394,6 +396,15 @@ namespace WrathBench
         _tasks.push_back(std::move(fn));
     }
 
+    // The time one world tick gives to queued requests. No io thread waits
+    // for a request's reply, so nothing holds requests back on their way
+    // here: however many arrive between two ticks are all queued by the next. The
+    // tick serves them in order until this much time has gone, always at
+    // least one, and leaves the rest at the head of the queue for the tick
+    // after. A burst is spread over a few ticks instead of holding one, and
+    // nothing is refused or reordered.
+    static constexpr std::chrono::milliseconds kTaskBudget{20};
+
     void Manager::Update(uint32 /*diff*/)
     {
         std::vector<std::function<void()>> tasks;
@@ -403,17 +414,28 @@ namespace WrathBench
         }
         // A task that throws must not take the worldserver with it: every
         // one of them runs a request a caller shaped. The request it was
-        // serving times out on its io thread (504); the rest run.
-        for (auto& t : tasks)
+        // serving is answered 504 when its wait runs out; the rest run.
+        auto const began = std::chrono::steady_clock::now();
+        size_t ran = 0;
+        for (; ran < tasks.size(); ++ran)
         {
+            if (ran > 0 && std::chrono::steady_clock::now() - began >= kTaskBudget)
+                break;
             try
             {
-                t();
+                tasks[ran]();
             }
             catch (std::exception const& e)
             {
                 LOG_ERROR("module", "wrathbench: a world-thread task threw: {}", e.what());
             }
+        }
+        if (ran < tasks.size())
+        {
+            // Ahead of whatever was queued meanwhile, a task's own
+            // re-queue included: the order requests arrived in is kept.
+            std::lock_guard<std::mutex> lock(_taskMutex);
+            _tasks.insert(_tasks.begin(), std::make_move_iterator(tasks.begin() + ran), std::make_move_iterator(tasks.end()));
         }
 
         int64_t const nowMs = NowMs();
@@ -559,17 +581,20 @@ namespace WrathBench
         return false;
     }
 
-    WsAdmit Manager::AuthorizeWs(std::string const& token, std::string const& authorization)
+    WsAdmit Manager::AuthorizeWs(std::string const& token, std::string const& authorization, IHttpPeer& peer)
     {
         std::string leaseToken;
         switch (Authenticate(authorization, &leaseToken, nullptr))
         {
-            case Cred::Operator: return {};
+            case Cred::Operator: peer.Admit(""); return {};
             case Cred::Session:  break;
             default:             return {401, "unauthorized"};
         }
         if (token.empty() || token != leaseToken)
             return {401, "unauthorized"};
+        // The lease's connections, this socket among them (HandleHttp).
+        if (!peer.Admit(leaseToken))
+            return {429, "connection_limit"};
         // A subscribe by a session that is in world costs the world thread a
         // state frame (OnWsOpen), so a subscribe draws from the lease's
         // bucket as an action does: a caller looping on connects is refused
@@ -605,8 +630,24 @@ namespace WrathBench
         return {status, Json::Writer().Add("ok", false).Add("error", code).Str()};
     }
 
+    // How long a request waits for the world thread's reply before it is
+    // answered 504 timeout instead (IHttpAck::Defer): an action or a logout
+    // is one task on the world thread, a create or a character-select
+    // utility a login flow over several ticks, after as much as 11 seconds
+    // for the account to be released (DoCreateSession). The task still runs
+    // when the world thread gets to it; only its reply is no longer waited
+    // for. No thread waits meanwhile: the io thread that took the request is
+    // back with the other connections as soon as the task is queued.
+    static constexpr std::chrono::seconds kActionWait{10};
+    static constexpr std::chrono::seconds kCreateWait{20};
+
+    static HttpReply TimeoutReply()
+    {
+        return ErrorReply(504, "timeout");
+    }
+
     HttpReply Manager::HandleHttp(std::string const& method, std::string const& target, std::string const& body,
-        std::string const& authorization, bool loopbackPeer)
+        std::string const& authorization, IHttpPeer& peer, std::shared_ptr<IHttpAck> const& ack)
     {
         try
         {
@@ -617,10 +658,26 @@ namespace WrathBench
             Lease lease;
             Cred const cred = Authenticate(authorization, &leaseToken, &lease);
             if (cred == Cred::None)
-                return ErrorReply(401, "unauthorized");
+            {
+                // And the connection goes: it has no caller behind it that
+                // the module knows, and is counted as such until it closes.
+                HttpReply refusal = ErrorReply(401, "unauthorized");
+                refusal.close = true;
+                return refusal;
+            }
+            // Whose connection this is, for the server's count of them. A
+            // lease secret authenticates only so many at once
+            // (WrathBench.MaxConnectionsPerLease): one past it is refused
+            // before any route and closed, as any request on it would be.
+            if (!peer.Admit(cred == Cred::Session ? leaseToken : std::string()))
+            {
+                HttpReply refusal = ErrorReply(429, "connection_limit");
+                refusal.close = true;
+                return refusal;
+            }
 
             if (method == "GET" && target == "/health")
-                return HttpHealth(loopbackPeer);
+                return HttpHealth(peer.Loopback());
 
             // Operator-only surfaces: leasing itself, and the character-select
             // utilities that act on an account rather than a session.
@@ -634,9 +691,9 @@ namespace WrathBench
             if (method == "DELETE" && target == "/lease")
                 return HttpReleaseLease(body);
             if (method == "POST" && target == "/character-delete")
-                return HttpCharacterDelete(body);
+                return HttpCharacterDelete(body, ack);
             if (method == "POST" && target == "/characters")
-                return HttpCharacterList(body);
+                return HttpCharacterList(body, ack);
 
             bool const tokenRoute =
                 (method == "POST" && target == "/session") ||
@@ -682,23 +739,28 @@ namespace WrathBench
 
             if (method == "POST" && target == "/session")
             {
-                HttpReply reply = HttpCreateSession(body, forcedAccount, forcedAllowGm);
-                if (cred == Cred::Session && reply.status == 200 && lease.character.empty())
+                if (cred == Cred::Session && lease.character.empty())
                 {
                     // Bind on success only: a create the core refused (name
                     // taken, bad race/class) must not pin the token to a
-                    // character that never existed.
-                    std::string const character = Json::Parse(body).GetString("character");
-                    std::lock_guard<std::mutex> lock(_leaseMutex);
-                    auto it = _leases.find(leaseToken);
-                    if (it != _leases.end() && it->second.character.empty())
-                        it->second.character = character;
+                    // character that never existed. The reply is the world
+                    // thread's and comes later, so the binding is a step it
+                    // passes through on its way out (an io thread).
+                    ack->Then([this, leaseToken, character = Json::Parse(body).GetString("character")](HttpReply const& reply)
+                    {
+                        if (reply.status != 200)
+                            return;
+                        std::lock_guard<std::mutex> lock(_leaseMutex);
+                        auto it = _leases.find(leaseToken);
+                        if (it != _leases.end() && it->second.character.empty())
+                            it->second.character = character;
+                    });
                 }
-                return reply;
+                return HttpCreateSession(body, forcedAccount, forcedAllowGm, ack);
             }
             if (method == "POST" && target == "/action")
-                return HttpAction(body);
-            return HttpDeleteSession(body);
+                return HttpAction(body, ack);
+            return HttpDeleteSession(body, ack);
         }
         catch (std::exception const& e)
         {
@@ -863,6 +925,7 @@ namespace WrathBench
             .Add("actionRate", _actionRate.load()).Add("actionBurst", _actionBurst.load())
             .Add("eventsSubscribersPerToken", _eventsSubscribersMax.load()).Add("leases", _leasesMax.load())
             .Add("connections", _httpLimits.maxConnections).Add("connectionsPerPeer", _httpLimits.maxConnectionsPerPeer)
+            .Add("connectionsPerLease", _httpLimits.maxConnectionsPerLease)
             .Add("eventsBacklogBytes", _httpLimits.eventsBacklogBytes).Str());
         w.Add("droppedPackets", _totalDrops.load()); // lifetime
         w.Add("droppedPacketsLive", liveDrops);      // across current sessions
@@ -873,7 +936,7 @@ namespace WrathBench
     }
 
     HttpReply Manager::HttpCreateSession(std::string const& body, std::string const& forcedAccount,
-        std::optional<bool> forcedAllowGm)
+        std::optional<bool> forcedAllowGm, std::shared_ptr<IHttpAck> const& ack)
     {
         Json::Value req = Json::Parse(body);
         std::string token = req.GetString("token");
@@ -926,21 +989,15 @@ namespace WrathBench
         if (s->charName.empty())
             return {400, Json::Writer().Add("ok", false).Add("error", "missing_character").Str()};
 
-        auto ack = std::make_shared<std::promise<HttpReply>>();
         s->ack = ack;
-        auto fut = ack->get_future();
 
         PushTask([this, s, ack]() { DoCreateSession(s, ack); });
 
-        if (fut.wait_for(std::chrono::seconds(20)) != std::future_status::ready)
-        {
-            // Don't leave a half-built session registered with an unset promise:
-            // that orphan is exactly what feeds a dangling-pointer crash on the
-            // next create for this account. Tear it down on the world thread.
-            PushTask([this, token]() { TeardownByToken(token); });
-            return {504, Json::Writer().Add("ok", false).Add("error", "timeout").Str()};
-        }
-        return fut.get();
+        // Don't leave a half-built session registered and unanswered past
+        // the wait: that orphan is exactly what feeds a dangling-pointer
+        // crash on the next create for this account. Tear it down on the
+        // world thread.
+        return ack->Defer(kCreateWait, TimeoutReply(), [this, token]() { PushTask([this, token]() { TeardownByToken(token); }); });
     }
 
     // A guid request field must be a decimal u64 string (PROTOCOL.md). Empty
@@ -1279,6 +1336,21 @@ namespace WrathBench
         return 0;
     }
 
+    // A caller-written string in an audit record: cut to Bounds::kAuditTextMax
+    // bytes, with its full length beside it (`<key>Bytes`) when it was cut.
+    // The record says what was asked without growing with it; what went to
+    // the core is the whole string, which the core bounds for itself.
+    static void AddAuditText(Json::Writer& w, std::string const& key, std::string const& text)
+    {
+        if (text.size() <= Bounds::kAuditTextMax)
+        {
+            w.Add(key, text);
+            return;
+        }
+        w.Add(key, Bounds::AuditText(text));
+        w.Add(key + "Bytes", (uint64_t)text.size());
+    }
+
     // Every missing/invalid-param reply names the action and the param it was
     // about: a bare "missing_guid" cost live-run turns to diagnose.
     static HttpReply MissingParam(std::string const& action, char const* code, char const* param)
@@ -1287,7 +1359,7 @@ namespace WrathBench
             .Add("action", action).Add("param", param).Str()};
     }
 
-    HttpReply Manager::HttpAction(std::string const& body)
+    HttpReply Manager::HttpAction(std::string const& body, std::shared_ptr<IHttpAck> const& ack)
     {
         Json::Value req = Json::Parse(body);
         std::string token = req.GetString("token");
@@ -1307,9 +1379,6 @@ namespace WrathBench
                     .Add("received", v.substr(0, 64)).Str()};
         }
 
-        auto ack = std::make_shared<std::promise<HttpReply>>();
-        auto fut = ack->get_future();
-
         if (action == "say")
         {
             std::string text = req.GetString("text");
@@ -1320,12 +1389,17 @@ namespace WrathBench
             if (!req.Has("x") || !req.Has("y") || !req.Has("z"))
                 return MissingParam(action, "missing_position",
                     !req.Has("x") ? "x" : (!req.Has("y") ? "y" : "z"));
-            float x = (float)req.GetDouble("x"), y = (float)req.GetDouble("y"), z = (float)req.GetDouble("z");
-            // Not a number is not a place. No JSON number parses to one, so
-            // only a hand-built body carries it, and it would pass every
-            // range test the planner makes (each compares false).
-            if (std::isnan(x) || std::isnan(y) || std::isnan(z))
-                return MissingParam(action, "invalid_position", std::isnan(x) ? "x" : (std::isnan(y) ? "y" : "z"));
+            // Not a number is not a place, and neither is one no map reaches
+            // (Bounds::FieldOk). A number that is not finite would pass every
+            // range test the planner makes (each compares false), and a
+            // finite one far enough out sizes whatever is then sampled along
+            // the way to it. Judged as the doubles the body carried, before
+            // they narrow to the floats the game uses.
+            double const dx = req.GetDouble("x"), dy = req.GetDouble("y"), dz = req.GetDouble("z");
+            if (!Bounds::FieldOk(dx) || !Bounds::FieldOk(dy) || !Bounds::FieldOk(dz))
+                return MissingParam(action, "invalid_position",
+                    !Bounds::FieldOk(dx) ? "x" : (!Bounds::FieldOk(dy) ? "y" : "z"));
+            float x = (float)dx, y = (float)dy, z = (float)dz;
             // Optional: the guid of the unit the point was read from. Only a
             // planning hint (the z of a patrolling NPC is resolved to the
             // ground under it before pathing, see ResolvePath); never a
@@ -1357,11 +1431,15 @@ namespace WrathBench
             bool hasXY = req.Has("x") && req.Has("y");
             if (!hasO && !hasXY)
                 return MissingParam(action, "missing_face_target", "orientation or x,y");
-            float o = (float)req.GetDouble("orientation");
-            float x = (float)req.GetDouble("x"), y = (float)req.GetDouble("y");
-            if ((hasO && std::isnan(o)) || (hasXY && (std::isnan(x) || std::isnan(y))))
+            // As for move_to: a facing that is not finite has no normal form
+            // (the core's NormalizeOrientation answers NaN for it).
+            double const dor = req.GetDouble("orientation");
+            double const dx = req.GetDouble("x"), dy = req.GetDouble("y");
+            if ((hasO && !Bounds::FieldOk(dor)) || (hasXY && (!Bounds::FieldOk(dx) || !Bounds::FieldOk(dy))))
                 return MissingParam(action, "invalid_position",
-                    hasO && std::isnan(o) ? "orientation" : (std::isnan(x) ? "x" : "y"));
+                    hasO && !Bounds::FieldOk(dor) ? "orientation" : (!Bounds::FieldOk(dx) ? "x" : "y"));
+            float o = (float)dor;
+            float x = (float)dx, y = (float)dy;
             PushTask([this, token, hasO, o, hasXY, x, y, ack]() { DoFace(token, hasO, o, hasXY, x, y, ack); });
         }
         else if (action == "jump")
@@ -1463,25 +1541,18 @@ namespace WrathBench
             PushTask([this, token, action, body, ack]() { DoGameAction(token, action, body, ack); });
         }
 
-        if (fut.wait_for(std::chrono::seconds(10)) != std::future_status::ready)
-            return {504, Json::Writer().Add("ok", false).Add("error", "timeout").Str()};
-        return fut.get();
+        return ack->Defer(kActionWait, TimeoutReply());
     }
 
-    HttpReply Manager::HttpDeleteSession(std::string const& body)
+    HttpReply Manager::HttpDeleteSession(std::string const& body, std::shared_ptr<IHttpAck> const& ack)
     {
         Json::Value req = Json::Parse(body);
         std::string token = req.GetString("token");
         if (token.empty())
             return {400, Json::Writer().Add("ok", false).Add("error", "missing_token").Str()};
 
-        auto ack = std::make_shared<std::promise<HttpReply>>();
-        auto fut = ack->get_future();
         PushTask([this, token, ack]() { DoDeleteSession(token, ack); });
-
-        if (fut.wait_for(std::chrono::seconds(10)) != std::future_status::ready)
-            return {504, Json::Writer().Add("ok", false).Add("error", "timeout").Str()};
-        return fut.get();
+        return ack->Defer(kActionWait, TimeoutReply());
     }
 
     // POST /character-delete: a short-lived utility session that parks at the
@@ -1489,7 +1560,7 @@ namespace WrathBench
     // so it must not be in world). Needed because episode resets (a fresh
     // character per episode) accumulate characters against the realm's
     // per-account cap.
-    HttpReply Manager::HttpCharacterDelete(std::string const& body)
+    HttpReply Manager::HttpCharacterDelete(std::string const& body, std::shared_ptr<IHttpAck> const& ack)
     {
         Json::Value req = Json::Parse(body);
         std::string token = req.GetString("token");
@@ -1526,20 +1597,12 @@ namespace WrathBench
         s->allowGm = req.GetBool("allowGm");
         s->deleteMode = true;
 
-        auto ack = std::make_shared<std::promise<HttpReply>>();
         s->ack = ack;
-        auto fut = ack->get_future();
         PushTask([this, s, ack]() { DoCreateSession(s, ack); });
-
-        if (fut.wait_for(std::chrono::seconds(20)) != std::future_status::ready)
-        {
-            PushTask([this, token]() { TeardownByToken(token); });
-            return {504, Json::Writer().Add("ok", false).Add("error", "timeout").Str()};
-        }
-        return fut.get();
+        return ack->Defer(kCreateWait, TimeoutReply(), [this, token]() { PushTask([this, token]() { TeardownByToken(token); }); });
     }
 
-    HttpReply Manager::HttpCharacterList(std::string const& body)
+    HttpReply Manager::HttpCharacterList(std::string const& body, std::shared_ptr<IHttpAck> const& ack)
     {
         Json::Value req = Json::Parse(body);
         std::string token = req.GetString("token");
@@ -1556,25 +1619,17 @@ namespace WrathBench
         s->allowGm = req.GetBool("allowGm");
         s->listMode = true;
 
-        auto ack = std::make_shared<std::promise<HttpReply>>();
         s->ack = ack;
-        auto fut = ack->get_future();
         PushTask([this, s, ack]() { DoCreateSession(s, ack); });
-
-        if (fut.wait_for(std::chrono::seconds(20)) != std::future_status::ready)
-        {
-            PushTask([this, token]() { TeardownByToken(token); });
-            return {504, Json::Writer().Add("ok", false).Add("error", "timeout").Str()};
-        }
-        return fut.get();
+        return ack->Defer(kCreateWait, TimeoutReply(), [this, token]() { PushTask([this, token]() { TeardownByToken(token); }); });
     }
 
     // ---------------------------------------------------- world-thread work
-    void Manager::DoCreateSession(std::shared_ptr<BenchSession> s, std::shared_ptr<std::promise<HttpReply>> ack)
+    void Manager::DoCreateSession(std::shared_ptr<BenchSession> s, std::shared_ptr<IHttpAck> ack)
     {
         auto fail = [&](std::string const& err, int status = 400) {
             if (!s->ackFired.exchange(true))
-                ack->set_value({status, Json::Writer().Add("ok", false).Add("error", err).Str()});
+                ack->Answer({status, Json::Writer().Add("ok", false).Add("error", err).Str()});
         };
 
         uint32 accountId = AccountMgr::GetId(s->account);
@@ -1599,7 +1654,7 @@ namespace WrathBench
             if (security > SEC_PLAYER)
             {
                 if (!s->ackFired.exchange(true))
-                    ack->set_value({403, Json::Writer().Add("ok", false).Add("error", "gm_account")
+                    ack->Answer({403, Json::Writer().Add("ok", false).Add("error", "gm_account")
                         .Add("hint", kGmOptInHint).Str()});
                 return;
             }
@@ -1642,7 +1697,7 @@ namespace WrathBench
                     // check above on its own terms). World thread, as its reads.
                     existing->allowGm = s->allowGm;
                     if (!s->ackFired.exchange(true))
-                        ack->set_value({200, Json::Writer().Add("ok", true)
+                        ack->Answer({200, Json::Writer().Add("ok", true)
                             .Add("account", existing->account).Add("character", existing->charName)
                             .AddGuid("guid", existing->targetGuidRaw).Add("inWorld", true).Str()});
                     // No new module session is created, so the SDK's per-session
@@ -1802,9 +1857,13 @@ namespace WrathBench
             _byWs[ws] = s;
         }
 
-        Audit(*s, "action", Json::Writer().Add("op", s->deleteMode ? "character_delete" : "session_create")
-            .Add("account", s->account).Add("character", s->charName)
-            .Add("race", (uint32)s->charRace).Add("class", (uint32)s->charClass).Str());
+        {
+            Json::Writer a;
+            a.Add("op", s->deleteMode ? "character_delete" : "session_create").Add("account", s->account);
+            AddAuditText(a, "character", s->charName);
+            a.Add("race", (uint32)s->charRace).Add("class", (uint32)s->charClass);
+            Audit(*s, "action", a.Str());
+        }
 
         s->phase.store(BenchSession::P_AUTH);
         sWorldSessionMgr->AddSession(ws);
@@ -1816,10 +1875,10 @@ namespace WrathBench
     // session is in world and still owned by the core, and resolves the player.
     // On failure the error reply is set and nullptr returned.
     Player* Manager::CheckActionSession(std::shared_ptr<BenchSession> const& s,
-        std::shared_ptr<std::promise<HttpReply>>& ack)
+        std::shared_ptr<IHttpAck>& ack)
     {
         auto reply = [&](int status, char const* err) {
-            ack->set_value({status, Json::Writer().Add("ok", false).Add("error", err).Str()});
+            ack->Answer({status, Json::Writer().Add("ok", false).Add("error", err).Str()});
             return nullptr;
         };
         if (!s || !s->ws)
@@ -1835,9 +1894,9 @@ namespace WrathBench
         return player;
     }
 
-    void Manager::DoSay(std::string token, std::string text, std::shared_ptr<std::promise<HttpReply>> ack)
+    void Manager::DoSay(std::string token, std::string text, std::shared_ptr<IHttpAck> ack)
     {
-        auto reply = [&](int status, std::string const& json) { ack->set_value({status, json}); };
+        auto reply = [&](int status, std::string const& json) { ack->Answer({status, json}); };
 
         auto s = FindByToken(token);
         Player* player = CheckActionSession(s, ack);
@@ -1859,7 +1918,12 @@ namespace WrathBench
         }
         s->ws->QueuePacket(p);
 
-        Audit(*s, "action", Json::Writer().Add("op", "say").Add("text", text).Str());
+        {
+            Json::Writer a;
+            a.Add("op", "say");
+            AddAuditText(a, "text", text);
+            Audit(*s, "action", a.Str());
+        }
         reply(200, Json::Writer().Add("ok", true).Add("action", "say").Str());
     }
 
@@ -2300,7 +2364,14 @@ namespace WrathBench
                 seconds += len / run;
                 continue;
             }
-            uint32 const n = std::max<uint32>(1, uint32(std::ceil(len / ETA_SAMPLE_YARDS)));
+            // A route's water reads are bounded in total (Bounds::kSamplesMax):
+            // past the bound a stretch is timed at the run speed, unsampled.
+            uint32 const n = Bounds::Samples(len, ETA_SAMPLE_YARDS, Bounds::kSamplesMax - std::min(eta.samples, Bounds::kSamplesMax));
+            if (n == 0)
+            {
+                seconds += len / run;
+                continue;
+            }
             float const step = len / float(n);
             for (uint32 k = 0; k < n; ++k)
             {
@@ -2351,7 +2422,11 @@ namespace WrathBench
         points.push_back(from);
         float const sx = to.x - from.x, sy = to.y - from.y, sz = to.z - from.z;
         float const len = std::sqrt(sx * sx + sy * sy + sz * sz);
-        uint32 const n = std::max<uint32>(1, uint32(std::ceil(len / FLIGHT_SAMPLE_YARDS)));
+        // Never more than Bounds::kSamplesMax, whatever the line's length:
+        // each sample is a terrain read and a line-of-sight query made while
+        // the world waits. DoMoveTo refuses a leg longer than its reach
+        // before it gets here, so the bound is not met by one it lets through.
+        uint32 const n = Bounds::Samples(len, FLIGHT_SAMPLE_YARDS);
         WbVec clear = from;
         for (uint32 k = 1; k <= n; ++k)
         {
@@ -3922,7 +3997,7 @@ namespace WrathBench
         EmitEvent(s, "WB_MOVE_RESULT", 0xFF01, w.Str());
     }
 
-    void Manager::DoMoveTo(std::string token, float x, float y, float z, std::string guid, bool force, bool fly, std::shared_ptr<std::promise<HttpReply>> ack)
+    void Manager::DoMoveTo(std::string token, float x, float y, float z, std::string guid, bool force, bool fly, std::shared_ptr<IHttpAck> ack)
     {
         auto s = FindByToken(token);
         Player* player = CheckActionSession(s, ack);
@@ -3956,7 +4031,7 @@ namespace WrathBench
                 FinishMove(*s, "controlling");
             uint64_t const moveId = ++s->moveIdGen;
             s->move.moveId = moveId;
-            ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "move_to").Add("moveId", moveId).Str()});
+            ack->Answer({200, Json::Writer().Add("ok", true).Add("action", "move_to").Add("moveId", moveId).Str()});
             Json::Writer w;
             w.Add("moveId", moveId).Add("status", "controlling");
             if (Unit* held = static_cast<Unit*>(player->m_mover))
@@ -3986,7 +4061,7 @@ namespace WrathBench
             {
                 uint64_t const moveId = ++s->moveIdGen;
                 s->move.moveId = moveId;
-                ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "move_to").Add("moveId", moveId).Str()});
+                ack->Answer({200, Json::Writer().Add("ok", true).Add("action", "move_to").Add("moveId", moveId).Str()});
                 Json::Writer w;
                 w.Add("moveId", moveId).Add("status", early);
                 w.Raw("pos", PosJson(mover->GetPositionX(), mover->GetPositionY(), mover->GetPositionZ(), mover->GetOrientation()));
@@ -4009,7 +4084,7 @@ namespace WrathBench
                 FinishMove(*s, status);
             uint64_t const moveId = ++s->moveIdGen;
             s->move.moveId = moveId;
-            ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "move_to").Add("moveId", moveId).Str()});
+            ack->Answer({200, Json::Writer().Add("ok", true).Add("action", "move_to").Add("moveId", moveId).Str()});
             Json::Writer w;
             w.Add("moveId", moveId).Add("status", status);
             addMover(w);
@@ -4062,7 +4137,7 @@ namespace WrathBench
                 if (m.etaMs > 0)
                     w.Add("etaMs", m.etaMs);
             }
-            ack->set_value({200, w.Str()});
+            ack->Answer({200, w.Str()});
         };
 
         auto failEvent = [&](char const* status) {
@@ -4081,7 +4156,7 @@ namespace WrathBench
             EmitEvent(*s, "WB_MOVE_RESULT", 0xFF01, w.Str());
         };
 
-        if (mover->GetExactDist2d(x, y) > 250.0f)
+        if (mover->GetExactDist2d(x, y) > Bounds::kMoveReachYards)
             return failEvent("too_far");
 
         // A flying mover (the Eye of Acherus, a flying vehicle) is not walked
@@ -4103,6 +4178,12 @@ namespace WrathBench
         bool const flying = mover != player
             ? (s->moverMoveFlags.load() & (MOVEMENTFLAG_CAN_FLY | MOVEMENTFLAG_DISABLE_GRAVITY)) != 0
             : ownCanFly && (fly || s->airborne.load());
+        // A flown leg goes to the z asked for, so its reach holds up and down
+        // as it does across: the line's length is what PlanFlight samples.
+        // A walked one ends on the ground the mesh finds at x,y, whatever z
+        // was asked from, and is bounded by that.
+        if (flying && !Bounds::WithinReach(mover->GetPositionZ(), z, Bounds::kMoveReachYards))
+            return failEvent("too_far");
         auto planFlight = [&](PathResolve& out) {
             out = PathResolve{};
             FlightPlan const fp = PlanFlight(mover, x, y, z, out.points);
@@ -4138,7 +4219,11 @@ namespace WrathBench
             Transport* targetT = FindTransportAt(map, x, y, z);
             if (flying)
                 planFlight(r);
-            else if (mover == player && (startT || targetT) && mover->GetExactDist2d(x, y) <= 30.0f)
+            // The straight leg is short in height as it is across: it ends at
+            // the z asked for where no ground is found under it, and no
+            // client's character crosses more than a deck's height that way.
+            else if (mover == player && (startT || targetT) && mover->GetExactDist2d(x, y) <= Bounds::kTransportLegYards
+                && Bounds::WithinReach(mover->GetPositionZ(), z, Bounds::kTransportLegYards))
             {
                 transportLeg = true;
                 bool leaving = startT != nullptr && !targetT;
@@ -4392,7 +4477,7 @@ namespace WrathBench
         Audit(*s, "action", startW.Raw("pos", PosJson(m.curX, m.curY, m.curZ, m.curO)).Str());
     }
 
-    void Manager::DoStop(std::string token, std::shared_ptr<std::promise<HttpReply>> ack)
+    void Manager::DoStop(std::string token, std::shared_ptr<IHttpAck> ack)
     {
         auto s = FindByToken(token);
         Player* player = CheckActionSession(s, ack);
@@ -4409,7 +4494,7 @@ namespace WrathBench
         {
             if (s->move.active)
                 FinishMove(*s, "controlling");
-            ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "stop").Str()});
+            ack->Answer({200, Json::Writer().Add("ok", true).Add("action", "stop").Str()});
             return;
         }
 
@@ -4417,7 +4502,7 @@ namespace WrathBench
         // with no fall clock would move the server's fall start: nothing sent.
         if (mover == player && (s->arc.active || s->pendingFall.load()))
         {
-            ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "stop").Str()});
+            ack->Answer({200, Json::Writer().Add("ok", true).Add("action", "stop").Str()});
             return;
         }
 
@@ -4449,11 +4534,11 @@ namespace WrathBench
                 mover->GetPositionX(), mover->GetPositionY(), mover->GetPositionZ(), mover->GetOrientation(),
                 mover->GetTransport());
         }
-        ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "stop").Str()});
+        ack->Answer({200, Json::Writer().Add("ok", true).Add("action", "stop").Str()});
     }
 
     void Manager::DoFace(std::string token, bool hasO, float o, bool hasXY, float x, float y,
-        std::shared_ptr<std::promise<HttpReply>> ack)
+        std::shared_ptr<IHttpAck> ack)
     {
         auto s = FindByToken(token);
         Player* player = CheckActionSession(s, ack);
@@ -4464,24 +4549,24 @@ namespace WrathBench
         // refused, nothing sent. Before the walk's own refusal, since a stun
         // that has not yet ended a walk is the reason the caller needs.
         if (Unit* held = ActiveMover(player); held && StunnedFor(held))
-            return ack->set_value({409, Json::Writer().Add("ok", false).Add("error", "stunned").Str()});
+            return ack->Answer({409, Json::Writer().Add("ok", false).Add("error", "stunned").Str()});
         // A walk is forward running, and a client running forward travels
         // where it faces: a facing sent mid-walk would either not match the
         // travel (no client sends that) or bend the walk off its planned path.
         // Refused, nothing sent (PROTOCOL.md "face").
         if (s->move.active)
-            return ack->set_value({409, Json::Writer().Add("ok", false).Add("error", "moving").Str()});
+            return ack->Answer({409, Json::Writer().Add("ok", false).Add("error", "moving").Str()});
         // The unit the client moves turns (ActiveMover): a vehicle's driving
         // seat turns the vehicle, a possession the possessed unit. A mover
         // the core holds out of this map takes no packet: refused, nothing
         // sent.
         Unit* mover = ActiveMover(player);
         if (!mover)
-            return ack->set_value({409, Json::Writer().Add("ok", false).Add("error", "controlling").Str()});
+            return ack->Answer({409, Json::Writer().Add("ok", false).Add("error", "controlling").Str()});
         // A body falling (TickArcs): a facing packet mid-air carries no fall
         // clock and would move the server's fall start; refused until it lands.
         if (mover == player && (s->arc.active || s->pendingFall.load()))
-            return ack->set_value({409, Json::Writer().Add("ok", false).Add("error", "falling").Str()});
+            return ack->Answer({409, Json::Writer().Add("ok", false).Add("error", "falling").Str()});
 
         float target = hasO ? Position::NormalizeOrientation(o)
                             : (hasXY ? mover->GetAngle(x, y) : mover->GetOrientation());
@@ -4489,7 +4574,7 @@ namespace WrathBench
         Audit(*s, "action", Json::Writer().Add("op", "face").Add("orientation", (double)target).Str());
         SendMovePacket(*s, mover, MSG_MOVE_SET_FACING, MOVEMENTFLAG_NONE,
             mover->GetPositionX(), mover->GetPositionY(), mover->GetPositionZ(), target);
-        ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "face")
+        ack->Answer({200, Json::Writer().Add("ok", true).Add("action", "face")
             .Add("orientation", (double)target).Str()});
     }
 
@@ -4511,7 +4596,7 @@ namespace WrathBench
     // arc is not carried by the deck).
     static constexpr float JUMP_VELOCITY = 7.955547f;
 
-    void Manager::DoJump(std::string token, bool forward, std::shared_ptr<std::promise<HttpReply>> ack)
+    void Manager::DoJump(std::string token, bool forward, std::shared_ptr<IHttpAck> ack)
     {
         auto s = FindByToken(token);
         Player* player = CheckActionSession(s, ack);
@@ -4519,7 +4604,7 @@ namespace WrathBench
             return;
         auto refuse = [&](char const* error) {
             Audit(*s, "action", Json::Writer().Add("op", "jump").Add("forward", forward).Add("refused", error).Str());
-            ack->set_value({409, Json::Writer().Add("ok", false).Add("error", error).Str()});
+            ack->Answer({409, Json::Writer().Add("ok", false).Add("error", error).Str()});
         };
         if (ActiveMover(player) != static_cast<Unit*>(player))
             return refuse("controlling");
@@ -4557,7 +4642,7 @@ namespace WrathBench
         w.Add("ok", true).Add("action", "jump");
         if (s->arc.hasLanding)
             w.Add("etaMs", uint64_t(s->arc.landMs));
-        ack->set_value({200, w.Str()});
+        ack->Answer({200, w.Str()});
     }
 
     // Parse a guid request field (decimal string, see PROTOCOL.md u64 note).
@@ -4596,11 +4681,12 @@ namespace WrathBench
         if (req.Has("destX"))
         {
             t.hasDest = true;
-            t.x = (float)req.GetDouble("destX");
-            t.y = (float)req.GetDouble("destY");
-            t.z = (float)req.GetDouble("destZ");
-            if (!std::isfinite(t.x) || !std::isfinite(t.y) || !std::isfinite(t.z))
+            double const dx = req.GetDouble("destX"), dy = req.GetDouble("destY"), dz = req.GetDouble("destZ");
+            if (!Bounds::FieldOk(dx) || !Bounds::FieldOk(dy) || !Bounds::FieldOk(dz))
                 return "invalid_dest";
+            t.x = (float)dx;
+            t.y = (float)dy;
+            t.z = (float)dz;
         }
         return nullptr;
     }
@@ -4646,7 +4732,7 @@ namespace WrathBench
     // handlers (docs/CONTRACTS.md action contract). The ack means "opcode
     // queued"; the game outcome arrives as whitelisted events.
     void Manager::DoGameAction(std::string token, std::string action, std::string body,
-        std::shared_ptr<std::promise<HttpReply>> ack)
+        std::shared_ptr<IHttpAck> ack)
     {
         auto s = FindByToken(token);
         Player* player = CheckActionSession(s, ack);
@@ -4657,7 +4743,7 @@ namespace WrathBench
         uint64_t guid = ParseGuid(req, "guid");
 
         auto err = [&](int status, char const* code) {
-            ack->set_value({status, Json::Writer().Add("ok", false).Add("error", code).Str()});
+            ack->Answer({status, Json::Writer().Add("ok", false).Add("error", code).Str()});
         };
 
         Json::Writer auditW;
@@ -4731,7 +4817,7 @@ namespace WrathBench
             {
                 std::string code = req.GetString("code");
                 *p << code;
-                auditW.Add("code", code);
+                AddAuditText(auditW, "code", code);
             }
         }
         else if (action == "quest_list")
@@ -5067,7 +5153,14 @@ namespace WrathBench
             *p << uint32(pairs.size());
             for (auto const& [id, rank] : pairs)
                 *p << uint32(id) << uint32(rank);
-            auditW.Add("count", (uint64_t)pairs.size()).Raw("talents", raw.empty() ? "[]" : raw);
+            // The pairs as read, never the caller's text: that is whatever
+            // the body held between the digits, of any size and not
+            // necessarily JSON.
+            std::string list = "[";
+            for (size_t k = 0; k < pairs.size(); ++k)
+                list += (k ? ",[" : "[") + std::to_string(pairs[k].first) + "," + std::to_string(pairs[k].second) + "]";
+            list += "]";
+            auditW.Add("count", (uint64_t)pairs.size()).Raw("talents", list);
         }
         else if (action == "vehicle_exit")
         {
@@ -5154,7 +5247,7 @@ namespace WrathBench
             if (op == CMSG_MESSAGECHAT && !s->allowGm && ChatPacketRunsCommand(*p))
             {
                 delete p;
-                ack->set_value({403, ChatCommandRefusal(action)});
+                ack->Answer({403, ChatCommandRefusal(action)});
                 return;
             }
             auditW.Add("opcode", opcode).Add("payload", payload);
@@ -5164,7 +5257,7 @@ namespace WrathBench
 
         s->ws->QueuePacket(p);
         Audit(*s, "action", auditW.Str());
-        ack->set_value({200, Json::Writer().Add("ok", true).Add("action", action).Str()});
+        ack->Answer({200, Json::Writer().Add("ok", true).Add("action", action).Str()});
     }
 
     // WDBC reader for AreaTrigger.dbc (3.3.5a: 10 fields of 4 bytes — id,
@@ -5579,7 +5672,7 @@ namespace WrathBench
         return w.Str();
     }
 
-    void Manager::DoTalentTree(std::string token, std::shared_ptr<std::promise<HttpReply>> ack)
+    void Manager::DoTalentTree(std::string token, std::shared_ptr<IHttpAck> ack)
     {
         auto s = FindByToken(token);
         Player* player = CheckActionSession(s, ack);
@@ -5588,7 +5681,7 @@ namespace WrathBench
         std::string json = TalentTreeJson(player);
         Audit(*s, "action", Json::Writer().Add("op", "talent_tree").Str());
         EmitEvent(*s, "WB_TALENT_TREE", 0xFF08, json);
-        ack->set_value({200, Json::Writer().Add("ok", true).Add("action", "talent_tree").Str()});
+        ack->Answer({200, Json::Writer().Add("ok", true).Add("action", "talent_tree").Str()});
     }
 
     // The wire carries dates as the client's packed bitfield
@@ -7781,13 +7874,13 @@ namespace WrathBench
         return s;
     }
 
-    void Manager::DoDeleteSession(std::string token, std::shared_ptr<std::promise<HttpReply>> ack)
+    void Manager::DoDeleteSession(std::string token, std::shared_ptr<IHttpAck> ack)
     {
         auto s = TeardownByToken(token);
         if (!s)
-            return ack->set_value({404, Json::Writer().Add("ok", false).Add("error", "no_session").Str()});
+            return ack->Answer({404, Json::Writer().Add("ok", false).Add("error", "no_session").Str()});
         Audit(*s, "action", Json::Writer().Add("op", "session_delete").Str());
-        ack->set_value({200, Json::Writer().Add("ok", true).Str()});
+        ack->Answer({200, Json::Writer().Add("ok", true).Str()});
     }
 
     // --------------------------------------------------------------- tap
@@ -7932,7 +8025,7 @@ namespace WrathBench
                         // dataJson is the whitelisted decode of this very packet:
                         // {"count":N,"characters":[{guid,name,race,class,gender,level},...]}
                         if (!s->ackFired.exchange(true) && s->ack)
-                            s->ack->set_value({200, Json::Writer().Add("ok", true)
+                            s->ack->Answer({200, Json::Writer().Add("ok", true)
                                 .Raw("enum", dataJson).Str()});
                         if (!s->tearingDown.exchange(true))
                         {
@@ -8033,7 +8126,7 @@ namespace WrathBench
                     if (result == CHAR_DELETE_SUCCESS)
                     {
                         if (!s->ackFired.exchange(true) && s->ack)
-                            s->ack->set_value({200, Json::Writer().Add("ok", true)
+                            s->ack->Answer({200, Json::Writer().Add("ok", true)
                                 .Add("character", s->charName).Add("deleted", true).Str()});
                         // The utility session's job is done: discard it the same
                         // way a failed login discards its session.
@@ -8098,13 +8191,13 @@ namespace WrathBench
         Json::Writer w;
         w.Add("ok", true).Add("account", s.account)
          .Add("character", s.charName).AddGuid("guid", s.targetGuidRaw).Add("inWorld", true);
-        s.ack->set_value({200, w.Str()});
+        s.ack->Answer({200, w.Str()});
     }
 
     void Manager::FailAck(BenchSession& s, std::string const& message, int status /*= 502*/)
     {
         if (!s.ackFired.exchange(true) && s.ack)
-            s.ack->set_value({status, Json::Writer().Add("ok", false).Add("error", message).Str()});
+            s.ack->Answer({status, Json::Writer().Add("ok", false).Add("error", message).Str()});
 
         // A failure here means the session never reached the world; discard it so it
         // does not linger in the session maps. Called from the tap on the world

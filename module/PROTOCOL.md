@@ -129,7 +129,15 @@ Per lease, refused with `429` and nothing dispatched, queued or audited:
   handshake. One consumer holds one socket; the rest is room for a reconnect
   that overlaps a socket whose loss the server has not yet seen.
 
-The operator class is exempt from both: the port secret may already do
+- **Connections** (`WrathBench.MaxConnectionsPerLease`; off by default, 32
+  where it is set). Connections, HTTP and `/events` together, on which the
+  lease's secret has authenticated and which are still open. A request or
+  upgrade that would make its connection one more:
+  `429 {"ok":false,"error":"connection_limit"}`, and that connection is
+  closed. A caller's concurrent requests each hold a connection, so the
+  limit also bounds how many it has in flight.
+
+The operator class is exempt from all three: the port secret may already do
 everything, so a limit on it would protect nothing, and its subscribers are
 neither counted nor refused.
 
@@ -141,7 +149,11 @@ On the module as a whole:
   `DELETE /lease` and has no idle reaper, so whoever leases releases.
 - **Connections** (`WrathBench.MaxConnections`, 4096;
   `WrathBench.MaxConnectionsPerPeer`, off). A connection past either is
-  closed at accept with no reply.
+  closed at accept with no reply. Connections on which no request has
+  authenticated yet hold at most half the total, one past that being closed
+  the same way, so that a caller with no credential cannot take the table
+  from those that have shown one; a request that does not authenticate
+  (`401`) closes its connection.
 - **Request size.** A request head over 8 KiB is
   `431 {"ok":false,"error":"header_too_large"}` and a body over 64 KiB
   `413 {"ok":false,"error":"body_too_large"}`, each before any credential is
@@ -149,6 +161,26 @@ On the module as a whole:
 - **Time.** A request not complete within 60 seconds of the connection going
   idle or starting it, or a reply not taken within 30, closes the connection
   (an idle kept-alive connection is closed the same way, as it always was).
+  A connection has 10 seconds for its first request, and for each one until
+  one has authenticated.
+- **Waiting on the world.** A request the game answers (`POST /action`,
+  `POST /session`, `DELETE /session`, `/characters`, `/character-delete`) is
+  queued for the world thread and answered when its work there is done, or
+  `504 timeout` after 10 seconds (20 for the three that log a session in);
+  the work itself still runs when the world thread reaches it. Nothing waits
+  on a thread meanwhile, so one caller's slow or many requests do not delay
+  another's, the event streams, or `/lease` and `/health`, which never touch
+  the world thread. A connection carries one request at a time, as before. A
+  world tick serves queued requests in the order they came for at most 20
+  milliseconds (always at least one) and leaves the rest for the next tick,
+  so a burst is spread over a few ticks.
+- **Numbers and text.** A position axis or a facing is a finite number within
+  ±100000 (`400 invalid_position`, `invalid_dest` on a cast's ground target),
+  judged before anything is planned. No planned line or route estimate takes
+  more than 256 samples of terrain or water on the world thread, whatever it
+  was asked. A caller-written string in an audit record (`say` text, a gossip
+  `code`, a character name) is cut to 255 bytes, its full length beside it as
+  `<field>Bytes`; what is sent to the core is not cut. Fixed, not settings.
 - **A subscriber that does not read** (`WrathBench.EventsBacklogBytes`;
   16 MiB). Events queue per socket while its reader is behind. A socket with
   more than this queued and unsent is closed, which its consumer sees as any
@@ -208,7 +240,8 @@ Operator (loopback) response `200`:
   "sessions": 1,
   "leases": 1,
   "limits": { "actionRate": 20, "actionBurst": 40, "eventsSubscribersPerToken": 4, "leases": 1024,
-              "connections": 4096, "connectionsPerPeer": 0, "eventsBacklogBytes": 16777216 },
+              "connections": 4096, "connectionsPerPeer": 0, "connectionsPerLease": 0,
+              "eventsBacklogBytes": 16777216 },
   "droppedPackets": 4213,
   "droppedPacketsLive": 37,
   "droppedByOpcode": { "SMSG_POWER_UPDATE": 1400, "SMSG_EMOTE": 220, "0x4F2": 3 },
@@ -245,8 +278,8 @@ Operator (loopback) response `200`:
 - `sessions` — number of live bench sessions.
 - `leases`, `limits` (operator view only) — leases held, and the limits in
   force ("Limits" above; `0` is off). The per-lease ones follow a
-  `.reload config`; `connections`, `connectionsPerPeer` and
-  `eventsBacklogBytes` are as read at startup.
+  `.reload config`; `connections`, `connectionsPerPeer`,
+  `connectionsPerLease` and `eventsBacklogBytes` are as read at startup.
 - `droppedPackets` — lifetime count of outbound packets suppressed because they
   were not on the event whitelist (survives session teardown). Whitelist tuning
   signal for later stages; see the whitelist section below.
@@ -616,8 +649,8 @@ refused at planning or as `too_far` acks with `moveId` alone, and its
 
 Additional errors: `400 {"ok":false,"error":"missing_position","action":"move_to","param":"<first missing axis>"}`,
 and `400 {"ok":false,"error":"invalid_position","action":"move_to","param":"<axis>"}`
-for an axis that is not a number (NaN). No JSON number is one, so only a
-hand-built body meets it.
+for an axis that is not a finite number within ±100000 ("Limits"). No
+position on any map is outside that, so only a hand-built body meets it.
 
 The outcome arrives as a `WB_MOVE_RESULT` event carrying the same `moveId`
 (statuses below). A `move_to` issued while a previous one is still running
@@ -667,7 +700,9 @@ A flight the caller did not ask for could stop short of its landing (a stop,
 a superseding move, a root, the drift guard) and leave the body hovering
 over a drop that a later dismount or a no-fly zone would fall from. The
 module serves the state as `WB_FLIGHT_STATE` (`canFly`, `airborne`), and the
-SDK's `dismount` refuses while airborne. `too_far` holds a flight too.
+SDK's `dismount` refuses while airborne. `too_far` holds a flight too, and
+up or down as it does across: a flown leg goes to the `z` asked for, so one
+more than 250 yards above or below the mover is `too_far` as well.
 
 The packets are a client's (unverified against a capture; every flight
 opcode goes to `HandleMovementOpcodes` as a run does, `Opcodes.cpp`, so the
@@ -721,7 +756,7 @@ or `{ "token": "run-abc123", "action": "face", "x": -8900.0, "y": -130.0 }`
 
 Success `200`: `{ "ok": true, "action": "face", "orientation": 1.57 }`
 Additional errors: `400 {"ok":false,"error":"missing_face_target","action":"face","param":"orientation or x,y"}`,
-`400 {"ok":false,"error":"invalid_position","action":"face","param":"<field>"}` (a field that is not a number, as for `move_to`),
+`400 {"ok":false,"error":"invalid_position","action":"face","param":"<field>"}` (a field that is not a finite number within ±100000, as for `move_to`),
 `409 {"ok":false,"error":"stunned"}` (the unit the client moves is stunned:
 a stunned client cannot turn, Roots below; nothing sent; a root alone does
 not refuse it),
@@ -794,7 +829,7 @@ them: `{ "ok": true, "action": "<name>" }`.
 | `clear_target` | — | `CMSG_SET_SELECTION` | guid 0 |
 | `attack_start` | `guid` | `CMSG_ATTACKSWING` | melee auto-attack; server swings while in range and facing. A swing it refuses is reported once as `SMSG_ATTACKSWING_NOTINRANGE` / `SMSG_ATTACKSWING_BADFACING` (latched: see "Swing errors" under the combat table) |
 | `attack_stop` | — | `CMSG_ATTACKSTOP` | |
-| `cast_spell` | `spellId`, `targetGuid?`, `itemTargetGuid?`, `destX?`, `destY?`, `destZ?` | `CMSG_CAST_SPELL` | no target = self/auto target (mask 0); with `targetGuid`, TARGET_FLAG_UNIT + packed guid. The target block is written in the order `SpellCastTargets::Read` (Spell.cpp) takes it: u32 mask, the unit's packed guid, then with `itemTargetGuid` TARGET_FLAG_ITEM (0x10) + the item's packed guid (an item the character holds; the server looks it up with `GetItemByGuid` and answers `item_gone` when it is not there), then with `destX`/`destY`/`destZ` TARGET_FLAG_DEST_LOCATION (0x40) + packed transport guid 0 + three floats, a world position. The three dest fields come together or not at all (`400 missing_dest`, `param` the first missing); an `itemTargetGuid` of 0 is `400 invalid_item_target`, a non-finite point `400 invalid_dest`. The trade-window item (TARGET_FLAG_TRADE_ITEM) and the projectile cast flags are not sent. A game object guid works too (the core resolves the packed guid by its type), which is how chests open; a client would set TARGET_FLAG_GAMEOBJECT for it. The leading cast count is the client's own: one per-session u8 counter, shared with `use_item`, one more on every cast and running 1..255 (never 0). The core skips its in-progress check for a count of 0 (`Spell::prepare`), so a cast sent while another is still casting would silently cancel it; with a count it is refused `SMSG_CAST_FAILED` `spell_in_progress` (105), as a client's is, and the cast in progress goes on. A cast sent with 400 ms or less of the running one left (and of the global cooldown) is held by the server's spell queue (`SpellQueue.Window`, default 400) and goes off after it, count or not. The audit row carries `castCount`, and `itemTargetGuid` and `destX`/`destY`/`destZ` when sent |
+| `cast_spell` | `spellId`, `targetGuid?`, `itemTargetGuid?`, `destX?`, `destY?`, `destZ?` | `CMSG_CAST_SPELL` | no target = self/auto target (mask 0); with `targetGuid`, TARGET_FLAG_UNIT + packed guid. The target block is written in the order `SpellCastTargets::Read` (Spell.cpp) takes it: u32 mask, the unit's packed guid, then with `itemTargetGuid` TARGET_FLAG_ITEM (0x10) + the item's packed guid (an item the character holds; the server looks it up with `GetItemByGuid` and answers `item_gone` when it is not there), then with `destX`/`destY`/`destZ` TARGET_FLAG_DEST_LOCATION (0x40) + packed transport guid 0 + three floats, a world position. The three dest fields come together or not at all (`400 missing_dest`, `param` the first missing); an `itemTargetGuid` of 0 is `400 invalid_item_target`, a point with an axis that is not finite or is beyond ±100000 `400 invalid_dest`. The trade-window item (TARGET_FLAG_TRADE_ITEM) and the projectile cast flags are not sent. A game object guid works too (the core resolves the packed guid by its type), which is how chests open; a client would set TARGET_FLAG_GAMEOBJECT for it. The leading cast count is the client's own: one per-session u8 counter, shared with `use_item`, one more on every cast and running 1..255 (never 0). The core skips its in-progress check for a count of 0 (`Spell::prepare`), so a cast sent while another is still casting would silently cancel it; with a count it is refused `SMSG_CAST_FAILED` `spell_in_progress` (105), as a client's is, and the cast in progress goes on. A cast sent with 400 ms or less of the running one left (and of the global cooldown) is held by the server's spell queue (`SpellQueue.Window`, default 400) and goes off after it, count or not. The audit row carries `castCount`, and `itemTargetGuid` and `destX`/`destY`/`destZ` when sent |
 | `cancel_cast` | `spellId` | `CMSG_CANCEL_CAST` | |
 | `interact` | `guid` | `CMSG_GAMEOBJ_USE` | doors, buttons, quest objects, mailboxes. Not chests: the core's `GameObject::Use` has no chest case and returns silently; a client opens a chest with `cast_spell` of the lock's Opening spell at the object's guid (the SDK's `lootCorpse` does this) |
 | `gossip_hello` | `guid` | `CMSG_GOSSIP_HELLO` | opens the NPC gossip menu (`SMSG_GOSSIP_MESSAGE`) |
@@ -1125,7 +1160,8 @@ secret, or the lease secret issued for this token; anything else is refused
 with a plain `401` before the handshake and no subscriber is registered). A
 lease secret's upgrade is refused the same way, as a plain reply in place of
 the handshake, with `429 subscriber_limit` when its token already has its cap
-of subscribers and `429 rate_limited` when its lease is over its request rate
+of subscribers, `429 rate_limited` when its lease is over its request rate
+and `429 connection_limit` when its lease holds its cap of connections
 ("Limits"). The
 server streams that session's whitelisted outbound packets as JSON text frames,
 one object per frame. The channel is send-only (server→client); frames the client
@@ -1811,7 +1847,8 @@ at the top of this document.
   `path_incomplete`, as for any route the mesh does not have. The audit
   log records it as `op: "move_end_reachable"` (`islandPolys`, `walked`,
   `from`, `to`).
-- `too_far` — destination beyond the single-move cap (~250yd straight-line);
+- `too_far` — destination beyond the single-move cap (~250yd straight-line
+  in x and y; on a flown leg, 250yd up or down as well);
   issue intermediate `move_to`s.
 - `no_mesh` — no navmesh tile is loaded under the character or under the
   destination. A harness/data limitation, not a route problem; nothing to
@@ -2026,9 +2063,9 @@ nothing else does. The module does the same from the same knowledge: when
 the mover's interpolated point lies inside a transport's model bounds (the
 `GameObjectModel` the server keeps current as the transport moves), every
 synthesized packet carries the transport block. Transports have no navmesh,
-so a `move_to` within 30y whose start or destination is on one is a straight
-line (boarding or disembarking, as a client walks it); anything longer goes
-through the mesh and answers `start_off_mesh` / `target_off_mesh`. A
+so a `move_to` within 30y, across and in height, whose start or destination
+is on one is a straight line (boarding or disembarking, as a client walks
+it); anything longer or to a `z` farther off goes through the mesh and answers `start_off_mesh` / `target_off_mesh`. A
 disembarking leg ends at the ground height under the requested x,y (terrain,
 vmap and model geometry a client has too), not at the z asked for: a
 client's character drops from the deck to the platform, and a leg left to

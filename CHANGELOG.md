@@ -32,6 +32,12 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   (a LAN with no TLS or proxy) drops the cookie and stays at the sign-in.
   Put TLS in front, directly or by a proxy; a bearer header still works
   without it.
+- **Local workers serve only trusted grants.** `localWorkers` runs each
+  credential's worker as the gateway's own user, beside the port secret, and
+  now refuses to start one unless told the grants are the operator's own:
+  `localWorkers({ trusted: true })`, or `--trusted-local-workers` on
+  `bun run gateway`, which otherwise does not start. `GatewayOptions.workers`
+  is required. A deployment for people outside it passes its own provider.
 - **The inspector's bearer secret is at least 32 characters**, where it was
   16, the floor the module asks of its port secret. An inspector started
   with a shorter one refuses to start; make a longer one.
@@ -75,6 +81,16 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   runs more than one worldserver, each over its own characters database: a
   guid is unique within one world only. Additive to `wrath-session/1`;
   absent is the host's one world. The inspector shows it.
+- **The module answers a request from the world thread instead of waiting
+  for it.** Its HTTP threads (`WrathBench.Threads`, 2) each waited, with the
+  connection, for the world thread's reply: at most two requests were in
+  flight on the whole module, one world tick apart at best, and one caller's
+  slow or many actions held up every other caller's requests, the `/events`
+  streams, and `/lease` and `/health`. A request is now queued and its reply
+  written when the world thread has it, with the same deadlines (`504
+  timeout` after 10 seconds, 20 for a create) and the same replies; a world
+  tick serves at most 20 ms of queued requests, in order, so a burst spreads
+  over a few ticks. No wire change.
 - **The module limits what a caller can make the worldserver hold.** Ahead of
   callers that hold only a lease secret and are not trusted (wrath-mcp#43,
   wrath-mcp#29). Per lease: a request rate (`429 rate_limited`;
@@ -90,7 +106,18 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   close at 1 MiB), a 30-second deadline on a reply, a subscriber left more
   than `WrathBench.EventsBacklogBytes` (16 MiB) behind or sending a frame
   over 4 KiB (closed), and TCP keepalive on subscriber sockets. A `move_to`
-  or `face` field that is NaN is `400 invalid_position`. The loopback
+  or `face` field that is not a finite number within ±100000 is
+  `400 invalid_position`, and a cast's ground target likewise
+  `400 invalid_dest`. A flown `move_to` reaches 250 yards up or down as it
+  does across (`too_far` past it), the straight leg onto or off a transport
+  30, and no planned line or route estimate samples more than 256 points on
+  the world thread. A caller-written string in an audit record is cut to 255
+  bytes with its full length beside it, and `learn_preview_talents` is
+  audited as the pairs read. Connections: one that has not authenticated has
+  10 seconds for its first request and such connections hold at most half
+  the table, a `401` closes its connection, and
+  `WrathBench.MaxConnectionsPerLease` (off; `429 connection_limit`) bounds
+  what one lease secret holds open. The loopback
   `GET /health` adds `leases` and `limits`. Nothing a session observes or an
   action does changes. The request rate ships off; the other defaults are
   several times what a client sends: a deployment running more than 1024 characters at once, or more
@@ -437,6 +464,20 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Changed
 
+- **The sandbox child's sockets and resources are confined too.** Beside
+  the Landlock ruleset, `confine.ts` installs a seccomp filter: the child may
+  open IPv4 and IPv6 TCP sockets, unix stream socketpairs, and UDP sockets
+  only when the module URL names a host to resolve; every other family
+  (pathname and abstract unix sockets, netlink, raw, packet), SCTP and MPTCP
+  are `EACCES`, and io_uring is `ENOSYS`. It also sets resource limits
+  (`SandboxLimits`, `SandboxHostOptions.limits`, the gateway's
+  `sandboxLimits` and `--limit-as`/`--limit-cpu`/`--limit-fsize`): a 1 GiB
+  file size and no core dumps by default, and address-space and CPU caps that
+  are off unless set (an address-space cap below about 12 GiB stops every
+  child from starting: Bun reserves 6 GiB, 10 GiB while starting). Nothing a
+  session legitimately does reaches the defaults. The sandbox now also needs x86-64 or arm64 and a container that
+  permits `prctl(PR_SET_SECCOMP)` (the default profiles do), and refuses to
+  start otherwise.
 - **The hosted gateway's audit and leases are bounded.** Every string in a
   person audit line is cut at 256 characters with a marker; refused
   requests are written off the event loop, one line per kind and address a
@@ -525,8 +566,16 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   so a harness can fold one kind of an opcode's events out of
   `recent_events` and keep the rest. A render that reads only the opcode is
   unchanged.
+- `sdk/API.md` is headed "SDK reference"; it was "WrathBench SDK reference".
 
 ### Fixed
+
+- A session writer that reopens a session a killed process left continues the
+  torn segment of its window, as `docs/SESSION-FORMAT.md` ("Tears") says. Its
+  recovery compressed that segment as well, racing its own appends: rows it
+  wrote before the compression landed could be lost, and the closed segment
+  could end in the torn line, which the validator calls an error. A torn
+  segment the first row does not continue is closed with its tear ended.
 
 - `leaseSessionSecret` retries a module it cannot reach for about a minute
   (`LEASE_RETRY_DELAYS_MS`), then throws. It used to return without a secret,
