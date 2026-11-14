@@ -570,7 +570,7 @@ describe("fan-out: a routine carries its character", () => {
     expect((await p.startRoutine({ name: "report", args: { slot: "b" }, character: "Bravo" })).ok).toBe(true);
     // One run per name and character: the same name again for Alpha is refused, and for nobody known is said.
     expect((await p.startRoutine({ name: "report", character: "Alpha" })).text).toStartWith("report (Alpha) is already running: started ");
-    expect((await p.startRoutine({ name: "report", character: "Zulu" })).text).toStartWith("unknown character: Zulu\n");
+    expect((await p.startRoutine({ name: "report", character: "Zulu" })).text).toStartWith("unknown character: Zulu. Logged in: Alpha, Bravo.\n");
     await until("both runs", async () => (await host.evalSnippet("Boolean(memory.a && memory.b)")).value === "true");
     expect((await host.evalSnippet("memory.a.self + '/' + memory.b.self + '/' + memory.a.others")).value).toBe('"Alpha/Bravo/Alpha,Bravo"');
     expect(p.routineLines()).toMatch(/^routines:\nreport \(Alpha\) running \d+s, deploy 1, no action yet\nreport \(Bravo\) running \d+s, deploy 1, no action yet$/);

@@ -56,8 +56,9 @@
  *   sdk, state, events
  *               the character the snippet was run for (`run_snippet`'s
  *               `character`), for the whole evaluation and for anything it
- *               leaves running; a snippet run for none gets a stand-in that
- *               says so on first use
+ *               leaves running (with a program, a routine started for one
+ *               has it); a snippet or routine run for none gets a stand-in
+ *               that says so on first use
  *   connect()   reopens that character's stream, or with none every closed one
  *   sleep(ms)   wakes for that character's world; a pure timer with none
  *
@@ -132,7 +133,7 @@ import { compileOneOff, compileSnippet } from "./rewrite";
 import { HarnessStop, installOwnership, isHarnessStop, Owner, type OwnableEvents, type Ownership } from "./owners";
 import { ENDED_REJECT_DELAY_MS, ProgramRuntime, type RoutineRun } from "./program";
 import { REATTACH_REPLAY_WAIT_MS, REATTACH_STATE_WAIT_MS } from "./reattach-waits";
-import type { ActionBatch, ActionHintNote, ActionNote, ChildToHost, EventSummary, HostToChild, HostcallResult, LogEntry, MoveIntentNote, MoveOwner, SeatClosed, SeatOpened } from "./ipc";
+import type { ActionBatch, ActionHintNote, ActionNote, ChildToHost, EventSummary, HostToChild, HostcallResult, LogEntry, MoveIntentNote, MoveOwner, ProgramOrigin, SeatClosed, SeatOpened } from "./ipc";
 
 import { SessionRecorder, type RecordedMove } from "../record/recorder";
 
@@ -284,8 +285,8 @@ interface Seat {
   /** See "movement intention", below. */
   moveIntent: MoveIntentNote | null;
   earlyVerdicts: Map<number, { status: string; ts: number }>;
-  /** See "action log", below. */
-  actionBatches: Map<number | null, PendingBatch>;
+  /** See "action log", below: by the eval that dispatched them, or by the run of a program's routine. */
+  actionBatches: Map<number | null | RoutineRun<Seat>, PendingBatch>;
   /** The session recorder, when the host keeps a record (`installSeat`). */
   recorder: SessionRecorder | null;
   extensions: SandboxChildExtension[];
@@ -393,6 +394,7 @@ function recordMove(seat: Seat, note: MoveIntentNote): void {
     status: note.status,
   };
   if (evalId !== null && !evalControllers.has(evalId)) move.routine = true;
+  if (extra?.routine !== undefined) move.program = programOrigin(extra.routine);
   if (note.target !== null) move.name = note.target;
   recorder.noteMove(move);
 }
@@ -469,8 +471,15 @@ const CLIENT_PARITY_ACTIONS = new Set(["questgiver_status_query", "questgiver_st
 
 interface PendingBatch {
   evalId: number | null;
+  /** With a program: the routine whose run dispatched them. A save restarts every routine under one load's id, so the run, not the id, tells them apart. */
+  program?: ProgramOrigin;
   actions: ActionNote[];
   dropped: Record<string, number>;
+}
+
+/** A routine run as the session record names what it dispatched. */
+function programOrigin(run: RoutineRun<Seat>): ProgramOrigin {
+  return { routine: run.note.name, ...(run.note.character !== undefined ? { character: run.note.character } : {}) };
 }
 function clipText(s: string, max: number): string {
   return s.length <= max ? s : `${s.slice(0, max - 1)}…(+${s.length - max + 1})`;
@@ -533,7 +542,7 @@ function actionNames(client: WrathClient, body: Record<string, unknown>): Action
 }
 
 /** Start a note for an action about to be sent, in the dispatching snippet's context. */
-function beginAction(seat: Seat, body: Record<string, unknown>): { note: ActionNote; evalId: number | null } {
+function beginAction(seat: Seat, body: Record<string, unknown>): { note: ActionNote; evalId: number | null; routine?: RoutineRun<Seat> } {
   const evalId = evalContext.getStore()?.evalId ?? null;
   const action = String(body["action"]);
   const note: ActionNote = { ts: Date.now(), action, status: 0, ms: 0 };
@@ -544,18 +553,18 @@ function beginAction(seat: Seat, body: Record<string, unknown>): { note: ActionN
   if (evalId === null && CLIENT_PARITY_ACTIONS.has(action)) note.auto = true;
   const routine = evalContext.getStore()?.routine;
   if (routine !== undefined) program?.noteAction(routine, action, note.ts);
-  return { note, evalId };
+  return { note, evalId, ...(routine !== undefined ? { routine } : {}) };
 }
 
 /** The module's answer arrived (or never will): fold or append the finished note. */
 function finishAction(
   seat: Seat,
-  pending: { note: ActionNote; evalId: number | null },
+  pending: { note: ActionNote; evalId: number | null; routine?: RoutineRun<Seat> },
   status: number,
   answer: unknown,
   failure?: string,
 ): void {
-  const { note, evalId } = pending;
+  const { note, evalId, routine } = pending;
   note.status = status;
   note.ms = Date.now() - note.ts;
   const a = answer !== null && typeof answer === "object" ? (answer as Record<string, unknown>) : {};
@@ -565,10 +574,11 @@ function finishAction(
   }
   if (typeof a["hint"] === "string") note.hint = clipText(a["hint"], ACTION_TEXT_MAX_CHARS);
   if (typeof a["moveId"] === "number") note.moveId = a["moveId"];
-  let batch = seat.actionBatches.get(evalId);
+  const key = routine ?? evalId;
+  let batch = seat.actionBatches.get(key);
   if (batch === undefined) {
-    batch = { evalId, actions: [], dropped: {} };
-    seat.actionBatches.set(evalId, batch);
+    batch = { evalId, ...(routine !== undefined ? { program: programOrigin(routine) } : {}), actions: [], dropped: {} };
+    seat.actionBatches.set(key, batch);
   }
   const last = batch.actions.at(-1);
   if (last !== undefined && sameAction(last, note)) {
@@ -612,6 +622,7 @@ function flushActions(finishing?: number): void {
       const out: ActionBatch = { evalId: b.evalId, actions: b.actions };
       if (MULTI) out.seat = seat.name;
       if (b.evalId !== null && b.evalId !== finishing && !evalControllers.has(b.evalId)) out.routine = true;
+      if (b.program !== undefined) out.program = b.program;
       if (Object.keys(b.dropped).length > 0) out.dropped = b.dropped;
       batches.push(out);
     }
@@ -964,6 +975,7 @@ const program: ProgramRuntime<Seat> | null =
         ownership,
         renderError: (err) => renderError(err),
         seat: (name) => seats.get(name),
+        characters: () => [...seats.keys()],
         multi: MULTI,
         // The socket and its timers are the session's plumbing, never a routine's.
         connect: (seat) => evalContext.exit(async () => void (await Promise.all((seat !== null ? [seat] : allSeats()).map((s) => connectSeat(s.client))))),
@@ -1569,8 +1581,9 @@ for (const name of ["sdk", "state", "events"] as const) {
 }
 
 /**
- * What `sdk`, `state` and `events` are in a snippet run for no character
- * (fan-out above 1 only): a stand-in that says so the first time it is used.
+ * What `sdk`, `state` and `events` are in a snippet run for no character, or
+ * a routine started for none (fan-out above 1 only): a stand-in that says so
+ * the first time it is used, naming the tool that would have given one.
  * An object rather than a throwing getter or `undefined`, so `typeof sdk` and
  * a truthiness check still read as they do with a client, and the error names
  * the cause rather than "undefined is not an object". Awaiting or printing it
@@ -1578,6 +1591,9 @@ for (const name of ["sdk", "state", "events"] as const) {
  */
 export const NO_CHARACTER_SELECTED =
   "no character selected: this snippet was run without `character`. Pass `character` to run_snippet, or use chars[name].sdk, chars[name].state and chars[name].events.";
+/** `NO_CHARACTER_SELECTED` in a routine of the model's program that was started for no character. */
+export const NO_CHARACTER_SELECTED_ROUTINE =
+  "no character selected: this routine was started without `character`. Pass `character` to start_routine, or use chars[name].sdk, chars[name].state and chars[name].events.";
 const noCharacterStandIns = new Map<string, unknown>();
 function noCharacter(name: string): unknown {
   let p = noCharacterStandIns.get(name);
@@ -1585,7 +1601,7 @@ function noCharacter(name: string): unknown {
     p = new Proxy(Object.freeze({}), {
       get: (_t, key) => {
         if (typeof key === "symbol" || key === "then" || key === "toJSON") return undefined;
-        throw new Error(`${name}.${key}: ${NO_CHARACTER_SELECTED}`);
+        throw new Error(`${name}.${key}: ${evalContext.getStore()?.routine !== undefined ? NO_CHARACTER_SELECTED_ROUTINE : NO_CHARACTER_SELECTED}`);
       },
     });
     noCharacterStandIns.set(name, p);
@@ -2154,6 +2170,8 @@ async function closeSeat(name: string, logout: boolean): Promise<SeatClosed> {
   if (pending !== undefined) pending.abandoned = true;
   const seat = seats.get(name);
   if (seat === undefined) return { drain: null };
+  // Its routines end before its client goes, so none acts on a session being logged out.
+  if (logout) program?.endCharacter(name);
   if (logout) {
     try {
       await seat.client.deleteSession();

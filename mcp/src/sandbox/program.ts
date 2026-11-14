@@ -111,6 +111,8 @@ export interface ProgramDeps<S> {
   renderError(err: unknown): string;
   /** The seat of a character: undefined for a name nobody holds. Only asked at fan-out above 1. */
   seat(name: string): S | undefined;
+  /** The characters that hold a seat, for the refusal of a name nobody holds. */
+  characters(): string[];
   /** Whether characters are named at all (fan-out above 1). */
   multi: boolean;
   /** Reopen the stream of a routine's character before a resumed start. */
@@ -367,7 +369,10 @@ export class ProgramRuntime<S> {
     let seat: S | null = null;
     if (msg.seat !== undefined) {
       const found = this.deps.seat(msg.seat);
-      if (found === undefined) return { ok: false, error: `unknown character: ${msg.seat}` };
+      if (found === undefined) {
+        const there = this.deps.characters();
+        return { ok: false, error: `unknown character: ${msg.seat}. ${there.length > 0 ? `Logged in: ${there.join(", ")}.` : "No character is logged in; use login_character."}` };
+      }
       seat = found;
     }
     const existing = this.runs.get(key(msg.name, msg.seat));
@@ -459,6 +464,20 @@ export class ProgramRuntime<S> {
     }
     this.end(run, "stopped", new RoutineStopped("the routine was stopped (stop_routine); pending waits cancelled"), Date.now());
     return { ok: true, routine: { ...run.note } };
+  }
+
+  /**
+   * A character was logged out (`logout_character`): the routines started
+   * for it are stopped, each an end the host hears of, since its client is
+   * gone. A routine started for no character is left to its own code.
+   */
+  endCharacter(character: string): void {
+    const now = Date.now();
+    for (const run of [...this.runs.values()]) {
+      if (run.ended || run.note.character !== character) continue;
+      this.end(run, "stopped", new RoutineStopped(`${character} was logged out; the routine was stopped`), now);
+      this.push({ kind: "ended", ts: now, routine: { ...run.note } });
+    }
   }
 
   /**

@@ -37,6 +37,7 @@ import {
   booleanish,
   coreTools,
   foldedNote,
+  PROGRAM_RUN_SNIPPET_DESCRIPTION,
   recentEventsScan,
   serveEvents,
   snippetToolResult,
@@ -700,13 +701,21 @@ function withProperty(inputSchema: Record<string, unknown>, name: string, prop: 
   return { ...inputSchema, properties: { ...(inputSchema["properties"] as Record<string, unknown>), [name]: prop } };
 }
 
+/** What `run_snippet` adds above fan-out 1 to the program's one-off description: nothing a snippet starts outlives it, so only the snippet has the character. */
+export const PROGRAM_FANOUT_RUN_SNIPPET_SENTENCE =
+  " With `character`, `sdk`, `state` and `events` are that character's for this snippet. `chars` holds every logged-in character by name, each with its own `sdk`, `state` and `events`, so one snippet can act for several.";
+
 /**
  * The tools a client granted more than one character is served: the core
  * five, with `character` on the three that act on one, and the three that
  * change who is logged in. The scratchpad pair is the core's own, unchanged:
  * there is one scratchpad per client, not one per character.
+ *
+ * With `program` (a sandbox that hosts a program), `run_snippet` is the
+ * program's one-off, described as such; a harness serves these beside
+ * `programTools(render, { characters: true })`'s file and routine tools.
  */
-export function fanoutTools<C extends FanoutToolContext>(render: CoreToolRender<C>, fan: FanoutRender = PLAIN_FANOUT_RENDER): Record<FanoutToolName, ToolSpec<C>> {
+export function fanoutTools<C extends FanoutToolContext>(render: CoreToolRender<C>, fan: FanoutRender = PLAIN_FANOUT_RENDER, o: { program?: boolean } = {}): Record<FanoutToolName, ToolSpec<C>> {
   const core = coreTools(render);
   const digests = async (ctx: C): Promise<CharacterDigest[]> => {
     if (!ctx.fanout.views().some((v) => v.state === "in")) return [];
@@ -717,8 +726,10 @@ export function fanoutTools<C extends FanoutToolContext>(render: CoreToolRender<
       def: {
         name: "run_snippet",
         description:
-          core.run_snippet.def.description +
-          " With `character`, `sdk`, `state` and `events` are that character's for this snippet and for anything it leaves running. `chars` holds every logged-in character by name, each with its own `sdk`, `state` and `events`, so one snippet can act for several.",
+          o.program === true
+            ? PROGRAM_RUN_SNIPPET_DESCRIPTION + PROGRAM_FANOUT_RUN_SNIPPET_SENTENCE
+            : core.run_snippet.def.description +
+              " With `character`, `sdk`, `state` and `events` are that character's for this snippet and for anything it leaves running. `chars` holds every logged-in character by name, each with its own `sdk`, `state` and `events`, so one snippet can act for several.",
         inputSchema: withProperty(core.run_snippet.def.inputSchema, "character", CHARACTER_PARAM),
       },
       schema: z.strictObject({ code: z.string().min(1), character: z.string().min(1).optional() }),

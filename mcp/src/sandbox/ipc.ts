@@ -129,6 +129,8 @@ export interface ActionBatch {
   seat?: string;
   /** True when the launching snippet had already returned: a background routine's actions. */
   routine?: true;
+  /** With a program: the routine of the model's program that dispatched them (`ProgramOrigin`). */
+  program?: ProgramOrigin;
   actions: ActionNote[];
   /** Dispatches past the per-flush cap, counted by action name rather than kept. */
   dropped?: Record<string, number>;
@@ -273,6 +275,17 @@ export interface RoutineNote {
   /** A returned routine's value, rendered and cut short. */
   value?: string;
   error?: ProgramErrorNote;
+}
+
+/**
+ * A routine of the model's program as the session record names what it
+ * dispatched: its name, and the character it was started for when it was
+ * started for one. Which seat's record a row lands in is the client that
+ * sent it, which a routine driving several through `chars` does not fix.
+ */
+export interface ProgramOrigin {
+  routine: string;
+  character?: string;
 }
 
 /** Who dispatched a move: a routine by name, or a snippet. */

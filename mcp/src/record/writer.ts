@@ -22,7 +22,7 @@ import { createHash } from "node:crypto";
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SecretRedactor } from "../redact";
-import type { ActionNote, EventSummary } from "../sandbox/ipc";
+import type { ActionNote, EventSummary, ProgramOrigin } from "../sandbox/ipc";
 import {
   CAPTURED_STREAMS,
   LIVE_FILE,
@@ -98,11 +98,17 @@ export interface SessionWriterOptions {
 export interface DispatchLink {
   call?: number | undefined;
   routine?: boolean | undefined;
+  /** With a program: the routine of the model's program that dispatched it, which makes it a `program` origin. */
+  program?: ProgramOrigin | undefined;
   /** Dispatched inside an eval's context at all; false for the SDK's own traffic. */
   inCall: boolean;
 }
 
 function originOf(link: DispatchLink): CallOriginRef {
+  if (link.inCall && link.program !== undefined) {
+    const p = link.program;
+    return { type: "program", ...(link.call !== undefined ? { call: link.call } : {}), routine: p.routine, ...(p.character !== undefined ? { character: p.character } : {}) };
+  }
   const type = !link.inCall ? "client" : link.routine === true ? "routine" : "tool";
   return link.call === undefined ? { type } : { type, call: link.call };
 }
@@ -427,7 +433,7 @@ export class SessionWriter {
    * belongs to, for the moves. A null drain (no child running) still beats
    * the heartbeat.
    */
-  ingest(drain: RecordDrain | null, link: (evalId: number | null, routine: boolean) => DispatchLink = () => ({ inCall: false })): void {
+  ingest(drain: RecordDrain | null, link: (evalId: number | null, routine: boolean, program?: ProgramOrigin) => DispatchLink = () => ({ inCall: false })): void {
     if (this.closed || this.session === null) return;
     try {
       if (drain !== null) {
@@ -436,7 +442,7 @@ export class SessionWriter {
         if (drain.players !== undefined) this.notePlayers(drain.players);
         this.writeTrace(drain.trace.rows, drain.trace.dict);
         for (const row of drain.events.rows) this.writeEvent(row);
-        for (const move of drain.moves) this.writeMove(move, link(move.evalId, move.routine === true));
+        for (const move of drain.moves) this.writeMove(move, link(move.evalId, move.routine === true, move.program));
         for (const row of drain.nearby.rows) this.writeNearby(row);
         if (drain.nearby.through > this.nearbyFold.ts && this.nearbyFold.any) this.writeNearby({ ts: drain.nearby.through, kind: "tick" });
         const dropped = drain.trace.dropped + drain.nearby.dropped + drain.events.dropped;

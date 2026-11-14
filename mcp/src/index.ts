@@ -69,6 +69,7 @@ export {
   MERGE_WINDOW_MS,
   mergeEvents,
   PLAIN_FANOUT_RENDER,
+  PROGRAM_FANOUT_RUN_SNIPPET_SENTENCE,
   ROLLUP,
 } from "./fanout";
 export type {
@@ -159,6 +160,7 @@ export type {
   ProgramEvent,
   ProgramLoadAnswer,
   ProgramLogLine,
+  ProgramOrigin,
   RoutineAnswer,
   RoutineNote,
   RoutineState,

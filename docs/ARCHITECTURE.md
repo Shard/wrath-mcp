@@ -382,6 +382,18 @@ the code is still the model's.
 - **Tools.** `programTools` beside `coreTools`: `read_file`, `write_file`,
   `edit_file`, `delete_file`, `start_routine`, `stop_routine`, and a
   `run_snippet` whose description says it is a one-off.
+- **Several characters.** One workspace and one program per client,
+  whatever its grant, and routines per character: `start_routine` and
+  `stop_routine` take the character a routine runs for
+  (`programTools(render, { characters: true })`), the routine's async context
+  carries that seat, and a routine started for none reaches every character
+  through `chars`. Rows, facts and lines name the character. A harness serves
+  them beside `fanoutTools(render, fan, { program: true })`, whose
+  `run_snippet` is the one-off with a `character`. Logging a character out
+  stops the routines started for it. What a routine dispatches is recorded
+  in the dispatching seat's record under a `program` origin that names the
+  routine and its character, so a routine acting through another
+  character's client is still known by name.
 
 Without the option none of this is loaded into what a model sees: the child
 is spawned with the arguments and environment it always had.

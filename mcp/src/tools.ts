@@ -1086,7 +1086,11 @@ export function programTools<C extends ProgramToolContext>(render: CoreToolRende
       def: {
         name: "start_routine",
         description:
-          "Run one exported async function of main.ts as a routine. It runs in the sandbox until it returns, throws or is stopped, with no time limit, whether or not you are awake. `args` is passed as its one argument. A name that is already running is refused and says since when. The result lists the state of every routine.",
+          "Run one exported async function of main.ts as a routine. It runs in the sandbox until it returns, throws or is stopped, with no time limit, whether or not you are awake. `args` is passed as its one argument. " +
+          (character
+            ? "One routine of a name runs per character at a time: a name already running for that character is refused and says since when. "
+            : "A name that is already running is refused and says since when. ") +
+          "The result lists the state of every routine.",
         inputSchema: {
           type: "object",
           properties: {

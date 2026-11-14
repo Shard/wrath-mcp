@@ -265,14 +265,19 @@ export type EventKind = EventRow["kind"];
 
 /**
  * What sent something, left open on purpose: `tool` a tool call, `routine`
- * code a call left running after it returned, `client` the SDK's own traffic
- * outside every call. A reader ignores a `type` it does not know; `program`
- * is reserved.
+ * code a call left running after it returned, `program` a routine of the
+ * model's program (`routine` its name, `character` the character it was
+ * started for when it was started for one), `client` the SDK's own traffic
+ * outside every call. A reader ignores a `type` it does not know.
  */
 export interface CallOriginRef {
   type: string;
   /** The call that launched it, when there is one: that `call` row's `id`. */
   call?: number;
+  /** `program`: the routine, by the name it was started under. */
+  routine?: string;
+  /** `program`: the character the routine was started for, when it was started for one. */
+  character?: string;
 }
 
 /**

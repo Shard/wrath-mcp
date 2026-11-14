@@ -45,6 +45,14 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   restart, with facts handed to the harness. `programTools` serves the file
   and routine tools beside the core tools (`docs/ARCHITECTURE.md`, "A
   program"). Without the option nothing a model is served changes.
+- **A program at fan-out.** One workspace and one program for a client
+  granted several characters, with routines per character:
+  `programTools(render, { characters: true })` beside
+  `fanoutTools(render, fan, { program: true })`, whose `run_snippet` is the
+  program's one-off with a `character`. Logging a character out stops the
+  routines started for it. What a routine dispatches is recorded with a
+  `program` origin naming the routine and its character
+  (`docs/SESSION-FORMAT.md`, `calls`).
 - **Jump.** `sdk.jump()` (in place) and `sdk.jump({ forward: true })` (at the
   run speed along the facing), the `jump` action: `MSG_MOVE_JUMP` with the
   stock client's launch, the arc flown as a client's physics fly it, and
