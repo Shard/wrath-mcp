@@ -104,7 +104,33 @@ describe("load on save", () => {
     expect(facts.filter((f) => f.kind === "loaded").length).toBe(1);
     // A file main.ts imports is the program: saving it loads again.
     const lib2 = await p.editFile("lib/combat.ts", "5", "8", false);
-    expect(lib2.text).toBe("edited lib/combat.ts (1 replacement) (24 chars)\nloaded: deploy 4 · routines: grind, trip");
+    expect(lib2.text).toBe("edited lib/combat.ts (1 replacement) (24 chars)\nloaded: deploy 5 · routines: grind, trip");
+  }, 30_000);
+
+  test("code reads its own files by their workspace paths, read-only, and the note names what fails", async () => {
+    const { host } = await rig();
+    const p = host.program!;
+    await p.writeFile("lib/combat.ts", "export const reach = 5;\n");
+    await p.writeFile("plan.txt", "walk north\n");
+    expect((await host.evalSnippet('await Bun.file("lib/combat.ts").text()')).value).toBe('"export const reach = 5;\\n"');
+    expect((await host.evalSnippet('(await import("node:fs")).readFileSync("./plan.txt", "utf8")')).value).toBe('"walk north\\n"');
+    expect((await host.evalSnippet('(await import("node:fs")).readdirSync(".").sort()')).value).toBe('[ "lib", "plan.txt" ]');
+    // A save is read at once: the newest version is what a relative path names.
+    await p.editFile("plan.txt", "north", "south", false);
+    expect((await host.evalSnippet('await Bun.file("plan.txt").text()')).value).toBe('"walk south\\n"');
+    // A write is refused by the kernel, and the note names the tools that write.
+    const write = await host.evalSnippet('await Bun.write("plan.txt", "x")');
+    expect(write.error).toContain("your workspace files are read-only to code: write_file, edit_file and delete_file change them.");
+    expect((await host.evalSnippet('await Bun.file("plan.txt").text()')).value).toBe('"walk south\\n"');
+    // A workspace file named by another path, and memory.json, say how they are read.
+    const abs = await host.evalSnippet('await Bun.file("/workspace/lib/combat.ts").text()');
+    expect(abs.error).toContain(' — lib/combat.ts is one of your workspace files: code reads it by its workspace path, Bun.file("lib/combat.ts"), and read_file({ path: "lib/combat.ts" }) returns it.');
+    const mem = await host.evalSnippet('await Bun.file("memory.json").text()');
+    expect(mem.error).toContain(" — memory.json is not read as a file: it is the ambient `memory` object in code.");
+    // Nothing outside the workspace became readable.
+    const out = await host.evalSnippet('(await import("node:fs")).readdirSync("../..")');
+    expect(out.error).toContain("EACCES");
+    expect(out.error).not.toContain("read-only to code");
   }, 30_000);
 
   test("a load that fails changes nothing: the error names the file and line, and the code already running keeps running", async () => {
@@ -526,6 +552,33 @@ describe("what a restart brings back", () => {
     expect((await next.host.evalSnippet("state.self.name")).value).toContain("Thalvorn");
   }, 40_000);
 
+  test("a routine brought back into a new process with no session in the world starts once the character is logged in again", async () => {
+    const r = await rig();
+    await r.host.evalSnippet(LOGIN);
+    const src = "export async function lvl() {\n  memory.runs = (memory.runs ?? 0) + 1;\n  memory.level = state.self.level.value;\n  while (!signal.aborted) await sleep(50, { wake: false });\n}\n";
+    await until("the self block", async () => (await r.host.evalSnippet("state.self.level?.value")).value === "3");
+    await r.host.program!.writeFile("main.ts", src);
+    await r.host.program!.startRoutine({ name: "lvl" });
+    await until("the first run", async () => (await r.host.evalSnippet("memory.level")).value === "3");
+    await r.host.stop();
+    // The session is gone by the time the run resumes (a release, a long pause).
+    const gone = await fetch(`${r.stub.baseUrl}/session`, { method: "DELETE", headers: { authorization: `Bearer ${STUB_PORT_SECRET}` }, body: JSON.stringify({ token: "program-token-0001" }) });
+    expect(gone.status).toBe(200);
+
+    const next = await r.again();
+    await next.host.start();
+    expect(next.facts.find((f) => f.kind === "restart")).toMatchObject({ restarted: [{ name: "lvl", state: "running" }], interrupted: [] });
+    await Bun.sleep(1_200);
+    // Not run into an empty state: it waits, and has not thrown.
+    expect(next.facts.some((f) => f.kind === "ended")).toBe(false);
+    expect((await next.host.evalSnippet("memory.runs")).value).toBe("1");
+    expect(next.host.program!.routines()).toMatchObject([{ name: "lvl", state: "running" }]);
+    // The model logs the character in, and the routine starts from the top.
+    expect((await next.host.evalSnippet(LOGIN)).value).toBe('"Thalvorn"');
+    await until("the run from the top", async () => (await next.host.evalSnippet("memory.runs")).value === "2");
+    expect(next.facts.some((f) => f.kind === "ended")).toBe(false);
+  }, 40_000);
+
   test("files a harness carried into a new workspace are loaded at the first start, memory.json with them, and nothing is started", async () => {
     const first = await rig();
     await first.host.evalSnippet(LOGIN);
@@ -601,6 +654,7 @@ describe("what a restart brings back", () => {
   test("a child killed while a snippet was in flight restarts the routines: the snippet may be what blocked it", async () => {
     const { host, facts } = await rig({ timeoutMs: 1_000, beatMs: 150, beatGraceMs: 10_000 });
     const p = host.program!;
+    await host.evalSnippet(LOGIN);
     await p.writeFile("main.ts", IDLE);
     await p.startRoutine({ name: "idle" });
     await until("the first run", async () => (await host.evalSnippet("memory.started")).value === "1");
@@ -744,12 +798,17 @@ describe("the program tools", () => {
     expect((await call("run_snippet", { code: "await walk_to_x()" })).text).not.toContain("is a tool");
     await call("write_file", { path: "notes.txt", content: "ReferenceError: stop_routine is not defined\n" });
     expect((await call("read_file", { path: "notes.txt" })).text).toBe("ReferenceError: stop_routine is not defined\n");
-    // args is a JSON object: its JSON text instead is refused, and the hint says which.
-    const text = await call("start_routine", { name: "walk", args: '{"to":{"x":1,"y":2,"z":3}}' });
+    // args is a JSON object: its JSON text is taken as that object.
+    const asText = await call("start_routine", { name: "walk", args: '{"to":{"x":-1200,"y":990,"z":42}}' });
+    expect(asText.text).toStartWith("started walk on deploy 4\n");
+    await call("stop_routine", { name: "walk" });
+    // A string that is no object's JSON is refused, and the hint says which.
+    const text = await call("start_routine", { name: "walk", args: "to the inn" });
     expect(text.isError).toBe(true);
     expect(text.text).toStartWith("invalid arguments for start_routine: args: must be a JSON object, not a string. Received: ");
     expect(text.text).toEndWith("start_routine expects { name: string, args?: object } — the export of main.ts to run, and the one argument it is called with.");
     // Anything else is passed on as before: only the string is refused.
+    expect((await call("start_routine", { name: "walk", args: "[1]" })).isError).toBe(true);
     expect((await call("start_routine", { name: "walk", args: [1] })).text).toStartWith("started walk on deploy 4\n");
   }, 40_000);
 });
@@ -850,15 +909,14 @@ describe("saves, starts and what a result carries", () => {
     expect((await tools.call(ctx, "read_file", { path: "API.md" })).text).toBe("mine\n");
   }, 30_000);
 
-  test("a snippet's read of a workspace file off the sandbox's disk says where the file is read instead", async () => {
+  test("a snippet's read of a workspace file by another path says how it is read", async () => {
     const { host } = await rig();
     await host.program!.writeFile("main.ts", IDLE);
-    for (const code of ['return await Bun.file("main.ts").text()', 'const fs = await import("node:fs"); return fs.readFileSync("/workspace/main.ts", "utf8")']) {
-      const res = await host.evalSnippet(code);
-      expect(res.ok).toBe(false);
-      expect(res.error).toContain("ENOENT");
-      expect(res.error).toEndWith(' — main.ts is one of your workspace files, which are not on the sandbox\'s disk: read_file({ path: "main.ts" }) returns it, and a snippet imports its exports by relative path.');
-    }
+    expect((await host.evalSnippet('return await Bun.file("main.ts").text()')).value).toBe(JSON.stringify(IDLE));
+    const res = await host.evalSnippet('const fs = await import("node:fs"); return fs.readFileSync("/workspace/main.ts", "utf8")');
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain("ENOENT");
+    expect(res.error).toEndWith(' — main.ts is one of your workspace files: code reads it by its workspace path, Bun.file("main.ts"), and read_file({ path: "main.ts" }) returns it.');
     // A missing file that is not the workspace's gets no such line.
     const other = await host.evalSnippet('return await Bun.file("nope.ts").text()');
     expect(other.error).toContain("ENOENT");

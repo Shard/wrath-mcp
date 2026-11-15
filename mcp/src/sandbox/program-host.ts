@@ -5,9 +5,9 @@
  * loaded, remembers what was running, and brings it back.
  *
  *  - Files. The four file operations are the workspace's (`workspace.ts`),
- *    answered here so a save can load. A save that changes a code or JSON
- *    file makes a new version of the files, which snippets import from at
- *    once; when it changed `main.ts` or a file in its import graph, that
+ *    answered here so a save can load. Every save makes a new version of
+ *    the files, which snippets import from and read at once; when it
+ *    changed `main.ts` or a file in its import graph, that
  *    version is loaded as the program and the answer says what happened. A
  *    load that fails changes nothing.
  *  - The registry. One row per routine name and character: its arguments,
@@ -400,12 +400,12 @@ export class ProgramHost {
     return this.serial(async () => {
       const res = op();
       if (!res.ok) return { ok: false, text: res.error };
+      // A new version for every change: a snippet imports and reads the files as they are now.
+      const version = this.workspace.snapshot();
+      if (this.port.running()) this.port.tell({ t: "program_version", version });
       const resolved = this.workspace.resolve(path);
       if (!resolved.ok || !isImportable(resolved.rel)) return { ok: true, text: res.text };
       const graph = this.workspace.graph();
-      // A new version either way: a snippet imports the files as they are now.
-      const version = this.workspace.snapshot();
-      if (this.port.running()) this.port.tell({ t: "program_version", version });
       if (sameImportGraph(graph, this.lastGraph)) return { ok: true, text: res.text };
       this.lastGraph = graph;
       const loaded = await this.load(version, "save", link);
