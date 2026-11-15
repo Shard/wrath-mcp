@@ -997,12 +997,30 @@ export const PROGRAM_RUN_SNIPPET_DESCRIPTION =
 
 /**
  * `start_routine`'s `args`. Its description says a JSON object, and its
- * schema stays untyped, the one shape every provider takes. What is
- * refused is a string, the object's JSON text sent in its place, which the routine would
- * get as a string and fail on at its first field. Any other value is passed
- * on as it always was.
+ * schema stays untyped, the one shape every provider takes. A string that is
+ * a JSON object's text, the object sent as its JSON in its place, is taken as
+ * that object: refusing it taught no model, which resent it or dropped the
+ * args. A string that is not one is refused, since the routine would get it
+ * as a string and fail on at its first field. Any other value is passed on as
+ * it always was.
  */
-const ROUTINE_ARGS = z.unknown().refine((v) => typeof v !== "string", { message: "must be a JSON object, not a string" });
+const ROUTINE_ARGS = z.unknown().transform((v, ctx) => {
+  if (typeof v !== "string") return v;
+  const obj = jsonObjectText(v);
+  if (obj !== undefined) return obj;
+  ctx.addIssue({ code: "custom", message: "must be a JSON object, not a string", input: v });
+  return z.NEVER;
+});
+
+/** The object `text` is the JSON of, or undefined when it is not one. */
+function jsonObjectText(text: string): Record<string, unknown> | undefined {
+  try {
+    const v: unknown = JSON.parse(text);
+    return v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 const answer = (a: ProgramToolAnswer): ToolResult => (a.ok ? { text: a.text } : { text: a.text, isError: true });
 

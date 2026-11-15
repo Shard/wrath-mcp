@@ -138,7 +138,8 @@ The floor that closes that (`module/PROTOCOL.md`
 - **The snippet child can reach the module's port and nothing else it was
   not given.** The child is exec'd under a Linux Landlock ruleset
   (`mcp/src/sandbox/confine.ts`; `docs/ARCHITECTURE.md`, "The sandbox") that the kernel enforces however a
-  snippet reaches: reads only of what the snippet runtime needs to run, so
+  snippet reaches: reads only of what the snippet runtime needs to run and,
+  with a program, of the model's own workspace files, read-only, so
   `.env`, the repo root, the home directory, `/tmp`, `/dev/shm` and every
   other process's `/proc` entry answer `EACCES`; TCP
   connections only to the port in the run's module URL, and no listening

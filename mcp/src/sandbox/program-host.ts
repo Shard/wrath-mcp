@@ -5,9 +5,9 @@
  * loaded, remembers what was running, and brings it back.
  *
  *  - Files. The four file operations are the workspace's (`workspace.ts`),
- *    answered here so a save can load. A save that changes a code or JSON
- *    file makes a new version of the files, which snippets import from at
- *    once; when it changed `main.ts` or a file in its import graph, that
+ *    answered here so a save can load. Every save makes a new version of
+ *    the files, which snippets import from and read at once; when it
+ *    changed `main.ts` or a file in its import graph, that
  *    version is loaded as the program and the answer says what happened. A
  *    load that fails changes nothing.
  *  - The registry. One row per routine name and character: its arguments,
@@ -158,15 +158,34 @@ export function routineDetailKey(r: RoutineRow): string | undefined {
   return undefined;
 }
 
+/** How many ended routines the lines show: the ones that ended last. */
+export const ROUTINES_ENDED_SHOWN = 10;
+
 /**
- * The routines as a tool result lists them, one per line. Pure: the rows, the
+ * The rows the routine lines show: every running one, and the
+ * `ROUTINES_ENDED_SHOWN` that ended last, in registry order; `hidden` counts
+ * the ended ones left out. A long run starts a routine per task, and the
+ * list of everything it ever started grows by the hour while what it needs
+ * is what runs and what just ended.
+ */
+export function routinesInView(rows: readonly RoutineRow[]): { rows: RoutineRow[]; hidden: number } {
+  const ended = rows.filter((r) => r.state !== "running");
+  if (ended.length <= ROUTINES_ENDED_SHOWN) return { rows: [...rows], hidden: 0 };
+  const kept = new Set([...ended].sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0)).slice(0, ROUTINES_ENDED_SHOWN));
+  return { rows: rows.filter((r) => r.state === "running" || kept.has(r)), hidden: ended.length - ROUTINES_ENDED_SHOWN };
+}
+
+/**
+ * The routines as a tool result lists them, one per line (`routinesInView`).
+ * Pure: the rows, the
  * clock and what was shown before arrive as data. Durations, never clock
  * times, so the lines mean the same in any time zone. An error or a returned
  * value whose `routineDetailKey` is in `shown` is already in the
  * conversation: its line refers to it rather than repeating it.
  */
-export function renderRoutines(rows: readonly RoutineRow[], now: number, shown: ReadonlySet<string> = new Set()): string {
-  if (rows.length === 0) return "routines: none started";
+export function renderRoutines(all: readonly RoutineRow[], now: number, shown: ReadonlySet<string> = new Set()): string {
+  if (all.length === 0) return "routines: none started";
+  const { rows, hidden } = routinesInView(all);
   const lines = rows.map((r) => {
     if (r.state === "running") {
       const acted = r.lastAction === undefined ? "no action yet" : `last action ${durationWords(now - r.lastAction.ts)} ago`;
@@ -186,6 +205,7 @@ export function renderRoutines(rows: readonly RoutineRow[], now: number, shown: 
     }
     return `${label(r)} stopped ${ago}${r.note !== undefined ? `: ${r.note}` : ""}`;
   });
+  if (hidden > 0) lines.push(`and ${hidden} more that ended earlier`);
   return `routines:\n${lines.join("\n")}`;
 }
 
@@ -300,9 +320,9 @@ export class ProgramHost {
     return new Set(this.shown);
   }
 
-  /** These rows' errors and values are in the model's conversation now. Only the current runs' are kept. */
+  /** These rows' errors and values, as far as the lines show them (`routinesInView`), are in the model's conversation now. Only the current runs' are kept. */
   markShown(rows: readonly RoutineRow[]): void {
-    for (const r of rows) {
+    for (const r of routinesInView(rows).rows) {
       const k = routineDetailKey(r);
       if (k !== undefined) this.shown.add(k);
     }
@@ -400,12 +420,12 @@ export class ProgramHost {
     return this.serial(async () => {
       const res = op();
       if (!res.ok) return { ok: false, text: res.error };
+      // A new version for every change: a snippet imports and reads the files as they are now.
+      const version = this.workspace.snapshot();
+      if (this.port.running()) this.port.tell({ t: "program_version", version });
       const resolved = this.workspace.resolve(path);
       if (!resolved.ok || !isImportable(resolved.rel)) return { ok: true, text: res.text };
       const graph = this.workspace.graph();
-      // A new version either way: a snippet imports the files as they are now.
-      const version = this.workspace.snapshot();
-      if (this.port.running()) this.port.tell({ t: "program_version", version });
       if (sameImportGraph(graph, this.lastGraph)) return { ok: true, text: res.text };
       this.lastGraph = graph;
       const loaded = await this.load(version, "save", link);

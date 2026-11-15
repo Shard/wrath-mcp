@@ -375,13 +375,16 @@ poll them, with no handle and no stop; here the lifecycle is the stack's and
 the code is still the model's.
 
 - **Files** (`mcp/src/workspace.ts`). The host process alone writes the
-  workspace, through the four file tools. Each change to a code or JSON file
-  becomes a new version in a directory of its own, hard-linked into a
-  content-addressed store, and the confined child is granted read access to
-  those versions and nothing else (`--read=`, as a harness's child extension
-  is). The child has no write grant. Importing a version by its plain path
-  makes every load a fresh module graph, so running code never changes under
-  itself and the directories are the record of which code was live when.
+  workspace, through the four file tools. Each change becomes a new version
+  in a directory of its own, hard-linked into a content-addressed store, and
+  the confined child is granted read access to those versions and nothing
+  else (`--read=`, as a harness's child extension is). The child has no write
+  grant. Its working directory follows the newest version, so code reads its
+  own files by the relative paths it imports them by (`Bun.file("lib/x.ts")`,
+  `readdirSync("lib")`), and a write there is refused. Importing a version by
+  its plain path makes every load a fresh module graph, so running code never
+  changes under itself and the directories are the record of which code was
+  live when.
 - **Load on save.** A save that changes `main.ts` or a file in its import
   graph loads that version at once and the tool's result says so. A load that
   fails changes nothing. The routines running when a load succeeds are stopped

@@ -12,6 +12,7 @@ import { isKnownOpcode, parseEventFrame } from "../src/protocol";
 import {
   BACKPACK_SLOT,
   CREATURE_GUID,
+  SELF_GUID,
   frames,
   inventorySlot,
   ITEM_GUID,
@@ -89,6 +90,10 @@ const repairerCreate = frame(20, "SMSG_UPDATE_OBJECT", {
 
 const world = () => frames([...loginSequence, selfCreate, repairerCreate, inventorySlot, itemCreate, itemQuery]);
 
+/** The same world with the charm worn down to 4 of 30 and 80 copper in the purse. */
+const update = (seq: number, guid: string, fields: Record<string, number>) => frame(seq, "SMSG_UPDATE_OBJECT", { blocks: 1, objects: [{ update: "values", guid, fields }] });
+const damagedWorld = () => frames([...loginSequence, selfCreate, repairerCreate, inventorySlot, itemCreate, itemQuery, update(39, ITEM_GUID, { durability: 4, maxDurability: 30 }), update(40, SELF_GUID, { money: 80 })]);
+
 async function inWorld(stub: StubServer): Promise<WrathClient> {
   const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
   await client.createSession({ character: "Fenwick" });
@@ -143,6 +148,48 @@ describe("repairAll with an item", () => {
       { action: "repair_all", token: "t", guid: REPAIRER, itemGuid: ITEM_GUID },
       { action: "repair_all", token: "t", guid: REPAIRER, itemGuid: ITEM_GUID },
     ]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("the answer says what it cost and what came back to full", async () => {
+    const stub: StubServer = startStub({
+      onConnect: damagedWorld,
+      failAction: (action) => {
+        if (action !== "repair_all") return undefined;
+        setTimeout(() => {
+          stub.push(JSON.stringify(update(41, ITEM_GUID, { durability: 30 })));
+          stub.push(JSON.stringify(update(42, SELF_GUID, { money: 45 })));
+        }, 10);
+        return undefined;
+      },
+    });
+    const client = await inWorld(stub);
+    await client.events.waitFor((e) => e.seq === 40, { timeout: 2000 });
+    expect(await client.repairAll(REPAIRER)).toEqual({ ok: true, action: "repair_all", cost: 35, repaired: ["Gritstone Charm"], stillDamaged: [] });
+    // Nothing damaged now: a repair of nothing, at once.
+    expect(await client.repairAll(REPAIRER)).toEqual({ ok: true, action: "repair_all", cost: 0, repaired: [], stillDamaged: [] });
+    client.close();
+    await stub.stop();
+  });
+
+  test("an item the money did not cover is still damaged, and the hint says why; options may stand in the item's place", async () => {
+    const stub = startStub({ onConnect: damagedWorld });
+    const client = await inWorld(stub);
+    await client.events.waitFor((e) => e.seq === 40, { timeout: 2000 });
+    const r = await client.repairAll(REPAIRER, { timeout: 50 });
+    expect(r).toEqual({
+      ok: true,
+      action: "repair_all",
+      cost: 0,
+      repaired: [],
+      stillDamaged: [{ guid: ITEM_GUID, name: "Gritstone Charm", durability: { current: 4, max: 30 } }],
+      hint: "1 item is still damaged: the server repairs an item only while your money covers its cost, and skips the rest without a message; you have 80 copper",
+    });
+    // `{ timeout }` was the options, not an item: everything was asked for.
+    expect(stub.actions).toEqual([{ action: "repair_all", token: "t", guid: REPAIRER }]);
+    await client.repairAll(REPAIRER, ITEM_GUID, { timeout: 50 });
+    expect(stub.actions.at(-1)).toEqual({ action: "repair_all", token: "t", guid: REPAIRER, itemGuid: ITEM_GUID });
     client.close();
     await stub.stop();
   });

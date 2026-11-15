@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { compileOneOff, compileSnippet, extractImportStatements, resolveWorkspaceImport } from "../src/sandbox/rewrite";
 import { durationWords } from "../src/sandbox/program";
-import { renderRoutines, routineDetailKey } from "../src/sandbox/program-host";
+import { renderRoutines, routineDetailKey, routinesInView, ROUTINES_ENDED_SHOWN } from "../src/sandbox/program-host";
 import { FILE_MAX_CHARS, MEMORY_MAX_CHARS, sameImportGraph, Workspace, WORKSPACE_MAX_BYTES, workspaceImportGraph } from "../src/workspace";
 
 const dirs: string[] = [];
@@ -297,5 +297,23 @@ describe("the routine lines", () => {
       ["routines:", 'trip returned 1m ago: "back"', "heal (Bravo) threw 1h05m ago: TypeError: x is undefined at heal (main.ts:9:3)"].join("\n"),
     );
     expect(routineDetailKey({ name: "grind", deploy: 7, startedAt: now, state: "running" })).toBeUndefined();
+  });
+
+  test("every running routine and the ten that ended last; the older ended ones are counted", () => {
+    const now = 1_000_000_000;
+    const ended = Array.from({ length: 14 }, (_, i) => ({ name: `job${i}`, deploy: 7, startedAt: now - 100_000, state: "stopped" as const, endedAt: now - 60_000 + i * 1_000 }));
+    const rows = [{ name: "grind", deploy: 7, startedAt: now - 1_000, state: "running" as const }, ...ended];
+    const view = routinesInView(rows);
+    expect(ROUTINES_ENDED_SHOWN).toBe(10);
+    expect(view.hidden).toBe(4);
+    expect(view.rows.map((r) => r.name)).toEqual(["grind", ...ended.slice(4).map((r) => r.name)]);
+    const lines = renderRoutines(rows, now).split("\n");
+    expect(lines.length).toBe(1 + 1 + 10 + 1);
+    expect(lines[1]).toBe("grind running 1s, deploy 7, no action yet");
+    expect(lines[2]).toBe("job4 stopped 56s ago");
+    expect(lines.at(-1)).toBe("and 4 more that ended earlier");
+    // Ten or fewer ended: all of them, and no count.
+    expect(routinesInView(rows.slice(0, 11))).toEqual({ rows: rows.slice(0, 11), hidden: 0 });
+    expect(renderRoutines(rows.slice(0, 11), now)).not.toContain("ended earlier");
   });
 });

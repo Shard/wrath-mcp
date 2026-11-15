@@ -40,8 +40,9 @@
  */
 
 import { statSync } from "node:fs";
+import { posix } from "node:path";
 import { HarnessStop, isHarnessStop, Owner, type Ownership } from "./owners";
-import { MAIN_PATH, MEMORY_MAX_CHARS, resolveWorkspaceImport } from "./rewrite";
+import { MAIN_PATH, MEMORY_MAX_CHARS, MEMORY_PATH, resolveWorkspaceImport } from "./rewrite";
 import type { ChildToHost, LogEntry, MoveOwner, ProgramBeat, ProgramErrorNote, ProgramEvent, ProgramLoadAnswer, ProgramLogLine, RoutineAnswer, RoutineNote } from "./ipc";
 
 /** How long an ended routine may still dispatch: long enough to unwind (a `finally` that stops an attack), no longer. */
@@ -117,7 +118,23 @@ export interface ProgramDeps<S> {
   multi: boolean;
   /** Reopen the stream of a routine's character before a resumed start. */
   connect(seat: S | null): Promise<void>;
+  /**
+   * Make `dir`, the newest version of the files, the directory a relative
+   * path is read against, so code reads its own files (`Bun.file("lib/x.ts")`,
+   * `readdirSync("lib")`) by the paths it imports them by.
+   */
+  follow?(dir: string): void;
+  /**
+   * Whether a routine's character is in the world: its own create block has
+   * arrived (a replay, or a login). A resumed start waits for it, so a routine the
+   * host brings back into a new process, before the model has logged the
+   * character in again, starts once it is in, not into an empty `state`.
+   */
+  inWorld?(seat: S | null): boolean;
 }
+
+/** How often a resumed start waiting for its character to be in the world looks again. */
+export const IN_WORLD_POLL_MS = 500;
 
 /** A duration as a routine line says it: `3s`, `12m`, `1h05m`. */
 export function durationWords(ms: number): string {
@@ -157,8 +174,7 @@ function short(text: string): string {
 }
 
 export class ProgramRuntime<S> {
-  /** The newest version of the files: what a snippet imports from. */
-  version = 0;
+  private newest = 0;
   private loaded: { version: number; module: Record<string, unknown>; owner: Owner; routines: string[] } | null = null;
   private loadError: string | undefined;
   private loading: { owner: Owner; marker: string } | undefined;
@@ -175,6 +191,16 @@ export class ProgramRuntime<S> {
   constructor(private readonly deps: ProgramDeps<S>) {}
 
   // ------------------------------------------------------------------ files
+
+  /** The newest version of the files: what a snippet imports from, and reads by relative path. */
+  get version(): number {
+    return this.newest;
+  }
+
+  set version(n: number) {
+    this.newest = n;
+    if (n > 0) this.deps.follow?.(this.dir(n));
+  }
 
   /** Where version `n` of the files lives. */
   private dir(n: number): string {
@@ -218,16 +244,34 @@ export class ProgramRuntime<S> {
   }
 
   /**
-   * The note a failed read of a workspace file ends with (a snippet's
-   * `Bun.file("main.ts")` or `readFileSync`, which look on the sandbox's own
-   * disk): where the file is read instead. Undefined for any other error.
+   * The note a failed file access in the workspace ends with. Code reads its
+   * files by their workspace paths (`follow`), so what fails is a path that
+   * names one some other way (`/workspace/lib/combat.ts`), memory.json, which
+   * is the ambient `memory` and no file, or a write, which only the file
+   * tools make. Undefined for any other error.
    */
   missingFileNote(err: unknown): string | undefined {
     const e = err as { code?: unknown; path?: unknown } | null;
-    if (e === null || typeof e !== "object" || e.code !== "ENOENT" || typeof e.path !== "string") return undefined;
-    const rel = this.workspaceFileOf(e.path);
-    if (rel === undefined) return undefined;
-    return ` — ${rel} is one of your workspace files, which are not on the sandbox's disk: read_file({ path: "${rel}" }) returns it, and a snippet imports its exports by relative path.`;
+    if (e === null || typeof e !== "object" || typeof e.path !== "string") return undefined;
+    if (e.code === "ENOENT") {
+      const tail = e.path.replace(/\\/g, "/").split("/").at(-1);
+      if (tail === MEMORY_PATH) return ` — ${MEMORY_PATH} is not read as a file: it is the ambient \`memory\` object in code.`;
+      const rel = this.workspaceFileOf(e.path);
+      if (rel === undefined) return undefined;
+      return ` — ${rel} is one of your workspace files: code reads it by its workspace path, Bun.file("${rel}"), and read_file({ path: "${rel}" }) returns it.`;
+    }
+    if ((e.code === "EACCES" || e.code === "EPERM") && this.inWorkspace(e.path)) {
+      return " — your workspace files are read-only to code: write_file, edit_file and delete_file change them.";
+    }
+    return undefined;
+  }
+
+  /** Whether `path` is inside the newest version of the files, read against it when relative. */
+  private inWorkspace(path: string): boolean {
+    const root = this.importRoot;
+    if (root === undefined) return false;
+    const abs = posix.resolve(root, path.replace(/\\/g, "/"));
+    return abs === root || abs.startsWith(`${root}/`);
   }
 
   /** The owner of a module's top-level code while a load's import is in flight (`OwnershipOptions.fallback`). */
@@ -399,11 +443,18 @@ export class ProgramRuntime<S> {
       // A load or a start may have landed while the stream reopened.
       const raced = this.runs.get(key(msg.name, msg.seat));
       if (this.loaded !== loaded || (raced !== undefined && !raced.ended)) return { ok: false, error: `${this.label(msg.name, msg.seat)} was started meanwhile` };
+      // No session in the world yet (a new process, before the model logs the character in): it runs once there is one.
+      if (this.deps.inWorld?.(seat) === false) return { ok: true, routine: { ...this.launch(msg.name, msg.args, msg.seat, seat, msg.id, 0, true).note } };
     }
     return { ok: true, routine: { ...this.launch(msg.name, msg.args, msg.seat, seat, msg.id, 0).note } };
   }
 
-  private launch(name: string, args: unknown, character: string | undefined, seat: S | null, evalId: number, delayMs: number): RoutineRun<S> {
+  /**
+   * Start a run: now, after `delayMs`, or, `untilInWorld`, once its
+   * character is in the world. A run stopped or restarted meanwhile never
+   * starts.
+   */
+  private launch(name: string, args: unknown, character: string | undefined, seat: S | null, evalId: number, delayMs: number, untilInWorld = false): RoutineRun<S> {
     const loaded = this.loaded!;
     const note: RoutineNote = { name, deploy: loaded.version, startedAt: Date.now(), state: "running" };
     if (character !== undefined) note.character = character;
@@ -420,7 +471,13 @@ export class ProgramRuntime<S> {
         (err: unknown) => this.finish(run, undefined, { err }),
       );
     };
-    if (delayMs > 0) this.deps.ownership.real.setTimeout(go, delayMs);
+    const waitForWorld = (): void => {
+      if (run.ended) return;
+      if (this.deps.inWorld?.(seat) === false) this.deps.ownership.real.setTimeout(waitForWorld, IN_WORLD_POLL_MS);
+      else go();
+    };
+    if (untilInWorld) waitForWorld();
+    else if (delayMs > 0) this.deps.ownership.real.setTimeout(go, delayMs);
     else go();
     return run;
   }

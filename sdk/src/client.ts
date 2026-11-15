@@ -477,6 +477,16 @@ function resolveItemTarget(state: StateCache, ref: ItemTargetRef, arg: string): 
   return { guid: own.guid, label: labelOf(own) };
 }
 
+/** `INVENTORY_SLOT_ITEM_END`: equipment, worn bags and the backpack, the slots a repair reaches; the bank's are past it. */
+const REPAIRED_SLOTS_END = 39;
+
+/** A `repairAll` second argument that is its options, not an item: a plain object of option keys alone. */
+function isRepairOptions(v: unknown): v is RepairOptions {
+  if (v === null || typeof v !== "object" || Array.isArray(v)) return false;
+  const keys = Object.keys(v);
+  return keys.length > 0 && keys.every((k) => k === "timeout");
+}
+
 /**
  * Resolve a cast's ground target to a point: `{ x, y, z }` as given, or a
  * unit (its guid or name) at its position now, as `state.units()` reports
@@ -4325,13 +4335,41 @@ export interface SpiritHealerOptions {
   timeout?: number;
 }
 
+export interface RepairOptions {
+  /** How long to wait for the repaired items' durability and the money to update after the repair is sent, in ms. Default 2000. */
+  timeout?: number;
+}
+
+/** A worn or carried item below its maximum durability, as its tooltip's durability line reads. */
+export interface DamagedItem {
+  readonly guid: string;
+  readonly name: string | undefined;
+  readonly durability: { readonly current: number; readonly max: number };
+}
+
 /**
- * The outcome of `repairAll`: the module's ack when the packet went out, or
- * `no_repair` when the NPC's observed flags carry no repair role and nothing
- * was sent. The ack says only that it was sent; `state.money` says what the
- * repair cost.
+ * The outcome of `repairAll` once the packet went out: what a client sees
+ * change. `cost` is the copper `state.money` went down by (absent when money
+ * was not observed); `repaired` names the items that were damaged before and
+ * are at their maximum now; `stillDamaged` lists the items still below it,
+ * with `hint` saying why when there are any. Nothing damaged before is a
+ * repair of nothing: `cost` 0, both lists empty.
  */
-export type RepairAllResult = ActionResponse | { readonly ok: false; readonly status: "no_repair"; readonly hint: string };
+export interface RepairDone {
+  readonly ok: true;
+  readonly action: string;
+  readonly cost?: number;
+  readonly repaired: readonly string[];
+  readonly stillDamaged: readonly DamagedItem[];
+  readonly hint?: string;
+}
+
+/**
+ * The outcome of `repairAll`: what the repair changed (`RepairDone`), or
+ * `no_repair` when the NPC's observed flags carry no repair role and nothing
+ * was sent.
+ */
+export type RepairAllResult = RepairDone | { readonly ok: false; readonly status: "no_repair"; readonly hint: string };
 
 /**
  * The outcome of `spiritHealerActivate`. `resurrected` is the resurrect
@@ -6116,11 +6154,23 @@ export class WrathClient {
    * is sent; unobserved flags are sent as before, since only the server knows.
    * An item the character does not hold throws before anything is sent; one it
    * holds that needs no repair is a repair of nothing, as at a client.
+   *
+   * The answer is what a client sees change (`RepairDone`): the money it cost
+   * and which items came back to full durability. The server repairs item by
+   * item and skips, without a word, each one the money no longer covers, so a
+   * repair short of money leaves items in `stillDamaged`. Options go last,
+   * `repairAll(vendor, { timeout })` included.
    */
-  repairAll(target: GuidOrUnit, item?: ItemTargetRef): Promise<WithResolved<RepairAllResult>> {
+  repairAll(target: GuidOrUnit, item?: ItemTargetRef | RepairOptions, options: RepairOptions = {}): Promise<WithResolved<RepairAllResult>> {
+    // An options object in the item's place (`{ timeout }`, as other helpers take it) is the options.
+    if (isRepairOptions(item)) {
+      options = item;
+      item = undefined;
+    }
     // Resolved where the caller stands, so a bad item throws before the vendor
     // lookup and nothing is sent.
-    const aim = item === undefined ? undefined : resolveItemTarget(this.state, item, "repairAll(vendor, item)");
+    const aim = item === undefined ? undefined : resolveItemTarget(this.state, item as ItemTargetRef, "repairAll(vendor, item)");
+    const timeout = options.timeout ?? 2000;
     return this.byName(target, "repairAll(guid)", async (guid): Promise<WithResolved<RepairAllResult>> => {
       const npc = this.state.nearby.get(guidKey(guid));
       const flags = npc?.fields.get("npcFlags")?.value;
@@ -6132,8 +6182,47 @@ export class WrathClient {
         this.noteActionHint("repairAll", "no_repair", hint);
         return { ok: false, status: "no_repair", hint };
       }
+      // What a repair can change, as the cache reads it: the damaged items (the one asked for, with an item) and the money.
+      // Worn and carried only: the server repairs nothing in the bank (`Player::DurabilityRepairAll`, slots below 39).
+      const damaged = (): DamagedItem[] =>
+        this.state.inventory.flatMap((i) =>
+          i.slot < REPAIRED_SLOTS_END && i.durability !== undefined && i.durability.current < i.durability.max && (aim === undefined || i.guid === aim.guid)
+            ? [{ guid: i.guid, name: i.name, durability: { current: i.durability.current, max: i.durability.max } }]
+            : [],
+        );
+      const before = damaged();
+      const moneyBefore = this.state.money?.value;
       const ack = await this.action({ action: "repair_all", guid, ...(aim === undefined ? {} : { itemGuid: aim.guid }) });
-      return aim === undefined ? ack : withResolved(aim, ack);
+      if (before.length > 0) {
+        // The durability and the coinage arrive as update fields; an item still damaged at the deadline is the answer, not an error.
+        const settled = (): boolean => damaged().length === 0 && (moneyBefore === undefined || this.state.money?.value !== moneyBefore);
+        if (!settled()) {
+          try {
+            await this.waitEvent(() => settled(), { timeout, description: "the repaired items' durability and the money to update" });
+          } catch (e) {
+            if (!(e instanceof EventTimeoutError)) throw e;
+          }
+        }
+      }
+      const still = damaged();
+      const moneyAfter = this.state.money?.value;
+      const cost = moneyBefore !== undefined && moneyAfter !== undefined ? Math.max(0, moneyBefore - moneyAfter) : undefined;
+      const repaired = before.filter((b) => !still.some((s) => s.guid === b.guid)).map((b) => b.name ?? `item ${b.guid}`);
+      const done: RepairDone = {
+        ok: true,
+        action: ack.action,
+        ...(cost !== undefined ? { cost } : {}),
+        repaired,
+        stillDamaged: still,
+        ...(still.length > 0
+          ? {
+              hint:
+                `${still.length === 1 ? "1 item is" : `${still.length} items are`} still damaged: the server repairs an item only while your money covers its cost, ` +
+                `and skips the rest without a message${moneyAfter !== undefined ? `; you have ${moneyAfter} copper` : ""}`,
+            }
+          : {}),
+      };
+      return aim === undefined ? done : withResolved(aim, done);
     });
   }
 

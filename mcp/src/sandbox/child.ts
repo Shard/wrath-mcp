@@ -71,8 +71,9 @@
  * The model keeps code in a file workspace rooted at `main.ts`, and every
  * function `main.ts` exports is a routine the host starts and stops by name
  * (`program.ts`, `program-host.ts`). This process may read the versions of
- * those files and nothing else of the workspace; it writes none of it. What
- * a snippet and a routine see then:
+ * those files and nothing else of the workspace; it writes none of it. Its
+ * working directory follows the newest version, so code reads its own files
+ * by the paths it imports them by. What a snippet and a routine see then:
  *
  *   memory      one plain-JSON object the host saves as memory.json and hands
  *               back to a new child
@@ -981,6 +982,20 @@ const program: ProgramRuntime<Seat> | null =
         multi: MULTI,
         // The socket and its timers are the session's plumbing, never a routine's.
         connect: (seat) => evalContext.exit(async () => void (await Promise.all((seat !== null ? [seat] : allSeats()).map((s) => connectSeat(s.client))))),
+        // Nothing of this process reads by relative path (API_MD_PATH and the
+        // imports are absolute), so the cwd is the model's alone. The version
+        // directories are already readable (confine.ts, `--read=`): this
+        // widens nothing. A chdir that fails leaves the previous one.
+        // Its own create block has arrived (the replay of a session in world, or a login's):
+        // health comes from its fields alone, where a seed or the character list can name a guid and a level first.
+        inWorld: (seat) => (seat !== null ? [seat] : allSeats()).every((s) => s.client.state.self.level !== undefined && s.client.state.self.health !== undefined),
+        follow: (dir) => {
+          try {
+            process.chdir(dir);
+          } catch {
+            // the read fails as it did, and its note says where the file is
+          }
+        },
       });
 
 /**
@@ -1244,7 +1259,7 @@ function releasePadCalls(id: number): void {
 // result, so read it in slices (one `## ` section, or lines filtered by name),
 // or, beside a program, by line range with `read_file` (`ProgramHost`).
 // The SDK names its own file (`API_MD_PATH` in @wrathbench/sdk), so the path
-// does not depend on the cwd, which the child does not control, nor on where
+// does not depend on the cwd (which, with a program, follows the workspace), nor on where
 // this package sits beside the SDK.
 const API_MD_PATH = SDK_API_MD_PATH;
 
