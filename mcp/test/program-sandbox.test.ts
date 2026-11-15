@@ -127,6 +127,9 @@ describe("load on save", () => {
     expect(abs.error).toContain(' — lib/combat.ts is one of your workspace files: code reads it by its workspace path, Bun.file("lib/combat.ts"), and read_file({ path: "lib/combat.ts" }) returns it.');
     const mem = await host.evalSnippet('await Bun.file("memory.json").text()');
     expect(mem.error).toContain(" — memory.json is not read as a file: it is the ambient `memory` object in code.");
+    // What never read by relative path is as it was: a computed import, and the SDK reference.
+    expect((await host.evalSnippet('const m = ["node:", "path"].join(""); return (await import(m)).basename("a/b")')).value).toBe('"b"');
+    expect((await host.evalSnippet("(await Bun.file(API_MD_PATH).text()).length > 1000")).value).toBe("true");
     // Nothing outside the workspace became readable.
     const out = await host.evalSnippet('(await import("node:fs")).readdirSync("../..")');
     expect(out.error).toContain("EACCES");

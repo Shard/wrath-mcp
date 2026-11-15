@@ -986,8 +986,9 @@ const program: ProgramRuntime<Seat> | null =
         // imports are absolute), so the cwd is the model's alone. The version
         // directories are already readable (confine.ts, `--read=`): this
         // widens nothing. A chdir that fails leaves the previous one.
-        // Its own guid and level have arrived: the replay of a session in world, or a login.
-        inWorld: (seat) => (seat !== null ? [seat] : allSeats()).every((s) => s.client.state.self.guid !== undefined && s.client.state.self.level !== undefined),
+        // Its own create block has arrived (the replay of a session in world, or a login's):
+        // health comes from its fields alone, where a seed or the character list can name a guid and a level first.
+        inWorld: (seat) => (seat !== null ? [seat] : allSeats()).every((s) => s.client.state.self.level !== undefined && s.client.state.self.health !== undefined),
         follow: (dir) => {
           try {
             process.chdir(dir);

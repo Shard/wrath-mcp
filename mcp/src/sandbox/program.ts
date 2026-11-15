@@ -125,8 +125,8 @@ export interface ProgramDeps<S> {
    */
   follow?(dir: string): void;
   /**
-   * Whether a routine's character is in the world: its own state has arrived
-   * (a replay, or a login). A resumed start waits for it, so a routine the
+   * Whether a routine's character is in the world: its own create block has
+   * arrived (a replay, or a login). A resumed start waits for it, so a routine the
    * host brings back into a new process, before the model has logged the
    * character in again, starts once it is in, not into an empty `state`.
    */
