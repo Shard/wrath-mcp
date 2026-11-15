@@ -560,6 +560,9 @@ describe("what a restart brings back", () => {
     await r.host.evalSnippet(LOGIN);
     const src = "export async function lvl() {\n  memory.runs = (memory.runs ?? 0) + 1;\n  memory.level = state.self.level.value;\n  while (!signal.aborted) await sleep(50, { wake: false });\n}\n";
     await until("the self block", async () => (await r.host.evalSnippet("state.self.level?.value")).value === "3");
+    // The snapshot a harness's HUD reads carries the race and class the self block named.
+    const fields = ((await r.host.stateSnapshot())["self"] as { fields?: Record<string, { value?: unknown }> }).fields;
+    expect([fields?.["race"]?.value, fields?.["class"]?.value]).toEqual([1, 1]);
     await r.host.program!.writeFile("main.ts", src);
     await r.host.program!.startRoutine({ name: "lvl" });
     await until("the first run", async () => (await r.host.evalSnippet("memory.level")).value === "3");

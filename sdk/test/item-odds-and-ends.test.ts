@@ -90,9 +90,9 @@ const repairerCreate = frame(20, "SMSG_UPDATE_OBJECT", {
 
 const world = () => frames([...loginSequence, selfCreate, repairerCreate, inventorySlot, itemCreate, itemQuery]);
 
-/** The same world with the charm worn down to 1 of 25 and 51 copper in the purse. */
+/** The same world with the charm worn down to 4 of 30 and 80 copper in the purse. */
 const update = (seq: number, guid: string, fields: Record<string, number>) => frame(seq, "SMSG_UPDATE_OBJECT", { blocks: 1, objects: [{ update: "values", guid, fields }] });
-const damagedWorld = () => frames([...loginSequence, selfCreate, repairerCreate, inventorySlot, itemCreate, itemQuery, update(39, ITEM_GUID, { durability: 1, maxDurability: 25 }), update(40, SELF_GUID, { money: 51 })]);
+const damagedWorld = () => frames([...loginSequence, selfCreate, repairerCreate, inventorySlot, itemCreate, itemQuery, update(39, ITEM_GUID, { durability: 4, maxDurability: 30 }), update(40, SELF_GUID, { money: 80 })]);
 
 async function inWorld(stub: StubServer): Promise<WrathClient> {
   const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
@@ -158,8 +158,8 @@ describe("repairAll with an item", () => {
       failAction: (action) => {
         if (action !== "repair_all") return undefined;
         setTimeout(() => {
-          stub.push(JSON.stringify(update(41, ITEM_GUID, { durability: 25 })));
-          stub.push(JSON.stringify(update(42, SELF_GUID, { money: 16 })));
+          stub.push(JSON.stringify(update(41, ITEM_GUID, { durability: 30 })));
+          stub.push(JSON.stringify(update(42, SELF_GUID, { money: 45 })));
         }, 10);
         return undefined;
       },
@@ -183,8 +183,8 @@ describe("repairAll with an item", () => {
       action: "repair_all",
       cost: 0,
       repaired: [],
-      stillDamaged: [{ guid: ITEM_GUID, name: "Gritstone Charm", durability: { current: 1, max: 25 } }],
-      hint: "1 item is still damaged: the server repairs an item only while your money covers its cost, and skips the rest without a message; you have 51 copper",
+      stillDamaged: [{ guid: ITEM_GUID, name: "Gritstone Charm", durability: { current: 4, max: 30 } }],
+      hint: "1 item is still damaged: the server repairs an item only while your money covers its cost, and skips the rest without a message; you have 80 copper",
     });
     // `{ timeout }` was the options, not an item: everything was asked for.
     expect(stub.actions).toEqual([{ action: "repair_all", token: "t", guid: REPAIRER }]);
