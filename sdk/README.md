@@ -266,8 +266,9 @@ NPC's, so the ceiling is set by the largest NPC in the pinned world rather than
 a typical one; a mailbox's is 10 y past its model. Nearer than that the call
 still goes out, and a silence is explained by the distance afterwards. So does
 any call the cache cannot judge: a guid with no observed position, a player, a
-creature riding a transport (its position is where the transport was), and
-any game object but a mailbox (its reach is its model's box).
+creature riding a transport (its position is where the transport was), any
+game object but a mailbox (its reach is its model's box), and anything while
+the character sits in a vehicle.
 
 The questgiver marker answers before the wire too. `acceptQuestFrom` and
 `questsAvailableFrom` refuse with `nothing_on_offer` when the NPC's marker says

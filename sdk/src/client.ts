@@ -2187,11 +2187,14 @@ const MOVEFLAG_ONTRANSPORT = 0x200;
  * call goes out as a client's would. Only a creature or a mailbox is judged:
  * a player has no NPC range (the core puts none on a player sharing a quest),
  * and any other game object's reach is its model's box, which the cache does
- * not know (a questgiver object's runs past 60y). A creature riding a
- * transport is not judged either: its cached position is where the transport
- * was when the server last sent it.
+ * not know (a large questgiver object's can run well past 30y). A creature
+ * riding a transport is not judged either: its cached position is where the
+ * transport was when the server last sent it. Nor is anything while the
+ * character sits in a vehicle, whose seat carries it without a position of
+ * its own being reported.
  */
 function interactOutOfReach(state: StateCache, guid: GuidArg): number | undefined {
+  if (state.self.vehicle !== undefined) return undefined;
   const key = guidKey(guid);
   const obj = state.nearby.get(key);
   if (obj === undefined) return undefined;

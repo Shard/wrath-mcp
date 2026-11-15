@@ -3,8 +3,8 @@
  * cached positions put the NPC or mailbox beyond any NPC's reach: the core
  * drops an out-of-range interaction without a word, and every such call used
  * to wait out its whole timeout. Inside the ceiling, with no position, for a
- * passenger on a transport and for any game object but a mailbox, the call
- * goes out as before. The fixture creature stands ~35y from the login
+ * passenger on a transport, for any game object but a mailbox and while the
+ * character sits in a vehicle, the call goes out as before. The fixture creature stands ~35y from the login
  * position; walking up puts the character 2y from it.
  */
 import { describe, expect, test } from "bun:test";
@@ -20,6 +20,7 @@ import {
   itemCreate,
   itemQuery,
   loginSequence,
+  SELF_GUID,
   selfArrived,
   selfCreate,
 } from "./fixtures";
@@ -223,6 +224,26 @@ describe("whatever the cache cannot prove out of reach still goes out", () => {
     const client = await inWorld(stub);
     await client.questsAvailableFrom(BOARD, { timeout: 100 }).catch(() => undefined);
     expect(sent(stub)).toContain("interact");
+    client.close();
+    await stub.stop();
+  });
+
+  test("nothing is judged while the character sits in a vehicle, whose seat carries it unreported", async () => {
+    const seated = JSON.parse(
+      frame(13, "SMSG_MONSTER_MOVE_TRANSPORT", {
+        guid: SELF_GUID,
+        transportGuid: "17365880163140700004",
+        seat: 0,
+        pos: { x: 0, y: -1.5, z: 0.4 },
+        destination: { x: 0, y: 0, z: 0 },
+        durationMs: 300,
+      }),
+    ) as unknown;
+    const stub = startStub({ onConnect: () => world([seated]) });
+    const client = await inWorld(stub);
+    expect(client.state.self.vehicle).toBeDefined();
+    await client.trainerList(CREATURE_GUID, { timeout: 100 }).catch(() => undefined);
+    expect(sent(stub)).toContain("trainer_list");
     client.close();
     await stub.stop();
   });

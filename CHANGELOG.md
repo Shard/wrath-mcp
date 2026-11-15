@@ -485,9 +485,10 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   `openBank`, `openMailbox` and `mailList`, which return a window, as a thrown
   error with the same text. `TrainerListResult` and `BindResult` become unions
   for it. A call the cache cannot judge still goes out: no observed position, a
-  player, a creature riding a transport, or a game object other than a
-  mailbox. That last one narrows the quest helpers' check, which judged a
-  questgiver object too, though its reach is its model's box.
+  player, a creature riding a transport, a game object other than a mailbox,
+  or any call while the character sits in a vehicle. The game object case
+  narrows the quest helpers' check, which judged a questgiver object too,
+  though its reach is its model's box.
 
 - **What a model is told, in a few places.** `run_snippet` states the
   snippet time limit (`SNIPPET_TIME_LIMIT_MS`, 30 seconds, the hosts'
