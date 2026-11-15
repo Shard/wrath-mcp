@@ -477,6 +477,9 @@ function resolveItemTarget(state: StateCache, ref: ItemTargetRef, arg: string): 
   return { guid: own.guid, label: labelOf(own) };
 }
 
+/** `INVENTORY_SLOT_ITEM_END`: equipment, worn bags and the backpack, the slots a repair reaches; the bank's are past it. */
+const REPAIRED_SLOTS_END = 39;
+
 /** A `repairAll` second argument that is its options, not an item: a plain object of option keys alone. */
 function isRepairOptions(v: unknown): v is RepairOptions {
   if (v === null || typeof v !== "object" || Array.isArray(v)) return false;
@@ -6180,9 +6183,10 @@ export class WrathClient {
         return { ok: false, status: "no_repair", hint };
       }
       // What a repair can change, as the cache reads it: the damaged items (the one asked for, with an item) and the money.
+      // Worn and carried only: the server repairs nothing in the bank (`Player::DurabilityRepairAll`, slots below 39).
       const damaged = (): DamagedItem[] =>
         this.state.inventory.flatMap((i) =>
-          i.durability !== undefined && i.durability.current < i.durability.max && (aim === undefined || i.guid === aim.guid)
+          i.slot < REPAIRED_SLOTS_END && i.durability !== undefined && i.durability.current < i.durability.max && (aim === undefined || i.guid === aim.guid)
             ? [{ guid: i.guid, name: i.name, durability: { current: i.durability.current, max: i.durability.max } }]
             : [],
         );
