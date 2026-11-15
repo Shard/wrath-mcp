@@ -1,14 +1,17 @@
 /**
  * A host leases through a `Leaser`: the roster and the single-character
- * server's shutdown take, end and give back every lease through the one they
- * are handed, so a host that never holds the port secret (a hosted worker)
- * can be handed one that asks whoever does. Without one, both lease with the
+ * host take, end and give back every lease through the one they are handed,
+ * so a host that never holds the port secret (a hosted worker) can be handed
+ * one that asks whoever does. Without one, both lease with the
  * port secret as before.
  */
 
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { CharacterRoster, type FanoutSandbox } from "../src/fanout";
-import { sessionShutdown } from "../src/main";
+import { openHost } from "../src/host";
 import { leaseRedacted, portSecretLeaser, type Leaser, type LeaseOutcome } from "../src/module-auth";
 import { SecretRedactor } from "../src/redact";
 import type { SeatSpec, SeatView } from "../src/sandbox/host";
@@ -138,12 +141,17 @@ describe("the port-secret leaser", () => {
   });
 });
 
-describe("the single-character shutdown", () => {
-  test("logs out and releases through the leaser it is handed", async () => {
+describe("the single-character host", () => {
+  test("leases, logs out and releases through the leaser it is handed, once however often it is asked", async () => {
     const leaser = recordingLeaser();
-    const shutdown = sessionShutdown({ sandbox: { stop: async () => {} }, moduleUrl: "http://module.invalid", token: "tok-s", leaser, fetch: noModule });
-    await shutdown();
-    await shutdown();
-    expect(leaser.log).toEqual(["logout tok-s", "release tok-s"]);
+    const dir = mkdtempSync(join(tmpdir(), "wrathbench-mcp-leaser-"));
+    try {
+      const host = await openHost({ moduleUrl: "http://module.invalid", dir, token: "tok-s", account: "ACCA", grant: null, program: false, record: null, leaser, log: () => {} });
+      await host.shutdown();
+      await host.shutdown();
+      expect(leaser.log).toEqual(["lease tok-s ACCA", "logout tok-s", "release tok-s"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

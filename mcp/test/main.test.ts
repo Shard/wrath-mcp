@@ -1,14 +1,14 @@
 /**
  * The standalone server's session handling: where the token lives, what names
- * it, and what a clean exit sends. No module, no sandbox: a stub fetch and a
- * stub sandbox stand in for both.
+ * it, and what it records. No module, no sandbox: a stub fetch stands in for
+ * the module. The clean exit is the host's (`host.test.ts`).
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { recordOption, resolveSession, sessionShutdown, TOKEN_FILE } from "../src/main";
+import { recordOption, resolveSession, TOKEN_FILE } from "../src/main";
 import { DEFAULT_RETENTION_MS } from "../src/record/retention";
 import { logoutSession, moduleIdentity, tokenFingerprint, tokenTag } from "../src/module-auth";
 
@@ -86,38 +86,8 @@ function stubFetch(calls: Call[], fail = false): typeof fetch {
   }) as typeof fetch;
 }
 
-describe("sessionShutdown", () => {
-  const env = { WRATHBENCH_MODULE_SECRET: "p".repeat(32) };
-
-  test("stops the sandbox, then logs out and releases the lease with the port secret, once however often it is asked", async () => {
-    const calls: Call[] = [];
-    const order: string[] = [];
-    const sandbox = { stop: async () => void order.push("stop") };
-    const fetch = stubFetch(calls);
-    const shutdown = sessionShutdown({ sandbox, moduleUrl: "http://module:8086", token: "tok-abc", env, fetch: ((i: string | URL | Request, init?: RequestInit) => (order.push(`${init?.method} ${new URL(String(i)).pathname}`), fetch(i, init))) as typeof fetch });
-    await Promise.all([shutdown(), shutdown()]);
-    await shutdown();
-    expect(order).toEqual(["stop", "DELETE /session", "DELETE /lease"]);
-    for (const c of calls) {
-      expect(c.auth).toBe(`Bearer ${env.WRATHBENCH_MODULE_SECRET}`);
-      expect(c.body).toEqual({ token: "tok-abc" });
-    }
-  });
-
-  test("a sandbox that fails to stop and a module that is gone still finish", async () => {
-    const calls: Call[] = [];
-    const shutdown = sessionShutdown({
-      sandbox: { stop: async () => Promise.reject(new Error("wedged")) },
-      moduleUrl: "http://module:8086",
-      token: "tok-abc",
-      env,
-      fetch: stubFetch(calls, true),
-    });
-    await shutdown();
-    expect(calls.map((c) => `${c.method} ${new URL(c.url).pathname}`)).toEqual(["DELETE /session", "DELETE /lease"]);
-  });
-
-  test("logoutSession without a port secret sends no credential and never throws", async () => {
+describe("logoutSession", () => {
+  test("without a port secret sends no credential and never throws", async () => {
     const calls: Call[] = [];
     await logoutSession({ moduleUrl: "http://module:8086", token: "tok-abc", env: {}, fetch: stubFetch(calls, true) });
     expect(calls).toHaveLength(1);
@@ -151,22 +121,5 @@ describe("the session record's options", () => {
     expect(await moduleIdentity("http://worldserver:8086", {}, down)).toBeNull();
     const denied = (async () => new Response("{}", { status: 401 })) as unknown as typeof fetch;
     expect(await moduleIdentity("http://worldserver:8086", {}, denied)).toBeNull();
-  });
-
-  test("a clean exit closes the record after the sandbox has stopped", async () => {
-    const order: string[] = [];
-    const shutdown = sessionShutdown({
-      sandbox: { stop: async () => void order.push("sandbox") },
-      record: { close: async () => void order.push("record") },
-      moduleUrl: "http://worldserver:8086",
-      token: "t",
-      env: {},
-      fetch: (async () => {
-        order.push("module");
-        return new Response("{}");
-      }) as unknown as typeof fetch,
-    });
-    await shutdown();
-    expect(order.slice(0, 2)).toEqual(["sandbox", "record"]);
   });
 });
