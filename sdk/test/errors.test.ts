@@ -68,6 +68,41 @@ describe("guid argument validation", () => {
     expect(() => client.interact(true as unknown as string)).toThrow(/a boolean.*unit\.guid/s);
   });
 
+  test("options put in reclaimCorpse's optional guid slot name the real signature, not the .guid fix", async () => {
+    const client = makeClient();
+    const err = await client.reclaimCorpse({ timeout: 90000 } as unknown as string).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(TypeError);
+    const msg = (err as Error).message;
+    expect(msg).toBe(
+      'reclaimCorpse(guid) is an object with no .guid (received {"timeout":90000}), not a guid — ' +
+        "the call is reclaimCorpse(guid?, options?), the guid optional and the options second: " +
+        "sdk.reclaimCorpse(undefined, { timeout })",
+    );
+    expect(msg).not.toContain("unit.guid");
+    expect(() => client.reclaimCorpseAsync({ timeout: 1 } as unknown as string)).toThrow(
+      /reclaimCorpseAsync\(guid\) is an object with no \.guid.*takes no options.*sdk\.reclaimCorpse\(undefined, \{ timeout \}\)/s,
+    );
+  });
+
+  test("an object with no guid key reaching a strict guid argument says what it received, not the .guid fix", () => {
+    const client = makeClient();
+    try {
+      client.sellItem("1", { count: 2 } as unknown as string);
+      throw new Error("did not throw");
+    } catch (e) {
+      expect(e).toBeInstanceOf(TypeError);
+      const msg = (e as Error).message;
+      expect(msg).toContain('sellItem(..., itemGuid) is an object with no .guid (received {"count":2})');
+      expect(msg).toContain("decimal string");
+      expect(msg).not.toContain("unit.guid");
+    }
+    // An object that has a guid key is the whole-unit mistake, and keeps its .guid fix.
+    expect(() => client.sellItem("1", { guid: 5 } as unknown as string)).toThrow(/is an object, not a guid.*\.guid field itself/s);
+  });
+
   test("a decimal string passes; a model-conjured bigint is repaired, not rejected", () => {
     const client = makeClient();
     // These reach fetch against an unreachable host: the returned promise

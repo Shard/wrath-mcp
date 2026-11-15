@@ -186,8 +186,14 @@ export type GuidArg = string;
  * whole unit (`sdk.setTarget(state.closest(...))`) instead of `.guid`, and
  * letting it reach the wire buys only the module's generic `invalid_guid`,
  * which cannot name the JS call site or the `.guid` fix.
+ *
+ * An object with no `guid` key at all is not a unit, and the `.guid` fix
+ * points the wrong way: it is most often the call's options put where the
+ * guid goes (`reclaimCorpse({ timeout })`, where the guid is optional). That
+ * shape is answered with what was received and, when the caller passes it,
+ * `usage`: the helper's real signature.
  */
-function assertGuid(guid: unknown, arg: string): asserts guid is string | bigint {
+function assertGuid(guid: unknown, arg: string, usage?: string): asserts guid is string | bigint {
   if (guid === undefined || guid === null) {
     throw new TypeError(
       `${arg} is ${guid === undefined ? "undefined" : "null"} — pass a guid as its decimal ` +
@@ -200,6 +206,13 @@ function assertGuid(guid: unknown, arg: string): asserts guid is string | bigint
         `precision (targeting nothing); pass the decimal string the state cache gave you (unit.guid)`,
     );
   }
+  if (typeof guid === "object" && !Array.isArray(guid) && !("guid" in guid)) {
+    throw new TypeError(
+      `${arg} is an object with no .guid (received ${showTarget(guid)}), not a guid — ` +
+        (usage ??
+          `pass a guid as its decimal string (guids come from state.nearbyUnits(), state.closest(...), or event data)`),
+    );
+  }
   if (typeof guid !== "string" && typeof guid !== "bigint") {
     const kind = Array.isArray(guid) ? "an array" : typeof guid === "object" ? "an object" : `a ${typeof guid}`;
     throw new TypeError(
@@ -208,6 +221,15 @@ function assertGuid(guid: unknown, arg: string): asserts guid is string | bigint
     );
   }
 }
+
+/** `reclaimCorpse`'s signature, for an options object put in its optional guid's place. */
+const RECLAIM_USAGE =
+  "the call is reclaimCorpse(guid?, options?), the guid optional and the options second: " +
+  "sdk.reclaimCorpse(undefined, { timeout })";
+/** `reclaimCorpseAsync` takes no options; the waiting helper does. */
+const RECLAIM_ASYNC_USAGE =
+  "reclaimCorpseAsync(guid?) takes no options; the call that takes them is " +
+  "sdk.reclaimCorpse(undefined, { timeout })";
 
 /**
  * Resolve `activateTaxi`'s destination — a node name, through the shared
@@ -242,8 +264,8 @@ function resolveTaxiNode(window: TaxiWindow, dest: string | number): TaxiNodeRef
   );
 }
 
-function guidArg(guid: GuidArg, arg: string): string {
-  assertGuid(guid, arg);
+function guidArg(guid: GuidArg, arg: string, usage?: string): string {
+  assertGuid(guid, arg, usage);
   return typeof guid === "bigint" ? guidKey(guid) : guid;
 }
 
@@ -2550,7 +2572,7 @@ function noneStoredHint(shown: number, refusals: readonly number[]): string {
  * how far, does it show as lootable.
  */
 function lootSilenceNote(state: StateCache, guid: string): string {
-  if (state.self.health?.value.current === 0 || state.self.ghost?.value === true) {
+  if (state.self.dead) {
     return "you are dead, and the server ignores a loot from a dead character";
   }
   const obj = state.nearby.get(guidKey(guid));
@@ -5410,7 +5432,7 @@ export class WrathClient {
    * health is never read as dead.
    */
   private isCorpse(): boolean {
-    return this.state.self.health?.value.current === 0 && this.state.self.ghost?.value !== true;
+    return this.state.self.dead && this.state.self.ghost?.value !== true;
   }
 
   /**
@@ -5783,7 +5805,7 @@ export class WrathClient {
     if (this.ownCancel !== undefined && this.ownCancel.at >= cast.sentAt && this.ownCancel.spellId === cast.spellId) {
       return tally("interrupted_by_cancel");
     }
-    const dead = (): boolean => this.state.self.health?.value.current === 0 || this.state.self.ghost?.value === true;
+    const dead = (): boolean => this.state.self.dead;
     const stunned = (): boolean => this.state.self.stunned?.value === true;
     const later = (): string | undefined => (dead() ? "caster_dead" : stunned() ? "interrupted_stunned" : undefined);
     const now = later();
@@ -6727,7 +6749,7 @@ export class WrathClient {
   reclaimCorpseAsync(guid?: GuidArg): Promise<ActionResponse> {
     return this.action({
       action: "reclaim_corpse",
-      guid: guid === undefined ? undefined : guidArg(guid, "reclaimCorpse(guid)"),
+      guid: guid === undefined ? undefined : guidArg(guid, "reclaimCorpseAsync(guid)", RECLAIM_ASYNC_USAGE),
     });
   }
 
@@ -6765,7 +6787,7 @@ export class WrathClient {
     const started = Date.now();
     const deadline = started + (options.timeout ?? 25_000);
     const attemptTimeout = Math.max(100, options.attemptTimeout ?? 2_500);
-    const id = guid === undefined ? undefined : guidArg(guid, "reclaimCorpse(guid)");
+    const id = guid === undefined ? undefined : guidArg(guid, "reclaimCorpse(guid)", RECLAIM_USAGE);
 
     /** Own health as the cache last saw it: 0 = dead, 1 = a released ghost, >1 = alive. */
     const health = (): number | undefined => this.state.self.health?.value.current;

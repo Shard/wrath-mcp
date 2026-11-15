@@ -15,7 +15,9 @@
  * description says that the `scratchpad` calls return Promises (operator,
  * 2026-11-12), which changed that description where it is served and
  * nothing else; and that description states the snippet time limit
- * (operator, 2026-11-15), likewise.
+ * (operator, 2026-11-15), likewise; and `state.self` carries `dead`, a
+ * computed boolean (operator, 2026-11-16), which added that key to `self` in
+ * `state_summary`'s answer and nothing else.
  */
 
 import { expect, test } from "bun:test";

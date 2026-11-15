@@ -519,6 +519,65 @@ describe("state cache: a ghost knows where its corpse is", () => {
   });
 });
 
+describe("state cache: self.dead", () => {
+  /** The release: the ghost flag, with the health a ghost reads (1). */
+  const released = (seq: number) => ({
+    seq,
+    opcode: "SMSG_UPDATE_OBJECT",
+    opcodeId: 0x0a9,
+    ts: 1_700_000_000_000 + seq,
+    data: { blocks: 1, objects: [{ update: "values", guid: SELF_GUID, fields: { health: 1, playerFlags: 0x10 } }] },
+  });
+  const at = (frames: readonly unknown[]) => StateCache.replay(toEvents([...loginSequence, selfCreate, ...frames]), { seed: SEED });
+
+  test("alive reads false, and so does health not yet observed", () => {
+    expect(StateCache.replay([], { seed: SEED }).self.dead).toBe(false);
+    const alive = at([selfHealth(50, 30)]);
+    expect(alive.self.dead).toBe(false);
+    let branch = "alive";
+    if (alive.self.dead) branch = "dead";
+    expect(branch).toBe("alive");
+  });
+
+  test("a body not yet released reads true", () => {
+    const corpse = at([selfHealth(0, 30)]);
+    expect(corpse.self.ghost?.value).not.toBe(true);
+    expect(corpse.self.dead).toBe(true);
+    let branch = "alive";
+    if (corpse.self.dead) branch = "dead";
+    expect(branch).toBe("dead");
+  });
+
+  test("a released ghost reads true though its health reads 1, and the resurrect reads false again", () => {
+    const ghost = at([selfHealth(0, 30), released(31)]);
+    expect(ghost.self.health?.value.current).toBe(1);
+    expect(ghost.self.dead).toBe(true);
+    ghost.apply(toEvents([selfHealth(80, 40)])[0]!);
+    ghost.apply(
+      toEvents([
+        {
+          seq: 41,
+          opcode: "SMSG_UPDATE_OBJECT",
+          opcodeId: 0x0a9,
+          ts: 1_700_000_000_041,
+          data: { blocks: 1, objects: [{ update: "values", guid: SELF_GUID, fields: { playerFlags: 0 } }] },
+        },
+      ])[0]!,
+    );
+    expect(ghost.self.dead).toBe(false);
+  });
+
+  test("it is read live, shows among self's keys, and a snapshot keeps the value it read", () => {
+    const cache = at([selfHealth(50, 30)]);
+    expect(Object.keys(cache.self)).toContain("dead");
+    const before = cache.snapshot();
+    cache.apply(toEvents([selfHealth(0, 31)])[0]!);
+    expect(cache.self.dead).toBe(true);
+    expect(before.self.dead).toBe(false);
+    expect(cache.snapshot().self.dead).toBe(true);
+  });
+});
+
 describe("state cache: world queries", () => {
   const events = toEvents([
     ...loginSequence,

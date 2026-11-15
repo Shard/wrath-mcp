@@ -49,6 +49,12 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Added
 
+- **`state.self.dead`.** A plain boolean, true while the character is dead,
+  as a body not yet released (health 0) or as a released ghost (whose health
+  reads 1), and false otherwise; `if (state.self.dead)` reads right. A
+  freeplay run's revive routine tested this name, read undefined, and took a
+  corpse for alive.
+
 - **Logins an hour, per lease.** `POST /lease` takes `loginsPerHour`, set
   only by the port secret's holder and stated afresh by each lease; the
   module then counts every `POST /session` the lease's secret makes and
@@ -472,6 +478,12 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Changed
 
+- **Options in a guid's place are named as such.** A strict guid argument
+  given an object with no `guid` key, most often the call's options, now
+  says what it received instead of "pass the .guid field", which pointed
+  the wrong way, and `reclaimCorpse({ timeout })` names its real signature,
+  `reclaimCorpse(undefined, { timeout })`. An object with a `guid` key keeps
+  the `.guid` fix. A freeplay run retried the first form four times.
 - **An accept carries the quest's objective areas.** A successful
   `acceptQuestFrom` sends the `CMSG_QUEST_POI_QUERY` a client sends for a
   quest entering its log and returns the answer as `areas`, the `pois`
