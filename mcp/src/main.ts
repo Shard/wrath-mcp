@@ -60,10 +60,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fanoutGrantProblem, MAX_CHARACTERS_LIMIT, type FanoutGrant } from "./fanout";
 import { openHost } from "./host";
-import { portSecretLeaser, tokenFingerprint, tokenTag, type Leaser } from "./module-auth";
+import { tokenFingerprint, tokenTag } from "./module-auth";
 import { DEFAULT_RETENTION_MS } from "./record/retention";
-import type { SessionWriter } from "./record/writer";
-import type { SandboxHost } from "./sandbox/host";
 import { McpServer, serveStdio } from "./server";
 import { MCP_PACKAGE_VERSION } from "./version";
 
@@ -171,33 +169,6 @@ export function recordOption(argv: readonly string[], stateDir: string): { root:
     retentionMs = n * 24 * 60 * 60_000;
   }
   return { root: flag("record-dir") ?? join(dirname(stateDir), "sessions"), retentionMs };
-}
-
-/**
- * The clean exit, once however many ways it is asked for: stop the sandbox,
- * close the session record, log the character out and release the lease,
- * each bounded, through the leaser (with the port secret, unless the host
- * hands another), so a wedged child cannot hold the character in the world.
- */
-export function sessionShutdown(o: {
-  sandbox: Pick<SandboxHost, "stop">;
-  record?: Pick<SessionWriter, "close"> | undefined;
-  moduleUrl: string;
-  token: string;
-  /** Absent, `portSecretLeaser` over `moduleUrl`, `env` and `fetch`. */
-  leaser?: Leaser;
-  env?: Record<string, string | undefined>;
-  fetch?: typeof fetch;
-}): () => Promise<void> {
-  const leaser = o.leaser ?? portSecretLeaser({ moduleUrl: o.moduleUrl, ...(o.env !== undefined ? { env: o.env } : {}), ...(o.fetch !== undefined ? { fetch: o.fetch } : {}) });
-  let done: Promise<void> | undefined;
-  return () =>
-    (done ??= (async () => {
-      await Promise.race([o.sandbox.stop().catch(() => {}), Bun.sleep(5_000)]);
-      if (o.record !== undefined) await Promise.race([o.record.close().catch(() => {}), Bun.sleep(5_000)]);
-      await leaser.logout(o.token);
-      await leaser.release(o.token);
-    })());
 }
 
 async function main(): Promise<void> {
