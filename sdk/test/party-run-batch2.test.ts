@@ -10,7 +10,7 @@ import { describe, expect, test } from "bun:test";
 import { connect, longRouteNote, type WrathClient } from "../src/client";
 import { parseEventFrame, type GameEvent } from "../src/protocol";
 import { StateCache } from "../src/state";
-import { CREATURE_GUID, creatureCreate, creatureQuery, deathReleaseCleared, frames, loginSequence, SELF_GUID, selfCreate } from "./fixtures";
+import { CREATURE_GUID, creatureCreate, creatureQuery, deathReleaseCleared, frames, loginSequence, SELF_GUID, selfArrived, selfCreate } from "./fixtures";
 import { startStub, type StubServer } from "./server";
 
 const TS = 1_700_000_000_000;
@@ -237,7 +237,8 @@ describe("moveToAsync: a ghost's climb is not told fall damage is free", () => {
 
 describe("spiritHealerActivate: the result is where the server moved you", () => {
   test("the graveyard nearest the corpse, from the teleport ack that lands before the alive fields", async () => {
-    const stub = startStub({ onConnect: () => world([ghostFlags(20)]) });
+    // Walked up to the healer first (the fixture creature is ~35y from the login position).
+    const stub = startStub({ onConnect: () => world([selfArrived(19, { x: -1202, y: 980, z: 42 }), ghostFlags(20)]) });
     const client = await inWorld(stub);
     await folded(client, "SMSG_UPDATE_OBJECT", 20);
     const pending = client.spiritHealerActivate(CREATURE_GUID, { timeout: 2000 });

@@ -22,6 +22,7 @@ import {
   loginSequence,
   PLAYER_GUID,
   SELF_GUID,
+  selfArrived,
   selfCreate,
   selfHealth,
 } from "./fixtures";
@@ -64,6 +65,8 @@ async function folded(client: WrathClient, opcode: string, seq: number): Promise
 }
 
 const world = (extra: readonly unknown[] = []) => frames([...loginSequence, SPELLS, selfCreate, creatureCreate, creatureQuery, ...extra]);
+/** Within reach of the fixture creature, which stands ~35y from the login position. */
+const AT_HEALER = { x: -1202, y: 980, z: 42 };
 
 describe("castSpell: a refusal reaches the harness, named", () => {
   test("SMSG_CAST_FAILED after a castSpell is tallied with the spell, the target and what the reason means", async () => {
@@ -334,7 +337,8 @@ describe("reclaimCorpse: an abandoned wait says what was waiting", () => {
 describe("spiritHealerActivate: the result says where you are", () => {
   test("position, zone and subzone from the cache", async () => {
     const area = frame(19, "WB_AREA", { mapId: 0, mapName: "Fixture Continent", instanceType: 0, zoneId: 40, zoneName: "Fixture Vale", areaId: 20, areaName: "Mossmill" });
-    const stub = startStub({ onConnect: () => world([area, selfHealth(1, 20)]) });
+    // Walked up to the healer first (the fixture creature is ~35y from the login position).
+    const stub = startStub({ onConnect: () => world([selfArrived(18, AT_HEALER), area, selfHealth(1, 20)]) });
     const client = await inWorld(stub);
     await folded(client, "SMSG_UPDATE_OBJECT", 20);
     const pending = client.spiritHealerActivate(CREATURE_GUID, { timeout: 2000 });
@@ -455,7 +459,7 @@ describe("resurrect helpers resolve once our own fields say alive (reference run
   });
 
   test("spiritHealerActivate waits the same way, and its result already reads alive", async () => {
-    const stub = startStub({ onConnect: () => world([ghostFlags(20), ghostAura(21)]) });
+    const stub = startStub({ onConnect: () => world([selfArrived(19, AT_HEALER), ghostFlags(20), ghostAura(21)]) });
     const client = await inWorld(stub);
     await folded(client, "SMSG_AURA_UPDATE_ALL", 21);
     let settled = false;

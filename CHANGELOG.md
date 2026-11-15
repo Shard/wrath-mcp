@@ -472,6 +472,24 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Changed
 
+- **An NPC interaction from out of reach fails fast.** The core drops an
+  out-of-range interaction without a word, so these helpers used to wait out
+  their whole timeout. When the cached positions put the NPC beyond any NPC's
+  reach (30y: 5.5y, both combat reaches, the largest NPC in the pinned world
+  and slack), or a mailbox beyond its own, they now send nothing and answer at
+  once with the distance and "the trainer is 35y away — interact range is ~5y;
+  moveTo it first": `trainerList`, `buySpell`, `resetTalents`,
+  `bindAtInnkeeper`, `spiritHealerActivate`, `bankDeposit`, `bankWithdraw`,
+  `sendMail`, `takeMailMoney`, `takeMailItem` and `deleteMail` as
+  `{ ok: false, status: "too_far", distance, hint }`, and `showTaxiNodes`,
+  `openBank`, `openMailbox` and `mailList`, which return a window, as a thrown
+  error with the same text. `TrainerListResult` and `BindResult` become unions
+  for it. A call the cache cannot judge still goes out: no observed position, a
+  player, a creature riding a transport, a game object other than a mailbox,
+  or any call while the character sits in a vehicle. The game object case
+  narrows the quest helpers' check, which judged a questgiver object too,
+  though its reach is its model's box.
+
 - **What a model is told, in a few places.** `run_snippet` states the
   snippet time limit (`SNIPPET_TIME_LIMIT_MS`, 30 seconds, the hosts'
   default), and an abandoned snippet that was awaiting an SDK wait whose

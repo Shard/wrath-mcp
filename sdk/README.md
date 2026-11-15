@@ -252,13 +252,23 @@ for any still missing), and a second call with the index takes it. Defaulting
 to the first choice would hide the choice completely. An explicit index, or one
 choice or none, completes without asking.
 
-The core answers an out-of-range quest call with silence, so all three quest
-helpers refuse locally with `too_far` and the distance when the cached
-positions put the NPC beyond any questgiver's reach. That reach is 5.5 y plus
-both combat reaches, and the module does not serve the NPC's, so the ceiling is
-set by the largest questgiver in the pinned world rather than a typical one;
-nearer than that the call still goes out, and a silence is explained by the
-distance afterwards.
+The core answers an out-of-range NPC interaction with silence, so the helpers
+that would wait for its answer refuse locally with `too_far` and the distance,
+sending nothing, when the cached positions put the NPC beyond any NPC's reach:
+the three quest helpers, `trainerList`, `buySpell`, `resetTalents`,
+`bindAtInnkeeper`, `spiritHealerActivate`, `showTaxiNodes` and `openBank`, and
+the bank moves and mail calls against the banker or mailbox their frame was
+opened at. A helper that returns a verdict returns
+`{ ok: false, status: "too_far", distance, hint }`; one that returns a window
+(`showTaxiNodes`, `openBank`, `openMailbox`, `mailList`) throws the same hint.
+That reach is 5.5 y plus both combat reaches, and the module does not serve the
+NPC's, so the ceiling is set by the largest NPC in the pinned world rather than
+a typical one; a mailbox's is 10 y past its model. Nearer than that the call
+still goes out, and a silence is explained by the distance afterwards. So does
+any call the cache cannot judge: a guid with no observed position, a player, a
+creature riding a transport (its position is where the transport was), any
+game object but a mailbox (its reach is its model's box), and anything while
+the character sits in a vehicle.
 
 The questgiver marker answers before the wire too. `acceptQuestFrom` and
 `questsAvailableFrom` refuse with `nothing_on_offer` when the NPC's marker says
