@@ -133,7 +133,8 @@ describe("moveTo: a climb refused at the character's own feet reads as any drop 
     await Bun.sleep(5);
     const [drop] = client.drainActionHints();
     expect(drop).toMatchObject({ action: "moveToAsync", status: "drop" });
-    expect(drop!.hint).toEndWith(`find the ramp/stairs. ${UNSTUCK}`);
+    // The second climb of the stretch: the way out was named on the first.
+    expect(drop!.hint).toEndWith("find the ramp/stairs.");
     client.close();
     await stub.stop();
   });

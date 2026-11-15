@@ -232,6 +232,12 @@ the answer in every shape the core sends:
   `SMSG_INVENTORY_CHANGE_FAILURE` when the item does not fit, and never enters
   the log: `inventory_full`.
 
+A successful accept then asks the server for the quest's objective areas, as a
+client does for a quest entering its log (`CMSG_QUEST_POI_QUERY`), and returns
+them as `areas`, the same `pois` `questAreas(questId)` answers. The wait is
+bounded at a second; an answer that does not come back leaves `areas` off with
+a hint naming `questAreas`, and the accept stands.
+
 `turnInQuest` handles the other side of the same asymmetry. An
 `SMSG_QUESTGIVER_REQUEST_ITEMS` that says the quest *is* completable is the
 client's cue to send the completion again; a completable one (a collect quest

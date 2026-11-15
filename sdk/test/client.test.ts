@@ -86,6 +86,7 @@ import {
   castFailed,
   chestCreate,
   chestLootResponse,
+  questAreasAnswer,
 } from "./fixtures";
 import { startStub, type StubServer } from "./server";
 
@@ -2426,7 +2427,7 @@ describe("client: lootCorpse", () => {
 
 describe("client: quests", () => {
   test("acceptQuestFrom reads the quest list out of a gossip menu", async () => {
-    const stub = startStub({ onConnect: () => npcWorld() });
+    const stub = startStub({ onConnect: () => npcWorld(), rawAnswer: questAreasAnswer(500) });
     const client = await inWorld(stub);
     const pending = client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 2000 });
     await untilAction(stub, "quest_list");
@@ -2444,7 +2445,7 @@ describe("client: quests", () => {
   });
 
   test("acceptQuestFrom reads the plain questgiver list too", async () => {
-    const stub = startStub({ onConnect: () => npcWorld() });
+    const stub = startStub({ onConnect: () => npcWorld(), rawAnswer: questAreasAnswer(500) });
     const client = await inWorld(stub);
     const pending = client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 2000 });
     await untilAction(stub, "quest_list");
@@ -2457,7 +2458,7 @@ describe("client: quests", () => {
   });
 
   test("acceptQuestFrom takes a quest a single-quest NPC answered with its details", async () => {
-    const stub = startStub({ onConnect: () => npcWorld() });
+    const stub = startStub({ onConnect: () => npcWorld(), rawAnswer: questAreasAnswer(500) });
     const client = await inWorld(stub);
     const pending = client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 2000 });
     await untilAction(stub, "quest_list");
@@ -2470,7 +2471,7 @@ describe("client: quests", () => {
   });
 
   test("an auto-accept quest the hello already added is accepted with nothing more sent", async () => {
-    const stub = startStub({ onConnect: () => npcWorld() });
+    const stub = startStub({ onConnect: () => npcWorld(), rawAnswer: questAreasAnswer(500) });
     const client = await inWorld(stub);
     const pending = client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 2000 });
     await untilAction(stub, "quest_list");
@@ -2499,7 +2500,7 @@ describe("client: quests", () => {
   });
 
   test("a quest the previous hello auto-accepted is already_in_log when its log field trails the next answer", async () => {
-    const stub = startStub({ onConnect: () => npcWorld() });
+    const stub = startStub({ onConnect: () => npcWorld(), rawAnswer: questAreasAnswer(500) });
     const client = await inWorld(stub);
     const listed = client.questsAvailableFrom(CREATURE_GUID, { timeout: 2000 });
     await untilAction(stub, "quest_list");
@@ -2525,7 +2526,7 @@ describe("client: quests", () => {
   });
 
   test("the same when the log field lands between the second hello and its answer", async () => {
-    const stub = startStub({ onConnect: () => npcWorld() });
+    const stub = startStub({ onConnect: () => npcWorld(), rawAnswer: questAreasAnswer(500) });
     const client = await inWorld(stub);
     const listed = client.questsAvailableFrom(CREATURE_GUID, { timeout: 2000 });
     await untilAction(stub, "quest_list");
@@ -2543,7 +2544,7 @@ describe("client: quests", () => {
   });
 
   test("a gossip NPC whose quest query auto-accepted lists its other quests; the queried one is already_in_log", async () => {
-    const stub = startStub({ onConnect: () => npcWorld() });
+    const stub = startStub({ onConnect: () => npcWorld(), rawAnswer: questAreasAnswer(500) });
     const client = await inWorld(stub);
     await client.questDetails(CREATURE_GUID, QUEST_ID);
     stub.push(JSON.stringify(questDetails(QUEST_ID, 73)));
@@ -2605,7 +2606,7 @@ describe("client: quests", () => {
   });
 
   test("a quest a turn-in chain already added is not asked for again", async () => {
-    const stub = startStub({ onConnect: () => [...combatWorld(), JSON.stringify(questAccepted)] });
+    const stub = startStub({ onConnect: () => [...combatWorld(), JSON.stringify(questAccepted)], rawAnswer: questAreasAnswer(500) });
     const client = await inWorld(stub);
     await client.events.waitFor((e) => e.seq === 30, { timeout: 2000 });
     const result = await client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 2000 });
@@ -2697,7 +2698,7 @@ describe("client: quests", () => {
   test("a full-log refusal from before the accept is not read as its answer", async () => {
     // An auto-accept hello on a full log sends its own SMSG_QUESTLOG_FULL
     // before the accept; only one after the accept answers it.
-    const stub = startStub({ onConnect: () => [...npcWorld(), JSON.stringify(questLogFull(31))] });
+    const stub = startStub({ onConnect: () => [...npcWorld(), JSON.stringify(questLogFull(31))], rawAnswer: questAreasAnswer(500) });
     const client = await inWorld(stub);
     await client.events.waitFor((e) => e.seq === 31, { timeout: 2000 });
     const pending = client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 2000 });
@@ -2711,7 +2712,7 @@ describe("client: quests", () => {
   });
 
   test("an inventory failure from before the accept is not read as its answer", async () => {
-    const stub = startStub({ onConnect: () => [...npcWorld(), JSON.stringify(inventoryChangeFailure(31, 50))] });
+    const stub = startStub({ onConnect: () => [...npcWorld(), JSON.stringify(inventoryChangeFailure(31, 50))], rawAnswer: questAreasAnswer(500) });
     const client = await inWorld(stub);
     await client.events.waitFor((e) => e.seq === 31, { timeout: 2000 });
     const pending = client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout: 2000 });
@@ -3234,7 +3235,7 @@ describe("client: a questgiver game object", () => {
   });
 
   test("acceptQuestFrom uses the object, then accepts from it", async () => {
-    const stub = startStub({ onConnect: () => objectWorld() });
+    const stub = startStub({ onConnect: () => objectWorld(), rawAnswer: questAreasAnswer(500) });
     const client = await objectsInView(stub);
     const pending = client.acceptQuestFrom(QUEST_OBJECT, QUEST_ID, { timeout: 2000 });
     await untilAction(stub, "interact");
@@ -5848,7 +5849,7 @@ describe("client: quest-start items and the questgiver marker pre-check (2026-08
     });
 
   test("useItem on a quest-start item waits for the server's offer and names the item as the questgiver", async () => {
-    const stub = startStub({ onConnect: () => tome() });
+    const stub = startStub({ onConnect: () => tome(), rawAnswer: questAreasAnswer(500) });
     const client = await inWorld(stub);
     await client.events.waitForOpcode("SMSG_ITEM_QUERY_SINGLE_RESPONSE", { timeout: 2000 });
     const pending = client.useItem("Tome of Divinity", undefined, undefined, { timeout: 2000 });
@@ -6103,7 +6104,7 @@ describe("client: quest-start items and the questgiver marker pre-check (2026-08
     // Right after a turn-in the NPC's marker still reads `reward` until the
     // refreshed one lands, and the next quest of its chain is on offer by
     // then: refusing on the old marker would refuse a quest the server offers.
-    const stub = startStub({ onConnect: () => npcWorld() });
+    const stub = startStub({ onConnect: () => npcWorld(), rawAnswer: questAreasAnswer(95) });
     const client = await inWorld(stub);
     stub.push(JSON.stringify(questAccepted)); // seq 30
     stub.push(JSON.stringify(questGiverStatus(CREATURE_GUID, 10, 91))); // reward
@@ -6123,7 +6124,7 @@ describe("client: quest-start items and the questgiver marker pre-check (2026-08
     const after = stub.actions.length;
     const listed = client.questsAvailableFrom(CREATURE_GUID, { timeout: 2000 });
     await untilAction(stub, "quest_list", after);
-    stub.push(JSON.stringify(questGiverList([], 95)));
+    stub.push(JSON.stringify(questGiverList([], 96)));
     expect(await listed).toEqual({ ok: true, quests: [] });
     expect(client.drainActionHints()).toEqual([]);
     client.close();
@@ -6155,7 +6156,7 @@ describe("client: quest-start items and the questgiver marker pre-check (2026-08
     // McBride for 15 the moment the completion resolved turnInQuest, while
     // the cache still held `reward` from before the turn-in and no field had
     // moved yet; the call answered nothing_on_offer with nothing sent.
-    const stub = startStub({ onConnect: () => npcWorld() });
+    const stub = startStub({ onConnect: () => npcWorld(), rawAnswer: questAreasAnswer(500) });
     const client = await inWorld(stub);
     await turnedInJustNow(stub, client);
     const accept = client.acceptQuestFrom(CREATURE_GUID, OTHER_QUEST_ID, { timeout: 2000 });

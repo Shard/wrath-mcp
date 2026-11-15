@@ -1403,6 +1403,9 @@ export const MOVE_HINTS: Readonly<Record<string, (point: MovePoint, data: MoveRe
  */
 const ASYNC_MOVE_UNREPORTED: ReadonlySet<string> = new Set(["arrived", "transferred", "teleported", "superseded", "stopped"]);
 
+/** The move verdicts that took the character where a move ended it: an arrival, a portal, a teleport. */
+const MOVE_SUCCEEDED: ReadonlySet<string> = new Set(["arrived", "transferred", "teleported"]);
+
 /**
  * How long `moveToAsync` waits after an undispatched ack (no `pathLength`)
  * for the refusal that goes with it, in ms. The module emits the refusal in
@@ -1414,9 +1417,26 @@ const ASYNC_MOVE_VERDICT_MS = 250;
 
 /**
  * What a `path_incomplete` and a climb's `drop` end on: `unstuck()` named, and
- * no more. Its first call sends nothing and says what a second will do.
+ * no more. Its first call sends nothing and says what a second will do. Said
+ * once per stretch of those refusals (`moveRecipe`; operator decision,
+ * 2026-11-15).
  */
 const UNSTUCK_POINTER = 'With no way out, unstuck() is the game\'s "I\'m stuck".';
+
+/**
+ * A tally line's hint when a later failure of the same kind replaces an
+ * earlier one's: the newer text, still ending on the unstuck() pointer when
+ * the earlier one carried it, so the line that holds a stretch's first
+ * refusal keeps the sentence the later ones leave off. Wherever lines merge.
+ */
+export function mergeHintText(older: string, newer: string): string {
+  return older.includes(UNSTUCK_POINTER) && !newer.includes(UNSTUCK_POINTER) ? `${newer} ${UNSTUCK_POINTER}` : newer;
+}
+
+/** `text` without the unstuck() pointer: a remembered refusal replayed is a later one of its stretch. */
+function withoutUnstuckPointer(text: string): string {
+  return text.replace(` ${UNSTUCK_POINTER}`, "");
+}
 
 /** The refusal of a move while dead and not released; nothing is sent. */
 const DEAD_MOVE_HINT =
@@ -2673,6 +2693,15 @@ export type QuestAcceptResult =
       readonly questId: number;
       readonly quest: QuestLogEntry;
       readonly title: string | undefined;
+      /**
+       * Where the quest wants you: its objective areas, asked of the server
+       * after the accept as a client asks for a quest entering its log
+       * (`CMSG_QUEST_POI_QUERY`), the same `pois` `questAreas(questId)`
+       * answers. `[]` when the server has none for it. Absent when the answer
+       * did not come back in time, and `hint` then says how to ask again.
+       */
+      readonly areas?: readonly QuestPoi[];
+      readonly hint?: string;
     }
   | {
       readonly ok: false;
@@ -3246,6 +3275,17 @@ const SINGLE_OFFER_OPCODES: ReadonlySet<string> = new Set([
  * window; the bound leaves room for a loaded server.
  */
 const QUEST_LOG_CATCH_UP_MS = 1000;
+
+/**
+ * How long a successful `acceptQuestFrom` waits for the quest's objective
+ * areas (`withQuestAreas`). The server answers the query from the session's
+ * own packet handler; the bound keeps a slow answer from holding the accept.
+ */
+const ACCEPT_AREAS_MS = 1000;
+
+/** An accepted quest whose objective areas did not come back in time: how to ask again. */
+const acceptAreasHint = (questId: number): string =>
+  `its objective areas did not come back in time; questAreas(${questId}) asks for them again`;
 
 /**
  * `QuestFailedReason` (QuestDef.h) as the reason a quest cannot be taken, in
@@ -4713,6 +4753,12 @@ export class WrathClient {
 
   /** Until when (epoch ms) a first `unstuck()` stays armed for the confirming call; undefined when not armed. */
   private unstuckArmedUntil: number | undefined;
+  /**
+   * The stretch of stranded refusals (`path_incomplete`, a climb's `drop`)
+   * whose first carried the unstuck() pointer: that refusal's moveId, in the
+   * session epoch it was answered in. Undefined when no stretch is open.
+   */
+  private unstuckNamedFor: { readonly moveId: number; readonly epoch: number } | undefined;
   /** When each spell of ours last went off (`SMSG_SPELL_GO`, the module's stamp), for a `not_ready` to say (`notReadyDetail`). */
   private readonly ownCastAt = new Map<number, number>();
   /** The last cast of ours that went off, whatever the spell. */
@@ -4803,6 +4849,8 @@ export class WrathClient {
       }
       const d = e.data as MoveResultData;
       this.lastMoveVerdictId = Math.max(this.lastMoveVerdictId, d.moveId);
+      // A stretch of stranded refusals ends when a move arrives (or a portal or teleport ends one).
+      if (MOVE_SUCCEEDED.has(d.status)) this.unstuckNamedFor = undefined;
       // A move refused at planning never moved the character: it is no walk
       // of ours, whatever it was sent during.
       if (NEVER_MOVED.has(d.status) || rootedRefusal(d)) {
@@ -4921,7 +4969,7 @@ export class WrathClient {
       action,
       status,
       count: (prev?.count ?? 0) + 1,
-      hint,
+      hint: prev === undefined ? hint : mergeHintText(prev.hint, hint),
       ...(point !== undefined ? { point: { x: point.x, y: point.y, z: point.z } } : {}),
       ts: Date.now(),
       ...(origin !== undefined ? { origin } : {}),
@@ -5341,7 +5389,19 @@ export class WrathClient {
     // out (operator decision, 2026-11-12). Last, after the flight a flyer
     // has, so the harness block's cut takes it first.
     const stranded = status === "path_incomplete" || (status === "drop" && data.dz !== undefined && data.dz > 0);
-    return `${recipe}${fly}${stranded ? ` ${UNSTUCK_POINTER}` : ""}`;
+    return `${recipe}${fly}${stranded && this.opensUnstuckStretch(data.moveId) ? ` ${UNSTUCK_POINTER}` : ""}`;
+  }
+
+  /**
+   * Whether this stranded refusal is the first of its stretch, the one that
+   * names unstuck(): true when no stretch is open (which opens one) and for
+   * the refusal that opened it, whose recipe a `moveToAsync` builds twice.
+   */
+  private opensUnstuckStretch(moveId: number): boolean {
+    const open = this.unstuckNamedFor;
+    if (open !== undefined && open.epoch === this.events.epoch) return open.moveId === moveId;
+    this.unstuckNamedFor = { moveId, epoch: this.events.epoch };
+    return true;
   }
 
   /**
@@ -8835,7 +8895,12 @@ export class WrathClient {
       // into the cache, so `recallMoveRejection` compares like with like.
       const here = this.state.self.position?.value;
       if (here !== undefined) {
-        this.lastMoveRejection = { point, from: here, at: Date.now(), status, recipe, result };
+        // Pointer-free: a repeat is a later refusal of the stretch this one is in.
+        const replay =
+          recipe === undefined
+            ? { recipe, result }
+            : { recipe: withoutUnstuckPointer(recipe), result: hint === undefined ? result : { ...result, hint: withoutUnstuckPointer(hint) } };
+        this.lastMoveRejection = { point, from: here, at: Date.now(), status, ...replay };
       }
     }
     return result;
@@ -9517,120 +9582,144 @@ export class WrathClient {
    * `SMSG_GOSSIP_MESSAGE` carrying the quests rather than an
    * `SMSG_QUESTGIVER_QUEST_LIST`, and one with a single quest answers with
    * that quest's own window. And the log is checked *first*, because a
-   * turn-in chain may already have added the quest for us.
+   * turn-in chain may already have added the quest for us. A success carries
+   * the quest's objective areas (`areas`), asked as a client asks after an
+   * accept.
    */
   async acceptQuestFrom(
     npcGuid: GuidOrUnit,
     questId: number,
     options: QuestOptions = {},
   ): Promise<WithResolved<QuestAcceptResult>> {
-    return this.byName(npcGuid, "acceptQuestFrom(npcGuid, questId)", async (npc) => {
-      const timeout = options.timeout ?? 10_000;
-      const inLog = this.state.quest(questId);
-      if (inLog) {
-        return { ok: true, status: "already_in_log", questId, quest: inLog, title: undefined };
-      }
+    const timeout = options.timeout ?? 10_000;
+    return this.byName(npcGuid, "acceptQuestFrom(npcGuid, questId)", async (npc) =>
+      this.withQuestAreas(await this.acceptQuestOnce(npc, questId, timeout), timeout),
+    );
+  }
 
-      let wanted: QuestOfferRow | undefined;
-      const carried = this.state.bag().items.find((i) => i.guid === npc);
-      if (carried !== undefined) {
-        // A quest-start item is its own questgiver: there is no quest list to
-        // ask it for (CMSG_QUESTGIVER_HELLO on an item guid is dropped), so the
-        // offer is the details the server sends for the query — the same
-        // packet useItem waits for.
-        const answer = await this.questDetailsFrom(npc, questId, timeout, carried);
-        if (answer.offer === undefined) {
-          const hint = questInvalidHint(questId, answer.refused);
-          this.noteActionHint("acceptQuestFrom", "refused", hint);
-          return { ok: false, status: "refused", questId, reason: answer.refused, hint };
-        }
-        const offer = answer.offer;
-        wanted = { questId: offer.questId, title: offer.title, icon: 0, level: 0 };
-      } else {
-        const offered = await this.questOffer(npc, timeout);
-        if ("nothing" in offered) {
-          this.noteActionHint("acceptQuestFrom", "nothing_on_offer", offered.hint);
-          return { ok: false, status: "nothing_on_offer", questId, offered: [], hint: offered.hint };
-        }
-        if ("tooFar" in offered) {
-          this.noteActionHint("acceptQuestFrom", "too_far", offered.hint);
-          return { ok: false, status: "too_far", questId, distance: offered.tooFar, hint: offered.hint };
-        }
-        wanted = offered.quests.find((q) => q.questId === questId);
-        if (!wanted) {
-          const landed = await this.questTakenByItsOwnOffer(npc, questId, timeout);
-          if (landed !== undefined) {
-            return { ok: true, status: "already_in_log", questId, quest: landed.quest, title: landed.title };
-          }
-          return { ok: false, status: "not_offered", questId, offered: offered.quests };
-        }
-        // An auto-accept quest offered on its own is added to the log by the
-        // hello itself; there is nothing left to accept.
-        const added = this.state.quest(questId);
-        if (added !== undefined) return { ok: true, status: "accepted", questId, quest: added, title: wanted.title };
-      }
+  /**
+   * A successful accept with the quest's objective areas, asked as a client
+   * asks for a quest that enters its log. The accept stands whatever the
+   * query does: an answer that does not come back within `ACCEPT_AREAS_MS`
+   * (or the caller's timeout, if shorter) leaves `areas` off and says how to
+   * ask again.
+   */
+  private async withQuestAreas(result: QuestAcceptResult, timeout: number): Promise<QuestAcceptResult> {
+    if (!result.ok) return result;
+    try {
+      const [answered] = await this.askQuestAreas([result.questId], Math.min(timeout, ACCEPT_AREAS_MS));
+      return { ...result, areas: answered?.pois ?? [] };
+    } catch {
+      return { ...result, hint: acceptAreasHint(result.questId) };
+    }
+  }
 
-      // Raced against the quest landing in the log: a quest that gives an item
-      // on accept is refused with SMSG_INVENTORY_CHANGE_FAILURE when the item
-      // does not fit, and the quest is never added — the same answer
-      // turnInQuest reads for a reward that does not fit. A full log is
-      // refused with the bodiless SMSG_QUESTLOG_FULL, likewise adding nothing.
-      // Only a refusal after this accept counts: an auto-accept hello on a
-      // full log sends one of its own before it.
-      const sinceSeq = this.events.recent(1)[0]?.seq;
-      await this.questAccept(npc, questId);
-      let quest = this.state.quest(questId);
-      let refused: InventoryChangeFailureData | undefined;
-      let logFull = false;
-      let invalid: QuestGiverQuestInvalidData | undefined;
-      if (quest === undefined) {
-        await this.waitEvent(
-          (e) => {
-            quest = this.state.quest(questId);
-            if (quest !== undefined) return true;
-            if (sinceSeq !== undefined && e.seq <= sinceSeq) return false;
-            if (isEvent(e, "SMSG_QUESTLOG_FULL")) {
-              logFull = true;
-              return true;
-            }
-            if (isEvent(e, "SMSG_QUESTGIVER_QUEST_INVALID") && !isDecodeError(e.data)) {
-              invalid = e.data as QuestGiverQuestInvalidData;
-              return true;
-            }
-            if (isEvent(e, "SMSG_INVENTORY_CHANGE_FAILURE") && !isDecodeError(e.data)) {
-              refused = e.data as InventoryChangeFailureData;
-              return true;
-            }
-            return false;
-          },
-          {
-            timeout,
-            ...(sinceSeq === undefined ? {} : { sinceSeq: sinceSeq + 1 }),
-            description:
-              `quest ${questId} to appear in the quest log after accept ` +
-              `(or SMSG_INVENTORY_CHANGE_FAILURE, SMSG_QUESTLOG_FULL or SMSG_QUESTGIVER_QUEST_INVALID)`,
-          },
-        );
-      }
-      if (quest === undefined && invalid !== undefined) {
-        const hint = questInvalidHint(questId, invalid.reason);
+  /** `acceptQuestFrom` without the objective areas: the accept itself. */
+  private async acceptQuestOnce(npc: string, questId: number, timeout: number): Promise<QuestAcceptResult> {
+    const inLog = this.state.quest(questId);
+    if (inLog) {
+      return { ok: true, status: "already_in_log", questId, quest: inLog, title: undefined };
+    }
+
+    let wanted: QuestOfferRow | undefined;
+    const carried = this.state.bag().items.find((i) => i.guid === npc);
+    if (carried !== undefined) {
+      // A quest-start item is its own questgiver: there is no quest list to
+      // ask it for (CMSG_QUESTGIVER_HELLO on an item guid is dropped), so the
+      // offer is the details the server sends for the query — the same
+      // packet useItem waits for.
+      const answer = await this.questDetailsFrom(npc, questId, timeout, carried);
+      if (answer.offer === undefined) {
+        const hint = questInvalidHint(questId, answer.refused);
         this.noteActionHint("acceptQuestFrom", "refused", hint);
-        return { ok: false, status: "refused", questId, reason: invalid.reason, hint };
+        return { ok: false, status: "refused", questId, reason: answer.refused, hint };
       }
-      if (quest === undefined && logFull) {
-        this.noteActionHint("acceptQuestFrom", "quest_log_full", QUEST_LOG_FULL_HINT);
-        return { ok: false, status: "quest_log_full", questId, hint: QUEST_LOG_FULL_HINT };
+      const offer = answer.offer;
+      wanted = { questId: offer.questId, title: offer.title, icon: 0, level: 0 };
+    } else {
+      const offered = await this.questOffer(npc, timeout);
+      if ("nothing" in offered) {
+        this.noteActionHint("acceptQuestFrom", "nothing_on_offer", offered.hint);
+        return { ok: false, status: "nothing_on_offer", questId, offered: [], hint: offered.hint };
       }
-      if (quest === undefined && refused !== undefined) {
-        const named = inventoryResultText(refused.result);
-        const hint =
-          `the item this quest hands over on accept could not be stored (InventoryResult ${refused.result}` +
-          `${named ? `: ${named}` : ""}) — free a bag slot (sell or destroyItem), then accept again`;
-        this.noteActionHint("acceptQuestFrom", "inventory_full", hint);
-        return { ok: false, status: "inventory_full", questId, result: refused.result, hint };
+      if ("tooFar" in offered) {
+        this.noteActionHint("acceptQuestFrom", "too_far", offered.hint);
+        return { ok: false, status: "too_far", questId, distance: offered.tooFar, hint: offered.hint };
       }
-      return { ok: true, status: "accepted", questId, quest: quest as QuestLogEntry, title: wanted.title };
-    });
+      wanted = offered.quests.find((q) => q.questId === questId);
+      if (!wanted) {
+        const landed = await this.questTakenByItsOwnOffer(npc, questId, timeout);
+        if (landed !== undefined) {
+          return { ok: true, status: "already_in_log", questId, quest: landed.quest, title: landed.title };
+        }
+        return { ok: false, status: "not_offered", questId, offered: offered.quests };
+      }
+      // An auto-accept quest offered on its own is added to the log by the
+      // hello itself; there is nothing left to accept.
+      const added = this.state.quest(questId);
+      if (added !== undefined) return { ok: true, status: "accepted", questId, quest: added, title: wanted.title };
+    }
+
+    // Raced against the quest landing in the log: a quest that gives an item
+    // on accept is refused with SMSG_INVENTORY_CHANGE_FAILURE when the item
+    // does not fit, and the quest is never added — the same answer
+    // turnInQuest reads for a reward that does not fit. A full log is
+    // refused with the bodiless SMSG_QUESTLOG_FULL, likewise adding nothing.
+    // Only a refusal after this accept counts: an auto-accept hello on a
+    // full log sends one of its own before it.
+    const sinceSeq = this.events.recent(1)[0]?.seq;
+    await this.questAccept(npc, questId);
+    let quest = this.state.quest(questId);
+    let refused: InventoryChangeFailureData | undefined;
+    let logFull = false;
+    let invalid: QuestGiverQuestInvalidData | undefined;
+    if (quest === undefined) {
+      await this.waitEvent(
+        (e) => {
+          quest = this.state.quest(questId);
+          if (quest !== undefined) return true;
+          if (sinceSeq !== undefined && e.seq <= sinceSeq) return false;
+          if (isEvent(e, "SMSG_QUESTLOG_FULL")) {
+            logFull = true;
+            return true;
+          }
+          if (isEvent(e, "SMSG_QUESTGIVER_QUEST_INVALID") && !isDecodeError(e.data)) {
+            invalid = e.data as QuestGiverQuestInvalidData;
+            return true;
+          }
+          if (isEvent(e, "SMSG_INVENTORY_CHANGE_FAILURE") && !isDecodeError(e.data)) {
+            refused = e.data as InventoryChangeFailureData;
+            return true;
+          }
+          return false;
+        },
+        {
+          timeout,
+          ...(sinceSeq === undefined ? {} : { sinceSeq: sinceSeq + 1 }),
+          description:
+            `quest ${questId} to appear in the quest log after accept ` +
+            `(or SMSG_INVENTORY_CHANGE_FAILURE, SMSG_QUESTLOG_FULL or SMSG_QUESTGIVER_QUEST_INVALID)`,
+        },
+      );
+    }
+    if (quest === undefined && invalid !== undefined) {
+      const hint = questInvalidHint(questId, invalid.reason);
+      this.noteActionHint("acceptQuestFrom", "refused", hint);
+      return { ok: false, status: "refused", questId, reason: invalid.reason, hint };
+    }
+    if (quest === undefined && logFull) {
+      this.noteActionHint("acceptQuestFrom", "quest_log_full", QUEST_LOG_FULL_HINT);
+      return { ok: false, status: "quest_log_full", questId, hint: QUEST_LOG_FULL_HINT };
+    }
+    if (quest === undefined && refused !== undefined) {
+      const named = inventoryResultText(refused.result);
+      const hint =
+        `the item this quest hands over on accept could not be stored (InventoryResult ${refused.result}` +
+        `${named ? `: ${named}` : ""}) — free a bag slot (sell or destroyItem), then accept again`;
+      this.noteActionHint("acceptQuestFrom", "inventory_full", hint);
+      return { ok: false, status: "inventory_full", questId, result: refused.result, hint };
+    }
+    return { ok: true, status: "accepted", questId, quest: quest as QuestLogEntry, title: wanted.title };
   }
 
   /**
@@ -10473,6 +10562,17 @@ export class WrathClient {
     // Every id is in the log, which holds at most MAX_QUEST_LOG_SIZE (25), the
     // most one query may name (WorldSession::HandleQuestPOIQuery drops a longer
     // one unanswered), so one query always covers the ask.
+    return { ok: true, status: "answered", quests: await this.askQuestAreas(asked, timeout) };
+  }
+
+  /**
+   * `CMSG_QUEST_POI_QUERY` for quests in the log and the server's answer, in
+   * the order asked. Throws `EventTimeoutError` when no answer comes in time.
+   */
+  private async askQuestAreas(
+    asked: readonly number[],
+    timeout: number,
+  ): Promise<{ readonly questId: number; readonly title: string | undefined; readonly pois: readonly QuestPoi[] }[]> {
     const sinceSeq = this.events.recent(1)[0]?.seq;
     await this.raw("CMSG_QUEST_POI_QUERY", [{ u32: asked.length }, ...asked.map((id) => ({ u32: id }))]);
     const reply = await this.waitEvent(
@@ -10484,11 +10584,7 @@ export class WrathClient {
       { timeout, description: `the objective areas of quest ${asked.join(", ")} (SMSG_QUEST_POI_QUERY_RESPONSE)` },
     );
     const answered = new Map((reply.data as QuestPoiQueryResponseData).quests.map((q) => [q.questId, q.pois] as const));
-    return {
-      ok: true,
-      status: "answered",
-      quests: asked.map((questId) => ({ questId, title: this.state.quests.get(questId)?.value.title, pois: answered.get(questId) ?? [] })),
-    };
+    return asked.map((questId) => ({ questId, title: this.state.quests.get(questId)?.value.title, pois: answered.get(questId) ?? [] }));
   }
 
   /**
@@ -10951,8 +11047,12 @@ export const CLIENT_PLUMBING: ReadonlySet<string> = new Set([
   "postMoveTo",
   "watchAsyncMove",
   "moveRecipe",
+  "opensUnstuckStretch",
   "asyncMoveRecipe",
   "isCorpse",
+  "acceptQuestOnce",
+  "withQuestAreas",
+  "askQuestAreas",
   "trackedCast",
   "dispatchCast",
   "castVerdict",

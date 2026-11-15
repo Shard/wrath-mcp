@@ -37,6 +37,12 @@ export interface StubOptions {
    * acks a dispatched walk with its route's `pathLength` and `etaMs`.
    */
   moveToAck?: (moveId: number) => Record<string, unknown>;
+  /**
+   * Frames the game answers a `raw` action with, pushed once its ack is out.
+   * The stub has no server behind it, so a test that wants an answer to a
+   * raw query (the area query a successful accept sends) says what it is.
+   */
+  rawAnswer?: (action: RecordedAction) => readonly string[] | undefined;
 }
 
 export interface CharacterDeleteBody {
@@ -199,6 +205,10 @@ export function startStub(options: StubOptions = {}): StubServer {
           if (action === "move_to") {
             const moveId = ++moveIdGen;
             return json({ ok: true, action, moveId, ...(options.moveToAck?.(moveId) ?? {}) });
+          }
+          if (action === "raw") {
+            const answer = options.rawAnswer?.({ ...(body as object), action } as RecordedAction);
+            if (answer !== undefined) setTimeout(() => answer.forEach((f) => sockets.forEach((ws) => ws.send(f))), 0);
           }
           if (action === "face") {
             const b = body as { orientation?: number; x?: number; y?: number };
