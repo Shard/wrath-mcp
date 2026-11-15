@@ -15,6 +15,7 @@ export {
   connect,
   inventoryResultText,
   KNOWN_ERROR_CODES,
+  mergeHintText,
   TRAINER_SPELL_STATE,
   WrathClient,
   WrathRequestError,

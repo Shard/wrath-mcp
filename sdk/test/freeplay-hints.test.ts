@@ -9,7 +9,7 @@
  */
 import { describe, expect, test } from "bun:test";
 
-import { connect, WrathRequestError, type WrathClient } from "../src/client";
+import { connect, mergeHintText, WrathRequestError, type WrathClient } from "../src/client";
 import { EventTimeoutError } from "../src/events";
 import {
   CREATURE_GUID,
@@ -313,11 +313,16 @@ describe("a refused move: the point as a field, and the way out named", () => {
     // The harness block cuts a hint at 320 characters (mcp, ACTION_HINT_RENDER):
     // with coordinates as long as the world has, the pointer still fits.
     expect(walker.length).toBeLessThanOrEqual(320);
-    push(stub, frame(91, "WB_FLIGHT_STATE", { canFly: true, airborne: false }));
-    await folded(client, 91);
-    const again = client.moveTo({ ...far, y: far.y + 1 });
+    // An arrival ends the stretch, so the next refusal names the way out again.
+    const walk = client.moveTo({ x: -1230, y: 980, z: 42 });
     await untilAction(stub, "move_to", 2);
-    push(stub, moveResult(92, 2, "path_incomplete", { reachedPos }));
+    push(stub, moveResult(91, 2, "arrived"));
+    expect(await walk).toMatchObject({ ok: true, status: "arrived" });
+    push(stub, frame(92, "WB_FLIGHT_STATE", { canFly: true, airborne: false }));
+    await folded(client, 92);
+    const again = client.moveTo({ ...far, y: far.y + 1 });
+    await untilAction(stub, "move_to", 3);
+    push(stub, moveResult(93, 3, "path_incomplete", { reachedPos }));
     expect((await again).hint).toEndWith(
       `or approach from another side. You can fly here (state.self.canFly): moveTo(p, { fly: true }) flies a straight line to the point. ${UNSTUCK}`,
     );
@@ -346,6 +351,82 @@ describe("a refused move: the point as a field, and the way out named", () => {
     expect(await refused(92, 3, "target_off_mesh", { nearest: null })).not.toContain("unstuck");
     client.close();
     await stub.stop();
+  });
+});
+
+describe("the way out, once per stretch of stranded refusals (operator decision, 2026-11-15)", () => {
+  const reachedPos = { x: -1210.5, y: 960.25, z: 61.5 };
+  const pathHint = (y: number) =>
+    `the walkable mesh has no continuous route to (-1200.0, ${y.toFixed(1)}); it ends at reachedPos (-1210.5, 960.3, z 61.5), ` +
+    "22y above the point asked for. The module already tried one subdivision. Route around (a road, a ramp, a door) " +
+    "or approach from another side.";
+
+  test("named on the first path_incomplete, left off the second, named again after an arrival ends the stretch", async () => {
+    const stub = startStub({ onConnect: () => world() });
+    const client = await inWorld(stub);
+    const refused = async (n: number, seq: number) => {
+      const pending = client.moveTo({ x: -1200, y: 950 + n, z: 40 });
+      await untilAction(stub, "move_to", n);
+      push(stub, moveResult(seq, n, "path_incomplete", { reachedPos }));
+      return (await pending).hint ?? "";
+    };
+    const first = await refused(1, 90);
+    expect(first).toEndWith(`or approach from another side. ${UNSTUCK}`);
+    const second = await refused(2, 91);
+    expect(second).toBe(pathHint(952));
+    // One harness line for both, and it keeps the sentence its first carried.
+    const [line] = client.drainActionHints();
+    expect(line).toMatchObject({ action: "moveTo", status: "path_incomplete", count: 2 });
+    expect(line!.hint).toBe(`${pathHint(952)} ${UNSTUCK}`);
+    // The next snippet's line is the later refusals', without it.
+    expect(await refused(3, 92)).not.toContain("unstuck");
+    expect(client.drainActionHints()[0]!.hint).not.toContain("unstuck");
+
+    const walk = client.moveTo({ x: -1230, y: 980, z: 42 });
+    await untilAction(stub, "move_to", 4);
+    push(stub, moveResult(93, 4, "arrived"));
+    expect(await walk).toMatchObject({ ok: true, status: "arrived" });
+    expect(await refused(5, 94)).toBe(`${pathHint(955)} ${UNSTUCK}`);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a moveToAsync that opens the stretch names it in its answer and its harness line alike", async () => {
+    const stub = startStub({ onConnect: () => world() });
+    const client = await inWorld(stub);
+    const queued = client.moveToAsync({ x: -1200, y: 951, z: 40 });
+    await untilAction(stub, "move_to");
+    push(stub, moveResult(90, 1, "path_incomplete", { reachedPos }));
+    const ack = (await queued) as { hint?: string };
+    expect(ack.hint).toBe(`${pathHint(951)} ${UNSTUCK}`);
+    await folded(client, 90);
+    await Bun.sleep(5);
+    expect(client.drainActionHints()).toMatchObject([{ action: "moveToAsync", status: "path_incomplete", hint: `${pathHint(951)} ${UNSTUCK}` }]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a repeated climb answered from the remembered refusal is a later one of the stretch", async () => {
+    const stub = startStub({ onConnect: () => world() });
+    const client = await inWorld(stub);
+    const edge = { x: -1234.5, y: 987.25, z: 42.125 };
+    const point = { x: -1200, y: 950, z: 40 };
+    const pending = client.moveTo(point);
+    await untilAction(stub, "move_to");
+    push(stub, moveResult(90, 1, "drop", { dz: 5.2, reachedPos: edge }));
+    expect((await pending).hint).toEndWith(`find the ramp/stairs. ${UNSTUCK}`);
+    const repeat = await client.moveTo(point);
+    expect(stub.actions.filter((a) => a.action === "move_to")).toHaveLength(1);
+    expect(repeat).toMatchObject({ ok: false, status: "drop" });
+    expect(repeat.hint).toEndWith("find the ramp/stairs.");
+    client.close();
+    await stub.stop();
+  });
+
+  test("mergeHintText keeps the sentence an earlier hint of the line carried", () => {
+    expect(mergeHintText(`a. ${UNSTUCK}`, "b.")).toBe(`b. ${UNSTUCK}`);
+    expect(mergeHintText("a.", "b.")).toBe("b.");
+    expect(mergeHintText(`a. ${UNSTUCK}`, `b. ${UNSTUCK}`)).toBe(`b. ${UNSTUCK}`);
   });
 });
 

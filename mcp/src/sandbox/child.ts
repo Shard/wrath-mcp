@@ -128,7 +128,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
-import { API_MD_PATH as SDK_API_MD_PATH, EventAbortedError, isGroupOrWhisperChat, WrathClient, type StreamEvent } from "@wrathbench/sdk";
+import { API_MD_PATH as SDK_API_MD_PATH, EventAbortedError, isGroupOrWhisperChat, mergeHintText, WrathClient, type StreamEvent } from "@wrathbench/sdk";
 import { callSiteLabel, SNIPPET_URL } from "./call-site";
 import { keepsAnswer, reparseFrame } from "./client-cache";
 import { toJsonSafe } from "../jsonsafe";
@@ -845,7 +845,11 @@ function drainSeatHints(seat: Seat, current?: number): ActionHintNote[] {
       out.push(h);
       continue;
     }
-    const merged = h.ts >= prev.ts ? { ...h, count: prev.count + h.count } : { ...prev, count: prev.count + h.count };
+    // The newer hint, keeping a sentence the older one's stretch carried (`mergeHintText`).
+    const merged =
+      h.ts >= prev.ts
+        ? { ...h, count: prev.count + h.count, hint: mergeHintText(prev.hint, h.hint) }
+        : { ...prev, count: prev.count + h.count, hint: mergeHintText(h.hint, prev.hint) };
     out[out.indexOf(prev)] = merged;
     own.set(key, merged);
   }

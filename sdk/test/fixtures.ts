@@ -1439,3 +1439,18 @@ export function chestLootResponse(seq: number, gold = 0): unknown {
     data: { guid: CHEST_GUID, lootType: 6, gold, items: [{ slot: 0, itemId: ITEM_ENTRY, count: 1, slotType: 0 }] },
   };
 }
+
+/**
+ * A stub's `rawAnswer` for `CMSG_QUEST_POI_QUERY`: the server's
+ * `SMSG_QUEST_POI_QUERY_RESPONSE` at `seq`, each quest the query named with
+ * `pois` (none by default). Read off the raw body: `u32 count, u32 questId × count`.
+ */
+export function questAreasAnswer(seq: number, pois: readonly unknown[] = []) {
+  return (action: { action: string; [key: string]: unknown }): readonly string[] | undefined => {
+    if (action.opcode !== "CMSG_QUEST_POI_QUERY" || typeof action.payload !== "string") return undefined;
+    const bytes = Buffer.from(action.payload, "hex");
+    const ids = Array.from({ length: bytes.readUInt32LE(0) }, (_, i) => bytes.readUInt32LE(4 + 4 * i));
+    const data = { quests: ids.map((questId) => ({ questId, pois })) };
+    return [JSON.stringify({ seq, opcode: "SMSG_QUEST_POI_QUERY_RESPONSE", opcodeId: 0x1e4, ts: 1_700_000_000_000 + seq, data })];
+  };
+}

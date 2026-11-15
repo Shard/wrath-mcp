@@ -8,7 +8,23 @@ import { describe, expect, test } from "bun:test";
 import { connect } from "../src/client";
 import { isKnownOpcode, parseEventFrame, type GameEvent } from "../src/protocol";
 import { StateCache } from "../src/state";
-import { frames, loginSequence, OTHER_QUEST_ID, QUEST_ID, questAccepted, questChained, questQueryResponse, SELF_GUID, selfCreate } from "./fixtures";
+import {
+  CREATURE_GUID,
+  creatureCreate,
+  creatureQuery,
+  frames,
+  loginSequence,
+  OTHER_QUEST_ID,
+  QUEST_ID,
+  questAccepted,
+  questAreasAnswer,
+  questChained,
+  questGiverList,
+  questQueryResponse,
+  SELF_GUID,
+  selfArrived,
+  selfCreate,
+} from "./fixtures";
 import { startStub, type StubServer } from "./server";
 
 const TS = 1_700_000_000_000;
@@ -122,5 +138,64 @@ describe("client: questAreas", () => {
     expect(empty.actions.filter((a) => a.action === "raw")).toEqual([]);
     client2.close();
     await empty.stop();
+  });
+});
+
+describe("client: acceptQuestFrom carries the quest's objective areas", () => {
+  /** In world beside the fixture questgiver. */
+  const npcWorld = () => frames([...loginSequence, selfCreate, creatureCreate, creatureQuery, selfArrived(20, { x: -1202, y: 980, z: 42 })]);
+
+  /** An accept through the questgiver's list, answered up to the quest landing in the log. */
+  async function accepted(stub: StubServer, client: Awaited<ReturnType<typeof inWorld>>, timeout = 2000) {
+    const pending = client.acceptQuestFrom(CREATURE_GUID, QUEST_ID, { timeout });
+    await untilAction(stub, "quest_list");
+    stub.push(JSON.stringify(questGiverList([QUEST_ID], 75)));
+    await untilAction(stub, "quest_accept");
+    stub.push(JSON.stringify({ ...(questAccepted as object), seq: 76 }));
+    return pending;
+  }
+
+  test("a successful accept asks for the quest's areas, as a client does, and carries them", async () => {
+    const stub = startStub({ onConnect: npcWorld, rawAnswer: questAreasAnswer(77, AREAS) });
+    const client = await inWorld(stub);
+    const result = await accepted(stub, client);
+    const asked = stub.actions.filter((a) => a.action === "raw");
+    expect(asked).toEqual([expect.objectContaining({ opcode: "CMSG_QUEST_POI_QUERY", payload: u32Hex(1) + u32Hex(QUEST_ID) })]);
+    expect(result).toMatchObject({ ok: true, status: "accepted", questId: QUEST_ID, areas: AREAS });
+    expect((result as { hint?: string }).hint).toBeUndefined();
+    expect(client.state.questPois.get(QUEST_ID)?.value).toEqual(AREAS);
+    expect(client.drainActionHints()).toEqual([]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("an accept whose area query goes unanswered still succeeds, within the bound, and says how to ask again", async () => {
+    const stub = startStub({ onConnect: npcWorld });
+    const client = await inWorld(stub);
+    // The caller's timeout is 5 s; the wait for the areas is bounded at 1 s on its own.
+    const started = Date.now();
+    const result = await accepted(stub, client, 5000);
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(result).toMatchObject({ ok: true, status: "accepted", questId: QUEST_ID });
+    expect((result as { areas?: unknown }).areas).toBeUndefined();
+    expect((result as { hint?: string }).hint).toBe(
+      `its objective areas did not come back in time; questAreas(${QUEST_ID}) asks for them again`,
+    );
+    // A success: nothing for the harness block.
+    expect(client.drainActionHints()).toEqual([]);
+    client.close();
+    await stub.stop();
+  });
+
+  test("an accept whose area query the module refuses still succeeds", async () => {
+    const refused = (): Response =>
+      new Response(JSON.stringify({ ok: false, error: "not_in_world" }), { status: 409, headers: { "content-type": "application/json" } });
+    const stub = startStub({ onConnect: npcWorld, failAction: (action) => (action === "raw" ? refused() : undefined) });
+    const client = await inWorld(stub);
+    const result = await accepted(stub, client);
+    expect(result).toMatchObject({ ok: true, status: "accepted", questId: QUEST_ID });
+    expect((result as { hint?: string }).hint).toContain(`questAreas(${QUEST_ID})`);
+    client.close();
+    await stub.stop();
   });
 });

@@ -472,6 +472,19 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Changed
 
+- **An accept carries the quest's objective areas.** A successful
+  `acceptQuestFrom` sends the `CMSG_QUEST_POI_QUERY` a client sends for a
+  quest entering its log and returns the answer as `areas`, the `pois`
+  `questAreas(questId)` gives, waiting at most a second for it. An answer
+  that does not come back leaves `areas` off with a `hint` naming
+  `questAreas(questId)`; the accept still succeeds. Earned by a freeplay run
+  that asked for the areas once, before taking the quest, and spent over an
+  hour without finding its objective.
+- **`unstuck()` is named once per stretch.** The sentence a `path_incomplete`
+  and a climb's `drop` end on is carried by the first such refusal and left
+  off the later ones until a move arrives (or a portal or teleport ends one);
+  a harness line that holds the first keeps it. A run that only probed met it
+  hundreds of times.
 - **An NPC interaction from out of reach fails fast.** The core drops an
   out-of-range interaction without a word, so these helpers used to wait out
   their whole timeout. When the cached positions put the NPC beyond any NPC's
