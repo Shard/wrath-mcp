@@ -717,6 +717,14 @@ export interface SelfState extends UnitFieldsState {
    */
   ghost: Observed<boolean> | undefined;
   /**
+   * Whether the character is dead: true as a body not yet released (own
+   * health observed at 0) and as a released ghost (`ghost`, whose health
+   * reads 1), false otherwise, health not yet observed included. Computed
+   * from those two fields on every read, and a plain boolean, not a
+   * `{ value }` cell: `if (state.self.dead)`.
+   */
+  readonly dead: boolean;
+  /**
    * `UNIT_FLAG_IN_COMBAT` and `UNIT_FLAG_STUNNED` on our own `unitFlags`: the
    * client's combat indicator and its stunned state. Guarded like `resting`:
    * a values update without `unitFlags` leaves the last observation standing,
@@ -2342,6 +2350,9 @@ export class StateCache {
     resting: undefined,
     casting: undefined,
     ghost: undefined,
+    get dead(): boolean {
+      return selfDead(this);
+    },
     inCombat: undefined,
     stunned: undefined,
     mounted: undefined,
@@ -6630,6 +6641,15 @@ function splinePoint(m: Motion, elapsedMs: number): Point3 {
     y: start.y + t * (end.y - start.y),
     z: start.z + t * (end.z - start.z),
   };
+}
+
+/**
+ * Dead, as a body or a released ghost: own health observed at 0, or the ghost
+ * flag (a ghost's health reads 1). Unobserved health is never read as dead.
+ * What `SelfState.dead` answers; the client's own dead checks read it there.
+ */
+function selfDead(self: Pick<SelfState, "health" | "ghost">): boolean {
+  return self.health?.value.current === 0 || self.ghost?.value === true;
 }
 
 /**
