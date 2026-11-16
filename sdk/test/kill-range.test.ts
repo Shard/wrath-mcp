@@ -17,9 +17,11 @@ import {
   frames,
   ITEM_GUID_HI,
   loginSequence,
+  monsterMove,
   moveResult,
   SELF_GUID,
   selfCreate,
+  swing,
 } from "./fixtures";
 import { startStub, type StubServer } from "./server";
 
@@ -58,6 +60,13 @@ const BOW = () => rangedWorn(2, "Practice Bow", 2512);
 const WAND = () => rangedWorn(19, "Practice Wand", 0);
 
 const world = (extra: readonly unknown[]) => frames([...loginSequence, selfCreate, creatureCreate, creatureQuery, ...extra]);
+/** The creature come to rest at a point (a stopped spline reads where it stopped). */
+const standAt = (pos: { x: number; y: number; z: number }, seq: number) => ({
+  ...monsterMove,
+  seq,
+  ts: Date.now(),
+  data: { guid: CREATURE_GUID, pos, stopped: true },
+});
 /** Our own shot going off at the creature. */
 const shot = (spellId: number, seq: number) =>
   frame(seq, "SMSG_SPELL_GO", { casterGuid: SELF_GUID, spellId, hitGuids: [CREATURE_GUID], misses: [] }, Date.now());
@@ -93,7 +102,7 @@ describe("killTarget with range", () => {
     push(stub, creatureHealth(0, 72));
     const result = await fight;
     expect(result).toMatchObject({ ok: true, status: "killed", attack: { spellId: AUTO_SHOT, name: "Auto Shot" }, shots: 2, reached: true });
-    expect(result.detail).toContain("Auto Shot, 2 shot(s); Auto Shot stopped");
+    expect(result.detail).toContain("Auto Shot, 2 shot(s) and 0 melee swing(s); Auto Shot stopped");
     const cast = stub.actions.find((a) => a.action === "cast_spell") as Record<string, unknown>;
     expect(cast).toMatchObject({ spellId: AUTO_SHOT, targetGuid: CREATURE_GUID });
     const sent = named(stub);
@@ -151,6 +160,75 @@ describe("killTarget with range", () => {
     expect(stub.actions.slice(first + 1).filter((a) => a.action === "cast_spell" || a.action === "move_to")).toHaveLength(0);
     push(stub, creatureHealth(0, 71));
     expect((await fight).status).toBe("killed");
+    client.close();
+    await stub.stop();
+  });
+
+  test("a bow whose target closes to melee and backs off: shoots, swings in melee, then stops swinging and shoots again", async () => {
+    const stub = startStub({ onConnect: () => world([spells(AUTO_SHOT), ...BOW()]) });
+    const client = await inWorld(stub);
+    const self = client.state.self.position!.value;
+    const fight = client.killTarget(CREATURE_GUID, { range: 40, timeout: 5000, pollIntervalMs: 10, reapproachIntervalMs: 60_000 });
+    const cast = await until(stub, (a) => a.action === "cast_spell");
+    push(stub, shot(AUTO_SHOT, 70));
+    // It charges to 2y: Auto Shot is held there, so the fight swings.
+    push(stub, standAt({ x: self.x + 2, y: self.y, z: self.z }, 71));
+    const melee = await until(stub, (a) => a.action === "attack_start", cast);
+    push(stub, swing(SELF_GUID, CREATURE_GUID, 72));
+    push(stub, swing(SELF_GUID, CREATURE_GUID, 73));
+    // It backs off to 15y: no more swinging, and Auto Shot resumes by itself (cast once, held, not re-cast).
+    push(stub, standAt({ x: self.x + 15, y: self.y, z: self.z }, 74));
+    const stopped = await until(stub, (a) => a.action === "attack_stop", melee);
+    push(stub, shot(AUTO_SHOT, 75));
+    await Bun.sleep(40);
+    push(stub, creatureHealth(0, 76));
+    const result = await fight;
+    expect(result).toMatchObject({ ok: true, status: "killed", attack: { spellId: AUTO_SHOT }, shots: 2, swings: 2 });
+    expect(result.detail).toContain("Auto Shot, 2 shot(s) and 2 melee swing(s); Auto Shot stopped");
+    expect(stopped).toBeGreaterThan(melee);
+    expect(stub.actions.filter((a) => a.action === "cast_spell")).toHaveLength(1);
+    expect(named(stub).at(-1)).toBe("CMSG_CANCEL_AUTO_REPEAT_SPELL");
+    client.close();
+    await stub.stop();
+  });
+
+  test("Shoot (3018) is cast again when the target backs out of melee, since the server stopped it there", async () => {
+    const stub = startStub({ onConnect: () => world([spells(3018), ...BOW()]) });
+    const client = await inWorld(stub);
+    const self = client.state.self.position!.value;
+    const fight = client.killTarget(CREATURE_GUID, { range: 40, timeout: 5000, pollIntervalMs: 10, reapproachIntervalMs: 60_000 });
+    const cast = await until(stub, (a) => a.action === "cast_spell");
+    push(stub, standAt({ x: self.x + 2, y: self.y, z: self.z }, 71));
+    const melee = await until(stub, (a) => a.action === "attack_start", cast);
+    push(stub, standAt({ x: self.x + 15, y: self.y, z: self.z }, 72));
+    const again = await until(stub, (a) => a.action === "cast_spell", melee);
+    expect(stub.actions[again]).toMatchObject({ spellId: 3018 });
+    push(stub, creatureHealth(0, 73));
+    const result = await fight;
+    expect(result).toMatchObject({ ok: true, attack: { spellId: 3018, name: "Shoot" } });
+    // Ended while not swinging: the auto-repeat cancelled, no second attack_stop.
+    expect(named(stub).filter((n) => n === "attack_stop")).toHaveLength(1);
+    client.close();
+    await stub.stop();
+  });
+
+  test("a wand up close keeps shooting and never swings", async () => {
+    const stub = startStub({ onConnect: () => world([spells(SHOOT_WAND), ...WAND()]) });
+    const client = await inWorld(stub);
+    const self = client.state.self.position!.value;
+    push(stub, standAt({ x: self.x + 2, y: self.y, z: self.z }, 60));
+    await Bun.sleep(30);
+    const fight = client.killTarget(CREATURE_GUID, { range: 30, timeout: 5000, pollIntervalMs: 10, reapproachIntervalMs: 60_000 });
+    await until(stub, (a) => a.action === "cast_spell");
+    push(stub, shot(SHOOT_WAND, 70));
+    await Bun.sleep(60);
+    push(stub, shot(SHOOT_WAND, 71));
+    push(stub, creatureHealth(0, 72));
+    const result = await fight;
+    expect(result).toMatchObject({ ok: true, attack: { spellId: SHOOT_WAND }, shots: 2, swings: 0 });
+    expect(named(stub)).not.toContain("attack_start");
+    expect(named(stub)).not.toContain("attack_stop");
+    expect(named(stub)).not.toContain("move_to");
     client.close();
     await stub.stop();
   });

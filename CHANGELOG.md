@@ -54,9 +54,12 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   holds, cast through the ordinary cast path: Auto Shot (75) for a bow, gun
   or crossbow (Shoot, 3018, for a class without it), Shoot (5019) for a
   wand, Throw (2764) for a thrown weapon. It walks until within `range`,
-  walks after a target that leaves it, and closer when no shot goes off;
-  the result's `attack` and `shots` say what it used. No melee swing is
-  started. An empty ranged slot, an attack not in the spellbook, or a bow,
+  walks after a target that leaves it, and closer when no shot goes off.
+  Inside melee reach, where the server holds Auto Shot and stops Shoot and
+  Throw, it swings in melee instead, as a client's auto-attack carries on
+  while Auto Shot waits, and shoots again once the target is beyond it; a
+  wand keeps shooting there. The result's `attack`, `shots` and `swings`
+  say what it used. An empty ranged slot, an attack not in the spellbook, or a bow,
   gun or crossbow with no ammunition set is answered `no_ranged_attack`, a
   new status, with nothing sent. Without `range` the fight is melee as
   before. Earned by a freeplay Hunter that rewrote a ranged loop of its own

@@ -2147,14 +2147,16 @@ export interface KillTargetOptions {
    * within `range` of the target, and the loop walks closer when the target
    * moves beyond it, or when no shot has gone off for `reapproachIntervalMs`
    * with the target in range (most often something in the line of sight,
-   * which only the server can tell). The result's `attack` names the attack
-   * and `shots` counts its shots. No melee swing is started: a target that
-   * closes to melee is shot by a wand as before, Auto Shot holds its fire
-   * inside melee reach (the server's minimum range) and resumes once the
-   * target is beyond it, and the server stops Shoot (3018) and Throw there,
-   * which the loop starts again once the target is beyond melee reach. A
-   * spell you cast during the fight stops Shoot and Throw (not Auto Shot),
-   * and the loop starts them again once nothing of yours is casting. An
+   * which only the server can tell). Inside melee reach the server holds
+   * Auto Shot and stops Shoot (3018) and Throw (their minimum range), so
+   * while the target is there the fight swings in melee instead, as a
+   * client's auto-attack carries on while Auto Shot waits, and once the
+   * target is beyond melee reach it stops swinging and shoots again. A wand
+   * keeps shooting in melee and never swings. The result's `attack` names
+   * the ranged attack, `shots` counts its shots and `swings` the melee
+   * swings. A spell you cast during the fight stops Shoot and Throw (not
+   * Auto Shot), and the loop starts them again once nothing of yours is
+   * casting. An
    * empty ranged slot, an attack for it not in your spellbook, or a bow, gun
    * or crossbow with no ammunition set is refused as `no_ranged_attack`, with
    * nothing sent. Without `range` the fight is melee.
@@ -2192,7 +2194,7 @@ interface KillResultFacts {
   readonly detail: string;
   /** With `range`: the ranged auto-attack the fight used. Absent from a melee fight. */
   readonly attack?: { readonly spellId: number; readonly name: string };
-  /** With `range`: the shots that went off (our own `SMSG_SPELL_GO` of `attack`). */
+  /** With `range`: the shots that went off (our own `SMSG_SPELL_GO` of `attack`); `swings` counts its melee swings. */
   readonly shots?: number;
 }
 
@@ -2487,11 +2489,17 @@ const RANGED_SLOT = 17;
 interface RangedAttack {
   readonly spellId: number;
   readonly name: string;
+  /**
+   * Whether the server holds or stops it inside melee reach (its range is
+   * flagged ranged: `Spell::CheckRange` answers too_close there), so a fight
+   * swings in melee instead until the target is beyond it again.
+   */
+  readonly heldInMelee: boolean;
 }
-const AUTO_SHOT: RangedAttack = { spellId: 75, name: "Auto Shot" };
-const SHOOT_BOW: RangedAttack = { spellId: 3018, name: "Shoot" };
-const SHOOT_WAND: RangedAttack = { spellId: 5019, name: "Shoot" };
-const THROW: RangedAttack = { spellId: 2764, name: "Throw" };
+const AUTO_SHOT: RangedAttack = { spellId: 75, name: "Auto Shot", heldInMelee: true };
+const SHOOT_BOW: RangedAttack = { spellId: 3018, name: "Shoot", heldInMelee: true };
+const SHOOT_WAND: RangedAttack = { spellId: 5019, name: "Shoot", heldInMelee: false };
+const THROW: RangedAttack = { spellId: 2764, name: "Throw", heldInMelee: true };
 
 /**
  * The ranged auto-attacks by the ranged-slot weapon's subclass (item class 2,
@@ -9282,10 +9290,11 @@ export class WrathClient {
    * are cast again after every walk, since moving stops them and not Auto
    * Shot. A spell of your own stops Shoot and Throw too (not Auto Shot), so
    * no re-cast is sent while one is casting or channeling, which it would
-   * otherwise interrupt or be refused by. `reached`
-   * then means within `range`, and leaving disarmed cancels the auto-repeat
-   * (`CMSG_CANCEL_AUTO_REPEAT_SPELL`, what the client sends) instead of
-   * sending `attack_stop`.
+   * otherwise interrupt or be refused by. Inside melee reach of any attack
+   * but a wand's it swings in melee instead, and shoots again beyond it.
+   * `reached` then means within `range`, and leaving disarmed cancels the
+   * auto-repeat (`CMSG_CANCEL_AUTO_REPEAT_SPELL`, what the client sends),
+   * with `attack_stop` too when it was swinging.
    *
    * Returns a value for every game outcome and throws only for a refused
    * request. The caller is expected to loot afterwards: `killTarget` does not,
@@ -9381,6 +9390,9 @@ export class WrathClient {
       });
       // A ranged fight's shots: each auto-repeat shot is its own SMSG_SPELL_GO.
       let shots = 0;
+      // A ranged fight's melee: on while the target is inside melee reach of
+      // an attack the server holds there (`RangedAttack.heldInMelee`).
+      let meleeOn = false;
       const offShot =
         ranged === undefined
           ? () => {}
@@ -9533,10 +9545,12 @@ export class WrathClient {
               ? armed
                 ? "still auto-attacking — call attackStop() or pass { disengage: true } to break off"
                 : "auto-attack stopped"
-              : `${ranged.name}, ${shots} shot(s); ` +
+              : `${ranged.name}, ${shots} shot(s) and ${swings} melee swing(s); ` +
                 (armed
-                  ? `still shooting — pass { disengage: true } to break off (raw CMSG_CANCEL_AUTO_REPEAT_SPELL stops it)`
-                  : `${ranged.name} stopped`)),
+                  ? meleeOn
+                    ? `still swinging in melee, ${ranged.name} waiting until the target is beyond melee reach — pass { disengage: true } to break off`
+                    : `still shooting — pass { disengage: true } to break off (raw CMSG_CANCEL_AUTO_REPEAT_SPELL stops it)`
+                  : `${ranged.name} stopped${meleeOn ? ", melee stopped" : ""}`)),
           ...(ranged === undefined ? {} : { attack: { spellId: ranged.spellId, name: ranged.name }, shots }),
         };
         return status === "killed"
@@ -9568,8 +9582,10 @@ export class WrathClient {
        * runs, and it starts one the server stopped), and after a second such
        * look walked halfway to, since the line of sight is the server's to
        * judge; a look while a spell of the caller's is casting does not count.
-       * Inside melee reach it waits: Auto Shot is held there, Shoot and Throw
-       * are stopped, and a re-cast would only be refused too_close.
+       * Inside melee reach of an attack the server holds or stops there (all
+       * but a wand's) it swings in melee instead, and shoots again once the
+       * target is beyond it (`meleeSwitch`); a re-cast there would only be
+       * refused too_close.
        */
       const rangedFight = async (): Promise<KillResult> => {
         const opening = aimAt();
@@ -9578,17 +9594,66 @@ export class WrathClient {
         // The client cancels a running auto-repeat before one at a new target;
         // the server would drop this cast while another of the same spell runs.
         await this.raw("CMSG_CANCEL_AUTO_REPEAT_SPELL");
-        await shoot();
+        /** Yards to the target now, in x/y, or undefined while unobserved. */
+        const yardsNow = (): number | undefined => {
+          const pos = this.state.self.position?.value;
+          const at = aimAt();
+          return pos === undefined || at === undefined ? undefined : distance2d(pos, at);
+        };
+        // Whether the attack has been cast at all: Auto Shot, once cast, only
+        // holds in melee and resumes by itself; Shoot and Throw are stopped.
+        let started = false;
+        const fire = async (): Promise<void> => {
+          await shoot();
+          started = true;
+        };
+        /**
+         * Melee reach of an attack the server holds there: swing instead, as
+         * a client's auto-attack carries on while Auto Shot waits; beyond it
+         * again (a yard of slack against flapping), stop swinging and shoot.
+         */
+        const meleeSwitch = async (): Promise<void> => {
+          if (ranged === undefined || !ranged.heldInMelee) return;
+          const yards = yardsNow();
+          if (yards === undefined) return;
+          if (!meleeOn && yards <= meleeRange) {
+            meleeOn = true;
+            const at = aimAt();
+            if (at) await this.faceQuietly(at);
+            await this.attackStart(id);
+          } else if (meleeOn && yards > meleeRange + 1) {
+            meleeOn = false;
+            await this.attackStop();
+            if (!started || ranged.spellId !== AUTO_SHOT.spellId) await fire();
+          }
+        };
+        const opened = yardsNow();
+        if (ranged !== undefined && ranged.heldInMelee && opened !== undefined && opened <= meleeRange) await meleeSwitch();
+        else await fire();
         let refaceAt = Date.now() + refaceMs;
         let reapproachAt = Date.now() + reapproachMs;
         let shotsSeen = shots;
         let quiet = 0;
+        let rearms = 0;
+        let rearmNotBefore = 0;
         for (;;) {
           this.throwIfAborted("killTarget's fight loop");
           const end = settled();
           if (end !== undefined) return end;
+          await meleeSwitch();
           const at = aimAt();
           const now = Date.now();
+          if (rearmWanted) {
+            rearmWanted = false;
+            // The server stopped the swing while we meant to be swinging: as
+            // the melee loop re-arms, rate-limited and capped.
+            if (meleeOn && rearms < REARM_CAP && now >= rearmNotBefore && !targetDead()) {
+              rearms++;
+              rearmNotBefore = now + REARM_MIN_INTERVAL_MS;
+              if (at) await this.faceQuietly(at);
+              await this.attackStart(id);
+            }
+          }
           if (at && now >= refaceAt) {
             refaceAt = now + refaceMs;
             await this.faceQuietly(at);
@@ -9601,8 +9666,9 @@ export class WrathClient {
               quiet = 0;
               await walkTo(at, reach);
               // Moving stops Shoot and Throw; Auto Shot only holds.
-              if (ranged?.spellId !== AUTO_SHOT.spellId) await shoot();
+              if (ranged?.spellId !== AUTO_SHOT.spellId || !started) await fire();
             } else if (
+              !meleeOn &&
               yards !== undefined &&
               yards > meleeRange &&
               shots === shotsSeen &&
@@ -9614,7 +9680,7 @@ export class WrathClient {
                 quiet = 0;
                 await walkTo(at, Math.max(meleeRange, yards / 2));
               }
-              await shoot();
+              await fire();
             } else quiet = 0;
             shotsSeen = shots;
           }
@@ -9683,7 +9749,10 @@ export class WrathClient {
           // A ranged fight is the auto-repeat, which attack_stop does not end;
           // left running on a dead target it would also swallow the next one.
           if (ranged === undefined) await this.attackStop().catch(() => {});
-          else await this.raw("CMSG_CANCEL_AUTO_REPEAT_SPELL").catch(() => {});
+          else {
+            await this.raw("CMSG_CANCEL_AUTO_REPEAT_SPELL").catch(() => {});
+            if (meleeOn) await this.attackStop().catch(() => {});
+          }
         }
       }
     });
