@@ -2152,7 +2152,9 @@ export interface KillTargetOptions {
    * closes to melee is shot by a wand as before, Auto Shot holds its fire
    * inside melee reach (the server's minimum range) and resumes once the
    * target is beyond it, and the server stops Shoot (3018) and Throw there,
-   * which the loop starts again once the target is beyond melee reach. An
+   * which the loop starts again once the target is beyond melee reach. A
+   * spell you cast during the fight stops Shoot and Throw (not Auto Shot),
+   * and the loop starts them again once nothing of yours is casting. An
    * empty ranged slot, an attack for it not in your spellbook, or a bow, gun
    * or crossbow with no ammunition set is refused as `no_ranged_attack`, with
    * nothing sent. Without `range` the fight is melee.
@@ -9221,7 +9223,7 @@ export class WrathClient {
       return {
         refusal:
           `your ${label} (a ${weapon.kind}) needs ammunition and none is set (state.self.fields ammoId 0), and the server fires no shot ` +
-          `without it; nothing was sent. raw("CMSG_SET_AMMO", [{ u32: itemId }]) with arrows or bullets you carry sets it.`,
+          `without it; nothing was sent. sdk.raw("CMSG_SET_AMMO", [{ u32: itemId }]) with arrows or bullets you carry sets it.`,
       };
     }
     return attack;
@@ -9230,8 +9232,8 @@ export class WrathClient {
   /**
    * Fight a target until it (or we) drops.
    *
-   * It only auto-attacks — melee, or with `range` the ranged auto-attack —
-   * and never casts a spell: `castSpell` from your own code runs alongside it
+   * It only auto-attacks (melee, or with `range` the ranged auto-attack) and
+   * casts nothing else: `castSpell` from your own code runs alongside it
    * while it fights.
    *
    * Owns the whole melee loop, because every part of it turned out to be
@@ -9276,8 +9278,11 @@ export class WrathClient {
    * With `range` (`KillTargetOptions.range`) the same loop fights from a
    * distance: the approach stops within `range`, the ranged auto-attack is
    * cast once there through the ordinary `castSpell` path (the server keeps
-   * firing it, and drops a repeat of it while it runs), and re-cast after
-   * every walk, since moving stops a wand's Shoot, Shoot and Throw. `reached`
+   * firing it, and drops a repeat of it while it runs), and Shoot and Throw
+   * are cast again after every walk, since moving stops them and not Auto
+   * Shot. A spell of your own stops Shoot and Throw too (not Auto Shot), so
+   * no re-cast is sent while one is casting or channeling, which it would
+   * otherwise interrupt or be refused by. `reached`
    * then means within `range`, and leaving disarmed cancels the auto-repeat
    * (`CMSG_CANCEL_AUTO_REPEAT_SPELL`, what the client sends) instead of
    * sending `attack_stop`.
@@ -9473,10 +9478,14 @@ export class WrathClient {
       /**
        * Start the ranged auto-attack, faced, through the ordinary cast path.
        * The server drops a repeat of the one already running, so a re-cast
-       * only starts one that stopped.
+       * only starts one that stopped. Not while a spell of the caller's is
+       * casting or channeling: Shoot and Throw would interrupt a channel, and
+       * any cast then is refused spell_in_progress and reported as the
+       * caller's.
        */
       const shoot = async (): Promise<void> => {
         if (ranged === undefined || selfDead()) return;
+        if (this.state.self.casting !== undefined || this.state.self.channeling !== undefined) return;
         const at = aimAt();
         if (at) await this.faceQuietly(at);
         await this.trackedCast(ranged.spellId, id);
@@ -9558,8 +9567,9 @@ export class WrathClient {
        * last look is shot at again (the server drops that while the attack
        * runs, and it starts one the server stopped), and after a second such
        * look walked halfway to, since the line of sight is the server's to
-       * judge. Inside melee reach it waits: Auto Shot is held there, Shoot and
-       * Throw are stopped, and a re-cast would only be refused too_close.
+       * judge; a look while a spell of the caller's is casting does not count.
+       * Inside melee reach it waits: Auto Shot is held there, Shoot and Throw
+       * are stopped, and a re-cast would only be refused too_close.
        */
       const rangedFight = async (): Promise<KillResult> => {
         const opening = aimAt();
@@ -9590,8 +9600,15 @@ export class WrathClient {
             if (yards !== undefined && yards > reach) {
               quiet = 0;
               await walkTo(at, reach);
-              await shoot();
-            } else if (yards !== undefined && yards > meleeRange && shots === shotsSeen) {
+              // Moving stops Shoot and Throw; Auto Shot only holds.
+              if (ranged?.spellId !== AUTO_SHOT.spellId) await shoot();
+            } else if (
+              yards !== undefined &&
+              yards > meleeRange &&
+              shots === shotsSeen &&
+              this.state.self.casting === undefined &&
+              this.state.self.channeling === undefined
+            ) {
               quiet++;
               if (quiet >= 2) {
                 quiet = 0;

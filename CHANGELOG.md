@@ -492,8 +492,8 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 ### Changed
 
 - **`killTarget` says it only auto-attacks.** Its doc comment and reference
-  row state that it never casts a spell, and that `castSpell` from the
-  model's own code runs alongside it while it fights.
+  row state that it casts nothing but its auto-attack, and that `castSpell`
+  from the model's own code runs alongside it while it fights.
 - **Options in a guid's place are named as such.** A strict guid argument
   given an object with no `guid` key, most often the call's options, now
   says what it received instead of "pass the .guid field", which pointed

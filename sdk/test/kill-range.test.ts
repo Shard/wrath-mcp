@@ -140,6 +140,21 @@ describe("killTarget with range", () => {
     await stub.stop();
   });
 
+  test("while a spell of the caller's is casting, no re-cast and no walk: the cast is the caller's", async () => {
+    const stub = startStub({ onConnect: () => world([spells(SHOOT_WAND, 133), ...WAND()]) });
+    const client = await inWorld(stub);
+    const fight = client.killTarget(CREATURE_GUID, { range: 40, timeout: 5000, pollIntervalMs: 10, reapproachIntervalMs: 60 });
+    const first = await until(stub, (a) => a.action === "cast_spell");
+    // A long cast of the caller's own, started from its own code.
+    push(stub, frame(70, "SMSG_SPELL_START", { casterGuid: SELF_GUID, spellId: 133, castTimeMs: 60_000, targetGuid: CREATURE_GUID }, Date.now()));
+    await Bun.sleep(400);
+    expect(stub.actions.slice(first + 1).filter((a) => a.action === "cast_spell" || a.action === "move_to")).toHaveLength(0);
+    push(stub, creatureHealth(0, 71));
+    expect((await fight).status).toBe("killed");
+    client.close();
+    await stub.stop();
+  });
+
   test("a wand: Shoot 5019, and a wand needs no ammunition", async () => {
     const stub = startStub({ onConnect: () => world([spells(SHOOT_WAND), ...WAND()]) });
     const client = await inWorld(stub);
