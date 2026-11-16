@@ -49,6 +49,19 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Added
 
+- **`killTarget(guid, { range })`.** Fights from up to `range` yards with
+  the ranged auto-attack a client's button fires for what the ranged slot
+  holds, cast through the ordinary cast path: Auto Shot (75) for a bow, gun
+  or crossbow (Shoot, 3018, for a class without it), Shoot (5019) for a
+  wand, Throw (2764) for a thrown weapon. It walks until within `range`,
+  walks after a target that leaves it, and closer when no shot goes off;
+  the result's `attack` and `shots` say what it used. No melee swing is
+  started. An empty ranged slot, an attack not in the spellbook, or a bow,
+  gun or crossbow with no ammunition set is answered `no_ranged_attack`, a
+  new status, with nothing sent. Without `range` the fight is melee as
+  before. Earned by a freeplay Hunter that rewrote a ranged loop of its own
+  six times while `killTarget` walked it into melee.
+
 - **`state.self.dead`.** A plain boolean, true while the character is dead,
   as a body not yet released (health 0) or as a released ghost (whose health
   reads 1), and false otherwise; `if (state.self.dead)` reads right. A
@@ -478,6 +491,9 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Changed
 
+- **`killTarget` says it only auto-attacks.** Its doc comment and reference
+  row state that it never casts a spell, and that `castSpell` from the
+  model's own code runs alongside it while it fights.
 - **Options in a guid's place are named as such.** A strict guid argument
   given an object with no `guid` key, most often the call's options, now
   says what it received instead of "pass the .guid field", which pointed
