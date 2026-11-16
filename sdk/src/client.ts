@@ -2139,6 +2139,27 @@ export interface KillTargetOptions {
    * asking is to stop taking hits. Unobserved health never triggers it.
    */
   abortBelowHealthPct?: number;
+  /**
+   * Fight from up to this many yards with the ranged auto-attack a client's
+   * button fires for what the ranged slot holds: Auto Shot (spell 75) for a
+   * bow, gun or crossbow (Shoot, 3018, for a class without Auto Shot), Shoot
+   * (5019) for a wand, Throw (2764) for a thrown weapon. The approach stops
+   * within `range` of the target, and the loop walks closer when the target
+   * moves beyond it, or when no shot has gone off for `reapproachIntervalMs`
+   * with the target in range (most often something in the line of sight,
+   * which only the server can tell). The result's `attack` names the attack
+   * and `shots` counts its shots. No melee swing is started: a target that
+   * closes to melee is shot by a wand as before, Auto Shot holds its fire
+   * inside melee reach (the server's minimum range) and resumes once the
+   * target is beyond it, and the server stops Shoot (3018) and Throw there,
+   * which the loop starts again once the target is beyond melee reach. A
+   * spell you cast during the fight stops Shoot and Throw (not Auto Shot),
+   * and the loop starts them again once nothing of yours is casting. An
+   * empty ranged slot, an attack for it not in your spellbook, or a bow, gun
+   * or crossbow with no ammunition set is refused as `no_ranged_attack`, with
+   * nothing sent. Without `range` the fight is melee.
+   */
+  range?: number;
 }
 
 /** What every `KillResult` carries, whatever the outcome. */
@@ -2169,6 +2190,10 @@ interface KillResultFacts {
   readonly distance: number | undefined;
   /** One line about how it ended and what state the character was left in. */
   readonly detail: string;
+  /** With `range`: the ranged auto-attack the fight used. Absent from a melee fight. */
+  readonly attack?: { readonly spellId: number; readonly name: string };
+  /** With `range`: the shots that went off (our own `SMSG_SPELL_GO` of `attack`). */
+  readonly shots?: number;
 }
 
 /**
@@ -2192,8 +2217,10 @@ export type KillResult =
        * `player_died` — we died. `lost` — it left view alive. `timeout` — still
        * up. `aborted_low_health` — we broke off at `abortBelowHealthPct`.
        * `dead` — we were already dead (a corpse or a ghost) and nothing was sent.
+       * `no_ranged_attack` — `range` was asked with nothing to shoot; nothing
+       * was sent, and `detail` says why.
        */
-      readonly status: "player_died" | "lost" | "timeout" | "aborted_low_health" | "dead";
+      readonly status: "player_died" | "lost" | "timeout" | "aborted_low_health" | "dead" | "no_ranged_attack";
     } & KillResultFacts);
 
 /** How each outcome reads, before the note and the armed/disarmed clause. */
@@ -2450,7 +2477,40 @@ const KILL_DETAIL: Record<KillResult["status"], string> = {
   timeout: "timed out with both alive",
   aborted_low_health: "broke off on low health",
   dead: "you are dead",
+  no_ranged_attack: "no ranged attack",
 };
+
+/** `EQUIPMENT_SLOT_RANGED` (Player.h): the worn slot a bow, gun, crossbow, wand or thrown weapon sits in. */
+const RANGED_SLOT = 17;
+
+/** A ranged auto-attack: the spell a client's button for it casts. */
+interface RangedAttack {
+  readonly spellId: number;
+  readonly name: string;
+}
+const AUTO_SHOT: RangedAttack = { spellId: 75, name: "Auto Shot" };
+const SHOOT_BOW: RangedAttack = { spellId: 3018, name: "Shoot" };
+const SHOOT_WAND: RangedAttack = { spellId: 5019, name: "Shoot" };
+const THROW: RangedAttack = { spellId: 2764, name: "Throw" };
+
+/**
+ * The ranged auto-attacks by the ranged-slot weapon's subclass (item class 2,
+ * `ITEM_SUBCLASS_WEAPON_*` in ItemTemplate.h), the first one in the
+ * spellbook winning. Each spell's equipped-item subclass mask in the pinned
+ * client's Spell.dbc says which weapons fire it: Auto Shot (a hunter's) and
+ * Shoot 3018 (anyone else's) bows, guns and crossbows, Shoot 5019 wands,
+ * Throw thrown weapons. Their ranges there: Auto Shot 35y, the rest 30y, and
+ * all but the wand's flagged ranged, so the core refuses them inside melee
+ * reach (`Spell::CheckRange`, too_close); `Unit::_UpdateAutoRepeatSpell`
+ * then holds Auto Shot and cancels the others.
+ */
+const RANGED_ATTACKS: ReadonlyMap<number, { readonly kind: string; readonly attacks: readonly RangedAttack[]; readonly ammo: boolean }> = new Map([
+  [2, { kind: "bow", attacks: [AUTO_SHOT, SHOOT_BOW], ammo: true }],
+  [3, { kind: "gun", attacks: [AUTO_SHOT, SHOOT_BOW], ammo: true }],
+  [18, { kind: "crossbow", attacks: [AUTO_SHOT, SHOOT_BOW], ammo: true }],
+  [19, { kind: "wand", attacks: [SHOOT_WAND], ammo: false }],
+  [16, { kind: "thrown weapon", attacks: [THROW], ammo: false }],
+]);
 
 /**
  * Whether the character is left swinging. Only an ended fight disarms, unless
@@ -9125,7 +9185,56 @@ export class WrathClient {
   }
 
   /**
+   * The ranged auto-attack for what the ranged slot holds (`RANGED_ATTACKS`),
+   * or the refusal that says why there is none: an empty slot, an item the
+   * server has not described yet, one that is not a ranged weapon, an attack
+   * not in the spellbook, or a bow, gun or crossbow with no ammunition set
+   * (`ammoId` 0: the core's `SPELL_FAILED_NO_AMMO`, which an auto-repeat
+   * meets in silence). Read from the cache alone.
+   */
+  private rangedAttackFor(): RangedAttack | { readonly refusal: string } {
+    const worn = this.state.inventory.find((i) => i.slot === RANGED_SLOT);
+    if (worn === undefined) {
+      return {
+        refusal:
+          "nothing is in your ranged slot (worn slot 17), so there is nothing to shoot with; nothing was sent. " +
+          "Equip a bow, gun, crossbow, wand or thrown weapon, or fight without range.",
+      };
+    }
+    const info = worn.itemId === undefined ? undefined : this.state.items.get(worn.itemId)?.value;
+    const label = info?.name ?? `item ${worn.itemId ?? worn.guid}`;
+    if (info === undefined || info.class === undefined || info.subClass === undefined) {
+      return {
+        refusal: `the server has not yet described the ${label} in your ranged slot, so which attack it fires is not known; nothing was sent. Try again in a moment.`,
+      };
+    }
+    const weapon = info.class === 2 ? RANGED_ATTACKS.get(info.subClass) : undefined;
+    if (weapon === undefined) {
+      return { refusal: `${label} in your ranged slot is not a bow, gun, crossbow, wand or thrown weapon, and has no attack; nothing was sent.` };
+    }
+    const named = weapon.attacks.map((a) => `${a.name} (spell ${a.spellId})`).join(" or ");
+    const attack = this.state.spells().length === 0 ? weapon.attacks[0] : weapon.attacks.find((a) => this.state.spell(a.spellId) !== undefined);
+    if (attack === undefined) {
+      return {
+        refusal: `your ${label} (a ${weapon.kind}) fires with ${named}, which is not in your spellbook (state.spells()); nothing was sent.`,
+      };
+    }
+    if (weapon.ammo && this.state.self.fields.get("ammoId")?.value === 0) {
+      return {
+        refusal:
+          `your ${label} (a ${weapon.kind}) needs ammunition and none is set (state.self.fields ammoId 0), and the server fires no shot ` +
+          `without it; nothing was sent. sdk.raw("CMSG_SET_AMMO", [{ u32: itemId }]) with arrows or bullets you carry sets it.`,
+      };
+    }
+    return attack;
+  }
+
+  /**
    * Fight a target until it (or we) drops.
+   *
+   * It only auto-attacks (melee, or with `range` the ranged auto-attack) and
+   * casts nothing else: `castSpell` from your own code runs alongside it
+   * while it fights.
    *
    * Owns the whole melee loop, because every part of it turned out to be
    * load-bearing on live runs:
@@ -9165,6 +9274,18 @@ export class WrathClient {
    * `reached` says whether melee range was ever reached and `distance` how far
    * the target was at the end; a `timeout` that never reached it leads `detail`
    * with "never reached melee range" rather than describing a fight.
+   *
+   * With `range` (`KillTargetOptions.range`) the same loop fights from a
+   * distance: the approach stops within `range`, the ranged auto-attack is
+   * cast once there through the ordinary `castSpell` path (the server keeps
+   * firing it, and drops a repeat of it while it runs), and Shoot and Throw
+   * are cast again after every walk, since moving stops them and not Auto
+   * Shot. A spell of your own stops Shoot and Throw too (not Auto Shot), so
+   * no re-cast is sent while one is casting or channeling, which it would
+   * otherwise interrupt or be refused by. `reached`
+   * then means within `range`, and leaving disarmed cancels the auto-repeat
+   * (`CMSG_CANCEL_AUTO_REPEAT_SPELL`, what the client sends) instead of
+   * sending `attack_stop`.
    *
    * Returns a value for every game outcome and throws only for a refused
    * request. The caller is expected to loot afterwards: `killTarget` does not,
@@ -9210,12 +9331,45 @@ export class WrathClient {
           detail: hint,
         };
       }
+      // The ranged auto-attack `range` asks for: what the ranged slot fires,
+      // or why nothing does, answered before any opcode.
+      let ranged: RangedAttack | undefined;
+      if (options.range !== undefined) {
+        const range: unknown = options.range;
+        if (typeof range !== "number" || !Number.isFinite(range) || range <= 0) {
+          throw new TypeError(
+            `killTarget(guid, { range }) got ${JSON.stringify(range) ?? String(range)} — range is a distance in yards, e.g. { range: 30 }`,
+          );
+        }
+        const pick = this.rangedAttackFor();
+        if ("refusal" in pick) {
+          this.noteActionHint("killTarget", "no_ranged_attack", pick.refusal);
+          const self = this.state.self.position?.value;
+          const obj = this.state.nearby.get(key);
+          const at = obj === undefined ? undefined : pointOf(obj)?.value;
+          const h = this.state.self.health?.value;
+          return {
+            ok: false,
+            status: "no_ranged_attack",
+            guid: id,
+            swings: 0,
+            healthPct: h === undefined || h.max <= 0 ? undefined : (h.current / h.max) * 100,
+            attacking: false,
+            reached: false,
+            distance: self === undefined || at === undefined ? undefined : Math.round(distance2d(self, at) * 10) / 10,
+            detail: pick.refusal,
+          };
+        }
+        ranged = pick;
+      }
       // Whether the cache has ever held the target while this fight ran: it is
       // what separates "left view alive" from "was never in view at all".
       let sawTarget = this.state.nearby.has(key);
       const refaceMs = options.refaceIntervalMs ?? 1500;
       const reapproachMs = options.reapproachIntervalMs ?? 6000;
       const meleeRange = options.meleeRange ?? 5;
+      /** How near the fight is fought from: melee range, or `range`. */
+      const reach = ranged === undefined ? meleeRange : (options.range as number);
       const pollMs = options.pollIntervalMs ?? 300;
       const deadline = Date.now() + (options.timeout ?? 25_000);
       const abortPct = options.abortBelowHealthPct;
@@ -9225,6 +9379,16 @@ export class WrathClient {
         if (isDecodeError(e.data)) return;
         if ((e.data as { attackerGuid: string }).attackerGuid === this.state.self.guid) swings++;
       });
+      // A ranged fight's shots: each auto-repeat shot is its own SMSG_SPELL_GO.
+      let shots = 0;
+      const offShot =
+        ranged === undefined
+          ? () => {}
+          : this.events.on("SMSG_SPELL_GO", (e) => {
+              if (isDecodeError(e.data)) return;
+              const d = e.data as SpellGoData;
+              if (d.spellId === ranged.spellId && this.state.self.guid !== undefined && guidKey(d.casterGuid) === this.state.self.guid) shots++;
+            });
       // The server cancelling our swing is observable, so react to it rather than
       // assuming the opening `attack_start` holds for the whole fight. The
       // handler only raises a flag; the loop decides, because by the time it runs
@@ -9265,7 +9429,7 @@ export class WrathClient {
         const at = aimAt();
         if (self === undefined || at === undefined) return undefined;
         const yards = distance2d(self, at);
-        if (yards <= meleeRange) reached = true;
+        if (yards <= reach) reached = true;
         return yards;
       };
       // How far the last walk got when it ran out the clock; cleared by a
@@ -9276,20 +9440,55 @@ export class WrathClient {
        * finishes is the clock running out, which the loop reports as `timeout` on
        * its next tick — so it is kept for `detail`, with how far it got, rather
        * than thrown out of a helper whose whole contract is a value per outcome.
-       * A walk that arrives clears what an earlier one said.
+       * A walk that arrives clears what an earlier one said. Given `within`
+       * (a ranged fight), the walk is stopped once the target is that near,
+       * as a player stops running once in range.
        */
-      const walkTo = async (at: Point3): Promise<void> => {
+      const walkTo = async (at: Point3, within?: number): Promise<void> => {
         const before = this.state.self.position?.value;
+        let walking = true;
+        let stopped = false;
+        const watch =
+          within === undefined
+            ? Promise.resolve()
+            : (async () => {
+                while (walking) {
+                  const yards = measure();
+                  if (!stopped && yards !== undefined && yards <= within) {
+                    stopped = true;
+                    await this.stop().catch(() => {});
+                  }
+                  await sleep(pollMs);
+                }
+              })();
         try {
           const walk = await this.moveTo(at, { timeout: Math.max(1000, deadline - Date.now()) });
-          note = walk.ok ? "" : ` (approach: ${walk.status})`;
+          note = walk.ok || (stopped && walk.status === "stopped") ? "" : ` (approach: ${walk.status})`;
           unfinished = undefined;
         } catch (e) {
           if (!(e instanceof EventTimeoutError)) throw e;
           note = "";
           unfinished = walkProgress(before, this.state.self.position?.value, at);
+        } finally {
+          walking = false;
+          await watch;
         }
         measure();
+      };
+      /**
+       * Start the ranged auto-attack, faced, through the ordinary cast path.
+       * The server drops a repeat of the one already running, so a re-cast
+       * only starts one that stopped. Not while a spell of the caller's is
+       * casting or channeling: Shoot and Throw would interrupt a channel, and
+       * any cast then is refused spell_in_progress and reported as the
+       * caller's.
+       */
+      const shoot = async (): Promise<void> => {
+        if (ranged === undefined || selfDead()) return;
+        if (this.state.self.casting !== undefined || this.state.self.channeling !== undefined) return;
+        const at = aimAt();
+        if (at) await this.faceQuietly(at);
+        await this.trackedCast(ranged.spellId, id);
       };
       const done = (status: KillResult["status"]): KillResult => {
         outcome = status;
@@ -9299,6 +9498,7 @@ export class WrathClient {
         // not finish, not a fight that did: that leads, with how far the walk
         // got. Only when the distance is observed — unknown is not "never".
         const neverReached = status === "timeout" && !reached && distance !== undefined;
+        const reachName = ranged === undefined ? "melee range" : `${reach}y of the target`;
         const walking =
           unfinished === undefined ? undefined : `${unfinished} when the timeout ran out; the character is still walking`;
         // A "lost" verdict on a guid the cache never held is not a target that
@@ -9308,7 +9508,7 @@ export class WrathClient {
             ? `target ${key} was never in view — a stale or mistyped guid, or a missed view update; ` +
               `get guids from state.nearbyUnits() or state.closest(...)`
             : neverReached
-              ? `never reached melee range${walking === undefined ? "" : `: ${walking}`}`
+              ? `never reached ${reachName}${walking === undefined ? "" : `: ${walking}`}`
               : KILL_DETAIL[status];
         const approach = walking !== undefined && !neverReached ? ` (approach never finished: ${walking})` : "";
         // At a timeout: who is fighting you, and how you stand.
@@ -9329,17 +9529,102 @@ export class WrathClient {
           distance: distance === undefined ? undefined : Math.round(distance * 10) / 10,
           detail:
             `${base}${approach}${note}${pressed}; ` +
-            (armed
-              ? "still auto-attacking — call attackStop() or pass { disengage: true } to break off"
-              : "auto-attack stopped"),
+            (ranged === undefined
+              ? armed
+                ? "still auto-attacking — call attackStop() or pass { disengage: true } to break off"
+                : "auto-attack stopped"
+              : `${ranged.name}, ${shots} shot(s); ` +
+                (armed
+                  ? `still shooting — pass { disengage: true } to break off (raw CMSG_CANCEL_AUTO_REPEAT_SPELL stops it)`
+                  : `${ranged.name} stopped`)),
+          ...(ranged === undefined ? {} : { attack: { spellId: ranged.spellId, name: ranged.name }, shots }),
         };
         return status === "killed"
           ? { ok: true, status, ...facts }
           : { ok: false, status, ...facts };
       };
+      /** The checks every tick of either loop makes first: an outcome, or undefined to fight on. */
+      const settled = (): KillResult | undefined => {
+        if (targetDead()) return done("killed");
+        if (selfDead()) return done("player_died");
+        if (this.state.nearby.has(key)) sawTarget = true;
+        else return done("lost");
+        if (abortPct !== undefined) {
+          const pct = healthPct();
+          if (pct !== undefined && pct < abortPct) {
+            note = ` (health ${pct.toFixed(0)}% below the ${abortPct}% floor)`;
+            return done("aborted_low_health");
+          }
+        }
+        measure();
+        if (Date.now() > deadline) return done("timeout");
+        return undefined;
+      };
+      /**
+       * The fight with `range`: walk until within it, start the ranged
+       * auto-attack, and keep it going. Every `reapproachIntervalMs` a target
+       * beyond `range` is walked after; one in range with no shot since the
+       * last look is shot at again (the server drops that while the attack
+       * runs, and it starts one the server stopped), and after a second such
+       * look walked halfway to, since the line of sight is the server's to
+       * judge; a look while a spell of the caller's is casting does not count.
+       * Inside melee reach it waits: Auto Shot is held there, Shoot and Throw
+       * are stopped, and a re-cast would only be refused too_close.
+       */
+      const rangedFight = async (): Promise<KillResult> => {
+        const opening = aimAt();
+        const gap = measure();
+        if (opening && gap !== undefined && gap > reach) await walkTo(opening, reach);
+        // The client cancels a running auto-repeat before one at a new target;
+        // the server would drop this cast while another of the same spell runs.
+        await this.raw("CMSG_CANCEL_AUTO_REPEAT_SPELL");
+        await shoot();
+        let refaceAt = Date.now() + refaceMs;
+        let reapproachAt = Date.now() + reapproachMs;
+        let shotsSeen = shots;
+        let quiet = 0;
+        for (;;) {
+          this.throwIfAborted("killTarget's fight loop");
+          const end = settled();
+          if (end !== undefined) return end;
+          const at = aimAt();
+          const now = Date.now();
+          if (at && now >= refaceAt) {
+            refaceAt = now + refaceMs;
+            await this.faceQuietly(at);
+          }
+          if (at && now >= reapproachAt) {
+            reapproachAt = now + reapproachMs;
+            const pos = this.state.self.position?.value;
+            const yards = pos === undefined ? undefined : distance2d(pos, at);
+            if (yards !== undefined && yards > reach) {
+              quiet = 0;
+              await walkTo(at, reach);
+              // Moving stops Shoot and Throw; Auto Shot only holds.
+              if (ranged?.spellId !== AUTO_SHOT.spellId) await shoot();
+            } else if (
+              yards !== undefined &&
+              yards > meleeRange &&
+              shots === shotsSeen &&
+              this.state.self.casting === undefined &&
+              this.state.self.channeling === undefined
+            ) {
+              quiet++;
+              if (quiet >= 2) {
+                quiet = 0;
+                await walkTo(at, Math.max(meleeRange, yards / 2));
+              }
+              await shoot();
+            } else quiet = 0;
+            shotsSeen = shots;
+          }
+          await sleep(pollMs);
+        }
+      };
 
       try {
         await this.setTarget(id);
+        if (ranged !== undefined) return await rangedFight();
         // Close the distance before the first swing, so it is a swing and not a
         // 25-second stare. A walk that runs out the clock is an answer too.
         const opening = aimAt();
@@ -9355,19 +9640,8 @@ export class WrathClient {
         let rearmNotBefore = 0;
         for (;;) {
           this.throwIfAborted("killTarget's fight loop");
-          if (targetDead()) return done("killed");
-          if (selfDead()) return done("player_died");
-          if (this.state.nearby.has(key)) sawTarget = true;
-          else return done("lost");
-          if (abortPct !== undefined) {
-            const pct = healthPct();
-            if (pct !== undefined && pct < abortPct) {
-              note = ` (health ${pct.toFixed(0)}% below the ${abortPct}% floor)`;
-              return done("aborted_low_health");
-            }
-          }
-          measure();
-          if (Date.now() > deadline) return done("timeout");
+          const end = settled();
+          if (end !== undefined) return end;
 
           const at = aimAt();
           const now = Date.now();
@@ -9401,11 +9675,15 @@ export class WrathClient {
       } finally {
         offSwing();
         offStop();
+        offShot();
         // Only disarm when the fight is over, or when the caller asked. Anything
         // else — including an exception on the way out — leaves the server
         // swinging, because a disarmed character in a live fight dies.
         if (!leavingArmed(outcome, options.disengage === true)) {
-          await this.attackStop().catch(() => {});
+          // A ranged fight is the auto-repeat, which attack_stop does not end;
+          // left running on a dead target it would also swallow the next one.
+          if (ranged === undefined) await this.attackStop().catch(() => {});
+          else await this.raw("CMSG_CANCEL_AUTO_REPEAT_SPELL").catch(() => {});
         }
       }
     });
@@ -11072,6 +11350,7 @@ export const CLIENT_PLUMBING: ReadonlySet<string> = new Set([
   "opensUnstuckStretch",
   "asyncMoveRecipe",
   "isCorpse",
+  "rangedAttackFor",
   "acceptQuestOnce",
   "withQuestAreas",
   "askQuestAreas",
