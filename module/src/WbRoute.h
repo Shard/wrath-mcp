@@ -61,6 +61,46 @@ namespace WrathBench
         {
             return !force || dz > 0.0f || buried;
         }
+
+        // The end of a walked route. The core's path keeps the z the request
+        // asked for at its last point and settles it the way it settles every
+        // point (NormalizePath: Map::GetHeight looking down from 2y over it),
+        // so a request under the road looks down from inside the terrain and
+        // keeps the guessed z (or finds a floor buried under the hill: a
+        // tunnel roof 45y down in Dun Algaz), and a request in the air over
+        // the floor lands on whatever surface lies within 2y under it (in a
+        // Deadmines corridor, 1.4y under a request 4.9y over the floor: the
+        // last segment then read as a 5.4y climb, refused 863 times). A
+        // client's click lands on
+        // the ground either way. So the end of the walk is the height of the
+        // polygon the path ends on when the settled end sits more than
+        // END_SINK_MAX under it or more than END_LIFT_MAX over it, and the
+        // arrival reports it as `meshZ`, as any mesh-corrected z. 2y each
+        // way: the band the core's own settling tolerates, and the guard's
+        // own step. `lower` false keeps an end over its polygon where it is
+        // (the caller's: a transport's deck has no mesh, and the polygon
+        // under it is the water).
+        inline constexpr float END_SINK_MAX = 2.0f;
+        inline constexpr float END_LIFT_MAX = 2.0f;
+
+        inline float EndZ(float endZ, float polyZ, bool lower = true)
+        {
+            if (endZ < polyZ - END_SINK_MAX)
+                return polyZ;
+            if (lower && endZ > polyZ + END_LIFT_MAX)
+                return polyZ;
+            return endZ;
+        }
+
+        // A walk that ends more than this far from the z the request asked
+        // for reports where it ended as `meshZ` (PROTOCOL.md, `arrived`): the
+        // request's z was off, and the caller should quote `meshZ` next time.
+        inline constexpr float MESH_Z_REPORT = 1.0f;
+
+        inline bool ReportsMeshZ(float endZ, float reqZ)
+        {
+            return std::fabs(endZ - reqZ) > MESH_Z_REPORT;
+        }
     }
 }
 

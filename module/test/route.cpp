@@ -80,9 +80,33 @@ static void Guard()
     Check(Route::IsDropSegment({ 0, 0, 0 }, { 2.5f, 0, 3.01f }, nullptr), "past 1.2 x across is a ledge");
 }
 
+// Fix: the end of the route on its own polygon (Route::EndZ), the case
+// that earned the upward half: a corridor floor at 50.5, a request 4.8y over
+// it at 55.3, which the core's settling put on a surface at 56.7, 1.4y
+// under the request. The last mesh point is at 51.3, 1.5y back.
+static void End()
+{
+    float const floor = 50.5f, reqZ = 55.3f, settled = 56.7f;
+    std::vector<WbVec> route{ { 0, 0, 50.6f }, { 4, 0, 50.9f }, { 8, 0, 51.3f }, { 9.5f, 0, settled } };
+    Check(FirstRefused(route, false) == 2, "before: the settled end over the floor reads as a 5.4y climb");
+    route.back().z = Route::EndZ(route.back().z, floor);
+    Check(route.back().z == floor, "an end 6.2y over its polygon ends on it");
+    Check(FirstRefused(route, false) == -1, "the route to the floor under the request passes");
+    Check(Route::ReportsMeshZ(route.back().z, reqZ), "the arrival reports meshZ, the floor's height");
+
+    // The band, both ways: within 2y the end stays where the core settled it
+    // (a step, a crate, a stale z), past it the polygon's height is the end.
+    Check(Route::EndZ(floor + 1.9f, floor) == floor + 1.9f, "an end 1.9y over its polygon stays");
+    Check(Route::EndZ(floor - 1.9f, floor) == floor - 1.9f, "an end 1.9y under its polygon stays");
+    Check(Route::EndZ(floor - 5.0f, floor) == floor, "an end 5y under its polygon is lifted to it");
+    Check(Route::EndZ(floor + 5.4f, floor, false) == floor + 5.4f, "an end over a polygon it may not be lowered to (a deck) stays");
+    Check(!Route::ReportsMeshZ(floor + 0.9f, floor), "an arrival within 1y of the request carries no meshZ");
+}
+
 int main()
 {
     Guard();
+    End();
     if (failures == 0)
         std::printf("ok\n");
     return failures;

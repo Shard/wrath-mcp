@@ -1865,7 +1865,14 @@ at the top of this document.
   and from inside the terrain finds nothing, or a floor buried under the hill
   — a tunnel roof 45y down, in Dun Algaz), so the module ends the walk at the
   height of the polygon the path ends on instead, and the arrival carries that
-  as `meshZ`. The audit log records the lift as `op: "move_end_z"`.
+  as `meshZ`. So does a request in the air over the floor, whose z the
+  normalization lands on whatever surface lies within 2y under it (in a
+  Deadmines corridor, 1.4y under a request 4.9y over the floor) rather than
+  on the floor: an end settled more
+  than 2y over the polygon the path ends on ends at that polygon's height, as
+  a client's click on the floor would (never off a transport's deck, which
+  the mesh does not have). The audit log records either as
+  `op: "move_end_z"`.
   A request whose own polygon lies on a closed island of the mesh that the
   start's polygon is not on (a component of fewer than 1024 polygons; a
   sliver under a WMO floor, a ledge nothing links to) can be reached by no
@@ -2826,9 +2833,10 @@ A move planned from the water surface over its start (the start's own
 polygon on a closed island; `path_incomplete` below) logs
 `op: "move_start_level"` with `from` (the start), `levelZ` (the level's
 height there) and `islandPolys` (the start island's size).
-A move whose endpoint the core's normalization left under the ground logs
-`op: "move_end_z"` with `normZ` (the z the core settled on) and `meshZ` (the
-height of the polygon the path ends on, where the walk ends instead).
+A move whose endpoint the core's normalization left more than 2y under or
+over the polygon the path ends on logs `op: "move_end_z"` with `normZ` (the z
+the core settled on) and `meshZ` (that polygon's height, where the walk ends
+instead).
 A move whose route the drop guard refused logs `op: "move_replan_steep"`
 (the re-plan under `drop`) with `outcome` — `ok` when a re-planned route
 passed the guard and is the walk, `failed` or `skipped` with a `reason` when

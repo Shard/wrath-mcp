@@ -2595,18 +2595,8 @@ namespace WrathBench
         return false;
     }
 
-    // The core's NormalizePath settles every path point onto the ground by
-    // asking Map::GetHeight from 2y above the point (Z_OFFSET_FIND_HEIGHT in
-    // Object.cpp). The last point keeps the z the request asked for, so a
-    // request more than 2y under the road looks down from inside the terrain:
-    // the terrain is behind it, and the first floor beneath is whatever lies
-    // buried there — nothing (the guessed z is kept, 4y deep) or a WMO roof
-    // under the hill (Dun Algaz: a tunnel roof 45y down). A client's click
-    // lands on the road either way. When the normalized endpoint sits more
-    // than END_SINK_MAX below its own polygon's height, the polygon height is
-    // the endpoint; the arrival then reports `meshZ` as any mesh-corrected
-    // z does. 2y: the same band the core's own normalization tolerates.
-    static constexpr float END_SINK_MAX = 2.0f;
+    // The end of a walked route on the polygon it ends on when the core's
+    // settling left it more than 2y under or over it (Route::EndZ).
 
     // The ground a character stepping off `edge` lands on at the foot's x,y:
     // the first surface Map::GetHeight finds looking down from just above
@@ -3234,17 +3224,25 @@ namespace WrathBench
     void Manager::SettleRoute(Unit* mover, PathResolve& r, float z, float reqZ, bool force, std::vector<size_t>* refusing)
     {
         // The endpoint: the core's normalization keeps a requested z that
-        // sits under the terrain (see END_SINK_MAX). The polygon the path
-        // ends on knows the ground; when the normalized point is under it by
-        // more than the band, the polygon height is where the walk ends.
+        // sits under the terrain, and lands one in the air on whatever lies
+        // under it (Route::EndZ). The polygon the path ends on knows the
+        // ground; when the normalized point is under or over it by more than
+        // the band, the polygon height is where the walk ends. Never lowered
+        // off a transport's deck, which the mesh does not have: the polygon
+        // under a docked boat is the water.
         {
             WbVec& end = r.points.back();
             float polyZ = 0.0f;
-            if (MeshHeightAt(mover, end.x, end.y, z, &polyZ) && end.z < polyZ - END_SINK_MAX)
+            if (MeshHeightAt(mover, end.x, end.y, z, &polyZ))
             {
-                r.hasEndLift = true;
-                r.endLiftFrom = end.z;
-                end.z = polyZ;
+                bool const deck = end.z > polyZ && FindTransportAt(mover->GetMap(), end.x, end.y, std::max(end.z, z)) != nullptr;
+                float const settled = Route::EndZ(end.z, polyZ, !deck);
+                if (settled != end.z)
+                {
+                    r.hasEndLift = true;
+                    r.endLiftFrom = end.z;
+                    end.z = settled;
+                }
             }
         }
         // A route planned from the water surface over the start
@@ -3295,7 +3293,7 @@ namespace WrathBench
         if (r.status)
             return;
         float endZ = r.points.back().z;
-        if (std::fabs(endZ - reqZ) > 1.0f)
+        if (Route::ReportsMeshZ(endZ, reqZ))
         {
             r.hasMeshZ = true;
             r.meshZ = endZ;
