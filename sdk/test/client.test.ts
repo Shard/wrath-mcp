@@ -1095,10 +1095,12 @@ describe("client: movement", () => {
         ev.data.surfaceZ = 154.04;
         return ev;
       };
-      // Wording approved by the operator, 2026-10-14.
+      // The surface may be a floor over a lower level, not the ground (operator, 2026-11-18).
       const expected =
-        "stopped at the edge (-4090.4, -2460.0): the drop ahead lands at z 108.8, underground (the ground here is " +
-        "z 154.0). Your target z 150.0 is below the ground — retry with a z on the surface. force does not apply.";
+        "stopped at the edge (-4090.4, -2460.0): the drop ahead lands at z 108.8, under a surface at z 154.0: the " +
+        "ground here, or a floor or roof with a level beneath it. Your target z 150.0 is under that surface: for a " +
+        "point on it, retry with its z; for one on a level beneath (a cellar, a cave), walk in by that level's own " +
+        "entrance. force does not apply.";
       const stub = startStub({ onConnect: () => frames([...loginSequence, selfCreate]) });
       const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
       await client.createSession({ character: "Fenwick" });
@@ -1141,7 +1143,7 @@ describe("client: movement", () => {
       expect(r.ok).toBe(false);
       if (r.ok) throw new Error("unreachable");
       expect(r.status).toBe("drop");
-      expect(r.hint).toContain("the drop ahead lands at z -3.5, underground (the ground here is z 0.6)");
+      expect(r.hint).toContain("the drop ahead lands at z -3.5, under a surface at z 0.6: the ground here, or a floor or roof");
       expect(stub.actions.map((a) => a.action)).toEqual(["move_to", "stop"]);
       client.close();
       await stub.stop();
@@ -3286,7 +3288,8 @@ describe("client: trainers", () => {
   });
 
   test("affordable is undefined while money is unobserved, never guessed", async () => {
-    const stub = startStub({ onConnect: () => npcWorld() });
+    // No create block of our own yet: nothing has stated the coinage.
+    const stub = startStub({ onConnect: () => frames([...loginSequence, creatureCreate, creatureQuery, walkedUp()]) });
     const client = await inWorld(stub);
     expect(client.state.money).toBeUndefined();
     const pending = client.trainerList(CREATURE_GUID, { timeout: 2000 });

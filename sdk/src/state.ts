@@ -5407,7 +5407,13 @@ export class StateCache {
         this.self.fields.clear();
         for (const [key, v] of kept) this.self.fields.set(key, v);
       }
-      this.mergeFields(this.self, createdFields(block, true), seq, ts);
+      const created = createdFields(block, true);
+      if (created !== undefined && block.objectType === "player") {
+        const powerType = typeof created.powerType === "number" ? created.powerType : this.self.fields.get("powerType")?.value;
+        const keys = powerType === undefined ? CREATE_ZERO_SELF_UNHELD_FIELDS : [...CREATE_ZERO_SELF_UNHELD_FIELDS, `power${powerType + 1}`];
+        for (const key of keys) if (!(key in created) && !this.self.fields.has(key)) created[key] = 0;
+      }
+      this.mergeFields(this.self, created, seq, ts);
       return;
     }
 
@@ -6111,6 +6117,20 @@ function supersededCorpses(objects: Iterable<NearbyObject>): Set<GuidKey> {
 const CREATE_ZERO_UNIT_FIELDS = ["unitFlags", "dynamicFlags", "standState", "shapeshiftForm"] as const;
 /** Our own `playerFlags` and rested XP. Rested XP is PRIVATE, so nobody else's create states it. */
 const CREATE_ZERO_SELF_FIELDS = ["playerFlags", "restedXp"] as const;
+
+/**
+ * Our own fields a create block states as zero by leaving them out, read so
+ * only while the cache holds no reading of them: the login's create and a
+ * replay's (which starts the field block over), while a later ordinary self
+ * create still merges (see `replayPending`). `money`, `xp` and `nextLevelXp`
+ * are PRIVATE: a fresh character's coinage and the XP at the start of a level
+ * are 0, and read "unobserved" until this listed them (a model's
+ * `state.money.value` threw minutes into a new character). And the power the
+ * character uses (`power<powerType + 1>`, what `self.power` reads): a
+ * warrior's rage and a death knight's runic power are 0 at login, and
+ * `self.power` had no reading until the first change.
+ */
+const CREATE_ZERO_SELF_UNHELD_FIELDS = ["money", "xp", "nextLevelXp"] as const;
 
 /**
  * A create block's fields as the client reads them: what the block leaves out

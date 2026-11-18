@@ -109,6 +109,13 @@ export interface ToolSpec<C extends CoreToolContext = CoreToolContext> {
   /** Alias key -> canonical key, applied only when the canonical key is absent, before validation. */
   readonly aliases?: Readonly<Record<string, string>>;
   /**
+   * Keys dropped before validation, for a tool that takes no such argument
+   * but is sent one often enough to cost runs: the scratchpad tools and a
+   * stray `path` or `file` (one model sent it four times in a run past the
+   * error that named it). Kept to keys whose meaning cannot change the call.
+   */
+  readonly ignored?: readonly string[];
+  /**
    * False when this context does not serve the tool (a harness's per-run
    * option). A call to it then answers as an unknown tool, listing the others.
    */
@@ -476,12 +483,15 @@ export class ToolSet<C extends CoreToolContext> {
     return this.byName.has(name);
   }
 
-  /** Rename known alias keys to their canonical names. Deterministic, model-agnostic. */
+  /** Rename known alias keys to their canonical names, and drop the tool's ignored keys. Deterministic, model-agnostic. */
   normalize(name: string, args: unknown): unknown {
-    const aliases = this.byName.get(name)?.aliases;
-    if (aliases === undefined || args === null || typeof args !== "object" || Array.isArray(args)) return args;
+    const spec = this.byName.get(name);
+    const aliases = spec?.aliases;
+    const ignored = spec?.ignored;
+    if ((aliases === undefined && ignored === undefined) || args === null || typeof args !== "object" || Array.isArray(args)) return args;
     const obj = { ...(args as Record<string, unknown>) };
-    for (const [alias, canonical] of Object.entries(aliases)) {
+    for (const key of ignored ?? []) delete obj[key];
+    for (const [alias, canonical] of Object.entries(aliases ?? {})) {
       if (alias in obj && !(canonical in obj)) {
         obj[canonical] = obj[alias];
         delete obj[alias];
@@ -890,6 +900,8 @@ export function coreTools<C extends CoreToolContext>(render: CoreToolRender<C>):
       schema: z.strictObject({ content: z.string() }),
       help: "write_scratchpad expects { content: string } — the full new scratchpad markdown.",
       aliases: { text: "content", markdown: "content" },
+      // There is one scratchpad: a path names nothing (operator, 2026-11-18).
+      ignored: ["path", "file"],
       run: async (ctx, args) => {
         const { content } = args as { content: string };
         const res = ctx.scratchpad.write(content);
@@ -940,6 +952,7 @@ export function coreTools<C extends CoreToolContext>(render: CoreToolRender<C>):
         replace_all: "replaceAll",
         replaceall: "replaceAll",
       },
+      ignored: ["path", "file"],
       run: async (ctx, args) => {
         const { old, new: replacement, replaceAll } = args as {
           old: string;

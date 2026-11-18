@@ -783,11 +783,16 @@ describe("state cache: self progress, target and inventory", () => {
     expect(cache.self.level?.value).toBe(4);
   });
 
-  test("nothing invents them before an event carried them", () => {
+  test("nothing invents them before our own create block; one that leaves them out states them as 0", () => {
+    const before = StateCache.replay(toEvents(loginSequence), { seed: SEED });
+    expect(before.money).toBeUndefined();
+    expect(before.xp).toBeUndefined();
+    expect(before.nextLevelXp).toBeUndefined();
+    // The fixture's create carries no coinage or XP: a fresh character's 0, not "unobserved".
     const cache = withWorld([]);
-    expect(cache.money).toBeUndefined();
-    expect(cache.xp).toBeUndefined();
-    expect(cache.nextLevelXp).toBeUndefined();
+    expect(cache.money).toMatchObject({ value: 0, seq: 17 });
+    expect(cache.xp?.value).toBe(0);
+    expect(cache.nextLevelXp?.value).toBe(0);
   });
 
   test("our own targetGuid resolves to the object in view", () => {
@@ -3632,8 +3637,9 @@ describe("the reattach replay: self fields and repeated creates", () => {
       { seed: SEED },
     );
     expect(cache.self.fields.get("health")?.value).toBe(64);
-    expect(cache.self.fields.get("money")).toBeUndefined();
-    expect(cache.self.fields.get("xp")).toBeUndefined();
+    // Zero, as the replay's create states it by leaving them out: not the stale 350.
+    expect(cache.self.fields.get("money")?.value).toBe(0);
+    expect(cache.self.fields.get("xp")?.value).toBe(0);
     // Only the replay's own create replaces; an ordinary one after it merges.
     const later = StateCache.replay(
       toEvents([...loginSequence, before, sessionState(60, { replay: true }), replayed, replayDone(62, 0), selfWith(70, { money: 12 })]),

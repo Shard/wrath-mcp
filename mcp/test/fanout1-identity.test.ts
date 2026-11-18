@@ -17,6 +17,9 @@
  * nothing else; and that description states the snippet time limit
  * (operator, 2026-11-15), likewise; and `state.self` carries `dead`, a
  * computed boolean (operator, 2026-11-16), which added that key to `self` in
+ * `state_summary`'s answer and nothing else; and our own create block's
+ * omitted coinage and XP read as 0 rather than unobserved (operator,
+ * 2026-11-18), which added `money`, `xp` and `nextLevelXp` at 0 to
  * `state_summary`'s answer and nothing else.
  */
 
