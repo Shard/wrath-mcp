@@ -41,6 +41,14 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 - **The inspector's bearer secret is at least 32 characters**, where it was
   16, the floor the module asks of its port secret. An inspector started
   with a shorter one refuses to start; make a longer one.
+- **The hosted gateway needs the module's request rate on.** A gateway with
+  a deployment's own worker provider reads `limits.actionRate` from the
+  module's `/health` and refuses to start while it is 0 (as
+  `WrathBench.ActionRate` ships) or not said, since nothing else bounds what
+  a tenant's snippet asks of the world thread; every sweep that later finds
+  it 0 logs a warning. Set `WrathBench.ActionRate` (20 for a hosted world).
+  `--trusted-local-workers`, the operator's own grants, is exempt
+  (`GatewayOptions.allowUnratedModule`).
 - **An inspector over a hosted state needs a credential on loopback too.**
   `--hosted-state` with neither `--grants` nor a secret now refuses to start
   whatever the bind, since a proxy on the same machine brings every visitor

@@ -48,6 +48,8 @@ export interface StubModuleOptions {
   /** Refuse a create: return an error body and status. */
   refuseSession?: (body: Record<string, unknown>) => { status: number; body: Record<string, unknown> } | undefined;
   now?: () => number;
+  /** The request rate per lease the port secret's `/health` reports (`limits.actionRate`). Default 20, a hosted world's; 0 is off. */
+  actionRate?: number;
 }
 
 interface SocketData {
@@ -134,7 +136,7 @@ export function startStubModule(options: StubModuleOptions = {}): StubModule {
         // Two views, by credential: the port secret's carries the counts and limits, a lease secret's is liveness with the counters zeroed.
         const head = { ok: true, module: "mod-wrathbench", protocol: 1, build: "stub", worldStopped: false };
         if (!operator) return json({ ...head, sessions: 0, droppedPackets: 0, droppedPacketsLive: 0 });
-        return json({ ...head, sessions: sessions.size, leases: leases.size, limits: { leases: 1024 }, droppedPackets: 0, droppedPacketsLive: 0 });
+        return json({ ...head, sessions: sessions.size, leases: leases.size, limits: { actionRate: options.actionRate ?? 20, actionBurst: 40, leases: 1024 }, droppedPackets: 0, droppedPacketsLive: 0 });
       }
       if (auth === "none") return json({ ok: false, error: bearer === "" ? "unauthorized" : "token_mismatch" }, bearer === "" ? 401 : 403);
       if (url.pathname === "/lease") {
