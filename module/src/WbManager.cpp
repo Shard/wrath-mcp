@@ -2742,19 +2742,24 @@ namespace WrathBench
     // distance, weighted mildly by slope), and the smooth path along it can
     // cut a single 4y step of 51-58 degrees: steeper than the drop guard's
     // 1.2 (about 50 degrees), inside the 60 the mesh is built to walk. The
-    // guard is the client-faithfulness line and stays as it is; when it
-    // refuses the mesh's route, the module plans again with the polygons
-    // under the refused segments barred, so the corridor goes around the band
+    // guard is the client-faithfulness line and stays as it is (the 3.3.5a
+    // client's own limit is 50 degrees, Route::CLIENT_WALKABLE_COS); when it
+    // refuses the mesh's route, the module plans again with the cost through
+    // each polygon weighted by how much of it is steeper than the client
+    // walks (WbNav::SteepCostFilter), so the corridor goes around the face
     // when the mesh has a way, and the walk is that route — guarded the same
     // way — or the original `drop`. Pathing detail like the z-ladder and the
     // subdivision retry: the caller sees only the verdict.
     //
-    // Up to REPLAN_STEEP_ROUNDS re-plans. The first bars the polygons under
-    // every segment of the mesh's route the guard refuses (a 12y climb is
-    // three 4y steps, and barring one only moves the refusal to the next);
-    // each later one adds those of the previous re-plan's refused segments.
-    // It stops at the first route the guard passes, at a round that bars
-    // nothing new, or at a re-plan that finds no complete route.
+    // Up to REPLAN_STEEP_ROUNDS re-plans, all on the steep cost. The first
+    // bars nothing: a polygon is mixed ground, and barring the ones under a
+    // steep step cut the only way down off Dun Morogh's hills where the cost
+    // alone goes round. Each later one bars the polygons under every segment
+    // of the previous route the guard refused (a 12y climb is three 4y steps,
+    // and barring one only moves the refusal to the next), on top of those
+    // already barred. It stops at the first route the guard passes, at a
+    // round that bars nothing new, or at a re-plan that finds no complete
+    // route.
     static constexpr uint32 REPLAN_STEEP_ROUNDS = 3;
     // The re-planned route's reach and corridor are the module planner's
     // (WbNav::PLAN_MAX_POINTS, PLAN_MAX_POLYS), so a re-plan never walks
@@ -3315,10 +3320,9 @@ namespace WrathBench
             r.status = "path_incomplete";
             return r;
         }
-        std::vector<size_t> refusing;
-        SettleRoute(mover, r, z, reqZ, force, &refusing);
+        SettleRoute(mover, r, z, reqZ, force);
         if (r.status && std::strcmp(r.status, "drop") == 0)
-            ReplanSteep(mover, sx, sy, sz, x, y, z, reqZ, force, refusing, r);
+            ReplanSteep(mover, sx, sy, sz, x, y, z, reqZ, force, r);
         return r;
     }
 
@@ -3407,15 +3411,15 @@ namespace WrathBench
 
     // The steep re-plan (see REPLAN_STEEP_ROUNDS). `r` holds the guard's
     // `drop` on the mesh's own route from (sx, sy, sz), the point the core
-    // planned from (the snapped start when the character stood off the mesh);
-    // `refusing` lists that route's refused segments. Each re-plan is a whole
+    // planned from (the snapped start when the character stood off the mesh).
+    // Each re-plan is a whole
     // route from the same start to the same end, settled by the same tail
     // (SettleRoute: endpoint lift, start-snap leg, guard), so a route the
     // guard passes is walked like any other and a route it refuses is never
     // walked. The start and end polygons are never barred: the first is
     // where the character stands, the second is where it asked to go.
     void Manager::ReplanSteep(Unit* mover, float sx, float sy, float sz, float x, float y, float z, float reqZ,
-        bool force, std::vector<size_t> const& refusing, PathResolve& r)
+        bool force, PathResolve& r)
     {
         PathResolve::Replan rp;
         rp.ran = true;
@@ -3449,27 +3453,30 @@ namespace WrathBench
             return finish("skipped", "far_from_poly");
 
         std::vector<dtPolyRef> excluded;
-        ExcludePolysFilter const filter(&excluded);
-        // The route whose refused segments feed the next round; the mesh's
-        // own first. Its first segment is the walk onto the mesh when the
-        // start was snapped, which is not a mesh segment to plan around.
-        std::vector<WbVec> route = r.points;
-        std::vector<size_t> segs = refusing;
+        WbNav::SteepCostFilter const filter(&excluded);
+        // The route whose refused segments feed the next round's bar. Its
+        // first segment is the walk onto the mesh when the start was snapped,
+        // which is not a mesh segment to plan around.
+        std::vector<WbVec> route;
+        std::vector<size_t> segs;
         for (uint32 round = 1; round <= REPLAN_STEEP_ROUNDS; ++round)
         {
-            size_t before = excluded.size();
-            std::vector<dtPolyRef> under;
-            for (size_t i : segs)
+            if (round > 1)
             {
-                if (r.hasSnap && i == 0)
-                    continue;
-                SegmentPolys(query, base, route[i], route[i + 1], under);
+                size_t before = excluded.size();
+                std::vector<dtPolyRef> under;
+                for (size_t i : segs)
+                {
+                    if (r.hasSnap && i == 0)
+                        continue;
+                    SegmentPolys(query, base, route[i], route[i + 1], under);
+                }
+                for (dtPolyRef ref : under)
+                    if (ref != startRef && ref != endRef && std::find(excluded.begin(), excluded.end(), ref) == excluded.end())
+                        excluded.push_back(ref);
+                if (excluded.size() == before)
+                    return finish("failed", "nothing_to_exclude");
             }
-            for (dtPolyRef ref : under)
-                if (ref != startRef && ref != endRef && std::find(excluded.begin(), excluded.end(), ref) == excluded.end())
-                    excluded.push_back(ref);
-            if (excluded.size() == before)
-                return finish(round == 1 ? "skipped" : "failed", "nothing_to_exclude");
 
             rp.rounds = round;
             rp.excluded = uint32(excluded.size());

@@ -9,9 +9,11 @@
 #include "WbNav.h"
 
 #include "DetourCommon.h"
+#include "WbRoute.h"
 
 #include <algorithm>
 #include <cfloat>
+#include <cmath>
 #include <unordered_set>
 
 namespace WbNav
@@ -32,6 +34,51 @@ namespace WbNav
         if (_excluded && std::find(_excluded->begin(), _excluded->end(), ref) != _excluded->end())
             return false;
         return dtQueryFilter::passFilter(ref, tile, poly);
+    }
+
+    float SteepShare(dtMeshTile const* tile, dtPoly const* poly)
+    {
+        if (!tile || !poly || poly->getType() != DT_POLYTYPE_GROUND || !tile->detailMeshes)
+            return 0.0f;
+        unsigned int const ip = (unsigned int)(poly - tile->polys);
+        dtPolyDetail const& pd = tile->detailMeshes[ip];
+        float steep = 0.0f, total = 0.0f;
+        for (int j = 0; j < pd.triCount; ++j)
+        {
+            unsigned char const* t = &tile->detailTris[(pd.triBase + j) * 4];
+            float const* v[3];
+            for (int k = 0; k < 3; ++k)
+                v[k] = t[k] < poly->vertCount
+                    ? &tile->verts[poly->verts[t[k]] * 3]
+                    : &tile->detailVerts[(pd.vertBase + (t[k] - poly->vertCount)) * 3];
+            float e0[3], e1[3], n[3];
+            dtVsub(e0, v[1], v[0]);
+            dtVsub(e1, v[2], v[0]);
+            dtVcross(n, e0, e1);
+            float const len = dtVlen(n); // twice the triangle's area
+            total += len;
+            if (WrathBench::Route::SteepSurface(n[1], len)) // Detour's y is up
+                steep += len;
+        }
+        return total > 0.0f ? steep / total : 0.0f;
+    }
+
+    SteepCostFilter::SteepCostFilter(std::vector<dtPolyRef> const* excluded, float weight)
+        : ExcludePolysFilter(excluded), _weight(weight < 0.0f ? WrathBench::Route::STEEP_COST : weight)
+    {
+    }
+
+    float SteepCostFilter::getCost(float const* pa, float const* pb,
+        dtPolyRef const prevRef, dtMeshTile const* prevTile, dtPoly const* prevPoly,
+        dtPolyRef const curRef, dtMeshTile const* curTile, dtPoly const* curPoly,
+        dtPolyRef const nextRef, dtMeshTile const* nextTile, dtPoly const* nextPoly) const
+    {
+        float const cost = dtQueryFilterExt::getCost(pa, pb, prevRef, prevTile, prevPoly, curRef, curTile, curPoly,
+            nextRef, nextTile, nextPoly);
+        auto it = _share.find(curRef);
+        if (it == _share.end())
+            it = _share.emplace(curRef, SteepShare(curTile, curPoly)).first;
+        return cost * WrathBench::Route::SteepCost(it->second, _weight);
     }
 
     dtPolyRef CorePolyAt(dtNavMeshQuery const* query, dtQueryFilter const& filter, float const* point, float* dist)

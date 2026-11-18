@@ -38,4 +38,4 @@ async function buildAndRun(name: string): Promise<void> {
   }
 }
 
-test.skipIf(compiler === null)("the drop guard's verdict holds: stairs pass, walls and sustained steep slopes are refused", () => buildAndRun("route"), 60_000);
+test.skipIf(compiler === null)("the drop guard's verdict holds: stairs pass, walls and sustained steep slopes are refused, at the client's 50 degrees", () => buildAndRun("route"), 60_000);

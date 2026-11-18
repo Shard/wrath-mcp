@@ -610,10 +610,10 @@ namespace WrathBench
             struct Replan
             {
                 bool ran{false};
-                char const* outcome{""};  // "ok" (the re-planned route is the walk), "failed", "skipped"
+                char const* outcome{""};  // "ok" (the re-planned route is the walk), "failed", "skipped" (no re-plan ran)
                 char const* reason{""};   // why it failed or was skipped
                 uint32 rounds{0};         // re-plans run (at most REPLAN_STEEP_ROUNDS)
-                uint32 excluded{0};       // polygons excluded by the last one
+                uint32 excluded{0};       // polygons excluded by the last one (0 on the first, which bars none)
                 uint32 firstPoints{0};    // the mesh's own route: point count, refused edge, step
                 WbVec edge;
                 float dz{0};
@@ -651,11 +651,12 @@ namespace WrathBench
         void SettleRoute(Unit* mover, PathResolve& r, float z, float reqZ, bool force,
             std::vector<size_t>* refusing = nullptr);
         // After the guard refused the mesh's route from (sx, sy, sz): plan again
-        // with the polygons under the refused segments excluded and take the
-        // first route the guard passes. `r` is replaced only then; otherwise
-        // only its `replan` record changes.
+        // with the cost of ground steeper than the client walks weighted up,
+        // then with the polygons under each re-plan's refused segments
+        // excluded, and take the first route the guard passes. `r` is
+        // replaced only then; otherwise only its `replan` record changes.
         void ReplanSteep(Unit* mover, float sx, float sy, float sz, float x, float y, float z, float reqZ,
-            bool force, std::vector<size_t> const& refusing, PathResolve& r);
+            bool force, PathResolve& r);
         // A path_incomplete whose request lies below the end of the mesh's
         // route (`partial`, from the planned start): walk on from that end
         // toward the request to an edge, fall to the surface below, and route
