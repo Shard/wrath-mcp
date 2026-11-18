@@ -134,8 +134,10 @@ describe("unit reaction from the template relations", () => {
     expect(cache.units({ reaction: "hostile" }).map((u) => u.guid)).toEqual([monster.guid]);
     expect(cache.units({ reaction: ["neutral", "friendly"] }).map((u) => u.guid).sort()).toEqual([guard.guid, critter.guid].sort());
     expect(cache.closest({ reaction: "friendly" })?.guid).toBe(guard.guid);
+    expect(cache.units({ reaction: "HOSTILE" as never }).map((u) => u.guid)).toEqual([monster.guid]);
+    expect(cache.units({ reaction: ["Neutral", "friendly"] as never }).map((u) => u.guid).sort()).toEqual([guard.guid, critter.guid].sort());
     expect(() => cache.units({ reaction: "enemy" } as never)).toThrow(
-      'state.units() filter: reaction received "enemy", expected one of "hostile", "neutral", "friendly" (exact, case-sensitive) or an array of them.',
+      'state.units() filter: reaction received "enemy", expected one of "hostile", "neutral", "friendly" (any letter case) or an array of them.',
     );
     expect(() => cache.units({ hostile: true } as never)).toThrow('(hostile: use reaction: "hostile".)');
   });

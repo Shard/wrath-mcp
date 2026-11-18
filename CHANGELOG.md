@@ -502,6 +502,14 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Changed
 
+- **Closed vocabularies accept any letter case.** `state.units()`'s `type`,
+  `role`, `questGiver` and `reaction`, `say`'s `type` and `lootRoll`'s
+  `choice` resolve a value in any letter case to its documented spelling, so
+  `{ type: "gameobject" }` is `{ type: "gameObject" }`; anything else is still
+  refused, and the `state.units()` refusals say "(any letter case)" where they
+  said "(exact, case-sensitive)". Names, filter keys and every other argument
+  are unchanged.
+
 - **`killTarget` says it only auto-attacks.** Its doc comment and reference
   row state that it casts nothing but its auto-attack, and that `castSpell`
   from the model's own code runs alongside it while it fights.

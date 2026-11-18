@@ -6252,6 +6252,34 @@ const UNIT_FILTER_KEY_HINTS: Readonly<Record<string, string>> = {
 const UNIT_FILTER_TYPES = ["unit", "player", "gameObject", "corpse"] as const;
 
 /**
+ * A closed vocabulary's members by their lowercase spelling. Letter case
+ * carries no meaning in these words, so a value in any case has one reading,
+ * the documented spelling: `"gameobject"` is `"gameObject"`. Two members that
+ * differ only by case would make that two readings, so building such a
+ * vocabulary throws at load.
+ */
+export function caseFoldedVocabulary<T extends string>(words: readonly T[]): ReadonlyMap<string, T> {
+  const folded = new Map<string, T>();
+  for (const word of words) {
+    const key = word.toLowerCase();
+    const other = folded.get(key);
+    if (other !== undefined) throw new Error(`vocabulary words ${JSON.stringify(other)} and ${JSON.stringify(word)} differ only by case`);
+    folded.set(key, word);
+  }
+  return folded;
+}
+
+/** The documented spelling of `value` in a case-folded vocabulary, or undefined for anything it does not name. */
+export function canonicalWord<T extends string>(vocabulary: ReadonlyMap<string, T>, value: unknown): T | undefined {
+  return typeof value === "string" ? vocabulary.get(value.toLowerCase()) : undefined;
+}
+
+const UNIT_FILTER_TYPE_WORDS = caseFoldedVocabulary(UNIT_FILTER_TYPES);
+const NPC_ROLE_WORDS = caseFoldedVocabulary(NPC_ROLES);
+const QUEST_GIVER_STATUS_WORDS = caseFoldedVocabulary(QUEST_GIVER_STATUS_NAMES);
+const UNIT_REACTION_WORDS = caseFoldedVocabulary(UNIT_REACTIONS);
+
+/**
  * How a `name` criterion is matched, resolved once at normalization. `text`
  * carries the lowercased query for substring matching and tier ranking; `regex`
  * carries a compiled matcher whose results stay in nearest-first order.
@@ -6448,15 +6476,17 @@ function normalizeUnitFilter(filter: UnitFilter | undefined): NormalizedUnitFilt
   if (filter.name !== undefined) out.name = compileNameMatcher(filter.name);
 
   if (filter.type !== undefined) {
-    // An enum near-miss ("gameobject", "npc") has more than one plausible
-    // reading, so reject rather than pick. No case folding here.
-    if (!(UNIT_FILTER_TYPES as readonly string[]).includes(filter.type as string)) {
+    // Letter case is folded ("gameobject" is "gameObject"); any other
+    // near-miss ("npc", "object") has more than one plausible reading, so
+    // reject rather than pick.
+    const type = canonicalWord(UNIT_FILTER_TYPE_WORDS, filter.type);
+    if (type === undefined) {
       throw filterError(
         `type received ${showValue(filter.type)}, expected one of ${UNIT_FILTER_TYPES.map(showValue).join(", ")} ` +
-          "(exact, case-sensitive).",
+          "(any letter case).",
       );
     }
-    out.type = filter.type;
+    out.type = type;
   }
 
   if (filter.alive !== undefined) out.alive = coerceBoolean(filter.alive, "alive");
@@ -6467,19 +6497,20 @@ function normalizeUnitFilter(filter: UnitFilter | undefined): NormalizedUnitFilt
     if (raw.length === 0) throw filterError('role received an empty array; pass a role word such as "vendor", or omit role.');
     const roles = new Set<NpcRole>();
     for (const item of raw) {
-      if (typeof item !== "string" || !(NPC_ROLES as readonly string[]).includes(item)) {
+      const role = canonicalWord(NPC_ROLE_WORDS, item);
+      if (role === undefined) {
         throw filterError(
           `role received ${showValue(item)}, expected one of ${NPC_ROLES.map(showValue).join(", ")} ` +
-            "(exact, case-sensitive) or an array of them.",
+            "(any letter case) or an array of them.",
         );
       }
-      roles.add(item as NpcRole);
+      roles.add(role);
     }
     out.role = roles;
   }
 
   if (filter.questGiver !== undefined) {
-    // Exact names only: "?"/"!" or "turnin" have more than one reading
+    // Names only, in any letter case: "?"/"!" or "turnin" have more than one reading
     // (reward vs reward_rep vs incomplete), so reject and list the options.
     // `true` is the exception: "does this NPC have anything for me" has one
     // reading (any marker but "none"), so it is honored. `false` has two
@@ -6501,14 +6532,15 @@ function normalizeUnitFilter(filter: UnitFilter | undefined): NormalizedUnitFilt
       }
       const names = new Set<QuestGiverStatusName>();
       for (const item of raw) {
-        if (typeof item !== "string" || !(QUEST_GIVER_STATUS_NAMES as readonly string[]).includes(item)) {
+        const name = canonicalWord(QUEST_GIVER_STATUS_WORDS, item);
+        if (name === undefined) {
           throw filterError(
             `questGiver received ${showValue(item)}, expected one of ${QUEST_GIVER_STATUS_NAMES.map(showValue).join(", ")} ` +
-              '(exact, case-sensitive), an array of them, or true for any marker at all. "reward" is a turn-in ready ' +
+              '(any letter case), an array of them, or true for any marker at all. "reward" is a turn-in ready ' +
               'now, "available" a quest on offer, "incomplete" an ender whose quest is not done yet.',
           );
         }
-        names.add(item as QuestGiverStatusName);
+        names.add(name);
       }
       out.questGiver = names;
     }
@@ -6519,10 +6551,11 @@ function normalizeUnitFilter(filter: UnitFilter | undefined): NormalizedUnitFilt
     if (raw.length === 0) throw filterError('reaction received an empty array; pass "hostile", "neutral" or "friendly", or omit reaction.');
     const reactions = new Set<UnitReaction>();
     for (const item of raw) {
-      if (typeof item !== "string" || !(UNIT_REACTIONS as readonly string[]).includes(item)) {
-        throw filterError(`reaction received ${showValue(item)}, expected one of ${UNIT_REACTIONS.map(showValue).join(", ")} (exact, case-sensitive) or an array of them.`);
+      const reaction = canonicalWord(UNIT_REACTION_WORDS, item);
+      if (reaction === undefined) {
+        throw filterError(`reaction received ${showValue(item)}, expected one of ${UNIT_REACTIONS.map(showValue).join(", ")} (any letter case) or an array of them.`);
       }
-      reactions.add(item as UnitReaction);
+      reactions.add(reaction);
     }
     out.reaction = reactions;
   }
