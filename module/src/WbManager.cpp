@@ -2343,7 +2343,12 @@ namespace WrathBench
     // A route's points over water deep enough to swim, under its surface, at
     // the surface (Route::WaterZ): a swimmer climbs out from there, and
     // PlaceMover holds the body at its swim depth under it. The depth is the
-    // liquid's own, read as WaterPoseAt reads it. Returns how many were raised.
+    // liquid's own, read as WaterPoseAt reads it: one read a point, made on
+    // the world thread, so at most Bounds::kSamplesMax of them a settle, as
+    // WalkEtaMs is bounded (a route past that, only ever an edge drop's
+    // concatenation, keeps its later points' z). A resolve settles a route
+    // once, up to four times when the steep re-plan runs all its rounds.
+    // Returns how many were raised.
     static uint32 OntoWater(Unit* mover, std::vector<WbVec>& points)
     {
         Map* map = mover->GetMap();
@@ -2352,8 +2357,10 @@ namespace WrathBench
         float const height = mover->GetCollisionHeight();
         float const swimDepth = height * SWIM_DEPTH_FRACTION + SWIM_DEPTH_MARGIN;
         uint32 raised = 0;
-        for (WbVec& p : points)
+        size_t const reads = std::min<size_t>(points.size(), Bounds::kSamplesMax);
+        for (size_t i = 0; i < reads; ++i)
         {
+            WbVec& p = points[i];
             LiquidData const liquid = map->GetLiquidData(mover->GetPhaseMask(), p.x, p.y, p.z, height, {});
             bool const water = liquid.Status != LIQUID_MAP_NO_WATER && liquid.Level > INVALID_HEIGHT
                 && liquid.DepthLevel > INVALID_HEIGHT && liquid.Level > liquid.DepthLevel;
@@ -2792,25 +2799,25 @@ namespace WrathBench
         add(CorePolyAt(query, filter, pb, nullptr));
     }
 
-    // A route's first `count` points at the mesh's own height where the
+    // A route's points [first, end) at the mesh's own height where the
     // core's settling lifted them over it (Route::PointZ), so the guard
     // (SettleRoute), its twin in TickMover, the walk's heartbeats and the
     // ground read under a step down (FootUnderSurface, from the edge's z) all
     // see the surface the route was smoothed along. Each point's polygon is
     // the one the smooth path walked onto from the point before
     // (WbNav::SurfaceHeights), from `start` (Detour order) on `startRef`,
-    // where the core planned from. The last point of a route to a request is
-    // the request's own and is left out (`count`): its z is the end's
-    // (SettleRoute, Route::EndZ). Returns how many points were lowered.
-    static uint32 OntoMesh(Unit* mover, dtPolyRef startRef, float const* start, std::vector<WbVec>& points, size_t count)
+    // where the core planned that stretch from. The last point of a route to
+    // a request is the request's own and is left out (`end`): its z is the
+    // end's (SettleRoute, Route::EndZ). Returns how many points were lowered.
+    static uint32 OntoMesh(Unit* mover, dtPolyRef startRef, float const* start, std::vector<WbVec>& points, size_t first, size_t end)
     {
         dtNavMeshQuery const* query = mover->GetMap()->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
-        count = std::min(count, points.size());
-        if (!query || !startRef || count == 0)
+        end = std::min(end, points.size());
+        if (!query || !startRef || first >= end)
             return 0;
         std::vector<float> det;
-        det.reserve(count * 3);
-        for (size_t i = 0; i < count; ++i)
+        det.reserve((end - first) * 3);
+        for (size_t i = first; i < end; ++i)
         {
             det.push_back(points[i].y);
             det.push_back(points[i].z);
@@ -2821,9 +2828,9 @@ namespace WrathBench
         std::vector<uint8_t> known;
         WbNav::SurfaceHeights(query, base, startRef, start, det, heights, known);
         uint32 lowered = 0;
-        for (size_t i = 0; i < count; ++i)
+        for (size_t i = first; i < end; ++i)
         {
-            float const z = Route::PointZ(points[i].z, known[i] != 0, heights[i]);
+            float const z = Route::PointZ(points[i].z, known[i - first] != 0, heights[i - first]);
             if (z != points[i].z)
             {
                 points[i].z = z;
@@ -2855,7 +2862,7 @@ namespace WrathBench
             mover->UpdateAllowedPositionZ(v.x, v.y, v.z);
             out.push_back(v);
         }
-        uint32 const n = OntoMesh(mover, startRef, start, out, out.size() - 1);
+        uint32 const n = OntoMesh(mover, startRef, start, out, 0, out.size() - 1);
         if (lowered)
             *lowered = n;
         return true;
@@ -3191,7 +3198,7 @@ namespace WrathBench
             }
             for (auto const& v : pts)
                 r.points.push_back({v.x, v.y, v.z});
-            r.meshPoints = OntoMesh(mover, startRef, startPt, r.points, r.points.size() - 1);
+            r.meshPoints = OntoMesh(mover, startRef, startPt, r.points, 0, r.points.size() - 1);
         }
         else
         {
@@ -3239,9 +3246,18 @@ namespace WrathBench
                     Movement::PointsArray const& pts2 = leg2.GetPath();
                     for (size_t i = 1; i < pts2.size(); ++i) // pts2[0] == mid
                         r.points.push_back({pts2[i].x, pts2[i].y, pts2[i].z});
-                    // One walk along the surface over both legs: the second
-                    // was smoothed from the first's last point.
-                    r.meshPoints = OntoMesh(mover, startRef, startPt, r.points, r.points.size() - 1);
+                    // Each leg from where the core planned it: the first from
+                    // the start, the second from `mid` as the core settled
+                    // it, on the polygon the core picks there. Were mid lifted
+                    // onto a landing, the second leg runs on the landing, and
+                    // a walk carried on from the first's stairs would lower it.
+                    r.meshPoints = OntoMesh(mover, startRef, startPt, r.points, 0, got);
+                    if (query)
+                    {
+                        float midPt[3] = { mid.y, mid.z, mid.x };
+                        dtPolyRef const midRef = CorePolyAt(query, base, midPt, nullptr);
+                        r.meshPoints += OntoMesh(mover, midRef, midPt, r.points, got, r.points.size() - 1);
+                    }
                 }
                 else
                 {
@@ -3252,7 +3268,7 @@ namespace WrathBench
                     // Every point of it is the smooth path's own (the request
                     // was left off above), the last one included: the edge
                     // drop walks on from there (TryEdgeDrop).
-                    r.meshPoints = OntoMesh(mover, startRef, startPt, partial, partial.size());
+                    r.meshPoints = OntoMesh(mover, startRef, startPt, partial, 0, partial.size());
                     r.reachedZ = partial.back().z;
                 }
             }
@@ -3894,7 +3910,7 @@ namespace WrathBench
                 {
                     for (auto const& v : gen.GetPath())
                         below.push_back({ v.x, v.y, v.z });
-                    belowLowered = OntoMesh(mover, startRef, startPt, below, below.size() - 1);
+                    belowLowered = OntoMesh(mover, startRef, startPt, below, 0, below.size() - 1);
                 }
             }
         }
