@@ -97,6 +97,26 @@ namespace WbNav
         dtPolyRef startRef, dtPolyRef endRef, float const* start, float const* end, uint32_t maxPoints,
         std::vector<float>& out, char const** why, int* polysOut = nullptr);
 
+    // The mesh's own height under each point of a route smoothed along the
+    // surface from `start` on `startRef` (the core's path or PlanCorridor's;
+    // `points` in Detour order, 3 floats a point). The core settles every
+    // point onto the first floor Map::GetHeight finds looking down from 2y
+    // over it, which lifts a stair point under a landing onto the landing
+    // (Kharanos: a cellar stair at 395.2 read as 397.5, and the step after it
+    // as a 5.1y fall). Each point's polygon is found as the smooth path found
+    // it: walking along the surface (Detour's moveAlongSurface, the step
+    // PathGenerator::FindSmoothPath takes) from the point before, starting
+    // where the core starts (the start polygon's boundary point nearest
+    // `start`). Asking for the polygon at the point's own z would not do: from
+    // the landing's height the nearest polygon is the landing. `known[i]` is
+    // false where the walk could not reach point i within SURFACE_REACH (an
+    // off-mesh leg, a gap), and for every point after it: the walk has lost
+    // the surface the route was smoothed along.
+    constexpr float SURFACE_REACH = 0.25f;
+    constexpr int SURFACE_MAX_VISITED = 32;
+    void SurfaceHeights(dtNavMeshQuery const* query, dtQueryFilter const& filter, dtPolyRef startRef, float const* start,
+        std::vector<float> const& points, std::vector<float>& heights, std::vector<uint8_t>& known);
+
     // Whether `ref` lies on an island `startRef` cannot reach: its component
     // closes under ISLAND_MAX_POLYS polygons without holding `startRef`.
     // `island` gets the component when it does. A zero `startRef` (no start

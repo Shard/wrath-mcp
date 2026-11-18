@@ -103,10 +103,36 @@ static void End()
     Check(!Route::ReportsMeshZ(floor + 0.9f, floor), "an arrival within 1y of the request carries no meshZ");
 }
 
+// Fix: each point at the mesh's height where the core lifted it
+// (Route::PointZ), the case that earned it: a switchback cellar stair whose
+// point under the landing was settled 1.8y up, onto the landing, so the next
+// step read as a 4.9y fall over 4y.
+static void Lifted()
+{
+    float const meshZ = 395.5f;
+    std::vector<WbVec> stair{ { 0, 0, 399.1f }, { 4, 0, 397.3f }, { 8, 0, 395.5f }, { 8, 4, meshZ + 1.8f }, { 8, 8, 392.4f }, { 10, 8, 392.4f } };
+    Check(FirstRefused(stair, false) == 3, "before: the step off the lifted point reads as a 4.9y fall");
+    stair[3].z = Route::PointZ(stair[3].z, true, meshZ);
+    Check(stair[3].z == meshZ, "a point lifted 1.8y over the mesh is judged at the mesh");
+    Check(FirstRefused(stair, false) == -1, "the stair the mesh has passes");
+
+    Check(Route::PointZ(meshZ + 0.9f, true, meshZ) == meshZ + 0.9f, "a point within 1y over the mesh keeps the core's z");
+    Check(Route::PointZ(meshZ - 1.2f, true, meshZ) == meshZ - 1.2f, "a point under the mesh keeps the core's z");
+    Check(Route::PointZ(meshZ + 1.8f, false, meshZ) == meshZ + 1.8f, "a point the surface walk did not reach keeps the core's z");
+
+    // A real wall stays a wall: the mesh's own heights are the wall's, so
+    // nothing is lowered and the climb is refused.
+    std::vector<WbVec> wall{ { 0, 0, 0 }, { 4, 0, 0 }, { 5.5f, 0, 5 }, { 9.5f, 0, 5 } };
+    for (std::size_t i = 0; i + 1 < wall.size(); ++i)
+        wall[i].z = Route::PointZ(wall[i].z, true, wall[i].z);
+    Check(FirstRefused(wall, false) == 1, "a 5y wall on the mesh's own heights is still refused");
+}
+
 int main()
 {
     Guard();
     End();
+    Lifted();
     if (failures == 0)
         std::printf("ok\n");
     return failures;

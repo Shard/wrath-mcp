@@ -92,6 +92,26 @@ namespace WrathBench
             return endZ;
         }
 
+        // A point along the route. The core settles each one onto the first
+        // floor Map::GetHeight finds looking down from 2.5y over the mesh
+        // (its smooth path's 0.5y lift and 2y look), game objects included,
+        // so a stair point under a landing is lifted onto the landing
+        // (Kharanos: a cellar stair at 395.2 read as 397.5, and the step
+        // after it as a 5.1y fall onto a foot "under" the landing, refused
+        // forced or not). A point the core lifted more than MESH_LIFT_MAX
+        // over the mesh's own height under it (`meshZ`, where `known`) is
+        // judged and walked at the mesh's height: the surface the route was
+        // smoothed along, which a client's character walks. A point at or
+        // under the mesh keeps the core's z: that is the ground, or a swimmer's
+        // depth under the water's surface. 1y: twice the smooth path's lift, inside which the core's
+        // ground is the better height.
+        inline constexpr float MESH_LIFT_MAX = 1.0f;
+
+        inline float PointZ(float coreZ, bool known, float meshZ)
+        {
+            return known && coreZ > meshZ + MESH_LIFT_MAX ? meshZ : coreZ;
+        }
+
         // A walk that ends more than this far from the z the request asked
         // for reports where it ended as `meshZ` (PROTOCOL.md, `arrived`): the
         // request's z was off, and the caller should quote `meshZ` next time.

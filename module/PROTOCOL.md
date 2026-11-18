@@ -2011,7 +2011,16 @@ at the top of this document.
 - `drop` — the mesh's route steps off a ledge: some segment of the resolved
   polyline falls (or climbs) more than 2.0y and steeper than 1.2x its 2D
   length — a cliff, not a ramp (stairs and ramps pass; a stale z within the
-  `meshZ` band passes). Before refusing, the module re-plans around the steep
+  `meshZ` band passes). Each point is judged where the route was smoothed
+  along the mesh: the core settles every path point onto the first floor it
+  finds looking down from 2y over it, game objects included, which lifts a
+  stair point under a landing onto the landing (a Kharanos cellar stair read
+  2.3y high, and the step after it as a 5.1y fall onto ground "under" the
+  landing). A point lifted more than 1y over the mesh's own height under it —
+  the polygon the route walked onto from the point before, never one looked
+  up from the lifted z — is judged, and walked, at the mesh's height; one at
+  or under it keeps the core's. The route's end is the request's (`arrived`,
+  above). Before refusing, the module re-plans around the steep
   band, up to three times, with the mesh polygons under every refused segment
   barred, and walks the first re-planned route this same guard passes; when
   none does, what follows describes the mesh's own route. A `drop` can also
@@ -2864,8 +2873,10 @@ its request is (within the smooth path's slop, above) logs
 the walk itself ends at that x,y at the start's z.
 Each `move_to` that reaches the mesh also logs one `op: "move_path"` record at
 dispatch — `moveId`, `status` (`"ok"` when the walk was dispatched, else the
-`WB_MOVE_RESULT` status), `pointCount`, and `points` (the resolved polyline,
-capped at 64 points with `truncated: true` when the cap bit) — so a route the
+`WB_MOVE_RESULT` status), `pointCount`, `points` (the resolved polyline,
+capped at 64 points with `truncated: true` when the cap bit) and, when any
+were, `meshPoints` (how many of its points the core's settling had lifted more
+than 1y over the mesh and were put back on it: `drop`, below) — so a route the
 mesh chose is read from the log, not reconstructed from heartbeats. Beside it,
 one `op: "move_eta"` record for each dispatched walk: `moveId`, `etaMs`,
 `pathLength`, `swimYards` (the stretches the walk-time estimate counted as

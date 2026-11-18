@@ -2601,7 +2601,9 @@ namespace WrathBench
     // The ground a character stepping off `edge` lands on at the foot's x,y:
     // the first surface Map::GetHeight finds looking down from just above
     // the edge's height (terrain, vmap and game-object floors, the geometry
-    // a client has too). A foot more than FOOT_UNDER_SURFACE below it is
+    // a client has too). The edge's height is the route's own: the mesh's
+    // where the core's settling lifted the point over it (OntoMesh), so the
+    // look starts under a landing the stair runs beneath, not on it. A foot more than FOOT_UNDER_SURFACE below it is
     // inside solid ground — a z the request guessed and the mesh never
     // resolved — and no client falls through terrain, so such a step is
     // refused forced or not. Searching from the edge rather than from the
@@ -2763,16 +2765,58 @@ namespace WrathBench
         add(CorePolyAt(query, filter, pb, nullptr));
     }
 
+    // A route's first `count` points at the mesh's own height where the
+    // core's settling lifted them over it (Route::PointZ), so the guard
+    // (SettleRoute), its twin in TickMover, the walk's heartbeats and the
+    // ground read under a step down (FootUnderSurface, from the edge's z) all
+    // see the surface the route was smoothed along. Each point's polygon is
+    // the one the smooth path walked onto from the point before
+    // (WbNav::SurfaceHeights), from `start` (Detour order) on `startRef`,
+    // where the core planned from. The last point of a route to a request is
+    // the request's own and is left out (`count`): its z is the end's
+    // (SettleRoute, Route::EndZ). Returns how many points were lowered.
+    static uint32 OntoMesh(Unit* mover, dtPolyRef startRef, float const* start, std::vector<WbVec>& points, size_t count)
+    {
+        dtNavMeshQuery const* query = mover->GetMap()->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
+        count = std::min(count, points.size());
+        if (!query || !startRef || count == 0)
+            return 0;
+        std::vector<float> det;
+        det.reserve(count * 3);
+        for (size_t i = 0; i < count; ++i)
+        {
+            det.push_back(points[i].y);
+            det.push_back(points[i].z);
+            det.push_back(points[i].x);
+        }
+        ExcludePolysFilter const base;
+        std::vector<float> heights;
+        std::vector<uint8_t> known;
+        WbNav::SurfaceHeights(query, base, startRef, start, det, heights, known);
+        uint32 lowered = 0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            float const z = Route::PointZ(points[i].z, known[i] != 0, heights[i]);
+            if (z != points[i].z)
+            {
+                points[i].z = z;
+                ++lowered;
+            }
+        }
+        return lowered;
+    }
+
     // One re-plan from `start` to `end` (Detour order, the points the core
     // planned between) with `filter`'s polygons barred, as the core builds a
     // route: findPath over the corridor, the smooth path along it, every point
     // settled on the ground the way NormalizePath does
-    // (WorldObject::UpdateAllowedPositionZ). False, with `why`, when the
-    // corridor does not reach the end polygon or the route would not fit
-    // REPLAN_MAX_POINTS; nothing is walked then.
+    // (WorldObject::UpdateAllowedPositionZ), and then onto the mesh where
+    // that lifted it (OntoMesh; `lowered` counts them). False, with `why`,
+    // when the corridor does not reach the end polygon or the route would not
+    // fit REPLAN_MAX_POINTS; nothing is walked then.
     static bool PlanAround(Unit* mover, dtNavMesh const* navMesh, dtNavMeshQuery const* query, ExcludePolysFilter const& filter,
         dtPolyRef startRef, dtPolyRef endRef, float const* start, float const* end, std::vector<WbVec>& out, char const** why,
-        int* polysOut = nullptr)
+        int* polysOut = nullptr, uint32* lowered = nullptr)
     {
         std::vector<float> pts;
         if (!WbNav::PlanCorridor(navMesh, query, filter, startRef, endRef, start, end, WbNav::PLAN_MAX_POINTS, pts, why, polysOut))
@@ -2784,6 +2828,9 @@ namespace WrathBench
             mover->UpdateAllowedPositionZ(v.x, v.y, v.z);
             out.push_back(v);
         }
+        uint32 const n = OntoMesh(mover, startRef, start, out, out.size() - 1);
+        if (lowered)
+            *lowered = n;
         return true;
     }
 
@@ -3117,6 +3164,7 @@ namespace WrathBench
             }
             for (auto const& v : pts)
                 r.points.push_back({v.x, v.y, v.z});
+            r.meshPoints = OntoMesh(mover, startRef, startPt, r.points, r.points.size() - 1);
         }
         else
         {
@@ -3164,6 +3212,9 @@ namespace WrathBench
                     Movement::PointsArray const& pts2 = leg2.GetPath();
                     for (size_t i = 1; i < pts2.size(); ++i) // pts2[0] == mid
                         r.points.push_back({pts2[i].x, pts2[i].y, pts2[i].z});
+                    // One walk along the surface over both legs: the second
+                    // was smoothed from the first's last point.
+                    r.meshPoints = OntoMesh(mover, startRef, startPt, r.points, r.points.size() - 1);
                 }
                 else
                 {
@@ -3171,6 +3222,11 @@ namespace WrathBench
                     r.reachedX = mid.x; r.reachedY = mid.y; r.reachedZ = mid.z;
                     for (size_t i = 0; i < got; ++i)
                         partial.push_back({pts[i].x, pts[i].y, pts[i].z});
+                    // Every point of it is the smooth path's own (the request
+                    // was left off above), the last one included: the edge
+                    // drop walks on from there (TryEdgeDrop).
+                    r.meshPoints = OntoMesh(mover, startRef, startPt, partial, partial.size());
+                    r.reachedZ = partial.back().z;
                 }
             }
             else
@@ -3194,9 +3250,10 @@ namespace WrathBench
                 dtNavMeshQuery const* plan = WbNav::PlannerQuery(navMesh);
                 char const* why = "";
                 int polys = 0;
+                uint32 lowered = 0;
                 std::vector<WbVec> planned;
                 if (!plan || !startRef || !endRef
-                    || !PlanAround(mover, navMesh, plan, base, startRef, endRef, startPt, endPt, planned, &why, &polys))
+                    || !PlanAround(mover, navMesh, plan, base, startRef, endRef, startPt, endPt, planned, &why, &polys, &lowered))
                     return incomplete();
                 WbVec const& last = planned.back();
                 float ex = last.x - x, ey = last.y - y;
@@ -3205,6 +3262,7 @@ namespace WrathBench
                 r.hasReached = false;
                 r.longPlan = true;
                 r.longPolys = uint32(polys);
+                r.meshPoints = lowered;
                 r.points = std::move(planned);
             }
         }
@@ -3376,7 +3434,7 @@ namespace WrathBench
             cand.levelZ = r.levelZ;
             cand.levelIslandPolys = r.levelIslandPolys;
             char const* why = "";
-            if (!PlanAround(mover, navMesh, plan, filter, startRef, endRef, start, end, cand.points, &why))
+            if (!PlanAround(mover, navMesh, plan, filter, startRef, endRef, start, end, cand.points, &why, nullptr, &cand.meshPoints))
                 return finish("failed", why);
             // The core's endpoint check (ResolvePathAt's endpointOk): the
             // route ends within 4y of the request in 2D.
@@ -3792,6 +3850,9 @@ namespace WrathBench
             return ex * ex + ey * ey <= 16.0f; // endpointOk: within 4y of the end, 2D
         };
         std::vector<WbVec> below;
+        uint32 belowLowered = 0;
+        float startPt[3] = { start.y, start.z, start.x };
+        dtPolyRef const startRef = query ? CorePolyAt(query, base, startPt, nullptr) : 0;
         {
             PathGenerator gen(mover);
             if (gen.CalculatePath(start.x, start.y, start.z, x, y, z, false)
@@ -3799,19 +3860,20 @@ namespace WrathBench
             {
                 G3D::Vector3 const& end = gen.GetActualEndPosition();
                 if (nearEnd({ end.x, end.y, end.z }))
+                {
                     for (auto const& v : gen.GetPath())
                         below.push_back({ v.x, v.y, v.z });
+                    belowLowered = OntoMesh(mover, startRef, startPt, below, below.size() - 1);
+                }
             }
         }
         if (below.empty())
         {
             dtNavMeshQuery const* plan = navMesh ? WbNav::PlannerQuery(navMesh) : nullptr;
-            float startPt[3] = { start.y, start.z, start.x };
-            dtPolyRef const startRef = query ? CorePolyAt(query, base, startPt, nullptr) : 0;
             char const* why = "";
             std::vector<WbVec> planned;
             if (plan && startRef && endRef
-                && PlanAround(mover, navMesh, plan, base, startRef, endRef, startPt, endPt, planned, &why)
+                && PlanAround(mover, navMesh, plan, base, startRef, endRef, startPt, endPt, planned, &why, nullptr, &belowLowered)
                 && nearEnd(planned.back()))
                 below = std::move(planned);
         }
@@ -3843,6 +3905,7 @@ namespace WrathBench
         cand.hasEndReachable = r.hasEndReachable;
         cand.endFromX = r.endFromX; cand.endFromY = r.endFromY; cand.endFromZ = r.endFromZ;
         cand.endToX = r.endToX; cand.endToY = r.endToY; cand.endToZ = r.endToZ;
+        cand.meshPoints = r.meshPoints + belowLowered;
         cand.points = partial;
         cand.points.insert(cand.points.end(), walk.begin(), walk.end());
         cand.points.push_back(landing);
@@ -4380,10 +4443,15 @@ namespace WrathBench
         }
         // The resolved polyline, at dispatch, so a diagnosis reads the route
         // the mesh chose instead of reconstructing it from heartbeats.
-        Audit(*s, "action", Json::Writer().Add("op", "move_path").Add("moveId", moveId)
-            .Add("status", r.status ? r.status : "ok")
-            .Add("pointCount", (uint64_t)r.points.size()).Add("truncated", r.points.size() > 64)
-            .Raw("points", PathPointsJson(r.points)).Str());
+        {
+            Json::Writer a;
+            a.Add("op", "move_path").Add("moveId", moveId)
+                .Add("status", r.status ? r.status : "ok")
+                .Add("pointCount", (uint64_t)r.points.size()).Add("truncated", r.points.size() > 64);
+            if (r.meshPoints)
+                a.Add("meshPoints", r.meshPoints);
+            Audit(*s, "action", a.Raw("points", PathPointsJson(r.points)).Str());
+        }
         if (r.status != nullptr)
         {
             if (mover->isMoving()) // see failEvent

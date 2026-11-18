@@ -111,6 +111,46 @@ namespace WbNav
         return true;
     }
 
+    void SurfaceHeights(dtNavMeshQuery const* query, dtQueryFilter const& filter, dtPolyRef startRef, float const* start,
+        std::vector<float> const& points, std::vector<float>& heights, std::vector<uint8_t>& known)
+    {
+        size_t const n = points.size() / VERTS;
+        heights.assign(n, 0.0f);
+        known.assign(n, 0);
+        if (!query || !startRef)
+            return;
+        float cur[3] = { 0.0f, 0.0f, 0.0f };
+        if (dtStatusFailed(query->closestPointOnPolyBoundary(startRef, start, cur)))
+            return;
+        dtPolyRef curRef = startRef;
+        for (size_t i = 0; i < n; ++i)
+        {
+            float const* target = &points[i * VERTS];
+            float result[3] = { 0.0f, 0.0f, 0.0f };
+            dtPolyRef visited[SURFACE_MAX_VISITED];
+            int nvisited = 0;
+            if (dtStatusFailed(query->moveAlongSurface(curRef, cur, target, &filter, result, visited, &nvisited, SURFACE_MAX_VISITED))
+                || nvisited <= 0 || dtVdist2DSqr(result, target) > SURFACE_REACH * SURFACE_REACH)
+                return;
+            dtPolyRef const ref = visited[nvisited - 1];
+            float h = 0.0f;
+            if (dtStatusFailed(query->getPolyHeight(ref, result, &h)))
+            {
+                // On the polygon's edge, where the inside test can miss by a hair.
+                float closest[3] = { 0.0f, 0.0f, 0.0f };
+                if (dtStatusFailed(query->closestPointOnPoly(ref, result, closest, nullptr)))
+                    return;
+                h = closest[1];
+            }
+            heights[i] = h;
+            known[i] = 1;
+            cur[0] = result[0];
+            cur[1] = h;
+            cur[2] = result[2];
+            curRef = ref;
+        }
+    }
+
     bool OnIsland(dtNavMesh const* navMesh, dtQueryFilter const& filter, dtPolyRef startRef, dtPolyRef ref,
         std::vector<dtPolyRef>* island)
     {
