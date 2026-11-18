@@ -12,6 +12,7 @@
 #include "WbHttpServer.h"
 #include "WbJson.h"
 #include "WbLease.h"
+#include "WbRoute.h" // WbVec, the drop guard's verdict
 
 #include <array>
 #include <atomic>
@@ -40,14 +41,6 @@ class Unit;
 
 namespace WrathBench
 {
-    // A waypoint of a resolved navmesh path. Internal to the mover; never leaves
-    // the module (docs/CONTRACTS.md: the agent gets progress/arrival/failure
-    // events, not the path).
-    struct WbVec
-    {
-        float x{0}, y{0}, z{0};
-    };
-
     // The jump block of a falling client's MovementInfo
     // (WorldSession::ReadMovementInfo: after fallTime, when
     // MOVEMENTFLAG_FALLING is set: zspeed, sinAngle, cosAngle, xyspeed) and

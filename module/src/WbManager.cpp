@@ -10,6 +10,7 @@
 #include "WbBounds.h"
 #include "WbJson.h"
 #include "WbNav.h"
+#include "WbRoute.h"
 
 #include "AccountMgr.h"
 #include "AchievementMgr.h"
@@ -2356,7 +2357,7 @@ namespace WrathBench
     // speed through a fall and covers ground no faster than that. A 143y fall
     // is about 4 s rather than the 20 s a run down its length took, during
     // which the server held the character at the lip.
-    static bool IsDropSegment(WbVec const& a, WbVec const& b, float* dzOut);
+    using Route::IsDropSegment;
     static uint64_t FallMs(Unit* mover, WbVec const& a, WbVec const& b)
     {
         float const fall = Movement::computeFallTime(a.z - b.z, mover->HasFeatherFallAura());
@@ -2676,23 +2677,11 @@ namespace WrathBench
             && pts.size() >= 2;
     }
 
-    // A mesh path that falls is a ledge, not a route (nav-probe c4 on map
-    // 369: a polyline segment with dz -7.64 over 1.0y of
-    // 2D travel was walked, `arrived` was reported from a 2D-only check, and
-    // the next move from down there was `start_off_mesh`). A segment is a
-    // drop when it is both tall (> 2.0y, so stairs and stale-z corrections
-    // stay `meshZ`) and steeper than a ramp (|dz| > 1.2 x its 2D length).
-    // Deliberately not the core's SetSlopeCheck: that is a pathing-time
-    // preference, this is a verdict on the route the mesh already chose.
-    static constexpr float DROP_MIN_DZ = 2.0f;
-    static constexpr float DROP_SLOPE = 1.2f;
-    static bool IsDropSegment(WbVec const& a, WbVec const& b, float* dzOut)
-    {
-        float dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
-        float d2 = std::sqrt(dx * dx + dy * dy);
-        if (dzOut) *dzOut = dz;
-        return std::fabs(dz) > DROP_MIN_DZ && std::fabs(dz) > DROP_SLOPE * d2;
-    }
+    // The drop guard: a segment both taller than DROP_MIN_DZ and steeper than
+    // DROP_SLOPE x its 2D length is a ledge (WbRoute.h, IsDropSegment), and
+    // Route::RefusesLedge says what the guard does with one.
+    using Route::DROP_MIN_DZ;
+    using Route::DROP_SLOPE;
 
     // The character's own fall-height reduction (SPELL_AURA_SAFE_FALL, the
     // rogue's Safe Fall and the like), in yards, served on a `drop` so the
@@ -3286,7 +3275,7 @@ namespace WrathBench
                 continue;
             float surfaceZ = 0.0f;
             bool buried = dz < 0.0f && FootUnderSurface(mover, r.points[i], r.points[i + 1], &surfaceZ);
-            if (!force || dz > 0.0f || buried)
+            if (Route::RefusesLedge(dz, force, buried))
             {
                 if (refusing)
                     refusing->push_back(i);
@@ -6559,7 +6548,7 @@ namespace WrathBench
                 {
                     float surfaceZ = 0.0f;
                     bool buried = dz < 0.0f && FootUnderSurface(mover, a, b, &surfaceZ);
-                    if (!m.force || dz > 0.0f || buried)
+                    if (Route::RefusesLedge(dz, m.force, buried))
                     {
                         PlaceMover(s, mover, a.x, a.y, a.z, MOVEMENTFLAG_FORWARD, nowMs);
                         SendMovePacket(s, mover, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, m.curX, m.curY, m.curZ, m.curO,
