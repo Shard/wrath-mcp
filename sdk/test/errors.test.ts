@@ -183,6 +183,14 @@ describe("error-code hints", () => {
     }
   });
 
+  test("session_gone says the server ended the session, and does not guess why", () => {
+    // A kick (the core's flood protection among others) tells a client
+    // nothing; the hint names what is known (operator, 2026-11-18).
+    const err = new WrathRequestError(410, { ok: false, error: "session_gone" });
+    expect(err.message).toContain("the server ended the session (a client is not told why)");
+    expect(err.message).toContain("deleteSession");
+  });
+
   test("character_bound is true whether the bound character was played or is still being created", () => {
     const err = new WrathRequestError(409, { ok: false, error: "character_bound", bound: "Thalvorn" } as never);
     expect(err.message).toBe(

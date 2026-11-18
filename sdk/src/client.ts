@@ -880,9 +880,12 @@ const ERROR_CODE_HINTS: Record<string, string> = {
   no_player:
     "the session exists but its player is gone — await sdk.deleteSession() to release the token, " +
     "then await sdk.createSession({...}); a bare createSession is refused with token_in_use while the old record remains",
+  // A kick (the core's flood protection among others) closes the socket and
+  // tells a client nothing, and the module emits no event for it: why the
+  // session ended is not knowable here, so the hint does not guess.
   session_gone:
-    "the session was torn down but its record can still hold the token — await sdk.deleteSession() " +
-    "(ignore its error), then await sdk.createSession({...})",
+    "the server ended the session (a client is not told why), and its record can still hold the token — " +
+    "await sdk.deleteSession() (ignore its error), then await sdk.createSession({...})",
   unsupported_action:
     "that action is not in the module's whitelist — inspect the sdk surface for what is supported",
   // Only face sends it: a walk runs forward, and a running character faces
@@ -1328,9 +1331,13 @@ export const MOVE_HINTS: Readonly<Record<string, (point: MovePoint, data: MoveRe
         `one flown move (moveTo or moveToAsync alike) covers ~250y up or down. Fly to an intermediate height first.`
       );
     }
+    // The module's 250y is not what a snippet can walk: it is ended at 30s,
+    // ~200y at run speed, and an awaited walk past that killed 14+ snippets
+    // across every model (operator, 2026-11-18). The limit stays the module's.
     return (
       `(${fmtXY(p)}) is ${Math.round(across)}y from where you stand, in a straight line; ` +
-      `one move (moveTo or moveToAsync alike) covers ~250y. Walk to an intermediate point first.`
+      `one move (moveTo or moveToAsync alike) covers ~250y, but an awaited moveTo in a snippet only ~200y, ` +
+      `what its 30s allow at run speed. Walk to an intermediate point; walk farther from a routine or with moveToAsync.`
     );
   },
   no_mesh: (p) =>
@@ -1612,8 +1619,12 @@ function climbHint(dz: number, edge: { x: number; y: number }): string {
  * A `drop` whose foot lies under the ground (`surfaceZ`): refused forced or
  * not, since no client falls through terrain. The module's guard, not the
  * fall estimate, is what stops it. When the request's own z is below the
- * surface (more than the module's 1y), the foot is a z the request guessed
- * and the recovery is a z on the surface. When it is not, the mesh's route
+ * surface (more than the module's 1y), the foot is a z the request guessed.
+ * The surface is the first one found looking down from the edge, which is
+ * not always the ground: at the Kharanos distillery it was the floor over a
+ * cellar the target was in. So the hint names both recoveries, a z on that
+ * surface or the lower level's own way in, and never calls the target
+ * underground (operator, 2026-11-18). When it is not, the mesh's route
  * ends under a structure whatever z is asked for (the foot is the mesh's,
  * not the request's), so the hint does not send the caller after a z.
  */
@@ -1629,9 +1640,10 @@ function buriedFootHint(p: MovePoint, d: MoveResultData, surfaceZ: number): stri
     );
   }
   return (
-    `stopped at the edge (${fmtXY(edge)}): the drop ahead lands at z ${foot.toFixed(1)}, underground (the ground ` +
-    `here is z ${surfaceZ.toFixed(1)}). Your target z ${p.z.toFixed(1)} is below the ground — retry with a z on ` +
-    `the surface. force does not apply.`
+    `stopped at the edge (${fmtXY(edge)}): the drop ahead lands at z ${foot.toFixed(1)}, under a surface at ` +
+    `z ${surfaceZ.toFixed(1)}: the ground here, or a floor or roof with a level beneath it. Your target z ` +
+    `${p.z.toFixed(1)} is under that surface: for a point on it, retry with its z; for one on a level beneath ` +
+    `(a cellar, a cave), walk in by that level's own entrance. force does not apply.`
   );
 }
 
@@ -3025,6 +3037,19 @@ const CAST_VERDICT_MS = 3000;
  * the tick, so at the failure the cache still reads alive.
  */
 const CAST_DEATH_WINDOW_MS = 300;
+
+/** How long `questAreas` answers again from the server's last answer, in ms, rather than asking again. */
+const QUEST_POI_FRESH_MS = 1_000;
+
+/**
+ * `CMSG_QUEST_POI_QUERY`s sent in any one second, at most: well under the 25
+ * the pinned core's AntiDOS allows before it kicks the session
+ * (`antidos_opcode_policies`: opcode 483, policy 1 Kick, 25 a second).
+ */
+const QUEST_POI_PER_SECOND = 10;
+
+/** How long `createSession` waits for the login's own position after the module's answer, in ms. */
+const SESSION_POSITION_WAIT_MS = 3_000;
 
 /** Timer slack past `settlesAt` for a death the window's own watch saw (`settledByDeath`). */
 const CAST_DEATH_SLACK_MS = 50;
@@ -4874,6 +4899,15 @@ export class WrathClient {
   /** Hint-bearing failures since the last drain, by `action:status:origin`. See `ActionHint`. */
   private readonly actionHints = new Map<string, ActionHint>();
   /**
+   * `questAreas`' own record of the server's last answer per quest, on this
+   * client's clock, the quest-area queries in flight, and when the last ones
+   * were sent: a loop that asks again and again is answered from these
+   * rather than flooding the server (`QUEST_POI_PER_SECOND`).
+   */
+  private readonly poiAnswers = new Map<number, { pois: readonly QuestPoi[]; at: number }>();
+  private readonly poiInFlight = new Set<{ ids: ReadonlySet<number>; reply: Promise<ReadonlyMap<number, readonly QuestPoi[]>> }>();
+  private readonly poiSentAt: number[] = [];
+  /**
    * When (this client's clock) a cast interrupt's death watch last saw the
    * character die inside the window (`CAST_DEATH_WINDOW_MS`): what
    * `settledByDeath` reads for an entry drained before the death landed.
@@ -5330,6 +5364,14 @@ export class WrathClient {
    * Blocks server-side until the session is in the world or fails, up to 20s.
    *
    * Seeds the state cache with our own guid and name, which no event carries.
+   * The answer and the login's `SMSG_LOGIN_VERIFY_WORLD` travel on different
+   * sockets, so the answer can land first: with no own position held yet, it
+   * waits for the first one to fold (`SESSION_POSITION_WAIT_MS` at most), so
+   * `state.self.position` is there when it resolves. A first snippet that
+   * read it straight after threw in 2 of 10 runs. The login's own create
+   * block also ends the wait: the core sends it after the position
+   * (`HandlePlayerLoginFromDB`), so a stream that brought one and not the
+   * other has no position coming.
    */
   async createSession(request: Omit<CreateSessionRequest, "token" | "allowGm">): Promise<SessionResponse> {
     // Runtime guard: race/class must be numeric ids. A string like "hunter"
@@ -5366,6 +5408,19 @@ export class WrathClient {
     const body: CreateSessionRequest = { token: this.token, ...rest, account, ...this.#gmOptIn() };
     const res = await this.request("POST", "/session", body, sessionResponseSchema);
     this.state.seedSelf({ guid: res.guid, name: res.character });
+    // `health` marks our own create block: it always states `maxHealth`, and a
+    // health it leaves out reads 0. (`level` does not: the character list seeds it.)
+    if (this.state.self.position === undefined && this.state.self.health === undefined) {
+      try {
+        await this.events.waitFor(() => this.state.self.position !== undefined || this.state.self.health !== undefined, {
+          timeout: SESSION_POSITION_WAIT_MS,
+          description: "the own position after createSession",
+        });
+      } catch (e) {
+        // Bounded, never a failure of its own: the session is in the world.
+        if (!(e instanceof EventTimeoutError)) throw e;
+      }
+    }
     return res;
   }
 
@@ -11042,13 +11097,53 @@ export class WrathClient {
   }
 
   /**
-   * `CMSG_QUEST_POI_QUERY` for quests in the log and the server's answer, in
-   * the order asked. Throws `EventTimeoutError` when no answer comes in time.
+   * The objective areas of quests in the log, in the order asked: the
+   * server's answer to a `CMSG_QUEST_POI_QUERY`, or the same answer again
+   * when every quest asked was answered less than `QUEST_POI_FRESH_MS` ago or
+   * is in a query still in flight. The core kicks a session that sends more
+   * than 25 of these in a second (`antidos_opcode_policies`, opcode 483,
+   * policy Kick), and a loop calling this did, four times in one run, for
+   * minutes each; so a query is also held while `QUEST_POI_PER_SECOND` have
+   * gone out in the last second. Throws `EventTimeoutError` when no answer
+   * comes in time.
    */
   private async askQuestAreas(
     asked: readonly number[],
     timeout: number,
   ): Promise<{ readonly questId: number; readonly title: string | undefined; readonly pois: readonly QuestPoi[] }[]> {
+    const answer = (pois: (id: number) => readonly QuestPoi[]) =>
+      asked.map((questId) => ({ questId, title: this.state.quests.get(questId)?.value.title, pois: pois(questId) }));
+    const now = Date.now();
+    if (asked.every((id) => now - (this.poiAnswers.get(id)?.at ?? -Infinity) < QUEST_POI_FRESH_MS)) {
+      return answer((id) => this.poiAnswers.get(id)!.pois);
+    }
+    for (const q of this.poiInFlight) {
+      if (asked.every((id) => q.ids.has(id))) {
+        const reply = await q.reply;
+        return answer((id) => reply.get(id) ?? []);
+      }
+    }
+    const query = { ids: new Set(asked), reply: this.sendQuestPoiQuery(asked, timeout) };
+    this.poiInFlight.add(query);
+    try {
+      const reply = await query.reply;
+      return answer((id) => reply.get(id) ?? []);
+    } finally {
+      this.poiInFlight.delete(query);
+    }
+  }
+
+  /** One `CMSG_QUEST_POI_QUERY`, once the send rate allows it, and its answer by quest, recorded in `poiAnswers`. */
+  private async sendQuestPoiQuery(asked: readonly number[], timeout: number): Promise<ReadonlyMap<number, readonly QuestPoi[]>> {
+    for (;;) {
+      const now = Date.now();
+      while (this.poiSentAt.length > 0 && now - this.poiSentAt[0]! >= 1_000) this.poiSentAt.shift();
+      if (this.poiSentAt.length < QUEST_POI_PER_SECOND) {
+        this.poiSentAt.push(now);
+        break;
+      }
+      await this.sleepAborting(1_000 - (now - this.poiSentAt[0]!) + 1, "the quest-area query rate (at most 10 a second)");
+    }
     const sinceSeq = this.events.recent(1)[0]?.seq;
     await this.raw("CMSG_QUEST_POI_QUERY", [{ u32: asked.length }, ...asked.map((id) => ({ u32: id }))]);
     const reply = await this.waitEvent(
@@ -11060,7 +11155,9 @@ export class WrathClient {
       { timeout, description: `the objective areas of quest ${asked.join(", ")} (SMSG_QUEST_POI_QUERY_RESPONSE)` },
     );
     const answered = new Map((reply.data as QuestPoiQueryResponseData).quests.map((q) => [q.questId, q.pois] as const));
-    return asked.map((questId) => ({ questId, title: this.state.quests.get(questId)?.value.title, pois: answered.get(questId) ?? [] }));
+    const at = Date.now();
+    for (const id of asked) this.poiAnswers.set(id, { pois: answered.get(id) ?? [], at });
+    return answered;
   }
 
   /**
@@ -11532,6 +11629,7 @@ export const CLIENT_PLUMBING: ReadonlySet<string> = new Set([
   "acceptQuestOnce",
   "withQuestAreas",
   "askQuestAreas",
+  "sendQuestPoiQuery",
   "trackedCast",
   "dispatchCast",
   "castVerdict",

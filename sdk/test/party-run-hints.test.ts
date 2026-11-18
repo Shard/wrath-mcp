@@ -189,7 +189,8 @@ describe("moveToAsync: a verdict that is not an arrival reaches the harness", ()
     const hints = client.drainActionHints();
     expect(hints).toHaveLength(1);
     expect(hints[0]).toMatchObject({ action: "moveToAsync", status: "too_far", point: { x: -500, y: 987, z: 42 } });
-    expect(hints[0]!.hint).toContain("one move (moveTo or moveToAsync alike) covers ~250y. Walk to an intermediate point first.");
+    expect(hints[0]!.hint).toContain("one move (moveTo or moveToAsync alike) covers ~250y, but an awaited moveTo in a snippet only ~200y");
+    expect(hints[0]!.hint).toContain("walk farther from a routine or with moveToAsync.");
     client.close();
     await stub.stop();
   });

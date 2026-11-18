@@ -238,6 +238,12 @@ them as `areas`, the same `pois` `questAreas(questId)` answers. The wait is
 bounded at a second; an answer that does not come back leaves `areas` off with
 a hint naming `questAreas`, and the accept stands.
 
+`questAreas` paces itself (operator, 2026-11-18): the core kicks a session that
+sends more than 25 `CMSG_QUEST_POI_QUERY` in a second (AntiDOS, opcode 483,
+policy Kick), and a model's loop did. A quest answered less than a second ago,
+or in a query still in flight, is answered again from that answer, and at most
+10 queries go out in any second; past that one waits its turn.
+
 `turnInQuest` handles the other side of the same asymmetry. An
 `SMSG_QUESTGIVER_REQUEST_ITEMS` that says the quest *is* completable is the
 client's cue to send the completion again; a completable one (a collect quest
@@ -485,6 +491,11 @@ it, and the tests enforce both.
    says "you are guid N". It is recorded on `state.seed` so a replay is
    explicit about it.
 
+`createSession` resolves with our own position folded: its answer and the
+login's `SMSG_LOGIN_VERIFY_WORLD` travel on different sockets, so with no
+position yet it waits, up to 3s, for the first one (or for our own create
+block, which the core sends after it).
+
 Every observed field group is an `Observed<T> = { value, seq, ts }`, so
 staleness is legible rather than implied. That matters most for position: our
 own is written by `SMSG_LOGIN_VERIFY_WORLD`, then by our own create block, then
@@ -580,10 +591,12 @@ field:
   `values` delta routinely carries `health` without `maxHealth`, and which of
   `power1..7` is the character's power depends on `powerType`. Half a gauge is
   not a gauge. The raw parts are always in `obj.fields`, which is where to look
-  when a gauge is `undefined`. (A level-1 warrior's create block carries
-  `powerType: 1` and `maxPower2` but no `power2`, because the current value is
-  0 and zero fields are not in the update mask, so `power` stays `undefined`
-  until the first change.)
+  when a gauge is `undefined`. A create block leaves out every zero-valued
+  field, so for our own character the cache reads the ones it documents as
+  0 when the login's create (or a replay's) leaves them out and nothing holds
+  them yet: coinage, XP and the bar's target, and the power `powerType`
+  names, so a level-1 warrior's rage reads 0 rather than `undefined`
+  (operator, 2026-11-18). A later ordinary self create still merges.
 - A `create` block flagged `self` whose guid contradicts the seeded identity
   does **not** overwrite `self`. It is recorded on `state.anomalies` and filed
   as an ordinary object in view, because the cache cannot tell which of the

@@ -94,7 +94,8 @@ describe("too_far hint", () => {
   test("a point out of reach across is named by its distance across, as before", () => {
     expect(MOVE_HINTS.too_far!({ x: 300, y: 400, z: 100 }, at)).toBe(
       "(300.0, 400.0) is 500y from where you stand, in a straight line; " +
-        "one move (moveTo or moveToAsync alike) covers ~250y. Walk to an intermediate point first.",
+        "one move (moveTo or moveToAsync alike) covers ~250y, but an awaited moveTo in a snippet only ~200y, " +
+        "what its 30s allow at run speed. Walk to an intermediate point; walk farther from a routine or with moveToAsync.",
     );
     // Out of reach both ways: the distance across is still the one to close.
     expect(MOVE_HINTS.too_far!({ x: 300, y: 400, z: 900 }, at)).toMatch(/^\(300\.0, 400\.0\) is 500y from where you stand/);

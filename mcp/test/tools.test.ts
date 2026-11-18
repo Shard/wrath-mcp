@@ -87,6 +87,14 @@ describe("ToolSet", () => {
     expect(pad.text).toBe("written (1 chars)\n--- harness ---\nmove_to too_far ×2: split the walk");
   });
 
+  test("the scratchpad tools ignore a stray path or file; any other stray key is still refused", async () => {
+    const ctx = context();
+    expect((await tools.call(ctx, "write_scratchpad", { content: "plan: north", path: "scratchpad.md" })).text).toBe("written (11 chars)");
+    expect((await tools.call(ctx, "edit_scratchpad", { old: "north", new: "south", file: "notes.md" })).text).toMatch(/^edited \(1 replacement;/);
+    const odd = await tools.call(ctx, "write_scratchpad", { content: "x", mode: "append" });
+    expect(odd.isError).toBe(true);
+  });
+
   test("recent_events folds what the render calls ambient", async () => {
     const res = await tools.call(context(), "recent_events", {});
     expect(res.text.split("\n")).toEqual([
