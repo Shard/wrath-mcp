@@ -249,7 +249,34 @@ describe("castSpell interrupted: what interrupted it, when the client can tell",
     push(stub, alive(42, 0));
     await folded(client, "SMSG_UPDATE_OBJECT", 42);
     await Bun.sleep(5);
-    expect(client.drainActionHints()).toMatchObject([{ action: "castSpell", status: "interrupted", hint: "Lesser Heal (2050): you are dead" }]);
+    const [hint] = client.drainActionHints();
+    expect(hint).toMatchObject({ action: "castSpell", status: "interrupted", hint: "Lesser Heal (2050): you are dead" });
+    // The death's, not the code's (operator, 2026-11-18), and settled.
+    expect(hint!.nonFault).toBe("death");
+    expect(hint!.settlesAt).toBeUndefined();
+    client.close();
+    await stub.stop();
+  });
+
+  test("alive, an interrupt with no cause is a fault still settling, and stays one when no death follows", async () => {
+    const stub = startStub({ onConnect: () => world() });
+    const client = await inWorld(stub);
+    await folded(client, "SMSG_UPDATE_OBJECT", 17);
+    await client.castSpell(2050);
+    push(stub, interrupted(41));
+    await folded(client, "SMSG_SPELL_FAILURE", 41);
+    // Drained before the death window has passed: a fault the harness holds until then.
+    const [early] = client.drainActionHints();
+    expect(early!.nonFault).toBeUndefined();
+    expect(early!.settlesAt).toBeGreaterThan(Date.now());
+    // Past the window with no death: a cast that failed while alive.
+    await client.castSpell(2050);
+    push(stub, interrupted(42));
+    await folded(client, "SMSG_SPELL_FAILURE", 42);
+    await Bun.sleep(350);
+    const [settled] = client.drainActionHints();
+    expect(settled!.nonFault).toBeUndefined();
+    expect(settled!.settlesAt).toBeLessThanOrEqual(Date.now());
     client.close();
     await stub.stop();
   });

@@ -802,20 +802,38 @@ function drainHints(current?: number): ActionHintNote[] {
 }
 
 /**
+ * A routine's cast interrupt whose cause may still be the character's death
+ * (`settlesAt`), held from the program until then: its hint has gone to the
+ * seat's `held` as any other, and only its refusal waits.
+ */
+const unsettled: { seat: Seat; routine: RoutineRun<Seat>; hint: SdkHint }[] = [];
+
+/**
  * With a program: move what the SDK tallied into each seat's `held`, and tell
  * the program of each failure a routine's call earned, so the first of a
  * signature can wake the model while no tool result is there to carry it.
  * Run once a second and before every drain; a tool result still delivers
- * every hint exactly as it does without a program.
+ * every hint exactly as it does without a program. An entry the SDK marks no
+ * fault of the code (`nonFault`) is no refusal, and the program drops it.
  */
 function harvestHints(): void {
+  const now = Date.now();
+  // Settled: one the character died in the meantime was the death's, not the code's (operator, 2026-11-18).
+  for (let i = unsettled.length - 1; i >= 0; i--) {
+    const u = unsettled[i]!;
+    if ((u.hint.settlesAt ?? 0) > now) continue;
+    unsettled.splice(i, 1);
+    if (!u.seat.client.state.self.dead) program?.noteRefusal(u.routine, u.hint, MULTI ? u.seat.name : undefined);
+  }
   for (const seat of allSeats()) {
     const fresh = seat.client.drainActionHints();
     if (fresh.length === 0) continue;
     (seat.held ??= []).push(...fresh);
     for (const h of fresh) {
       const routine = h.origin === undefined ? undefined : callSites.get(h.origin)?.routine;
-      if (routine !== undefined) program?.noteRefusal(routine, h, MULTI ? seat.name : undefined);
+      if (routine === undefined) continue;
+      if (h.nonFault === undefined && (h.settlesAt ?? 0) > now) unsettled.push({ seat, routine, hint: h });
+      else program?.noteRefusal(routine, h, MULTI ? seat.name : undefined);
     }
   }
 }
@@ -827,7 +845,8 @@ function drainSeatHints(seat: Seat, current?: number): ActionHintNote[] {
   // The current snippet's own lines, one per (action, status) as before: its
   // call sites are told apart only for an earlier snippet's code.
   const own = new Map<string, ActionHintNote>();
-  for (const { origin, ...h } of tallied) {
+  // `nonFault` and `settlesAt` are the refusal tally's, not the line's.
+  for (const { origin, nonFault: _nonFault, settlesAt: _settlesAt, ...h } of tallied) {
     const site = origin === undefined ? undefined : callSites.get(origin);
     if (site?.routine !== undefined) {
       out.push({ ...h, routine: site.routine.note.name });

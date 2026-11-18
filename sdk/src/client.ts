@@ -1416,17 +1416,24 @@ export const MOVE_HINTS: Readonly<Record<string, (point: MovePoint, data: MoveRe
     `or at a snippet's time limit.`,
 };
 
-/**
- * `moveToAsync` verdicts the harness does not report: the move's own success
- * (an arrival, a portal, a teleport), and the two ends a caller makes
- * itself. Re-sending a move is how a caller steers with `moveToAsync`, so a
- * `superseded` or `stopped` older move is the steering, not a failure
- * (operator, 2026-10-20).
- */
-const ASYNC_MOVE_UNREPORTED: ReadonlySet<string> = new Set(["arrived", "transferred", "teleported", "superseded", "stopped"]);
-
 /** The move verdicts that took the character where a move ended it: an arrival, a portal, a teleport. */
 const MOVE_SUCCEEDED: ReadonlySet<string> = new Set(["arrived", "transferred", "teleported"]);
+
+/**
+ * The two ends of a move the caller's own code makes: a newer move
+ * (`superseded`) or a `stop()` (`stopped`). Re-sending a move is how a caller
+ * steers, so these are the steering, not a failure, and neither `moveTo` nor
+ * `moveToAsync` tallies them for the harness (operator, 2026-10-20 for
+ * `moveToAsync`, 2026-11-18 for `moveTo`). The call's own result still says
+ * which it was.
+ */
+const MOVE_STEERED: ReadonlySet<string> = new Set(["superseded", "stopped"]);
+
+/**
+ * `moveToAsync` verdicts the harness does not report: the move's own success
+ * (an arrival, a portal, a teleport), and the steering (`MOVE_STEERED`).
+ */
+const ASYNC_MOVE_UNREPORTED: ReadonlySet<string> = new Set([...MOVE_SUCCEEDED, ...MOVE_STEERED]);
 
 /**
  * How long `moveToAsync` waits after an undispatched ack (no `pathLength`)
@@ -1715,10 +1722,36 @@ export interface ActionHint {
   ts: number;
   /** The `origin` the client was given for the code that made the call, when it was given one. */
   origin?: number;
+  /**
+   * Set when the entry is no failure of the code that made the call, so a
+   * harness tallies no refusal for it (operator, 2026-11-18); the hint still
+   * reaches the harness block. `note`: a remark on a call that went ahead
+   * (`long_route`). `death`: a call the character's death refused or cut
+   * short (`dead`, `caster_dead`, a move or cast `interrupted` by the death).
+   * Kept only while every occurrence merged into the entry was one.
+   */
+  nonFault?: "note" | "death";
+  /**
+   * A cast `interrupted` with no cause seen yet: until this moment (epoch ms)
+   * the character's death may still follow and make it one (see
+   * `CAST_DEATH_WINDOW_MS`). A harness holds its refusal until then.
+   */
+  settlesAt?: number;
 }
 
 /** Distinct (action, status, origin) triples kept between drains. A guard, never reached in practice. */
 const ACTION_HINT_MAX_KEYS = 32;
+
+/** How a tallied hint is classed beside its status: see `ActionHint.nonFault` and `ActionHint.settlesAt`. */
+interface HintClass {
+  nonFault?: "note" | "death";
+  settlesAt?: number;
+}
+
+/** A tally of the character's death (`ActionHint.nonFault`). */
+const BY_DEATH: HintClass = { nonFault: "death" };
+/** A tally that is a remark on a call that went ahead (`ActionHint.nonFault`). */
+const A_NOTE: HintClass = { nonFault: "note" };
 
 /**
  * The move statuses that mean *nothing moved and no movement packet was sent*.
@@ -5024,8 +5057,14 @@ export class WrathClient {
    * or timeout remark is already in the result and would vary per call).
    * Called on the caller's own path, so the caller's `origin` is current.
    */
-  private noteActionHint(action: string, status: string, hint: string | undefined, point?: { x: number; y: number; z: number }): void {
-    this.tallyActionHint(this.originOf?.(), action, status, hint, point);
+  private noteActionHint(
+    action: string,
+    status: string,
+    hint: string | undefined,
+    point?: { x: number; y: number; z: number },
+    cls?: HintClass,
+  ): void {
+    this.tallyActionHint(this.originOf?.(), action, status, hint, point, cls);
   }
 
   /**
@@ -5042,7 +5081,9 @@ export class WrathClient {
    * `noteActionHint` with the origin given: for a failure the event stream
    * reports, whose handler runs in no caller's context. A routine's failures
    * and the current snippet's are tallied apart, so each line can say whose
-   * code it was.
+   * code it was. `cls` marks an entry that is no failure of that code
+   * (`ActionHint.nonFault`), or one whose cause may still turn out to be the
+   * character's death (`ActionHint.settlesAt`).
    */
   private tallyActionHint(
     origin: number | undefined,
@@ -5050,11 +5091,16 @@ export class WrathClient {
     status: string,
     hint: string | undefined,
     point?: { x: number; y: number; z: number },
+    cls: HintClass = {},
   ): void {
     if (hint === undefined || hint.length === 0) return;
     const key = `${action}:${status}:${origin ?? ""}`;
     const prev = this.actionHints.get(key);
     if (prev === undefined && this.actionHints.size >= ACTION_HINT_MAX_KEYS) return;
+    // A fault merged into a non-fault entry makes it a fault: a live
+    // interrupt and one the death caused share a key.
+    const nonFault = prev === undefined || prev.nonFault === cls.nonFault ? cls.nonFault : undefined;
+    const settlesAt = Math.max(prev?.settlesAt ?? 0, cls.settlesAt ?? 0);
     this.actionHints.set(key, {
       action,
       status,
@@ -5063,18 +5109,28 @@ export class WrathClient {
       ...(point !== undefined ? { point: { x: point.x, y: point.y, z: point.z } } : {}),
       ts: Date.now(),
       ...(origin !== undefined ? { origin } : {}),
+      ...(nonFault !== undefined ? { nonFault } : {}),
+      ...(settlesAt > 0 ? { settlesAt } : {}),
     });
   }
 
   /**
    * Replace the hint of a tally entry still waiting to be drained, leaving its
    * count alone: a later observation that says more about the same failure.
-   * Nothing is added once it has been drained.
+   * Nothing is added once it has been drained. `byDeath` settles a pending
+   * cause: the death made the failure (when it is the entry's only
+   * occurrence), or it did not.
    */
-  private rewordActionHint(origin: number | undefined, action: string, status: string, hint: string): void {
+  private rewordActionHint(origin: number | undefined, action: string, status: string, hint: string, byDeath?: boolean): void {
     const key = `${action}:${status}:${origin ?? ""}`;
     const prev = this.actionHints.get(key);
-    if (prev !== undefined) this.actionHints.set(key, { ...prev, hint });
+    if (prev === undefined) return;
+    if (byDeath === undefined) {
+      this.actionHints.set(key, { ...prev, hint });
+      return;
+    }
+    const { settlesAt: _settled, ...rest } = prev;
+    this.actionHints.set(key, { ...rest, hint, ...(byDeath && prev.count === 1 ? { nonFault: "death" as const } : {}) });
   }
 
   /**
@@ -5352,7 +5408,7 @@ export class WrathClient {
       return Promise.resolve({ ok: false, status: "unknown_target", hint: resolved.unknown });
     }
     if (this.isCorpse()) {
-      this.noteActionHint("moveToAsync", "dead", DEAD_MOVE_HINT);
+      this.noteActionHint("moveToAsync", "dead", DEAD_MOVE_HINT, undefined, BY_DEATH);
       return Promise.resolve({ ok: false, status: "dead", hint: DEAD_MOVE_HINT });
     }
     // The raw tier: no fall estimate stands in for the caller. A `drop`
@@ -5410,8 +5466,9 @@ export class WrathClient {
             : longRouteNote(resolved.point, distance2d(from, resolved.point), ack.pathLength, etaMs);
         if (note === undefined) return ack;
         // Also to the harness block, so a dropped ack still tells the model
-        // (operator, 2026-10-20): once per dispatch, like a refusal.
-        this.tallyActionHint(origin, "moveToAsync", "long_route", note, resolved.point);
+        // (operator, 2026-10-20): once per dispatch. A note on a move that
+        // went ahead, never a refusal (operator, 2026-11-18).
+        this.tallyActionHint(origin, "moveToAsync", "long_route", note, resolved.point, A_NOTE);
         return { ...ack, hint: note };
       })
       .finally(offEarly);
@@ -5437,7 +5494,8 @@ export class WrathClient {
         const data = event.data as MoveResultData;
         const status = status_(data);
         if (ASYNC_MOVE_UNREPORTED.has(status)) return;
-        this.tallyActionHint(origin, "moveToAsync", status, this.asyncMoveRecipe(status, point, data), point);
+        const cls = this.movedDied(status) ? BY_DEATH : undefined;
+        this.tallyActionHint(origin, "moveToAsync", status, this.asyncMoveRecipe(status, point, data), point, cls);
       })
       .catch(() => {});
   }
@@ -5461,7 +5519,7 @@ export class WrathClient {
    * same tick) says so instead of listing the possible causes.
    */
   private moveRecipe(status: string, point: MovePoint, data: MoveResultData, judged?: DropJudgement): string | undefined {
-    if (status === "interrupted" && this.isCorpse()) return MOVE_DIED_HINT;
+    if (this.movedDied(status)) return MOVE_DIED_HINT;
     const recipe =
       (status === "target_off_mesh" ? transportDockHint(this.state, point) : undefined) ??
       (status === "drop" && judged !== undefined ? dropRefusalHint(point, data, judged) : undefined) ??
@@ -5501,6 +5559,15 @@ export class WrathClient {
    */
   private isCorpse(): boolean {
     return this.state.self.dead && this.state.self.ghost?.value !== true;
+  }
+
+  /**
+   * Whether a move verdict is the character's death: `interrupted` with the
+   * character a corpse, which the server's health-0 update, sent before the
+   * result, makes certain. What picks `MOVE_DIED_HINT` and classes the tally.
+   */
+  private movedDied(status: string): boolean {
+    return status === "interrupted" && this.isCorpse();
   }
 
   /**
@@ -5735,7 +5802,7 @@ export class WrathClient {
     // only once login has served it.
     const refusal = this.castRefusal(spellId, targetGuid);
     if (refusal !== undefined) {
-      this.noteActionHint("castSpell", refusal.status, refusal.hint);
+      this.noteActionHint("castSpell", refusal.status, refusal.hint, undefined, refusal.status === "dead" ? BY_DEATH : undefined);
       throw new Error(`castSpell ${refusal.status}: ${refusal.hint}`);
     }
     // Registered before the dispatch: the handler answers in the same world
@@ -5855,7 +5922,8 @@ export class WrathClient {
         status === "not_ready"
           ? notReadyDetail(this.state, cast.spellId, event.ts, this.ownCastAt.get(cast.spellId), this.lastOwnCast)
           : undefined;
-      this.tallyActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status, status, undefined, said));
+      const cls = status === "caster_dead" ? BY_DEATH : undefined;
+      this.tallyActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status, status, undefined, said), undefined, cls);
       return;
     }
     // An interrupt names no cause on the wire: the core answers every
@@ -5865,9 +5933,19 @@ export class WrathClient {
     // health 0 or the stunned flag lands just after the failure), a target
     // that left view, and a hit that landed in the same instant. Each is
     // said with the meaning of the refusal it amounts to; with none of
-    // them, that the server gave no cause.
-    const tally = (cause: string, said?: string): void =>
-      this.tallyActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status, cause, undefined, said));
+    // them, that the server gave no cause. Only the death makes it no fault
+    // of the caller's code (operator, 2026-11-18); a hit or a stun while
+    // alive is a cast that failed. Until the death window passes, a cause
+    // not yet seen may still be the death (`settlesAt`).
+    const tally = (cause: string, said?: string, pending?: true): void =>
+      this.tallyActionHint(
+        cast.origin,
+        "castSpell",
+        status,
+        castFailedHint(this.state, cast, status, cause, undefined, said),
+        undefined,
+        cause === "caster_dead" ? BY_DEATH : pending ? { settlesAt: Date.now() + CAST_DEATH_WINDOW_MS } : undefined,
+      );
     if (this.ownMoveSince(cast.sentAt)) return tally("moving");
     if (this.ownLootAt !== undefined && this.ownLootAt >= cast.sentAt) return tally("interrupted_by_loot");
     if (this.ownCancel !== undefined && this.ownCancel.at >= cast.sentAt && this.ownCancel.spellId === cast.spellId) {
@@ -5882,14 +5960,17 @@ export class WrathClient {
     // place (the count unchanged) if the death or the stun follows.
     const target = cast.targetGuid === undefined ? undefined : guidKey(cast.targetGuid);
     const hit = sameInstantHit(this.state, this.events.recent(INTERRUPT_HIT_LOOKBACK), event);
-    if (target !== undefined && target !== this.state.self.guid && !this.state.nearby.has(target)) tally("interrupted_target_gone");
+    if (target !== undefined && target !== this.state.self.guid && !this.state.nearby.has(target)) tally("interrupted_target_gone", undefined, true);
     else if (hit !== undefined) {
-      tally(status, `it was interrupted in the same instant ${hit} landed on you; the server names no cause, and a hit or an interrupt effect ends some casts`);
-    } else tally(status, INTERRUPT_NO_CAUSE);
+      tally(status, `it was interrupted in the same instant ${hit} landed on you; the server names no cause, and a hit or an interrupt effect ends some casts`, true);
+    } else tally(status, INTERRUPT_NO_CAUSE, true);
     this.events
       .waitFor(() => later() !== undefined, { timeout: CAST_DEATH_WINDOW_MS, includeBuffered: false, description: "own death or stun after an interrupt" })
       .then(
-        () => this.rewordActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status, later() ?? status)),
+        () => {
+          const cause = later() ?? status;
+          this.rewordActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status, cause), cause === "caster_dead");
+        },
         () => {},
       );
   }
@@ -8668,7 +8749,7 @@ export class WrathClient {
       return { ok: false, status: "unknown_target", hint: resolved.unknown };
     }
     if (this.isCorpse()) {
-      this.noteActionHint("moveTo", "dead", DEAD_MOVE_HINT);
+      this.noteActionHint("moveTo", "dead", DEAD_MOVE_HINT, undefined, BY_DEATH);
       return { ok: false, status: "dead", hint: DEAD_MOVE_HINT };
     }
     const point = resolved.point;
@@ -8817,9 +8898,10 @@ export class WrathClient {
       const budget = budgetMs === undefined ? undefined : walkBudgetNote(straight, verdict.pathLength, budgetMs, eta);
       const longRoute = verdict.pathLength === undefined ? undefined : longRouteNote(point, straight, verdict.pathLength, eta);
       // The long route reaches the harness block once per move whether or not
-      // the result is read (operator, 2026-10-20); the result's hint carries
-      // the budget note instead when that one already names the route.
-      if (longRoute !== undefined) this.noteActionHint("moveTo", "long_route", longRoute, point);
+      // the result is read (operator, 2026-10-20), as a note on a move that
+      // went ahead, never a refusal (operator, 2026-11-18); the result's hint
+      // carries the budget note instead when that one already names the route.
+      if (longRoute !== undefined) this.noteActionHint("moveTo", "long_route", longRoute, point, A_NOTE);
       const note = budget ?? longRoute;
       if (note !== undefined) extras.push(note);
     };
@@ -8963,7 +9045,8 @@ export class WrathClient {
     const recipe = this.moveRecipe(status, point, data, dropJudgement);
     // Recorded before the call-specific notes are folded in: the recipe is what
     // the model needs and what dedupes; the notes are per-call (see ActionHint).
-    this.noteActionHint("moveTo", status, recipe, point);
+    // Not the steering (`MOVE_STEERED`): the result alone says it.
+    if (!MOVE_STEERED.has(status)) this.noteActionHint("moveTo", status, recipe, point, this.movedDied(status) ? BY_DEATH : undefined);
     const hint = withNotes(recipe);
     const reachedPos = data.reachedPos ? { x: data.reachedPos.x, y: data.reachedPos.y, z: data.reachedPos.z } : undefined;
     const nearest =
@@ -9323,7 +9406,7 @@ export class WrathClient {
         const hint = ghost
           ? "you are a ghost and cannot attack; nothing was sent. Get back to life first (reclaimCorpse, or a Spirit Healer)."
           : "you are dead and cannot attack; nothing was sent. sdk.repop() releases your spirit.";
-        this.noteActionHint("killTarget", "dead", hint);
+        this.noteActionHint("killTarget", "dead", hint, undefined, BY_DEATH);
         const self = this.state.self.position?.value;
         const obj = this.state.nearby.get(key);
         const at = obj === undefined ? undefined : pointOf(obj)?.value;
@@ -11419,6 +11502,7 @@ export const CLIENT_PLUMBING: ReadonlySet<string> = new Set([
   "opensUnstuckStretch",
   "asyncMoveRecipe",
   "isCorpse",
+  "movedDied",
   "rangedAttackFor",
   "acceptQuestOnce",
   "withQuestAreas",

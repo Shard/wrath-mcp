@@ -608,9 +608,9 @@ describe("client: movement", () => {
     await stub.stop();
   });
 
-  test("a superseded moveTo carries a hint and is tallied with it", async () => {
-    // With no hint on either channel nothing told the model its move had
-    // been replaced by a newer one.
+  test("a superseded moveTo carries a hint on its result, and is not tallied (operator, 2026-11-18)", async () => {
+    // The result tells the caller its move was replaced by a newer one; the
+    // harness channel, like moveToAsync's, does not report the steering.
     const stub = startStub({ onConnect: () => frames(loginSequence) });
     const client = await connect({ baseUrl: stub.baseUrl, token: "t", events: { reconnect: false } });
     await client.createSession({ character: "Fenwick" });
@@ -623,19 +623,14 @@ describe("client: movement", () => {
     expect(result.status).toBe("superseded");
     // The fact only: a follower re-sending moveTo toward a moving target is steering, not a fault.
     expect(result.hint).toBe("a newer moveTo replaced this one and is the move walking now.");
-    const drained = client.drainActionHints();
-    expect(drained).toHaveLength(1);
-    expect(drained[0]).toMatchObject({ action: "moveTo", status: "superseded", count: 1, point, hint: result.hint });
-    // Whole on the harness channel: under the runner's render cap
-    // (ACTION_HINT_RENDER.MAX_HINT_CHARS, 320), so it is never cut short.
-    expect(result.hint!.length).toBeLessThan(320);
+    expect(client.drainActionHints()).toEqual([]);
     // Still no stop and no memory: a newer move is walking.
     expect(stub.actions.map((a) => a.action)).toEqual(["move_to"]);
     client.close();
     await stub.stop();
   });
 
-  test("a stopped moveTo carries a hint naming where a stop comes from, and is tallied with it", async () => {
+  test("a stopped moveTo carries a hint naming where a stop comes from, and is not tallied (operator, 2026-11-18)", async () => {
     // The module ends a move `stopped` only for a `stop` action, and only this
     // run's client sends one; with no hint the README's "every failure status
     // carries a hint" was untrue for it.
@@ -656,11 +651,8 @@ describe("client: movement", () => {
     expect(result.hint).toBe(
       "stop() ended this move, called from within this run: by your own code, after another moveTo was refused, or at a snippet's time limit.",
     );
-    const drained = client.drainActionHints();
-    expect(drained).toHaveLength(1);
-    expect(drained[0]).toMatchObject({ action: "moveTo", status: "stopped", count: 1, point, hint: result.hint });
-    // Whole on the harness channel (ACTION_HINT_RENDER.MAX_HINT_CHARS, 320).
-    expect(result.hint!.length).toBeLessThan(320);
+    // The caller's own stop is the steering: the result says it, the harness channel does not.
+    expect(client.drainActionHints()).toEqual([]);
     // The caller's own stop is the only one: moveTo adds none, and remembers nothing.
     expect(stub.actions.map((a) => a.action)).toEqual(["move_to", "stop"]);
     client.close();
