@@ -3026,6 +3026,9 @@ const CAST_VERDICT_MS = 3000;
  */
 const CAST_DEATH_WINDOW_MS = 300;
 
+/** Timer slack past `settlesAt` for a death the window's own watch saw (`settledByDeath`). */
+const CAST_DEATH_SLACK_MS = 50;
+
 /**
  * How long a completed transfer waits for the WB_AREA that names the new map,
  * in ms. The module sends it on its next tick after `SMSG_NEW_WORLD`; this
@@ -4870,6 +4873,12 @@ export class WrathClient {
 
   /** Hint-bearing failures since the last drain, by `action:status:origin`. See `ActionHint`. */
   private readonly actionHints = new Map<string, ActionHint>();
+  /**
+   * When (this client's clock) a cast interrupt's death watch last saw the
+   * character die inside the window (`CAST_DEATH_WINDOW_MS`): what
+   * `settledByDeath` reads for an entry drained before the death landed.
+   */
+  private castDeathAt: number | undefined;
 
   /** `castSpell` casts awaiting the server's first word, by spell id (`castVerdict`). */
   private readonly pendingCasts = new Map<number, PendingCast>();
@@ -5100,6 +5109,9 @@ export class WrathClient {
     // A fault merged into a non-fault entry makes it a fault: a live
     // interrupt and one the death caused share a key.
     const nonFault = prev === undefined || prev.nonFault === cls.nonFault ? cls.nonFault : undefined;
+    // The latest pending window holds the whole entry: a definite interrupt
+    // merged with one still settling waits with it, and a death inside that
+    // window takes both (rare: two interrupts of one routine between drains).
     const settlesAt = Math.max(prev?.settlesAt ?? 0, cls.settlesAt ?? 0);
     this.actionHints.set(key, {
       action,
@@ -5131,6 +5143,17 @@ export class WrathClient {
     }
     const { settlesAt: _settled, ...rest } = prev;
     this.actionHints.set(key, { ...rest, hint, ...(byDeath && prev.count === 1 ? { nonFault: "death" as const } : {}) });
+  }
+
+  /**
+   * Whether an entry still settling when it was drained (`settlesAt`) turned
+   * out to be the character's death: the death landed after its interrupt and
+   * inside its window. For a harness that holds such an entry's refusal until
+   * `settlesAt`; not part of the model-facing surface.
+   */
+  settledByDeath(h: Pick<ActionHint, "ts" | "settlesAt">): boolean {
+    const at = this.castDeathAt;
+    return h.settlesAt !== undefined && at !== undefined && at >= h.ts && at <= h.settlesAt + CAST_DEATH_SLACK_MS;
   }
 
   /**
@@ -5969,6 +5992,7 @@ export class WrathClient {
       .then(
         () => {
           const cause = later() ?? status;
+          if (cause === "caster_dead") this.castDeathAt = Date.now();
           this.rewordActionHint(cast.origin, "castSpell", status, castFailedHint(this.state, cast, status, cause), cause === "caster_dead");
         },
         () => {},
@@ -11495,6 +11519,7 @@ export const CLIENT_PLUMBING: ReadonlySet<string> = new Set([
   "tallyActionHint",
   "rewordActionHint",
   "drainActionHints",
+  "settledByDeath",
   "request",
   "postMoveTo",
   "watchAsyncMove",

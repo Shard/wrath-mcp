@@ -984,33 +984,31 @@ describe("a routine's cast interrupt the death caused is no refusal (operator, 2
   while (!signal.aborted) await sleep(50, { wake: false });
 }
 `;
-  /** Start `heal`, interrupt its cast, and drain the hint before anything else arrives. */
-  async function interrupted(): Promise<{ r: Rig; guid: string }> {
-    const r = await rig();
+  const TOKEN = "program-token-0001";
+  /** Start `heal`, interrupt its cast, and drain the hint at once, before anything else arrives. */
+  async function interrupted(o: { beatMs?: number } = {}): Promise<{ r: Rig; died: () => void }> {
+    const r = await rig(o);
     const p = r.host.program!;
     await r.host.evalSnippet(LOGIN);
-    const guid = r.stub.sessions.get("program-token-0001")!.guid;
+    const guid = r.stub.sessions.get(TOKEN)!.guid;
     await p.writeFile("main.ts", HEAL);
     await p.startRoutine({ name: "heal" });
     await until("the cast", () => r.stub.calls.some((c) => c.path === "/action" && c.body?.["action"] === "cast_spell"));
-    r.stub.push("program-token-0001", {
+    r.stub.push(TOKEN, {
       opcode: "SMSG_SPELL_FAILURE",
       opcodeId: 0x133,
       data: { casterGuid: guid, castCount: 1, spellId: 2050, result: 40, reason: "interrupted" },
     });
-    // A tool result drains the routine's hint while no death has followed yet.
-    let delivered = false;
-    await until("the interrupt's hint on a tool result", async () => {
-      const res = await r.host.evalSnippet("1");
-      delivered ||= (res.actionHints ?? []).some((h) => h.action === "castSpell" && h.status === "interrupted" && h.routine === "heal");
-      return delivered;
-    });
-    return { r, guid };
+    // The snippet's result drains the routine's hint the moment the failure has landed.
+    const res = await r.host.evalSnippet('await sdk.events.waitForOpcode("SMSG_SPELL_FAILURE", { timeout: 2000 }); 1');
+    expect((res.actionHints ?? []).some((h) => h.action === "castSpell" && h.status === "interrupted" && h.routine === "heal")).toBe(true);
+    const died = () => r.stub.push(TOKEN, { opcode: "SMSG_UPDATE_OBJECT", opcodeId: 0x0a9, data: { blocks: 1, objects: [{ update: "values", guid, fields: { health: 0 } }] } });
+    return { r, died };
   }
 
-  test("drained before the death lands, it is held until the window passes, and the death makes it none", async () => {
-    const { r, guid } = await interrupted();
-    r.stub.push("program-token-0001", { opcode: "SMSG_UPDATE_OBJECT", opcodeId: 0x0a9, data: { blocks: 1, objects: [{ update: "values", guid, fields: { health: 0 } }] } });
+  test("drained before the death lands, it is held until the window passes, and the death inside it makes it none", async () => {
+    const { r, died } = await interrupted();
+    died();
     await until("the death", async () => (await r.host.evalSnippet("state.self.dead")).value === "true");
     await Bun.sleep(400);
     await r.host.evalSnippet("1");
@@ -1022,6 +1020,18 @@ describe("a routine's cast interrupt the death caused is no refusal (operator, 2
     const { r } = await interrupted();
     await Bun.sleep(400);
     await r.host.evalSnippet("1");
+    expect(r.facts.filter((f) => f.kind === "refusal")).toMatchObject([{ routine: "heal", action: "castSpell", status: "interrupted", fresh: true }]);
+  }, 30_000);
+
+  test("a death after the window leaves the interrupt a refusal: it failed while alive", async () => {
+    // Beats far apart, so only the once-a-second harvest runs in between.
+    const { r, died } = await interrupted({ beatMs: 60_000 });
+    await Bun.sleep(340);
+    // Just past the window and no tool call in between: the death has most
+    // likely landed before any harvest settles the interrupt.
+    died();
+    await Bun.sleep(150);
+    expect((await r.host.evalSnippet("state.self.dead")).value).toBe("true");
     expect(r.facts.filter((f) => f.kind === "refusal")).toMatchObject([{ routine: "heal", action: "castSpell", status: "interrupted", fresh: true }]);
   }, 30_000);
 });

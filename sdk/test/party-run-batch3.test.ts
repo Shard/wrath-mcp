@@ -277,6 +277,30 @@ describe("castSpell interrupted: what interrupted it, when the client can tell",
     const [settled] = client.drainActionHints();
     expect(settled!.nonFault).toBeUndefined();
     expect(settled!.settlesAt).toBeLessThanOrEqual(Date.now());
+    // A death after the window does not make either interrupt the death's.
+    push(stub, alive(44, 0));
+    await folded(client, "SMSG_UPDATE_OBJECT", 44);
+    expect(client.settledByDeath(early!)).toBe(false);
+    expect(client.settledByDeath(settled!)).toBe(false);
+    client.close();
+    await stub.stop();
+  });
+
+  test("drained before the death lands, a death inside the window settles it as the death's", async () => {
+    const stub = startStub({ onConnect: () => world() });
+    const client = await inWorld(stub);
+    await folded(client, "SMSG_UPDATE_OBJECT", 17);
+    await client.castSpell(2050);
+    push(stub, interrupted(41));
+    await folded(client, "SMSG_SPELL_FAILURE", 41);
+    const [early] = client.drainActionHints();
+    expect(early!.settlesAt).toBeGreaterThan(Date.now());
+    push(stub, alive(42, 0));
+    await folded(client, "SMSG_UPDATE_OBJECT", 42);
+    await Bun.sleep(5);
+    expect(client.settledByDeath(early!)).toBe(true);
+    // Nothing is left in the tally to reword: the drained entry is the one settled.
+    expect(client.drainActionHints()).toEqual([]);
     client.close();
     await stub.stop();
   });

@@ -818,12 +818,16 @@ const unsettled: { seat: Seat; routine: RoutineRun<Seat>; hint: SdkHint }[] = []
  */
 function harvestHints(): void {
   const now = Date.now();
-  // Settled: one the character died in the meantime was the death's, not the code's (operator, 2026-11-18).
-  for (let i = unsettled.length - 1; i >= 0; i--) {
+  // Settled: one whose window saw the character die was the death's, not
+  // the code's (operator, 2026-11-18); a death after the window is not.
+  for (let i = 0; i < unsettled.length; ) {
     const u = unsettled[i]!;
-    if ((u.hint.settlesAt ?? 0) > now) continue;
+    if ((u.hint.settlesAt ?? 0) > now) {
+      i++;
+      continue;
+    }
     unsettled.splice(i, 1);
-    if (!u.seat.client.state.self.dead) program?.noteRefusal(u.routine, u.hint, MULTI ? u.seat.name : undefined);
+    if (!u.seat.client.settledByDeath(u.hint)) program?.noteRefusal(u.routine, u.hint, MULTI ? u.seat.name : undefined);
   }
   for (const seat of allSeats()) {
     const fresh = seat.client.drainActionHints();

@@ -463,7 +463,8 @@ cancel a repop sends in a burst, is not a refusal. A cast refused `dead` or
 character's death, are tallied as the death's (`nonFault: "death"`); the death
 lands just after the interrupt, so until a 300 ms window has passed an
 interrupt with no cause seen carries `settlesAt`, and a harness waits that out
-before counting it. An interrupt by a hit or a stun while alive is a cast that
+and asks `settledByDeath` whether the death landed inside it before counting
+it; a death after the window leaves it a failure. An interrupt by a hit or a stun while alive is a cast that
 failed. Helpers that read their own
 cast verdicts (the chest's Opening ladder) dispatch untracked.
 
