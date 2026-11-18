@@ -39,8 +39,16 @@ namespace WrathBench
         // 50 degrees). Deliberately not the core's SetSlopeCheck: that is a
         // pathing-time preference, this is a verdict on the route the mesh
         // already chose.
+        // 1.2 is the 3.3.5a client's own limit: the client refuses ground
+        // whose surface normal's up component is under cos 50 degrees
+        // (CLIENT_WALKABLE_COS), and atan(1.2) is 50.2 degrees, inside a 4y
+        // chord's own error. The server's mmaps are built walkable to 60
+        // degrees (AzerothCore's mmaps-config.yaml, an NPC default), so a
+        // route the mesh plans can cross a 50-60 degree face no client walks
+        // up; the steep re-plan (SteepCost) steers around such faces.
         inline constexpr float DROP_MIN_DZ = 2.0f;
         inline constexpr float DROP_SLOPE = 1.2f;
+        inline constexpr float CLIENT_WALKABLE_COS = 0.6427876f;
 
         inline bool IsDropSegment(WbVec const& a, WbVec const& b, float* dzOut)
         {
@@ -129,6 +137,33 @@ namespace WrathBench
         inline float WaterZ(float z, bool water, float level, float bed, float swimDepth)
         {
             return water && level - bed > swimDepth && z < level ? level : z;
+        }
+
+        // A surface the client will not walk up: its normal (any length, any
+        // sign) points less than CLIENT_WALKABLE_COS up. `up` is the normal's
+        // vertical component, `len` its length; a degenerate triangle is
+        // not steep (it has no surface to stand on or slide off).
+        inline bool SteepSurface(float up, float len)
+        {
+            return len > 0.0f && std::fabs(up) < CLIENT_WALKABLE_COS * len;
+        }
+
+        // The steep re-plan's travel cost through a polygon, as a factor on
+        // the core's own (dtQueryFilterExt: distance, weighted mildly by
+        // slope): 1 + STEEP_COST x the share of the polygon's surface steeper
+        // than the client walks (SteepSurface over its detail triangles, by
+        // area). A wholly steep polygon costs 1 + STEEP_COST times its
+        // distance, so the search goes the long way round a face before it
+        // goes up it, and a polygon with a steep corner costs a little more.
+        // A penalty, not a bar: a polygon is mixed ground, and barring one
+        // for its steep part can cut the only way through (Dun Morogh's
+        // hills); the guard still judges the route that comes back.
+        inline constexpr float STEEP_COST = 20.0f;
+
+        inline float SteepCost(float steepShare, float weight = STEEP_COST)
+        {
+            float const share = steepShare < 0.0f ? 0.0f : steepShare > 1.0f ? 1.0f : steepShare;
+            return 1.0f + weight * share;
         }
 
         // A walk that ends more than this far from the z the request asked

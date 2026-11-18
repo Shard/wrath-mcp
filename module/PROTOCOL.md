@@ -2011,7 +2011,11 @@ at the top of this document.
 - `drop` — the mesh's route steps off a ledge: some segment of the resolved
   polyline falls (or climbs) more than 2.0y and steeper than 1.2x its 2D
   length — a cliff, not a ramp (stairs and ramps pass; a stale z within the
-  `meshZ` band passes). Each point is judged where the route was smoothed
+  `meshZ` band passes). 1.2 is the client's own slope: the 3.3.5a client walks
+  up no surface whose normal is under cos 50 degrees (0.6427876), and atan 1.2
+  is 50.2 degrees, while the server's mmaps are built walkable to 60 degrees
+  for NPCs, so the mesh can route up a hillside no client climbs (operator
+  decision, 2026-11-18; WrathBench's METHODOLOGY, "Client fidelity"). Each point is judged where the route was smoothed
   along the mesh: the core settles every path point onto the first floor it
   finds looking down from 2y over it, game objects included, which lifts a
   stair point under a landing onto the landing (a Kharanos cellar stair read
@@ -2024,10 +2028,16 @@ at the top of this document.
   judged and walked at the surface: a swimmer climbs out from there, so a
   bank the mesh walks out of the water is not refused for the swimmer's
   depth, while a dock face 3y over the water is still a climb. The route's
-  end is the request's (`arrived`, above). Before refusing, the module re-plans around the steep
-  band, up to three times, with the mesh polygons under every refused segment
-  barred, and walks the first re-planned route this same guard passes; when
-  none does, what follows describes the mesh's own route. A `drop` can also
+  end is the request's (`arrived`, above). Before refusing, the module re-plans
+  around the steep band, up to three times, and walks the first re-planned
+  route this same guard passes; when none does, what follows describes the
+  mesh's own route. Every re-plan weights the cost through each mesh polygon
+  by the share of its surface steeper than the client walks (up to 21 times
+  the core's cost for a wholly steep one), so the corridor goes round a face
+  rather than up it; the first bars nothing, and each later one also bars the
+  polygons under every segment the previous re-plan's route was refused for.
+  A steep step inside the polygon the character stands on, or the one it
+  asked for, cannot be routed round this way: those two are never barred. A `drop` can also
   be the edge past the end of the mesh (`path_incomplete`, above): then
   `reachedPos` is that edge, `dz` the fall to where it lands, and no re-plan
   runs, since the mesh has no route to plan around. Without `force` the
@@ -2852,9 +2862,10 @@ the core settled on) and `meshZ` (that polygon's height, where the walk ends
 instead).
 A move whose route the drop guard refused logs `op: "move_replan_steep"`
 (the re-plan under `drop`) with `outcome` — `ok` when a re-planned route
-passed the guard and is the walk, `failed` or `skipped` with a `reason` when
-the `drop` stands — `rounds` (re-plans run, at most three), `excluded` (mesh
-polygons the last one barred), the refused route's `edge`, `dz` and
+passed the guard and is the walk, `failed` or `skipped` (no re-plan ran)
+with a `reason` when the `drop` stands — `rounds` (re-plans run, at most
+three), `excluded` (mesh polygons the last one barred, 0 after the first,
+which bars none), the refused route's `edge`, `dz` and
 `pointCount`, and `replanPointCount` (the last re-planned route's, 0 when none
 was built).
 A `path_incomplete` whose request lies below the end of the mesh's route logs

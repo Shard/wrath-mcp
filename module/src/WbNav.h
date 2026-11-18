@@ -20,6 +20,7 @@
 #include "DetourNavMeshQuery.h"
 
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 namespace WbNav
@@ -64,6 +65,33 @@ namespace WbNav
 
     private:
         std::vector<dtPolyRef> const* _excluded;
+    };
+
+    // The share of a polygon's surface, by area over its detail triangles
+    // (the mesh's own heights), that the client will not walk up
+    // (Route::SteepSurface). 0 for an off-mesh connection or a polygon with
+    // no detail mesh.
+    float SteepShare(dtMeshTile const* tile, dtPoly const* poly);
+
+    // The steep re-plan's filter (WbManager.cpp, ReplanSteep): the player's
+    // filter with its barred polygons, and the core's cost through each
+    // polygon weighted by its steep share (Route::SteepCost), so a corridor
+    // goes round a face the client cannot climb when the mesh has a way.
+    // Only the re-plan uses it; every other query searches as the core does.
+    // Each polygon's share is computed once per filter. `weight` is
+    // Route::STEEP_COST except in an offline check.
+    class SteepCostFilter : public ExcludePolysFilter
+    {
+    public:
+        explicit SteepCostFilter(std::vector<dtPolyRef> const* excluded = nullptr, float weight = -1.0f);
+        float getCost(float const* pa, float const* pb,
+            dtPolyRef const prevRef, dtMeshTile const* prevTile, dtPoly const* prevPoly,
+            dtPolyRef const curRef, dtMeshTile const* curTile, dtPoly const* curPoly,
+            dtPolyRef const nextRef, dtMeshTile const* nextTile, dtPoly const* nextPoly) const override;
+
+    private:
+        float _weight;
+        mutable std::unordered_map<dtPolyRef, float> _share;
     };
 
     // The polygon the core's path builder picks for a point

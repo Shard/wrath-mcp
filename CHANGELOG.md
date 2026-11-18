@@ -502,6 +502,16 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Changed
 
+- **The steep re-plan goes round ground steeper than the client walks.**
+  The 3.3.5a client walks up nothing steeper than 50 degrees (the drop
+  guard's 1.2 ramp, unchanged), while the server's mmaps are built walkable
+  to 60, so the mesh planned routes up hillsides the guard then refused
+  (`drop`). Every re-plan under a `drop` now weights the cost through each
+  mesh polygon by the share of its surface steeper than 50 degrees, and the
+  first bars nothing, so a route goes round the face where the mesh has a
+  way: more such moves arrive, by a longer walk. `move_replan_steep`'s
+  `excluded` is 0 after a first re-plan, and its first round is never
+  `skipped` for `nothing_to_exclude`.
 - **Closed vocabularies accept any letter case.** `state.units()`'s `type`,
   `role`, `questGiver` and `reaction`, `say`'s `type` and `lootRoll`'s
   `choice` resolve a value in any letter case to its documented spelling, so

@@ -14,6 +14,7 @@
 
 #include "WbRoute.h"
 
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <vector>
@@ -160,12 +161,55 @@ static void Water()
     Check(Route::WaterZ(held, false, level, bed, swimDepth) == held, "no liquid there, nothing moves");
 }
 
+// The client's own limit (Route::CLIENT_WALKABLE_COS, cos 50 degrees) and
+// the guard's ramp agree, so a climb the guard passes is one the client
+// walks: the Dun Morogh hills the mesh plans up at 50-61 degrees are refused,
+// and the steep re-plan's cost (SteepSurface, SteepCost) is judged at the
+// same 50 degrees.
+static void Slope()
+{
+    double const deg = 180.0 / 3.14159265358979323846;
+    double const client = std::acos(double(Route::CLIENT_WALKABLE_COS)) * deg;
+    Check(std::fabs(client - 50.0) < 0.01, "the client's limit is cos 50 degrees");
+    Check(std::fabs(std::atan(double(Route::DROP_SLOPE)) * deg - client) < 0.3, "the guard's ramp is the client's 50 degrees");
+
+    // A 4y step of the core's smooth path: tan 50 x 4 = 4.77y.
+    Check(FirstRefused({ { 0, 0, 0 }, { 4.0f, 0, 4.75f } }, false) == -1, "a 4y step at 49.9 degrees passes");
+    Check(FirstRefused({ { 0, 0, 0 }, { 4.0f, 0, 4.85f } }, true) == 0, "a 4y step at 50.5 degrees is refused, forced or not");
+    // The runs' hillsides: (-5546.8,-341.3) at 51.9, (-5664.7,-430.8) at
+    // 56.7, the Gates of Ironforge at 59 and (-5892.8,-295.8) at 61 degrees.
+    for (float a : { 51.9f, 56.7f, 59.0f, 61.0f })
+        Check(FirstRefused({ { 0, 0, 0 }, { 4.0f, 0, 4.0f * float(std::tan(a / deg)) } }, false) == 0, "a 51-61 degree hillside climb is refused");
+    // The floor stays: a step under 2.0y passes however steep, a near-vertical
+    // wall over it does not.
+    Check(FirstRefused({ { 0, 0, 0 }, { 0.2f, 0, 1.95f } }, false) == -1, "a 1.95y step at 84 degrees passes under the floor");
+    Check(FirstRefused({ { 0, 0, 0 }, { 0.2f, 0, 2.05f } }, false) == 0, "a 2.05y wall is refused");
+
+    // The surface test, on a normal of length 1 tilted `a` degrees off up:
+    // either sign (a triangle wound either way), and no surface at all.
+    auto tilted = [&](double a, float sign) { return Route::SteepSurface(sign * float(std::cos(a / deg)), 1.0f); };
+    Check(!tilted(49.9, 1.0f) && !tilted(49.9, -1.0f), "a 49.9 degree surface is walkable");
+    Check(tilted(50.1, 1.0f) && tilted(50.1, -1.0f), "a 50.1 degree surface is steep");
+    Check(!tilted(0.0, 1.0f), "flat ground is walkable");
+    Check(Route::SteepSurface(0.0f, 2.0f), "a wall is steep");
+    Check(!Route::SteepSurface(0.0f, 0.0f), "a degenerate triangle is not steep");
+
+    // The re-plan's cost factor: flat ground costs what the core's does, a
+    // wholly steep polygon 1 + STEEP_COST times, linearly between, clamped.
+    Check(Route::SteepCost(0.0f) == 1.0f, "no steep share, the core's cost");
+    Check(Route::SteepCost(1.0f) == 1.0f + Route::STEEP_COST, "a wholly steep polygon");
+    Check(Route::SteepCost(0.5f) == 1.0f + 0.5f * Route::STEEP_COST, "half steep, half the penalty");
+    Check(Route::SteepCost(-0.1f) == 1.0f && Route::SteepCost(1.5f) == 1.0f + Route::STEEP_COST, "the share is clamped");
+    Check(Route::SteepCost(1.0f, 5.0f) == 6.0f, "an offline check's own weight");
+}
+
 int main()
 {
     Guard();
     End();
     Lifted();
     Water();
+    Slope();
     if (failures == 0)
         std::printf("ok\n");
     return failures;
