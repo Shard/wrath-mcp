@@ -1,0 +1,172 @@
+/*
+ * This file is part of mod-wrathbench, an AzerothCore module.
+ * SPDX-License-Identifier: MIT
+ *
+ * Copyright (c) 2026 Mark Beukers
+ * Licensed under the MIT License; see LICENSE in the module's root.
+ */
+
+// The drop guard's verdict on a route, run without an AzerothCore tree:
+// WbRoute.h includes nothing of the core's. Built and run by
+// scripts/module-route.test.ts; not part of the module (AzerothCore compiles
+// src/ only). The routes are invented, shaped like the ones that earned each
+// rule. Prints one line per failed check and exits with their count.
+
+#include "WbRoute.h"
+
+#include <cstddef>
+#include <cstdio>
+#include <vector>
+
+using namespace WrathBench;
+
+static int failures = 0;
+
+static void Check(bool ok, char const* what)
+{
+    if (ok)
+        return;
+    ++failures;
+    std::printf("FAILED: %s\n", what);
+}
+
+// The guard over a whole polyline, as SettleRoute and TickMover run it: the
+// first segment it refuses, or -1 when it refuses none. `buried` stands in for
+// the world's ground read under a step down (FootUnderSurface).
+static long FirstRefused(std::vector<WbVec> const& pts, bool force, bool buried = false)
+{
+    for (std::size_t i = 0; i + 1 < pts.size(); ++i)
+    {
+        float dz = 0.0f;
+        if (Route::IsDropSegment(pts[i], pts[i + 1], &dz) && Route::RefusesLedge(dz, force, dz < 0.0f && buried))
+            return long(i);
+    }
+    return -1;
+}
+
+// A straight polyline from `from`, `n` steps of `d2` yards across, each
+// rising `rise`.
+static std::vector<WbVec> Line(WbVec from, int n, float d2, float rise)
+{
+    std::vector<WbVec> pts{ from };
+    for (int i = 1; i <= n; ++i)
+        pts.push_back({ from.x + d2 * float(i), from.y, from.z + rise * float(i) });
+    return pts;
+}
+
+static void Guard()
+{
+    // Stairs and ramps pass: a 4y step of the core's smooth path rising 2.6y
+    // (33 degrees), and a 1.9y rise over half a yard (under the 2.0y floor).
+    Check(FirstRefused(Line({ 0, 0, 0 }, 3, 4.0f, 2.6f), false) == -1, "a 33 degree stair passes");
+    Check(FirstRefused({ { 0, 0, 0 }, { 0.5f, 0, 1.9f } }, false) == -1, "a step under 2.0y passes however steep");
+
+    // A real wall: 5y straight up over 1.5y across, refused both ways, and
+    // up whatever the request says.
+    std::vector<WbVec> wall{ { 0, 0, 0 }, { 4, 0, 0 }, { 5.5f, 0, 5 }, { 9.5f, 0, 5 } };
+    Check(FirstRefused(wall, false) == 1, "a 5y wall up is refused");
+    Check(FirstRefused(wall, true) == 1, "a 5y wall up is refused with force");
+    std::vector<WbVec> down{ { 9.5f, 0, 5 }, { 5.5f, 0, 5 }, { 4, 0, 0 }, { 0, 0, 0 } };
+    Check(FirstRefused(down, false) == 1, "a 5y ledge down is refused unforced");
+    Check(FirstRefused(down, true) == -1, "a 5y ledge down is walked with force");
+    Check(FirstRefused(down, true, true) == 1, "a ledge down onto a buried foot is refused with force");
+
+    // A sustained 55 degree slope (tan 55 = 1.43, past the 1.2 ramp): every 4y
+    // step of it rises 3.3y over 2.3y across.
+    Check(FirstRefused(Line({ 0, 0, 0 }, 5, 2.29f, 3.28f), false) == 0, "a sustained 55 degree slope is refused");
+    Check(FirstRefused(Line({ 0, 0, 0 }, 5, 2.29f, 3.28f), true) == 0, "a sustained 55 degree climb is refused with force");
+    // The bounds themselves: 1.2 x across is not a ledge, a hair past it is.
+    Check(!Route::IsDropSegment({ 0, 0, 0 }, { 2.5f, 0, 3.0f }, nullptr), "exactly 1.2 x across is a ramp");
+    Check(Route::IsDropSegment({ 0, 0, 0 }, { 2.5f, 0, 3.01f }, nullptr), "past 1.2 x across is a ledge");
+}
+
+// Fix: the end of the route on its own polygon (Route::EndZ), the case
+// that earned the upward half: a corridor floor at 50.5, a request 4.8y over
+// it at 55.3, which the core's settling put on a surface at 56.7, 1.4y
+// under the request. The last mesh point is at 51.3, 1.5y back.
+static void End()
+{
+    float const floor = 50.5f, reqZ = 55.3f, settled = 56.7f;
+    std::vector<WbVec> route{ { 0, 0, 50.6f }, { 4, 0, 50.9f }, { 8, 0, 51.3f }, { 9.5f, 0, settled } };
+    Check(FirstRefused(route, false) == 2, "before: the settled end over the floor reads as a 5.4y climb");
+    route.back().z = Route::EndZ(route.back().z, floor);
+    Check(route.back().z == floor, "an end 6.2y over its polygon ends on it");
+    Check(FirstRefused(route, false) == -1, "the route to the floor under the request passes");
+    Check(Route::ReportsMeshZ(route.back().z, reqZ), "the arrival reports meshZ, the floor's height");
+
+    // The band, both ways: within 2y the end stays where the core settled it
+    // (a step, a crate, a stale z), past it the polygon's height is the end.
+    Check(Route::EndZ(floor + 1.9f, floor) == floor + 1.9f, "an end 1.9y over its polygon stays");
+    Check(Route::EndZ(floor - 1.9f, floor) == floor - 1.9f, "an end 1.9y under its polygon stays");
+    Check(Route::EndZ(floor - 5.0f, floor) == floor, "an end 5y under its polygon is lifted to it");
+    Check(Route::EndZ(floor + 5.4f, floor, false) == floor + 5.4f, "an end over a polygon it may not be lowered to (a deck) stays");
+    Check(!Route::ReportsMeshZ(floor + 0.9f, floor), "an arrival within 1y of the request carries no meshZ");
+}
+
+// Fix: each point at the mesh's height where the core lifted it
+// (Route::PointZ), the case that earned it: a switchback cellar stair whose
+// point under the landing was settled 1.8y up, onto the landing, so the next
+// step read as a 4.9y fall over 4y.
+static void Lifted()
+{
+    float const meshZ = 395.5f;
+    std::vector<WbVec> stair{ { 0, 0, 399.1f }, { 4, 0, 397.3f }, { 8, 0, 395.5f }, { 8, 4, meshZ + 1.8f }, { 8, 8, 392.4f }, { 10, 8, 392.4f } };
+    Check(FirstRefused(stair, false) == 3, "before: the step off the lifted point reads as a 4.9y fall");
+    stair[3].z = Route::PointZ(stair[3].z, true, meshZ);
+    Check(stair[3].z == meshZ, "a point lifted 1.8y over the mesh is judged at the mesh");
+    Check(FirstRefused(stair, false) == -1, "the stair the mesh has passes");
+
+    Check(Route::PointZ(meshZ + 0.9f, true, meshZ) == meshZ + 0.9f, "a point within 1y over the mesh keeps the core's z");
+    Check(Route::PointZ(meshZ - 1.2f, true, meshZ) == meshZ - 1.2f, "a point under the mesh keeps the core's z");
+    Check(Route::PointZ(meshZ + 1.8f, false, meshZ) == meshZ + 1.8f, "a point the surface walk did not reach keeps the core's z");
+
+    // A real wall stays a wall: the mesh's own heights are the wall's, so
+    // nothing is lowered and the climb is refused.
+    std::vector<WbVec> wall{ { 0, 0, 0 }, { 4, 0, 0 }, { 5.5f, 0, 5 }, { 9.5f, 0, 5 } };
+    for (std::size_t i = 0; i + 1 < wall.size(); ++i)
+        wall[i].z = Route::PointZ(wall[i].z, true, wall[i].z);
+    Check(FirstRefused(wall, false) == 1, "a 5y wall on the mesh's own heights is still refused");
+}
+
+// Fix: a climb out of the water measured from its surface (Route::WaterZ).
+// The surface at 0, a bed 6y down, a swim depth of 1.6y; the core held the
+// swimmer's point 1.2y under the surface.
+static void Water()
+{
+    float const level = 0.0f, bed = -6.0f, swimDepth = 1.6f, held = -1.2f;
+    std::vector<WbVec> bank{ { 0, 0, held }, { 4, 0, held }, { 6, 0, 1.5f }, { 10, 0, 1.8f } };
+    Check(FirstRefused(bank, false) == 1, "before: a bank 1.5y over the surface reads as a 2.7y climb from 1.2y under it");
+    for (WbVec& p : bank)
+        p.z = Route::WaterZ(p.z, p.z < level, level, bed, swimDepth);
+    Check(bank[1].z == level, "a swimmer's point is judged at the surface");
+    Check(bank[2].z == 1.5f, "a point on the bank is not moved");
+    Check(FirstRefused(bank, false) == -1, "the climb out onto a bank 1.5y over the surface passes");
+
+    // The cove's own shape: a 47-50 degree bank, 3.0y up over 2.6y across
+    // from the surface, read from 1.2y under it.
+    std::vector<WbVec> cove{ { 0, 0, held }, { 2.6f, 0, 3.0f } };
+    Check(FirstRefused(cove, false) == 0, "before: the cove bank reads as a 4.2y climb");
+    cove[0].z = Route::WaterZ(cove[0].z, true, level, bed, swimDepth);
+    Check(FirstRefused(cove, false) == -1, "the cove bank, from the surface, passes");
+
+    // A dock face 3y over the water, straight up: still a climb.
+    std::vector<WbVec> dock{ { 0, 0, held }, { 1.0f, 0, 3.0f } };
+    dock[0].z = Route::WaterZ(dock[0].z, true, level, bed, swimDepth);
+    Check(FirstRefused(dock, true) == 0, "a dock face 3y over the water is refused, forced or not");
+
+    // Only water deep enough to swim, and only under its surface.
+    Check(Route::WaterZ(-0.8f, true, level, -1.0f, swimDepth) == -0.8f, "a wading point keeps the bed");
+    Check(Route::WaterZ(0.4f, true, level, bed, swimDepth) == 0.4f, "a point over the surface (a pier) is not moved");
+    Check(Route::WaterZ(held, false, level, bed, swimDepth) == held, "no liquid there, nothing moves");
+}
+
+int main()
+{
+    Guard();
+    End();
+    Lifted();
+    Water();
+    if (failures == 0)
+        std::printf("ok\n");
+    return failures;
+}

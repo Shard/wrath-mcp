@@ -1865,7 +1865,14 @@ at the top of this document.
   and from inside the terrain finds nothing, or a floor buried under the hill
   — a tunnel roof 45y down, in Dun Algaz), so the module ends the walk at the
   height of the polygon the path ends on instead, and the arrival carries that
-  as `meshZ`. The audit log records the lift as `op: "move_end_z"`.
+  as `meshZ`. So does a request in the air over the floor, whose z the
+  normalization lands on whatever surface lies within 2y under it (in a
+  Deadmines corridor, 1.4y under a request 4.9y over the floor) rather than
+  on the floor: an end settled more
+  than 2y over the polygon the path ends on ends at that polygon's height, as
+  a client's click on the floor would (never off a transport's deck, which
+  the mesh does not have). The audit log records either as
+  `op: "move_end_z"`.
   A request whose own polygon lies on a closed island of the mesh that the
   start's polygon is not on (a component of fewer than 1024 polygons; a
   sliver under a WMO floor, a ledge nothing links to) can be reached by no
@@ -2004,7 +2011,20 @@ at the top of this document.
 - `drop` — the mesh's route steps off a ledge: some segment of the resolved
   polyline falls (or climbs) more than 2.0y and steeper than 1.2x its 2D
   length — a cliff, not a ramp (stairs and ramps pass; a stale z within the
-  `meshZ` band passes). Before refusing, the module re-plans around the steep
+  `meshZ` band passes). Each point is judged where the route was smoothed
+  along the mesh: the core settles every path point onto the first floor it
+  finds looking down from 2y over it, game objects included, which lifts a
+  stair point under a landing onto the landing (a Kharanos cellar stair read
+  2.3y high, and the step after it as a 5.1y fall onto ground "under" the
+  landing). A point lifted more than 1y over the mesh's own height under it —
+  the polygon the route walked onto from the point before, never one looked
+  up from the lifted z — is judged, and walked, at the mesh's height; one at
+  or under it keeps the core's. A point over water deep enough to swim
+  (Swimming, above), which the core settles about 1.2y under the surface, is
+  judged and walked at the surface: a swimmer climbs out from there, so a
+  bank the mesh walks out of the water is not refused for the swimmer's
+  depth, while a dock face 3y over the water is still a climb. The route's
+  end is the request's (`arrived`, above). Before refusing, the module re-plans around the steep
   band, up to three times, with the mesh polygons under every refused segment
   barred, and walks the first re-planned route this same guard passes; when
   none does, what follows describes the mesh's own route. A `drop` can also
@@ -2826,9 +2846,10 @@ A move planned from the water surface over its start (the start's own
 polygon on a closed island; `path_incomplete` below) logs
 `op: "move_start_level"` with `from` (the start), `levelZ` (the level's
 height there) and `islandPolys` (the start island's size).
-A move whose endpoint the core's normalization left under the ground logs
-`op: "move_end_z"` with `normZ` (the z the core settled on) and `meshZ` (the
-height of the polygon the path ends on, where the walk ends instead).
+A move whose endpoint the core's normalization left more than 2y under or
+over the polygon the path ends on logs `op: "move_end_z"` with `normZ` (the z
+the core settled on) and `meshZ` (that polygon's height, where the walk ends
+instead).
 A move whose route the drop guard refused logs `op: "move_replan_steep"`
 (the re-plan under `drop`) with `outcome` — `ok` when a re-planned route
 passed the guard and is the walk, `failed` or `skipped` with a `reason` when
@@ -2856,8 +2877,12 @@ its request is (within the smooth path's slop, above) logs
 the walk itself ends at that x,y at the start's z.
 Each `move_to` that reaches the mesh also logs one `op: "move_path"` record at
 dispatch — `moveId`, `status` (`"ok"` when the walk was dispatched, else the
-`WB_MOVE_RESULT` status), `pointCount`, and `points` (the resolved polyline,
-capped at 64 points with `truncated: true` when the cap bit) — so a route the
+`WB_MOVE_RESULT` status), `pointCount`, `points` (the resolved polyline,
+capped at 64 points with `truncated: true` when the cap bit) and, when any
+were, `meshPoints` (how many of its points the core's settling had lifted more
+than 1y over the mesh and were put back on it: `drop`, below) and
+`waterPoints` (how many lay under the surface of water deep enough to swim and
+were put on the surface) — so a route the
 mesh chose is read from the log, not reconstructed from heartbeats. Beside it,
 one `op: "move_eta"` record for each dispatched walk: `moveId`, `etaMs`,
 `pathLength`, `swimYards` (the stretches the walk-time estimate counted as

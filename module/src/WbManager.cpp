@@ -10,6 +10,7 @@
 #include "WbBounds.h"
 #include "WbJson.h"
 #include "WbNav.h"
+#include "WbRoute.h"
 
 #include "AccountMgr.h"
 #include "AchievementMgr.h"
@@ -2339,6 +2340,40 @@ namespace WrathBench
         return pose;
     }
 
+    // A route's points over water deep enough to swim, under its surface, at
+    // the surface (Route::WaterZ): a swimmer climbs out from there, and
+    // PlaceMover holds the body at its swim depth under it. The depth is the
+    // liquid's own, read as WaterPoseAt reads it: one read a point, made on
+    // the world thread, so at most Bounds::kSamplesMax of them a settle, as
+    // WalkEtaMs is bounded (a route past that, only ever an edge drop's
+    // concatenation, keeps its later points' z). A resolve settles a route
+    // once, up to four times when the steep re-plan runs all its rounds.
+    // Returns how many were raised.
+    static uint32 OntoWater(Unit* mover, std::vector<WbVec>& points)
+    {
+        Map* map = mover->GetMap();
+        if (!map)
+            return 0;
+        float const height = mover->GetCollisionHeight();
+        float const swimDepth = height * SWIM_DEPTH_FRACTION + SWIM_DEPTH_MARGIN;
+        uint32 raised = 0;
+        size_t const reads = std::min<size_t>(points.size(), Bounds::kSamplesMax);
+        for (size_t i = 0; i < reads; ++i)
+        {
+            WbVec& p = points[i];
+            LiquidData const liquid = map->GetLiquidData(mover->GetPhaseMask(), p.x, p.y, p.z, height, {});
+            bool const water = liquid.Status != LIQUID_MAP_NO_WATER && liquid.Level > INVALID_HEIGHT
+                && liquid.DepthLevel > INVALID_HEIGHT && liquid.Level > liquid.DepthLevel;
+            float const z = Route::WaterZ(p.z, water, liquid.Level, liquid.DepthLevel, swimDepth);
+            if (z != p.z)
+            {
+                p.z = z;
+                ++raised;
+            }
+        }
+        return raised;
+    }
+
     // How finely WalkEtaMs classifies a route: one WaterPoseAt per this many
     // yards of polyline (at least one per segment), at the middle of each
     // stretch. TickMover reclassifies every tick, so a stretch's pace can be
@@ -2356,7 +2391,7 @@ namespace WrathBench
     // speed through a fall and covers ground no faster than that. A 143y fall
     // is about 4 s rather than the 20 s a run down its length took, during
     // which the server held the character at the lip.
-    static bool IsDropSegment(WbVec const& a, WbVec const& b, float* dzOut);
+    using Route::IsDropSegment;
     static uint64_t FallMs(Unit* mover, WbVec const& a, WbVec const& b)
     {
         float const fall = Movement::computeFallTime(a.z - b.z, mover->HasFeatherFallAura());
@@ -2594,23 +2629,15 @@ namespace WrathBench
         return false;
     }
 
-    // The core's NormalizePath settles every path point onto the ground by
-    // asking Map::GetHeight from 2y above the point (Z_OFFSET_FIND_HEIGHT in
-    // Object.cpp). The last point keeps the z the request asked for, so a
-    // request more than 2y under the road looks down from inside the terrain:
-    // the terrain is behind it, and the first floor beneath is whatever lies
-    // buried there — nothing (the guessed z is kept, 4y deep) or a WMO roof
-    // under the hill (Dun Algaz: a tunnel roof 45y down). A client's click
-    // lands on the road either way. When the normalized endpoint sits more
-    // than END_SINK_MAX below its own polygon's height, the polygon height is
-    // the endpoint; the arrival then reports `meshZ` as any mesh-corrected
-    // z does. 2y: the same band the core's own normalization tolerates.
-    static constexpr float END_SINK_MAX = 2.0f;
+    // The end of a walked route on the polygon it ends on when the core's
+    // settling left it more than 2y under or over it (Route::EndZ).
 
     // The ground a character stepping off `edge` lands on at the foot's x,y:
     // the first surface Map::GetHeight finds looking down from just above
     // the edge's height (terrain, vmap and game-object floors, the geometry
-    // a client has too). A foot more than FOOT_UNDER_SURFACE below it is
+    // a client has too). The edge's height is the route's own: the mesh's
+    // where the core's settling lifted the point over it (OntoMesh), so the
+    // look starts under a landing the stair runs beneath, not on it. A foot more than FOOT_UNDER_SURFACE below it is
     // inside solid ground — a z the request guessed and the mesh never
     // resolved — and no client falls through terrain, so such a step is
     // refused forced or not. Searching from the edge rather than from the
@@ -2676,23 +2703,11 @@ namespace WrathBench
             && pts.size() >= 2;
     }
 
-    // A mesh path that falls is a ledge, not a route (nav-probe c4 on map
-    // 369: a polyline segment with dz -7.64 over 1.0y of
-    // 2D travel was walked, `arrived` was reported from a 2D-only check, and
-    // the next move from down there was `start_off_mesh`). A segment is a
-    // drop when it is both tall (> 2.0y, so stairs and stale-z corrections
-    // stay `meshZ`) and steeper than a ramp (|dz| > 1.2 x its 2D length).
-    // Deliberately not the core's SetSlopeCheck: that is a pathing-time
-    // preference, this is a verdict on the route the mesh already chose.
-    static constexpr float DROP_MIN_DZ = 2.0f;
-    static constexpr float DROP_SLOPE = 1.2f;
-    static bool IsDropSegment(WbVec const& a, WbVec const& b, float* dzOut)
-    {
-        float dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
-        float d2 = std::sqrt(dx * dx + dy * dy);
-        if (dzOut) *dzOut = dz;
-        return std::fabs(dz) > DROP_MIN_DZ && std::fabs(dz) > DROP_SLOPE * d2;
-    }
+    // The drop guard: a segment both taller than DROP_MIN_DZ and steeper than
+    // DROP_SLOPE x its 2D length is a ledge (WbRoute.h, IsDropSegment), and
+    // Route::RefusesLedge says what the guard does with one.
+    using Route::DROP_MIN_DZ;
+    using Route::DROP_SLOPE;
 
     // The character's own fall-height reduction (SPELL_AURA_SAFE_FALL, the
     // rogue's Safe Fall and the like), in yards, served on a `drop` so the
@@ -2784,16 +2799,58 @@ namespace WrathBench
         add(CorePolyAt(query, filter, pb, nullptr));
     }
 
+    // A route's points [first, end) at the mesh's own height where the
+    // core's settling lifted them over it (Route::PointZ), so the guard
+    // (SettleRoute), its twin in TickMover, the walk's heartbeats and the
+    // ground read under a step down (FootUnderSurface, from the edge's z) all
+    // see the surface the route was smoothed along. Each point's polygon is
+    // the one the smooth path walked onto from the point before
+    // (WbNav::SurfaceHeights), from `start` (Detour order) on `startRef`,
+    // where the core planned that stretch from. The last point of a route to
+    // a request is the request's own and is left out (`end`): its z is the
+    // end's (SettleRoute, Route::EndZ). Returns how many points were lowered.
+    static uint32 OntoMesh(Unit* mover, dtPolyRef startRef, float const* start, std::vector<WbVec>& points, size_t first, size_t end)
+    {
+        dtNavMeshQuery const* query = mover->GetMap()->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
+        end = std::min(end, points.size());
+        if (!query || !startRef || first >= end)
+            return 0;
+        std::vector<float> det;
+        det.reserve((end - first) * 3);
+        for (size_t i = first; i < end; ++i)
+        {
+            det.push_back(points[i].y);
+            det.push_back(points[i].z);
+            det.push_back(points[i].x);
+        }
+        ExcludePolysFilter const base;
+        std::vector<float> heights;
+        std::vector<uint8_t> known;
+        WbNav::SurfaceHeights(query, base, startRef, start, det, heights, known);
+        uint32 lowered = 0;
+        for (size_t i = first; i < end; ++i)
+        {
+            float const z = Route::PointZ(points[i].z, known[i - first] != 0, heights[i - first]);
+            if (z != points[i].z)
+            {
+                points[i].z = z;
+                ++lowered;
+            }
+        }
+        return lowered;
+    }
+
     // One re-plan from `start` to `end` (Detour order, the points the core
     // planned between) with `filter`'s polygons barred, as the core builds a
     // route: findPath over the corridor, the smooth path along it, every point
     // settled on the ground the way NormalizePath does
-    // (WorldObject::UpdateAllowedPositionZ). False, with `why`, when the
-    // corridor does not reach the end polygon or the route would not fit
-    // REPLAN_MAX_POINTS; nothing is walked then.
+    // (WorldObject::UpdateAllowedPositionZ), and then onto the mesh where
+    // that lifted it (OntoMesh; `lowered` counts them). False, with `why`,
+    // when the corridor does not reach the end polygon or the route would not
+    // fit REPLAN_MAX_POINTS; nothing is walked then.
     static bool PlanAround(Unit* mover, dtNavMesh const* navMesh, dtNavMeshQuery const* query, ExcludePolysFilter const& filter,
         dtPolyRef startRef, dtPolyRef endRef, float const* start, float const* end, std::vector<WbVec>& out, char const** why,
-        int* polysOut = nullptr)
+        int* polysOut = nullptr, uint32* lowered = nullptr)
     {
         std::vector<float> pts;
         if (!WbNav::PlanCorridor(navMesh, query, filter, startRef, endRef, start, end, WbNav::PLAN_MAX_POINTS, pts, why, polysOut))
@@ -2805,6 +2862,9 @@ namespace WrathBench
             mover->UpdateAllowedPositionZ(v.x, v.y, v.z);
             out.push_back(v);
         }
+        uint32 const n = OntoMesh(mover, startRef, start, out, 0, out.size() - 1);
+        if (lowered)
+            *lowered = n;
         return true;
     }
 
@@ -3138,6 +3198,7 @@ namespace WrathBench
             }
             for (auto const& v : pts)
                 r.points.push_back({v.x, v.y, v.z});
+            r.meshPoints = OntoMesh(mover, startRef, startPt, r.points, 0, r.points.size() - 1);
         }
         else
         {
@@ -3185,6 +3246,18 @@ namespace WrathBench
                     Movement::PointsArray const& pts2 = leg2.GetPath();
                     for (size_t i = 1; i < pts2.size(); ++i) // pts2[0] == mid
                         r.points.push_back({pts2[i].x, pts2[i].y, pts2[i].z});
+                    // Each leg from where the core planned it: the first from
+                    // the start, the second from `mid` as the core settled
+                    // it, on the polygon the core picks there. Were mid lifted
+                    // onto a landing, the second leg runs on the landing, and
+                    // a walk carried on from the first's stairs would lower it.
+                    r.meshPoints = OntoMesh(mover, startRef, startPt, r.points, 0, got);
+                    if (query)
+                    {
+                        float midPt[3] = { mid.y, mid.z, mid.x };
+                        dtPolyRef const midRef = CorePolyAt(query, base, midPt, nullptr);
+                        r.meshPoints += OntoMesh(mover, midRef, midPt, r.points, got, r.points.size() - 1);
+                    }
                 }
                 else
                 {
@@ -3192,6 +3265,11 @@ namespace WrathBench
                     r.reachedX = mid.x; r.reachedY = mid.y; r.reachedZ = mid.z;
                     for (size_t i = 0; i < got; ++i)
                         partial.push_back({pts[i].x, pts[i].y, pts[i].z});
+                    // Every point of it is the smooth path's own (the request
+                    // was left off above), the last one included: the edge
+                    // drop walks on from there (TryEdgeDrop).
+                    r.meshPoints = OntoMesh(mover, startRef, startPt, partial, 0, partial.size());
+                    r.reachedZ = partial.back().z;
                 }
             }
             else
@@ -3215,9 +3293,10 @@ namespace WrathBench
                 dtNavMeshQuery const* plan = WbNav::PlannerQuery(navMesh);
                 char const* why = "";
                 int polys = 0;
+                uint32 lowered = 0;
                 std::vector<WbVec> planned;
                 if (!plan || !startRef || !endRef
-                    || !PlanAround(mover, navMesh, plan, base, startRef, endRef, startPt, endPt, planned, &why, &polys))
+                    || !PlanAround(mover, navMesh, plan, base, startRef, endRef, startPt, endPt, planned, &why, &polys, &lowered))
                     return incomplete();
                 WbVec const& last = planned.back();
                 float ex = last.x - x, ey = last.y - y;
@@ -3226,6 +3305,7 @@ namespace WrathBench
                 r.hasReached = false;
                 r.longPlan = true;
                 r.longPolys = uint32(polys);
+                r.meshPoints = lowered;
                 r.points = std::move(planned);
             }
         }
@@ -3245,17 +3325,25 @@ namespace WrathBench
     void Manager::SettleRoute(Unit* mover, PathResolve& r, float z, float reqZ, bool force, std::vector<size_t>* refusing)
     {
         // The endpoint: the core's normalization keeps a requested z that
-        // sits under the terrain (see END_SINK_MAX). The polygon the path
-        // ends on knows the ground; when the normalized point is under it by
-        // more than the band, the polygon height is where the walk ends.
+        // sits under the terrain, and lands one in the air on whatever lies
+        // under it (Route::EndZ). The polygon the path ends on knows the
+        // ground; when the normalized point is under or over it by more than
+        // the band, the polygon height is where the walk ends. Never lowered
+        // off a transport's deck, which the mesh does not have: the polygon
+        // under a docked boat is the water.
         {
             WbVec& end = r.points.back();
             float polyZ = 0.0f;
-            if (MeshHeightAt(mover, end.x, end.y, z, &polyZ) && end.z < polyZ - END_SINK_MAX)
+            if (MeshHeightAt(mover, end.x, end.y, z, &polyZ))
             {
-                r.hasEndLift = true;
-                r.endLiftFrom = end.z;
-                end.z = polyZ;
+                bool const deck = end.z > polyZ && FindTransportAt(mover->GetMap(), end.x, end.y, std::max(end.z, z)) != nullptr;
+                float const settled = Route::EndZ(end.z, polyZ, !deck);
+                if (settled != end.z)
+                {
+                    r.hasEndLift = true;
+                    r.endLiftFrom = end.z;
+                    end.z = settled;
+                }
             }
         }
         // A route planned from the water surface over the start
@@ -3266,6 +3354,11 @@ namespace WrathBench
             r.points.front() = { r.levelFromX, r.levelFromY, r.levelFromZ };
         if (r.hasSnap)
             r.points.insert(r.points.begin(), { mover->GetPositionX(), mover->GetPositionY(), mover->GetPositionZ() });
+        // Points in water deep enough to swim are judged and walked at its
+        // surface (OntoWater); the end's z as the core settled it is still
+        // what meshZ compares with the request, below.
+        float const endZ = r.points.back().z;
+        r.waterPoints = OntoWater(mover, r.points);
         // Per-segment drop guard over the whole polyline (the main path and,
         // when spliced, the leg2 continuation): the walk is not dispatched.
         // `points` is kept so the move_path audit shows the route that fell.
@@ -3286,7 +3379,7 @@ namespace WrathBench
                 continue;
             float surfaceZ = 0.0f;
             bool buried = dz < 0.0f && FootUnderSurface(mover, r.points[i], r.points[i + 1], &surfaceZ);
-            if (!force || dz > 0.0f || buried)
+            if (Route::RefusesLedge(dz, force, buried))
             {
                 if (refusing)
                     refusing->push_back(i);
@@ -3305,8 +3398,7 @@ namespace WrathBench
         }
         if (r.status)
             return;
-        float endZ = r.points.back().z;
-        if (std::fabs(endZ - reqZ) > 1.0f)
+        if (Route::ReportsMeshZ(endZ, reqZ))
         {
             r.hasMeshZ = true;
             r.meshZ = endZ;
@@ -3389,7 +3481,7 @@ namespace WrathBench
             cand.levelZ = r.levelZ;
             cand.levelIslandPolys = r.levelIslandPolys;
             char const* why = "";
-            if (!PlanAround(mover, navMesh, plan, filter, startRef, endRef, start, end, cand.points, &why))
+            if (!PlanAround(mover, navMesh, plan, filter, startRef, endRef, start, end, cand.points, &why, nullptr, &cand.meshPoints))
                 return finish("failed", why);
             // The core's endpoint check (ResolvePathAt's endpointOk): the
             // route ends within 4y of the request in 2D.
@@ -3805,6 +3897,9 @@ namespace WrathBench
             return ex * ex + ey * ey <= 16.0f; // endpointOk: within 4y of the end, 2D
         };
         std::vector<WbVec> below;
+        uint32 belowLowered = 0;
+        float startPt[3] = { start.y, start.z, start.x };
+        dtPolyRef const startRef = query ? CorePolyAt(query, base, startPt, nullptr) : 0;
         {
             PathGenerator gen(mover);
             if (gen.CalculatePath(start.x, start.y, start.z, x, y, z, false)
@@ -3812,19 +3907,20 @@ namespace WrathBench
             {
                 G3D::Vector3 const& end = gen.GetActualEndPosition();
                 if (nearEnd({ end.x, end.y, end.z }))
+                {
                     for (auto const& v : gen.GetPath())
                         below.push_back({ v.x, v.y, v.z });
+                    belowLowered = OntoMesh(mover, startRef, startPt, below, 0, below.size() - 1);
+                }
             }
         }
         if (below.empty())
         {
             dtNavMeshQuery const* plan = navMesh ? WbNav::PlannerQuery(navMesh) : nullptr;
-            float startPt[3] = { start.y, start.z, start.x };
-            dtPolyRef const startRef = query ? CorePolyAt(query, base, startPt, nullptr) : 0;
             char const* why = "";
             std::vector<WbVec> planned;
             if (plan && startRef && endRef
-                && PlanAround(mover, navMesh, plan, base, startRef, endRef, startPt, endPt, planned, &why)
+                && PlanAround(mover, navMesh, plan, base, startRef, endRef, startPt, endPt, planned, &why, nullptr, &belowLowered)
                 && nearEnd(planned.back()))
                 below = std::move(planned);
         }
@@ -3856,6 +3952,7 @@ namespace WrathBench
         cand.hasEndReachable = r.hasEndReachable;
         cand.endFromX = r.endFromX; cand.endFromY = r.endFromY; cand.endFromZ = r.endFromZ;
         cand.endToX = r.endToX; cand.endToY = r.endToY; cand.endToZ = r.endToZ;
+        cand.meshPoints = r.meshPoints + belowLowered;
         cand.points = partial;
         cand.points.insert(cand.points.end(), walk.begin(), walk.end());
         cand.points.push_back(landing);
@@ -4393,10 +4490,17 @@ namespace WrathBench
         }
         // The resolved polyline, at dispatch, so a diagnosis reads the route
         // the mesh chose instead of reconstructing it from heartbeats.
-        Audit(*s, "action", Json::Writer().Add("op", "move_path").Add("moveId", moveId)
-            .Add("status", r.status ? r.status : "ok")
-            .Add("pointCount", (uint64_t)r.points.size()).Add("truncated", r.points.size() > 64)
-            .Raw("points", PathPointsJson(r.points)).Str());
+        {
+            Json::Writer a;
+            a.Add("op", "move_path").Add("moveId", moveId)
+                .Add("status", r.status ? r.status : "ok")
+                .Add("pointCount", (uint64_t)r.points.size()).Add("truncated", r.points.size() > 64);
+            if (r.meshPoints)
+                a.Add("meshPoints", r.meshPoints);
+            if (r.waterPoints)
+                a.Add("waterPoints", r.waterPoints);
+            Audit(*s, "action", a.Raw("points", PathPointsJson(r.points)).Str());
+        }
         if (r.status != nullptr)
         {
             if (mover->isMoving()) // see failEvent
@@ -6559,7 +6663,7 @@ namespace WrathBench
                 {
                     float surfaceZ = 0.0f;
                     bool buried = dz < 0.0f && FootUnderSurface(mover, a, b, &surfaceZ);
-                    if (!m.force || dz > 0.0f || buried)
+                    if (Route::RefusesLedge(dz, m.force, buried))
                     {
                         PlaceMover(s, mover, a.x, a.y, a.z, MOVEMENTFLAG_FORWARD, nowMs);
                         SendMovePacket(s, mover, MSG_MOVE_STOP, MOVEMENTFLAG_NONE, m.curX, m.curY, m.curZ, m.curO,

@@ -12,6 +12,7 @@
 #include "WbHttpServer.h"
 #include "WbJson.h"
 #include "WbLease.h"
+#include "WbRoute.h" // WbVec, the drop guard's verdict
 
 #include <array>
 #include <atomic>
@@ -40,14 +41,6 @@ class Unit;
 
 namespace WrathBench
 {
-    // A waypoint of a resolved navmesh path. Internal to the mover; never leaves
-    // the module (docs/CONTRACTS.md: the agent gets progress/arrival/failure
-    // events, not the path).
-    struct WbVec
-    {
-        float x{0}, y{0}, z{0};
-    };
-
     // The jump block of a falling client's MovementInfo
     // (WorldSession::ReadMovementInfo: after fallTime, when
     // MOVEMENTFLAG_FALLING is set: zspeed, sinAngle, cosAngle, xyspeed) and
@@ -579,8 +572,10 @@ namespace WrathBench
             float dropDz{0};
             bool hasSurfaceZ{false};    // drop: the step's foot lies under the ground surface at its x,y (surfaceZ)
             float surfaceZ{0};
-            bool hasEndLift{false};     // the endpoint's normalized z sat under its mesh polygon and was lifted to it
+            bool hasEndLift{false};     // the endpoint's normalized z sat more than 2y under or over its mesh polygon and was settled onto it (Route::EndZ)
             float endLiftFrom{0};       // ... from this z (audit only)
+            uint32 meshPoints{0};       // route points the core lifted over the mesh, judged and walked at the mesh's height (OntoMesh), audit only
+            uint32 waterPoints{0};      // route points under the surface of water deep enough to swim, judged and walked at the surface (OntoWater), audit only
             bool hasSnap{false};        // the start was off the mesh and was snapped to the nearest point
             float snapX{0}, snapY{0}, snapZ{0};
             // The start's own polygon is on a closed island that does not hold
