@@ -133,6 +133,8 @@ import {
   pointOf,
   questGiverStatusName,
   StateCache,
+  canonicalWord,
+  caseFoldedVocabulary,
   type BagSlotItem,
   type BankContents,
   type BindPoint,
@@ -4476,6 +4478,8 @@ export type ReclaimCorpseReason =
 
 /** Where `say` sends a line: local say, the party, a yell, or a whisper to one player. */
 export type SayType = "say" | "party" | "yell" | "whisper";
+const ROLL_CHOICE_WORDS = caseFoldedVocabulary(Object.keys(ROLL_VOTE) as RollChoice[]);
+const SAY_TYPE_WORDS = caseFoldedVocabulary<SayType>(["say", "party", "yell", "whisper"]);
 
 export interface SayOptions {
   /** Default "say". */
@@ -5436,7 +5440,11 @@ export class WrathClient {
    * drops a party line from someone in no party without a word.
    */
   say(text: string, options: SayOptions = {}): Promise<ActionResponse> {
-    const type = options.type ?? "say";
+    const given = options.type ?? "say";
+    const type = canonicalWord(SAY_TYPE_WORDS, given);
+    if (type === undefined) {
+      throw new TypeError(`say(text, { type }): type must be "say", "party", "yell" or "whisper" (got ${JSON.stringify(given)})`);
+    }
     if (type !== "whisper" && options.to !== undefined) {
       throw new TypeError(`say(text, { to }): to is only for type "whisper" (got type ${JSON.stringify(type)})`);
     }
@@ -5447,9 +5455,6 @@ export class WrathClient {
         { token: this.token, action: "say", text },
         actionResponseSchema,
       );
-    }
-    if (!Object.hasOwn(CHAT_MSG_CODE, type)) {
-      throw new TypeError(`say(text, { type }): type must be "say", "party", "yell" or "whisper" (got ${JSON.stringify(type)})`);
     }
     const lang = chatLanguage(this.state);
     const message = String(text);
@@ -8358,10 +8363,11 @@ export class WrathClient {
    */
   async lootRoll(which: string | number, choice: RollChoice, options: LootRollOptions = {}): Promise<WithResolved<LootRollResult>> {
     const timeout = options.timeout ?? 10_000;
-    const vote = ROLL_VOTE[choice];
-    if (vote === undefined) {
+    const voted = canonicalWord(ROLL_CHOICE_WORDS, choice);
+    if (voted === undefined) {
       throw new TypeError(`lootRoll(which, choice): choice must be "need", "greed", "pass" or "disenchant", not ${JSON.stringify(choice)}`);
     }
+    const vote = ROLL_VOTE[voted];
     const pending = this.state.pendingRolls();
     const show = (rows: readonly PendingRoll[]) =>
       rows.map((r) => `${JSON.stringify(r.name ?? `item ${r.itemId}`)} (${r.allowed.join("/")}, roll ${r.rollGuid})`).join(", ");
@@ -8392,7 +8398,7 @@ export class WrathClient {
     if (roll === undefined) {
       return this.lootRollRefusal("no_pending_roll", `no open roll is for ${JSON.stringify(which)} — the open rolls are [${show(pending)}] (state.pendingRolls())`);
     }
-    if (!roll.allowed.includes(choice)) {
+    if (!roll.allowed.includes(voted)) {
       return this.lootRollRefusal("roll_not_allowed",
         `the server offered only ${roll.allowed.join(" / ")} on ${JSON.stringify(roll.name ?? `item ${roll.itemId}`)} — need is withheld when your class ` +
         `cannot use the item, disenchant when nobody in the group can`);
@@ -8409,7 +8415,7 @@ export class WrathClient {
         ((e.data as LootRollData).rollGuid === chosen.rollGuid ||
           ((e.data as LootRollData).rollGuid === "0" && (e.data as LootRollData).slot === chosen.slot && (e.data as LootRollData).itemId === chosen.itemId)) &&
         (e.data as LootRollData).playerGuid === this.state.self.guid,
-      { timeout, description: `the server counting the ${choice} vote (SMSG_LOOT_ROLL)` },
+      { timeout, description: `the server counting the ${voted} vote (SMSG_LOOT_ROLL)` },
     );
     const d = echo.data as LootRollData;
     const out: LootRollResult = {
@@ -8418,7 +8424,7 @@ export class WrathClient {
       rollGuid: chosen.rollGuid,
       // The acknowledgement cannot be read back for the button: a need ack
       // carries rollType 0, which is ROLL_PASS. Report what was pressed.
-      choice,
+      choice: voted,
       // 0 (the need ack) and 128 (every other ack, and a pass) are not rolls.
       roll: d.roll >= 1 && d.roll <= 100 ? d.roll : undefined,
       item: { itemId: chosen.itemId, name: chosen.name },

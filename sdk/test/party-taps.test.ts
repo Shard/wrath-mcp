@@ -204,6 +204,11 @@ describe("client: say with a chat type", () => {
     await client.events.waitFor((e) => e.seq === 500, { timeout: 2000 });
     await client.say("run", { type: "yell" });
     expect(stub.actions.at(-1)).toMatchObject({ opcode: "CMSG_MESSAGECHAT", payload: u32Hex(6) + u32Hex(1) + cstr("run") });
+    // A type in any letter case is the documented one.
+    await client.say("RUN", { type: "Yell" as never });
+    expect(stub.actions.at(-1)).toMatchObject({ opcode: "CMSG_MESSAGECHAT", payload: u32Hex(6) + u32Hex(1) + cstr("RUN") });
+    await client.say("hi", { type: "SAY" as never });
+    expect(stub.actions.at(-1)).toMatchObject({ action: "say", text: "hi" });
     client.close();
     await stub.stop();
   });
@@ -215,6 +220,7 @@ describe("client: say with a chat type", () => {
     expect(() => client.say("hi", { type: "whisper" })).toThrow(/to is the name/);
     expect(() => client.say("hi", { to: "Quilby" })).toThrow(/only for type "whisper"/);
     expect(() => client.say("hi", { type: "raid" as never })).toThrow(/type must be/);
+    expect(() => client.say("hi", { type: "RAID" as never, to: "Quilby" })).toThrow('type must be "say", "party", "yell" or "whisper" (got "RAID")');
     expect(stub.actions.length).toBe(sent);
     client.close();
     await stub.stop();

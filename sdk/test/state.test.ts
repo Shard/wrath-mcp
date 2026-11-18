@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import { parseEventFrame, type GameEvent } from "../src/protocol";
 import { STREAM_GAP, type StreamEvent, type StreamGapEvent } from "../src/events";
-import { gameObjectTypeName, pointOf, randomPropertyOf, reputationRank, StateCache, type UnitFilter } from "../src/state";
+import { canonicalWord, caseFoldedVocabulary, gameObjectTypeName, pointOf, randomPropertyOf, reputationRank, StateCache, type UnitFilter } from "../src/state";
 import {
   addKill,
   auraRemoved,
@@ -1522,6 +1522,21 @@ describe("state.units(): the flat scan helper", () => {
     expect(c.units({ type: "unit" }).map((r) => r.guid)).not.toContain(OBJECT_GUID);
   });
 
+  test("type matches its documented spelling in any letter case; an unknown type is still refused", () => {
+    const c = cache();
+    const guids = (type: string) => c.units({ type } as never).map((r) => r.guid);
+    for (const type of ["gameobject", "GameObject", "GAMEOBJECT"]) expect(guids(type)).toEqual([OBJECT_GUID]);
+    expect(guids("Unit")).toEqual(guids("unit"));
+    expect(guids("PLAYER")).toEqual(guids("player"));
+    expect(c.closest({ type: "gameobject" } as never)?.guid).toBe(OBJECT_GUID);
+    for (const type of ["npc", "game_object", "gameobjects", " gameObject"]) {
+      expect(() => c.units({ type } as never)).toThrow(
+        `state.units() filter: type received ${JSON.stringify(type)}, expected one of "unit", "player", "gameObject", "corpse" (any letter case).`,
+      );
+    }
+    expect(() => c.units({ type: 1 } as never)).toThrow(/type received 1, expected one of/);
+  });
+
   test("alive: true and alive: false both need the observation", () => {
     const c = cache();
     const alive = c.units({ alive: true }).map((r) => r.guid);
@@ -1587,8 +1602,8 @@ describe("state.units(): the flat scan helper", () => {
     expect(() => c.units({ entry: "boar" as unknown as number })).toThrow(TypeError);
     expect(() => c.units({ entry: "boar" as unknown as number })).toThrow(/received "boar" \(string\)/);
     expect(() => c.units({ entry: 69.5 })).toThrow(/whole template id/);
-    // An enum near-miss has two readings, so it is rejected rather than picked.
-    expect(() => c.units({ type: "gameobject" as "gameObject" })).toThrow(/expected one of/);
+    // An enum near-miss other than letter case has two readings, so it is rejected rather than picked.
+    expect(() => c.units({ type: "object" as "gameObject" })).toThrow(/expected one of/);
     expect(() => c.units({ alive: "true" as unknown as boolean })).toThrow(/expected true or false/);
     expect(() => c.units({ minLevel: 5 } as unknown as UnitFilter)).toThrow(/unknown key "minLevel"/);
     expect(() => c.units({ minLevel: 5 } as unknown as UnitFilter)).toThrow(/Valid keys are entry, name/);
@@ -2053,12 +2068,17 @@ describe("state cache: questgiver markers", () => {
     expect(c.units({ questGiver: "incomplete" })).toEqual([]);
     expect(withWorld([]).units({ questGiver: "none" })).toEqual([]);
     expect(c.closest({ questGiver: "available" })?.guid).toBe(PLAYER_GUID);
+    // Letter case carries no meaning in a status name.
+    expect(c.units({ questGiver: "Reward" as never }).map((r) => r.guid)).toEqual([CREATURE_GUID]);
+    expect(c.units({ questGiver: ["REWARD", "Available"] as never }).map((r) => r.guid).sort()).toEqual(
+      [CREATURE_GUID, PLAYER_GUID].sort(),
+    );
   });
 
   test("units({ questGiver }) rejects a name it cannot read, and says what it takes", () => {
     const c = withWorld([]);
     expect(() => c.units({ questGiver: "?" as never })).toThrow(/questGiver received "\?", expected one of "none", .*"reward"/);
-    expect(() => c.units({ questGiver: "Reward" as never })).toThrow(/exact, case-sensitive/);
+    expect(() => c.units({ questGiver: "turnin" as never })).toThrow(/questGiver received "turnin", expected one of .*\(any letter case\), an array of them/);
     expect(() => c.units({ questGiver: [] })).toThrow(/empty array/);
     expect(() => c.units({ questGiver: 10 as never })).toThrow(/questGiver received 10/);
   });
@@ -2657,6 +2677,13 @@ describe("units(): NPC roles from UNIT_NPC_FLAGS", () => {
     expect(c.units({ role: "questGiver" }).map((u) => u.guid)).toEqual(["901"]);
     expect(c.units({ role: ["repair", "flightMaster"] }).map((u) => u.guid)).toEqual(["902", "903"]);
     expect(c.units({ role: "innkeeper" })).toEqual([]);
+  });
+
+  test("a role word in any letter case is the documented one", () => {
+    const c = cache();
+    expect(c.units({ role: "FlightMaster" as never }).map((u) => u.guid)).toEqual(["903"]);
+    expect(c.units({ role: ["REPAIR", "flightmaster"] as never }).map((u) => u.guid)).toEqual(["902", "903"]);
+    expect(() => c.units({ role: "flight_master" as never })).toThrow(/role received "flight_master", expected one of .*\(any letter case\)/);
   });
 
   test("an unknown role word is rejected with the list", () => {
@@ -3672,5 +3699,20 @@ describe("the reattach replay: self fields and repeated creates", () => {
     expect(unit.fields.get("health")?.value).toBe(90);
     expect(unit.fields.get("maxHealth")?.value).toBe(120);
     expect(unit.objectType?.value).toBe("unit");
+  });
+});
+
+describe("closed vocabularies fold letter case", () => {
+  test("a word resolves to its documented spelling in any case, and nothing else resolves", () => {
+    const words = caseFoldedVocabulary(["unit", "gameObject"] as const);
+    expect(canonicalWord(words, "GAMEOBJECT")).toBe("gameObject");
+    expect(canonicalWord(words, "gameObject")).toBe("gameObject");
+    expect(canonicalWord(words, "game object")).toBeUndefined();
+    expect(canonicalWord(words, 5)).toBeUndefined();
+    expect(canonicalWord(words, undefined)).toBeUndefined();
+  });
+
+  test("two words that differ only by case would be two readings, so the vocabulary refuses to build", () => {
+    expect(() => caseFoldedVocabulary(["reward", "Reward"])).toThrow('vocabulary words "reward" and "Reward" differ only by case');
   });
 });

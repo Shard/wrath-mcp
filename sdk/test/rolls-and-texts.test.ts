@@ -237,7 +237,9 @@ describe("client: lootRoll", () => {
     expect(stub.actions.some((a) => a.action === "raw")).toBe(false);
     // "open" is the frames opening, tallied for the harness block whoever looks.
     expect(client.drainActionHints().map((h) => h.status).sort()).toEqual(["ambiguous_roll", "no_pending_roll", "open", "roll_not_allowed"]);
-    const passed = client.lootRoll(OTHER_ROLL_GUID, "pass");
+    // A choice in any letter case is the documented one; an unknown one is refused before anything is sent.
+    await expect(client.lootRoll(OTHER_ROLL_GUID, "roll" as never)).rejects.toThrow('choice must be "need", "greed", "pass" or "disenchant", not "roll"');
+    const passed = client.lootRoll(OTHER_ROLL_GUID, "Pass" as never);
     const at = await untilAction(stub, "raw");
     expect(stub.actions[at]).toMatchObject({ opcode: "CMSG_LOOT_ROLL", payload: guidHex(OTHER_ROLL_GUID) + u32Hex(2) + "00" });
     stub.push(JSON.stringify(frame(503, "SMSG_LOOT_ROLL", { rollGuid: OTHER_ROLL_GUID, slot: 2, playerGuid: SELF_GUID, itemId: 17922, roll: 128, rollType: 0, autoPass: false })));
