@@ -697,6 +697,19 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Fixed
 
+- A stall of the world's updates no longer ends a walk `interrupted`. The
+  walker runs on the world thread, so it stalls with it and sends nothing,
+  and the first tick after a stall advanced it by the whole gap: two
+  seconds or so mid-walk at run speed put it past the 15y drift guard
+  (a 3s stall is 21y), and the walk ended `interrupted` though nothing had
+  stopped it (the module-navigation smoke, live). Near the end of a route
+  the same tick stopped the walk at its destination in one jump no client
+  makes. The walker now advances at most 250ms on any one tick
+  (`module/src/WbWalk.h`), as a client that hitches resumes from where it
+  was: a stall delays the walk by its length, past its `etaMs`, and the
+  stop's 3s confirmation is held back by it too. A knockback, a teleport or
+  a server correction still ends the walk as before.
+
 - A routine that ended before its `start_routine` answered (a throw before
   its first await) was shown in that answer as running, and, when its name
   had run before, held as running until the next beat: the end arrived

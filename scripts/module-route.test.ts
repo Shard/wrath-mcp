@@ -4,7 +4,9 @@
  * it: which segment of a polyline is a ledge, what the guard does with one,
  * and the z each route point is judged and walked at. The module reads the
  * world and hands the numbers in. The checks are `module/test/route.cpp`,
- * invented routes shaped like the ones that earned each rule.
+ * invented routes shaped like the ones that earned each rule. Beside it,
+ * `module/src/WbWalk.h` holds the walker's clock and drift guard, checked by
+ * `module/test/walk.cpp`: a world stall delays a walk and never ends it.
  *
  * The module proper builds only inside an AzerothCore tree, so this is one of
  * the few pieces of it a checkout compiles (module-bounds.test.ts has the
@@ -39,3 +41,5 @@ async function buildAndRun(name: string): Promise<void> {
 }
 
 test.skipIf(compiler === null)("the drop guard's verdict holds: stairs pass, walls and sustained steep slopes are refused, at the client's 50 degrees", () => buildAndRun("route"), 60_000);
+
+test.skipIf(compiler === null)("a world stall delays a walk and never ends it: the walker's step is capped inside the drift guard", () => buildAndRun("walk"), 60_000);

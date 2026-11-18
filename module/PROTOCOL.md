@@ -2080,7 +2080,10 @@ at the top of this document.
   guid), which the server sends before this result.
 - `interrupted` — the move stopped early (death, rejection, or the
   character left the map for a non-teleport reason); `pos` is where the
-  character actually is.
+  character actually is. A stall of the world's updates is none of these:
+  the walker advances at most 250ms on any one world tick, so after a stall
+  the walk takes up again from its last point and arrives late, past its
+  `etaMs`, rather than ending.
 - `stopped` — a `stop` action ended the move.
 - `falling` — the character's body is in the air on an arc (a jump, a
   knockback, a fall after losing can-fly: "Arcs", below): a refusal,
