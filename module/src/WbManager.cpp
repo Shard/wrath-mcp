@@ -11,6 +11,7 @@
 #include "WbJson.h"
 #include "WbNav.h"
 #include "WbRoute.h"
+#include "WbWalk.h"
 
 #include "AccountMgr.h"
 #include "AchievementMgr.h"
@@ -6580,10 +6581,19 @@ namespace WrathBench
             return;
         }
 
+        // The walker's own clock (Walk::StepMs): a world stall delays the walk
+        // by its length rather than putting the walker ahead of the server.
+        int64_t const elapsedMs = nowMs - m.lastMs;
+        m.lastMs = nowMs;
+        int64_t const dt = Walk::StepMs(elapsedMs);
+
         if (m.stopping)
         {
             // MSG_MOVE_STOP is queued; arrival is confirmed when the server-side
-            // position reaches the destination.
+            // position reaches the destination. A stall holds the deadline
+            // back by its length: the server had no update in it to apply
+            // the stop.
+            m.stopDeadlineMs += Walk::StallMs(elapsedMs);
             if (mover->GetExactDist2d(m.destX, m.destY) < 2.5f)
                 FinishMove(s, "arrived");
             else if (nowMs > m.stopDeadlineMs)
@@ -6615,8 +6625,6 @@ namespace WrathBench
             return;
         }
 
-        int64_t dt = nowMs - m.lastMs;
-        m.lastMs = nowMs;
         if (dt <= 0)
             return;
 
@@ -6812,13 +6820,10 @@ namespace WrathBench
         // runs before a turn report (below), which restarts the interval: on a
         // bending route at a mount's speed turns can come faster than 500ms,
         // and the check must not wait on a heartbeat that never falls due.
-        // The character's own walk keeps the 15y it always had. A flight, or
-        // a walk of another unit, follows the pace: the server's position is
-        // the last packet's, up to a heartbeat (500 ms) plus a map update
-        // behind the walker, so a mover at several times run speed is
-        // legitimately farther from its walker than a runner — 0.8 s of the
-        // pace plus 10y, never under 15.
-        float const driftTolerance = (m.flying || m.moverGuid) ? std::max(15.0f, pace * 0.8f + 10.0f) : 15.0f;
+        // The tolerance (Walk::DriftTolerance): the character's own walk keeps
+        // the 15y it always had; a flight, or a walk of another unit, follows
+        // the pace.
+        float const driftTolerance = Walk::DriftTolerance(m.flying || m.moverGuid, pace);
         auto drifted = [&]() -> bool
         {
             if (mover->GetExactDist2d(m.curX, m.curY) <= driftTolerance)
@@ -6829,7 +6834,7 @@ namespace WrathBench
             FinishMove(s, "interrupted");
             return true;
         };
-        if (nowMs - m.lastPacketMs >= 500 && !m.inFall)
+        if (nowMs - m.lastPacketMs >= Walk::HEARTBEAT_MS && !m.inFall)
         {
             if (drifted())
                 return;
