@@ -246,7 +246,13 @@ connects with its key as `Authorization: Bearer <key>`:
   `<state>/ledger.json` (0600) and released on the next start if the
   process died with them.
 - Requests past the grant's rate are `429`; tool calls of one credential run
-  one at a time, and past its in-flight cap are refused. With no
+  one at a time, and past its in-flight cap are refused. None of that bounds
+  what one call's snippet asks of the world: the module's request rate per
+  lease (`WrathBench.ActionRate`) does, and it ships off. The gateway reads it
+  from the module's `/health` and does not start while it is off (or not
+  said), unless it runs its own `--trusted-local-workers`; a module it could
+  not reach at start is checked at each sweep, and every sweep that finds the
+  rate off (a `.reload config`, a restarted world) logs a warning. With no
   authenticated request for the idle minutes, the credential's characters are
   logged out and its host stopped; the next call opens it again. A grant
   disabled, removed or left with no key stops its host at the next sweep,

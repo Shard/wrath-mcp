@@ -41,6 +41,14 @@
  * with no authenticated request for `idleMinutes`, the host is shut and its
  * characters logged out. A program's routines run between requests, which
  * is the point of them; idle is measured from the person, not the game.
+ *
+ * None of those bounds what a snippet asks of the world: one tool call can
+ * send the module requests as fast as it awaits them. That is the module's
+ * request rate per lease (`WrathBench.ActionRate`), which ships off, so the
+ * gateway reads it from `/health` and does not start while the module says
+ * it is off (`allowUnratedModule` says the grants are the operator's own),
+ * and logs it on every sweep that finds it off, since the module re-reads
+ * its conf on `.reload config` and a restarted world may carry another.
  */
 
 import { createHash, randomBytes } from "node:crypto";
@@ -328,7 +336,26 @@ export interface GatewayOptions {
   snippetTimeoutMs?: number;
   /** The resource limits of every credential's sandbox child, each replacing its default (`SandboxLimits`). */
   sandboxLimits?: Partial<SandboxLimits>;
+  /**
+   * Serve while the module's request rate per lease (`WrathBench.ActionRate`)
+   * is off, as it ships: only for grants that are the operator's own, whose
+   * snippets may ask the world as fast as they like. Default false: the
+   * gateway refuses to start when `/health` says the rate is off or does not
+   * say, and logs it on every sweep that finds it off.
+   */
+  allowUnratedModule?: boolean;
 }
+
+/** What the gateway reads of the module's `/health`: the world's start and the request rate per lease. */
+interface ModuleHealth {
+  startedAtMs: number | undefined;
+  /** `limits.actionRate`, requests a second per lease; 0 is off. Undefined when the answer does not carry it. */
+  actionRate: number | undefined;
+}
+
+const UNRATED =
+  "the module's request rate per lease is off (WrathBench.ActionRate 0, as it ships), so a tenant's snippet can ask the world thread as fast as it awaits; " +
+  "set WrathBench.ActionRate in the worldserver's conf (20 for a hosted world)";
 
 /** Why a lease was refused before the module was asked. */
 export class LeaseRefused extends Error {}
@@ -375,6 +402,15 @@ export class Gateway {
    * process), prune the audit, and start the sweep.
    */
   async start(): Promise<void> {
+    const health = await this.readHealth();
+    if (health === undefined) this.log("could not read the module's /health: its request rate per lease is checked at each sweep");
+    else if (!(this.o.allowUnratedModule ?? false) && !((health.actionRate ?? 0) > 0)) {
+      throw new Error(
+        health.actionRate === undefined
+          ? "the module's /health does not say its request rate per lease (limits.actionRate), so the gateway cannot tell it is on and does not start"
+          : `${UNRATED}; the gateway does not start without it`,
+      );
+    }
     for (const seat of this.ledger.seats()) {
       await this.base.logout(seat.token);
       await this.base.release(seat.token);
@@ -383,7 +419,7 @@ export class Gateway {
     }
     const pruned = this.audit.prune();
     if (pruned > 0) this.log(`removed ${pruned} audit file(s) past ${AUDIT_RETENTION_DAYS} days`);
-    this.worldStartedAt = await this.worldStart();
+    this.worldStartedAt = health?.startedAtMs;
     const every = this.o.sweepMs ?? 30_000;
     if (every > 0) {
       this.timer = setInterval(() => void this.sweep(), every);
@@ -424,7 +460,9 @@ export class Gateway {
         t.grant = g;
         if (t.host !== undefined && now - t.lastSeen > t.limits.idleMinutes * 60_000) await this.stopHost(t, "idle");
       }
-      const started = await this.worldStart();
+      const health = await this.readHealth();
+      if (health?.actionRate === 0 && !(this.o.allowUnratedModule ?? false)) this.log(`WARNING: ${UNRATED}`);
+      const started = health?.startedAtMs;
       if (started !== undefined && this.worldStartedAt !== undefined && started !== this.worldStartedAt) {
         this.log("the worldserver restarted: every lease is gone, so every host stops and opens again at its next call");
         for (const t of this.tenants.values()) if (t.host !== undefined) await this.stopHost(t, "world restarted");
@@ -441,12 +479,19 @@ export class Gateway {
     }
   }
 
-  private async worldStart(): Promise<number | undefined> {
+  /**
+   * The module's `/health`, as the port secret is served it; undefined when
+   * there is no usable answer. A world still loading answers 503 with the
+   * same body, limits included, so that body is read too.
+   */
+  private async readHealth(): Promise<ModuleHealth | undefined> {
     try {
       const res = await (this.o.fetch ?? fetch)(new URL("/health", this.o.moduleUrl), { headers: moduleAuthHeaders(this.o.env ?? process.env), signal: AbortSignal.timeout(3_000) });
-      if (!res.ok) return undefined;
-      const j = (await res.json()) as { startedAtMs?: unknown };
-      return typeof j.startedAtMs === "number" ? j.startedAtMs : undefined;
+      if (!res.ok && res.status !== 503) return undefined;
+      const j = (await res.json()) as { startedAtMs?: unknown; limits?: { actionRate?: unknown } };
+      if (typeof j !== "object" || j === null) return undefined;
+      const rate = j.limits?.actionRate;
+      return { startedAtMs: res.ok && typeof j.startedAtMs === "number" ? j.startedAtMs : undefined, actionRate: typeof rate === "number" ? rate : undefined };
     } catch {
       return undefined;
     }

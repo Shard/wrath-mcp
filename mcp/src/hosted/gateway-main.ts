@@ -22,6 +22,12 @@
  * says every grant the file holds is the operator's own: such a worker runs
  * beside this process's environment and state, the port secret included. A
  * deployment for anyone else calls `runGateway` with its own provider.
+ *
+ * The module's request rate per lease (`WrathBench.ActionRate`) ships off.
+ * With a deployment's own provider the gateway does not start while the
+ * module's `/health` says it is off; with `--trusted-local-workers`, whose
+ * grants are the operator's own, it does.
+ *
  * `--limit-as`, `--limit-cpu` and `--limit-fsize` set every credential's
  * sandbox child's resource limits (`SandboxLimits`; a number, or
  * `unlimited`), each replacing its default; an address-space cap below about
@@ -148,9 +154,11 @@ export interface RunningGateway {
  * `workers`, MCP served at `/mcp`. A deployment that starts its workers its
  * own way (a pod per credential) calls this with its own provider; without
  * one, workers are processes of this user on this machine, and only when
- * `args.trustedLocalWorkers` says every grant is the operator's own. Throws
- * on a configuration the gateway refuses, such as no port secret or no way
- * to start a worker.
+ * `args.trustedLocalWorkers` says every grant is the operator's own, and
+ * only then is the module's request rate per lease allowed to be off. Throws
+ * on a configuration the gateway refuses, such as no port secret, no way to
+ * start a worker, or, with a provider of the deployment's own, a module
+ * whose request rate is off.
  */
 export async function runGateway(
   args: GatewayArgs,
@@ -175,6 +183,8 @@ export async function runGateway(
     allowedOrigins: args.allowedOrigins,
     recordRetentionMs: args.recordRetentionMs,
     workers,
+    // The grants are the operator's own only where this entry starts the trusted local workers itself.
+    allowUnratedModule: o.workers === undefined,
     ...(args.sandboxLimits !== undefined ? { sandboxLimits: args.sandboxLimits } : {}),
     log,
   });

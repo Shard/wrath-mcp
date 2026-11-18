@@ -128,9 +128,9 @@ WrathBench.AuditDir = "/azerothcore/env/dist/logs/wrathbench"
 #                     hosted world); 20 and 40 are several times what one
 #                     character's client sends, there so that such a caller
 #                     cannot occupy the world thread, not to pace play.
-#                     Nothing checks that a hosted deployment has set it: a
-#                     world that hands lease secrets to callers it does not
-#                     trust sets it, in its own conf.
+#                     The hosted gateway reads it from /health and does not
+#                     start while it is 0, unless its grants are the
+#                     operator's own (--trusted-local-workers).
 #                     Re-read on `.reload config`.
 #        Default:     0 (no limit) and 40
 #                     Hosted:      20 and 40

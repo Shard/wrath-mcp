@@ -65,7 +65,7 @@ interface Rig {
   audit(person: string): Record<string, unknown>[];
 }
 
-async function rig(o: { grants: TenantGrant[]; program?: boolean; health?: () => number | undefined; start?: (state: string, stub: StubModule) => void; openHost?: typeof openHost; workers?: WorkerProvider; sandboxLimits?: GatewayOptions["sandboxLimits"] } = { grants: [grant("a")] }): Promise<Rig> {
+async function rig(o: { grants: TenantGrant[]; program?: boolean; health?: () => number | undefined; start?: (state: string, stub: StubModule) => void; openHost?: typeof openHost; workers?: WorkerProvider; sandboxLimits?: GatewayOptions["sandboxLimits"]; log?: (line: string) => void } = { grants: [grant("a")] }): Promise<Rig> {
   const stub = startStubModule();
   const state = mkdtempSync(join(tmpdir(), "wm-gateway-"));
   const grantsPath = join(state, "..", `${state.split("/").pop()}-grants.json`);
@@ -77,7 +77,7 @@ async function rig(o: { grants: TenantGrant[]; program?: boolean; health?: () =>
   const fetches: Rig["fetches"] = [];
   const f = (async (input: string | URL | Request, init?: RequestInit) => {
     fetches.push({ path: new URL(String(input)).pathname, authorization: new Headers(init?.headers).get("authorization") ?? undefined });
-    if (o.health !== undefined && new URL(String(input)).pathname === "/health") return Response.json({ ok: true, startedAtMs: o.health() });
+    if (o.health !== undefined && new URL(String(input)).pathname === "/health") return Response.json({ ok: true, startedAtMs: o.health(), limits: { actionRate: 20 } });
     return fetch(input, init);
   }) as typeof fetch;
   const gateway = new Gateway({
@@ -89,7 +89,7 @@ async function rig(o: { grants: TenantGrant[]; program?: boolean; health?: () =>
     program: o.program ?? false,
     sweepMs: 0,
     now: () => clock.now,
-    log: () => {},
+    log: o.log ?? (() => {}),
     snippetTimeoutMs: 5_000,
     workers: o.openHost !== undefined ? inProcessWorkers(o.openHost) : (o.workers ?? localWorkers({ trusted: true })),
     ...(o.sandboxLimits !== undefined ? { sandboxLimits: o.sandboxLimits } : {}),
@@ -612,6 +612,67 @@ describe("hardening", () => {
     cleanups.push(() => rmSync(state, { recursive: true, force: true }));
     const grants = { current: () => new GrantSet(emptyGrantsFile()), close: () => {} };
     expect(() => new Gateway({ grants, stateDir: state, moduleUrl: "http://module.invalid", env: {}, workers: localWorkers({ trusted: true }) })).toThrow("WRATHBENCH_MODULE_SECRET is not set");
+  });
+
+  describe("the module's request rate per lease", () => {
+    /** A gateway whose module answers `/health` with `health()`; `lines` is what it logged. */
+    function overHealth(health: () => Response, o: { allowUnratedModule?: boolean } = {}): { gateway: Gateway; lines: string[] } {
+      const state = mkdtempSync(join(tmpdir(), "wm-gateway-rate-"));
+      cleanups.push(() => rmSync(state, { recursive: true, force: true }));
+      const lines: string[] = [];
+      const grants = { current: () => new GrantSet(emptyGrantsFile()), close: () => {} };
+      const f = (async (input: string | URL | Request) => {
+        if (new URL(String(input)).pathname === "/health") return health();
+        throw new Error("unreachable");
+      }) as typeof fetch;
+      const gateway = new Gateway({ grants, stateDir: state, moduleUrl: "http://module.invalid", env: { WRATHBENCH_MODULE_SECRET: STUB_PORT_SECRET }, fetch: f, sweepMs: 0, log: (l) => lines.push(l), workers: localWorkers({ trusted: true }), ...o });
+      cleanups.push(() => gateway.stop());
+      return { gateway, lines };
+    }
+    const rated = (actionRate: number | undefined, status = 200): Response => Response.json({ ok: status === 200, module: "mod-wrathbench", limits: actionRate === undefined ? { leases: 1024 } : { actionRate, actionBurst: 40, leases: 1024 } }, { status });
+
+    test("off: the gateway does not start, naming the setting", async () => {
+      await expect(overHealth(() => rated(0)).gateway.start()).rejects.toThrow("WrathBench.ActionRate");
+    });
+
+    test("off on a world still loading (503, the same body): the gateway does not start", async () => {
+      await expect(overHealth(() => rated(0, 503)).gateway.start()).rejects.toThrow("WrathBench.ActionRate");
+    });
+
+    test("not said: the gateway does not start", async () => {
+      await expect(overHealth(() => rated(undefined)).gateway.start()).rejects.toThrow("limits.actionRate");
+    });
+
+    test("set: the gateway starts", async () => {
+      const { gateway, lines } = overHealth(() => rated(20));
+      await gateway.start();
+      await gateway.sweep();
+      expect(lines.some((l) => l.includes("ActionRate"))).toBe(false);
+    });
+
+    test("allowed off for the operator's own grants: the gateway starts and says nothing of it", async () => {
+      const { gateway, lines } = overHealth(() => rated(0), { allowUnratedModule: true });
+      await gateway.start();
+      await gateway.sweep();
+      expect(lines.some((l) => l.includes("ActionRate"))).toBe(false);
+    });
+
+    test("no answer at start: the gateway starts, and every sweep that then finds it off says so", async () => {
+      let answer: () => Response = () => {
+        throw new Error("connection refused");
+      };
+      const { gateway, lines } = overHealth(() => answer());
+      await gateway.start();
+      expect(lines.some((l) => l.includes("could not read the module's /health"))).toBe(true);
+      answer = () => rated(20);
+      await gateway.sweep();
+      expect(lines.filter((l) => l.startsWith("WARNING")).length).toBe(0);
+      // A `.reload config` or a restarted world can turn it off under a running gateway.
+      answer = () => rated(0);
+      await gateway.sweep();
+      await gateway.sweep();
+      expect(lines.filter((l) => l.startsWith("WARNING") && l.includes("WrathBench.ActionRate 0")).length).toBe(2);
+    });
   });
 });
 

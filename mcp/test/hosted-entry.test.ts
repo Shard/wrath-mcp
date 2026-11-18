@@ -61,6 +61,19 @@ test("runGateway refuses to start with no provider unless local workers are trus
   await running.stop();
 });
 
+test("runGateway refuses a module whose request rate is off with a provider of the deployment's own, and serves its own trusted local workers", async () => {
+  const stub = startStubModule({ actionRate: 0 });
+  cleanups.push(() => stub.stop());
+  const dir = mkdtempSync(join(tmpdir(), "wm-entry-"));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  writeGrantsFile(join(dir, "grants.json"), emptyGrantsFile());
+  const args = { grants: join(dir, "grants.json"), state: join(dir, "state"), host: "127.0.0.1", port: 0, program: false, allowedOrigins: [], trustForwardedFor: false, recordRetentionMs: 1 };
+  const env = { WRATHBENCH_MODULE_SECRET: STUB_PORT_SECRET, WRATHBENCH_MODULE_URL: stub.baseUrl };
+  await expect(runGateway(args, { workers: localWorkers({ trusted: true }), env, log: () => {} })).rejects.toThrow("WrathBench.ActionRate");
+  const running = await runGateway({ ...args, trustedLocalWorkers: true }, { env, log: () => {} });
+  await running.stop();
+});
+
 test("behind a proxy, the audit names the address the proxy added, never one the client sent", async () => {
   const { forwardedFor } = await import("../src/hosted/gateway-main");
   expect(forwardedFor(new Headers({ "x-forwarded-for": "6.6.6.6, 10.0.0.9" }))).toBe("10.0.0.9");

@@ -549,7 +549,11 @@ grants are trusted with that user (`--trusted-local-workers`); people
 outside the deployment get a worker per pod, which a deployment's own
 provider starts. The module's part is to protect itself:
 per-lease caps on the action rate, the `/events` subscribers and the number
-of leases. `docs/CONTRACTS.md`, "Control-surface authentication", states what
+of leases. The action rate is what bounds a snippet's requests of the world
+thread, which no gateway limit reaches, and it ships off; so the gateway reads
+it from `/health` and does not start while it is off, but for grants the
+operator trusts (`--trusted-local-workers`), and logs it at every sweep that
+finds it off after a `.reload config` or a restart. `docs/CONTRACTS.md`, "Control-surface authentication", states what
 each side holds.
 
 ### Harness-delivered hints
