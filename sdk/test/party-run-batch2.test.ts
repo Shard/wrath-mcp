@@ -87,6 +87,8 @@ describe("moveToAsync: the ack carries the route", () => {
     const hints = client.drainActionHints();
     expect(hints).toHaveLength(1);
     expect(hints[0]).toMatchObject({ action: "moveToAsync", status: "long_route", count: 1, hint: ack.hint, point: { x: -1204.5, y: 987.25, z: 42 } });
+    // A note on a move that went ahead, never a refusal (operator, 2026-11-18).
+    expect(hints[0]!.nonFault).toBe("note");
     client.close();
     await stub.stop();
   });
@@ -138,7 +140,7 @@ describe("moveTo: the result carries the route", () => {
     // The harness block carries the same sentence, once for this move.
     const hints = client.drainActionHints();
     expect(hints).toHaveLength(1);
-    expect(hints[0]).toMatchObject({ action: "moveTo", status: "long_route", count: 1, hint: r.hint });
+    expect(hints[0]).toMatchObject({ action: "moveTo", status: "long_route", count: 1, hint: r.hint, nonFault: "note" });
     client.close();
     await stub.stop();
   });

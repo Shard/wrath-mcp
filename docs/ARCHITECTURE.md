@@ -409,15 +409,22 @@ the code is still the model's.
   there to. A workspace with no registry whose files the harness put there
   before the first start, carried over from another run with its
   `memory.json`, is loaded at that start and nothing is started.
-- **Facts, not wording.** Routine ends, the first error or refusal of each
-  signature since a load, `wake(reason)`, a move of the model's that replaced
+- **Facts, not wording.** Routine ends, the first error of each signature
+  since a load and the first refusal of each in the sandbox's life (a save
+  does not make a refusal new again, and a run of the deploy a load replaced
+  mints none; operator, 2026-11-18), `wake(reason)`, a move of the model's that replaced
   another of its own, loads and restarts reach a harness as data
   (`ProgramOptions.onFact`, `ProgramHost.drainFacts`), and the action hints
   each tool result carries are handed to it as the result is built
   (`CoreToolContext.onHintsDelivered`), so it can tell a refusal the model
-  has been told of from one it has not. Whether any of them
-  wakes a model, and what the model is shown, is the harness's. The stack
-  never holds, backs off or stops the model's code for repeating itself.
+  has been told of from one it has not. A refusal is a failure of the
+  routine's own call: what the SDK marks no fault of the code
+  (`ActionHint.nonFault`: the long-route note on a move that went ahead, a
+  call the character's death refused or cut short) is none, and neither is
+  a move the code itself replaced or stopped, which the SDK does not tally.
+  Whether any of them wakes a model, and what the model is shown, is the
+  harness's. The stack never holds, backs off or stops the model's code for
+  repeating itself.
 - **Tools.** `programTools` beside `coreTools`: `read_file`, `write_file`,
   `edit_file`, `delete_file`, `start_routine`, `stop_routine`, and a
   `run_snippet` whose description says it is a one-off. `read_file` also

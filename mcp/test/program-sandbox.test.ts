@@ -976,3 +976,92 @@ describe("saves, starts and what a result carries", () => {
     }
   }, 30_000);
 });
+
+describe("a routine's cast interrupt the death caused is no refusal (operator, 2026-11-18)", () => {
+  const HEAL = `export async function heal() {
+  await sdk.castSpell(2050);
+  memory.cast = true;
+  while (!signal.aborted) await sleep(50, { wake: false });
+}
+`;
+  const TOKEN = "program-token-0001";
+  /** Start `heal`, interrupt its cast, and drain the hint at once, before anything else arrives. */
+  async function interrupted(o: { beatMs?: number } = {}): Promise<{ r: Rig; died: () => void }> {
+    const r = await rig(o);
+    const p = r.host.program!;
+    await r.host.evalSnippet(LOGIN);
+    const guid = r.stub.sessions.get(TOKEN)!.guid;
+    await p.writeFile("main.ts", HEAL);
+    await p.startRoutine({ name: "heal" });
+    await until("the cast", () => r.stub.calls.some((c) => c.path === "/action" && c.body?.["action"] === "cast_spell"));
+    r.stub.push(TOKEN, {
+      opcode: "SMSG_SPELL_FAILURE",
+      opcodeId: 0x133,
+      data: { casterGuid: guid, castCount: 1, spellId: 2050, result: 40, reason: "interrupted" },
+    });
+    // The snippet's result drains the routine's hint the moment the failure has landed.
+    const res = await r.host.evalSnippet('await sdk.events.waitForOpcode("SMSG_SPELL_FAILURE", { timeout: 2000 }); 1');
+    expect((res.actionHints ?? []).some((h) => h.action === "castSpell" && h.status === "interrupted" && h.routine === "heal")).toBe(true);
+    const died = () => r.stub.push(TOKEN, { opcode: "SMSG_UPDATE_OBJECT", opcodeId: 0x0a9, data: { blocks: 1, objects: [{ update: "values", guid, fields: { health: 0 } }] } });
+    return { r, died };
+  }
+
+  test("drained before the death lands, it is held until the window passes, and the death inside it makes it none", async () => {
+    const { r, died } = await interrupted();
+    died();
+    await until("the death", async () => (await r.host.evalSnippet("state.self.dead")).value === "true");
+    await Bun.sleep(400);
+    await r.host.evalSnippet("1");
+    await r.host.program!.beat();
+    expect(r.facts.filter((f) => f.kind === "refusal")).toEqual([]);
+  }, 30_000);
+
+  test("alive, the same interrupt is a refusal once the window passes", async () => {
+    const { r } = await interrupted();
+    await Bun.sleep(400);
+    await r.host.evalSnippet("1");
+    expect(r.facts.filter((f) => f.kind === "refusal")).toMatchObject([{ routine: "heal", action: "castSpell", status: "interrupted", fresh: true }]);
+  }, 30_000);
+
+  test("a death after the window leaves the interrupt a refusal: it failed while alive", async () => {
+    // Beats far apart, so only the once-a-second harvest runs in between.
+    const { r, died } = await interrupted({ beatMs: 60_000 });
+    await Bun.sleep(340);
+    // Just past the window and no tool call in between: the death has most
+    // likely landed before any harvest settles the interrupt.
+    died();
+    await Bun.sleep(150);
+    expect((await r.host.evalSnippet("state.self.dead")).value).toBe("true");
+    expect(r.facts.filter((f) => f.kind === "refusal")).toMatchObject([{ routine: "heal", action: "castSpell", status: "interrupted", fresh: true }]);
+  }, 30_000);
+});
+
+describe("a save does not make a refusal new again (operator, 2026-11-18)", () => {
+  test("the restarted routine's same refusal is counted, not fresh", async () => {
+    const { host, stub, facts } = await rig();
+    const p = host.program!;
+    await host.evalSnippet(LOGIN);
+    const stop = answerMoves(stub, "program-token-0001", "too_far");
+    const walk = (n: number) => `export async function walk() {
+  for (let i = 0; i < ${n}; i++) memory.status = (await sdk.moveTo({ x: -1200, y: 990, z: 42 }, { timeout: 4000 })).status;
+  while (!signal.aborted) await sleep(50, { wake: false });
+}
+`;
+    try {
+      await p.writeFile("main.ts", walk(1));
+      await p.startRoutine({ name: "walk" });
+      await until("the first refusal", () => facts.some((f) => f.kind === "refusal"));
+      // The save restarts walk on deploy 2, which is refused the same way.
+      expect((await p.writeFile("main.ts", walk(2))).ok).toBe(true);
+      await until("the restarted run's moves", () => stub.calls.filter((c) => c.path === "/action" && c.body?.["action"] === "move_to").length >= 3, 20_000);
+      await Bun.sleep(1_200);
+      await host.evalSnippet("1");
+      await p.beat();
+      const refusals = facts.filter((f) => f.kind === "refusal");
+      expect(refusals).toMatchObject([{ signature: "walk||moveTo|too_far", deploy: 1, fresh: true }]);
+      expect(p.drainFacts().repeats).toContainEqual({ signature: "walk||moveTo|too_far", count: expect.any(Number), ts: expect.any(Number) });
+    } finally {
+      stop();
+    }
+  }, 40_000);
+});

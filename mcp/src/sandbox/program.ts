@@ -27,9 +27,14 @@
  *    swallows every error neither acts beside its replacement nor spins.
  *  - Signatures. An error is the same error when its routine, name and first
  *    frame in the model's files agree; a refusal when its routine, character,
- *    helper and status do. The first of each since the last load is pushed
- *    to the host at once, marked fresh; repeats are counted and ride the
- *    next beat. Nothing is ever disabled, held or backed off for repeating.
+ *    helper and status do. The first error of each since the last load, and
+ *    the first refusal of each in this sandbox's life, is pushed to the host
+ *    at once, marked fresh; repeats are counted and ride the next beat. A
+ *    save does not make a refusal new again (operator, 2026-11-18): models
+ *    save tens of times a run. Nothing is ever disabled, held or backed off
+ *    for repeating. What the SDK marks no fault of the code (`nonFault`: a
+ *    note on a call that went ahead, a call the character's death refused)
+ *    is no refusal at all.
  *  - Memory. One plain-JSON object, the ambient `memory`, serialized once a
  *    second and after every snippet and routine; a change is sent to the
  *    host, which alone writes memory.json.
@@ -65,8 +70,14 @@ export const PROGRAM_LOG_KEEP = 200;
 export const STACK_FRAMES_SHOWN = 4;
 /** A `wake(reason)` reason and a returned value are cut to this many characters. */
 const SHORT_TEXT_MAX_CHARS = 200;
-/** Distinct signatures remembered per load; past it a new one is counted, not pushed. */
+/** Distinct error signatures remembered per load; past it a new one is counted, not pushed. */
 const SIGNATURES_MAX = 500;
+/**
+ * Distinct refusal signatures remembered for the sandbox's life; past it a
+ * new one is counted, not pushed. Larger than a load's: they are kept across
+ * loads, and a model that names a routine per task mints new ones all run.
+ */
+const REFUSAL_SIGNATURES_MAX = 10_000;
 
 /** A routine was stopped by `stop_routine`: its signal is aborted with this. */
 export class RoutineStopped extends HarnessStop {
@@ -182,9 +193,12 @@ export class ProgramRuntime<S> {
   private readonly runs = new Map<string, RoutineRun<S>>();
   private memoryValue: Record<string, unknown> = {};
   private memorySaved = "{}";
-  /** Signatures seen since the last load. */
+  /** Error signatures seen since the last load. */
   private readonly seen = new Set<string>();
   private readonly repeats = new Map<string, { count: number; ts: number }>();
+  /** Refusal signatures seen in this sandbox's life, and their repeats since the last beat: neither is cleared by a load. */
+  private readonly refusalsSeen = new Set<string>();
+  private readonly refusalRepeats = new Map<string, { count: number; ts: number }>();
   private readonly log: ProgramLogLine[] = [];
   private logDropped = 0;
 
@@ -553,7 +567,7 @@ export class ProgramRuntime<S> {
 
   // ------------------------------------------------------ errors, refusals
 
-  /** Whether `signature` is new since the last load; a repeat is counted for the next beat. */
+  /** Whether error `signature` is new since the last load; a repeat is counted for the next beat. */
   private fresh(signature: string, ts: number): boolean {
     if (!this.seen.has(signature)) {
       if (this.seen.size < SIGNATURES_MAX) {
@@ -622,12 +636,22 @@ export class ProgramRuntime<S> {
    * A hint-bearing failure of a call a routine made, as the SDK tallied it;
    * `seat` is the client's character at fan-out above 1, the signature's
    * character then (a routine started for no character drives any of them).
+   * Fresh only the first time its signature is seen in this sandbox's life,
+   * and never from a run of a deploy a load has replaced, still unwinding:
+   * its name is the restarted run's, and its refusal is not the new code's.
+   * One the SDK marks no fault of the code is dropped (operator, 2026-11-18).
    */
-  noteRefusal(run: RoutineRun<S>, h: { action: string; status: string; hint: string; count: number; ts: number }, seat?: string): void {
+  noteRefusal(
+    run: RoutineRun<S>,
+    h: { action: string; status: string; hint: string; count: number; ts: number; nonFault?: string | undefined },
+    seat?: string,
+  ): void {
+    if (h.nonFault !== undefined) return;
     const signature = `${run.note.name}|${seat ?? run.note.character ?? ""}|${h.action}|${h.status}`;
     let count = h.count;
-    if (!this.seen.has(signature) && this.seen.size < SIGNATURES_MAX) {
-      this.seen.add(signature);
+    const replaced = run.ended && this.loaded !== null && run.note.deploy !== this.loaded.version;
+    if (!replaced && !this.refusalsSeen.has(signature) && this.refusalsSeen.size < REFUSAL_SIGNATURES_MAX) {
+      this.refusalsSeen.add(signature);
       count--;
       this.push({
         kind: "refusal",
@@ -644,8 +668,8 @@ export class ProgramRuntime<S> {
       });
     }
     if (count <= 0) return;
-    const r = this.repeats.get(signature);
-    if (r === undefined) this.repeats.set(signature, { count, ts: h.ts });
+    const r = this.refusalRepeats.get(signature);
+    if (r === undefined) this.refusalRepeats.set(signature, { count, ts: h.ts });
     else {
       r.count += count;
       r.ts = Math.max(r.ts, h.ts);
@@ -729,8 +753,9 @@ export class ProgramRuntime<S> {
 
   beat(): ProgramBeat {
     this.saveMemory();
-    const repeats = [...this.repeats.entries()].map(([signature, r]) => ({ signature, count: r.count, ts: r.ts }));
+    const repeats = [...this.repeats.entries(), ...this.refusalRepeats.entries()].map(([signature, r]) => ({ signature, count: r.count, ts: r.ts }));
     this.repeats.clear();
+    this.refusalRepeats.clear();
     const dropped = this.logDropped;
     this.logDropped = 0;
     return {

@@ -358,17 +358,26 @@ charges the fall; what a fall costs is a game rule and lives here.
 `moveToAsync` acks with a `moveId` and nothing more, so the client watches that
 move's `WB_MOVE_RESULT` and tallies any verdict but an arrival, a transfer, a
 teleport, `superseded` or `stopped` on the harness hint channel as
-`moveToAsync <status>` (re-sending a move is how a caller steers with it, so
-those two are the steering, not failures; operator, 2026-10-20), the same
-recipe `moveTo` returns: a move refused at planning (`too_far`, `drop`) never
-started, and the ack alone let a snippet sleep on it.
+`moveToAsync <status>`, the same recipe `moveTo` returns: a move refused at
+planning (`too_far`, `drop`) never started, and the ack alone let a snippet
+sleep on it. Re-sending a move is how a caller steers, so `superseded` and
+`stopped` are the steering, not failures, and `moveTo` does not tally them
+either (operator, 2026-10-20 for `moveToAsync`, 2026-11-18 for `moveTo`); the
+call's own result still says which it was.
+
+Some tallies are no failure of the code that made the call, and carry
+`nonFault` so a harness counts no refusal for them, while the hint still
+reaches the hint channel (operator, 2026-11-18): `note`, the long-route
+remark on a move that went ahead (also on the call's own result), and
+`death`, a call the character's death refused or cut short.
 
 A dead character that has not released its spirit is a body, and a body cannot
 move or fight: `moveTo` answers `dead` and `moveToAsync` rejects, both with
 nothing sent, and `killTarget` answers `dead` for a body and for a ghost alike.
 A ghost walks. Unobserved health is never read as dead. An `interrupted` verdict
 that finds the character dead (the health-0 block precedes the result in the
-same tick) says the character died.
+same tick) says the character died. These are tallied as the death's
+(`nonFault: "death"`), not as failures of the code.
 
 A `moveTo` issued while another is running supersedes it, and the older call
 returns `status: "superseded"`. `stop()` returns as soon as the module has
@@ -449,7 +458,14 @@ hint channel as `castSpell <reason>` with the spell and target named, so a
 refusal reaches the model whichever snippet or routine cast it. Matched by
 spell id (`SMSG_CAST_FAILED` names no caster), watched past the cast time once
 the cast starts, ended by `SMSG_SPELL_GO`; `dont_report`, the server's silent
-cancel a repop sends in a burst, is not a refusal. Helpers that read their own
+cancel a repop sends in a burst, is not a refusal. A cast refused `dead` or
+`caster_dead`, and an `interrupted` one whose cause turns out to be the
+character's death, are tallied as the death's (`nonFault: "death"`); the death
+lands just after the interrupt, so until a 300 ms window has passed an
+interrupt with no cause seen carries `settlesAt`, and a harness waits that out
+and asks `settledByDeath` whether the death landed inside it before counting
+it; a death after the window leaves it a failure. An interrupt by a hit or a stun while alive is a cast that
+failed. Helpers that read their own
 cast verdicts (the chest's Opening ladder) dispatch untracked.
 
 ## State cache

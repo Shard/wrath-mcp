@@ -197,7 +197,7 @@ describe("castSpell: refused before dispatch when it cannot go off", () => {
         "Get back to life first (reclaimCorpse, or a Spirit Healer).",
     );
     expect(stub.actions.some((a) => a.action === "cast_spell")).toBe(false);
-    expect(client.drainActionHints().map((h) => [h.action, h.status, h.count])).toEqual([["castSpell", "dead", 2]]);
+    expect(client.drainActionHints().map((h) => [h.action, h.status, h.count, h.nonFault])).toEqual([["castSpell", "dead", 2, "death"]]);
     client.close();
     await stub.stop();
   });

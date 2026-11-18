@@ -148,7 +148,8 @@ describe("castSpell: a refusal reaches the harness, named", () => {
     await untilAction(stub, "cast_spell");
     push(stub, frame(90, "SMSG_CAST_FAILED", { spellId: 501, result: 23 }));
     await folded(client, "SMSG_CAST_FAILED", 90);
-    expect(client.drainActionHints()[0]).toMatchObject({ action: "castSpell", status: "caster_dead" });
+    // The death's, not the code's: no refusal (operator, 2026-11-18).
+    expect(client.drainActionHints()[0]).toMatchObject({ action: "castSpell", status: "caster_dead", nonFault: "death" });
     client.close();
     await stub.stop();
   });
@@ -252,7 +253,7 @@ describe("acting while dead: a corpse cannot move or fight, a ghost can walk", (
     // Resolved, not rejected: the refusal moveTo answers, the same way.
     expect(await client.moveToAsync({ x: -1220, y: 987, z: 42 })).toEqual({ ok: false, status: "dead", hint: DEAD });
     expect(stub.actions.filter((a) => a.action === "move_to")).toEqual([]);
-    expect(client.drainActionHints().map((h) => `${h.action} ${h.status}`).sort()).toEqual(["moveTo dead", "moveToAsync dead"]);
+    expect(client.drainActionHints().map((h) => `${h.action} ${h.status} ${h.nonFault}`).sort()).toEqual(["moveTo dead death", "moveToAsync dead death"]);
 
     push(stub, ghostFlags(21));
     await folded(client, "SMSG_UPDATE_OBJECT", 21);
@@ -276,7 +277,7 @@ describe("acting while dead: a corpse cannot move or fight, a ghost can walk", (
     expect(ghost).toMatchObject({ ok: false, status: "dead" });
     expect(ghost.detail).toContain("you are a ghost and cannot attack");
     expect(stub.actions.map((a) => a.action).filter((a) => a !== "questgiver_status_query" && a !== "creature_query")).toEqual([]);
-    expect(client.drainActionHints()).toMatchObject([{ action: "killTarget", status: "dead", count: 2 }]);
+    expect(client.drainActionHints()).toMatchObject([{ action: "killTarget", status: "dead", count: 2, nonFault: "death" }]);
     client.close();
     await stub.stop();
   });
@@ -296,6 +297,8 @@ describe("acting while dead: a corpse cannot move or fight, a ghost can walk", (
     expect(moved.hint).toBe(
       "the move stopped because the character died. A corpse cannot move: sdk.repop() releases the spirit, and a ghost can walk.",
     );
+    // The death's, not the code's: no refusal (operator, 2026-11-18).
+    expect(client.drainActionHints()).toMatchObject([{ action: "moveTo", status: "interrupted", nonFault: "death" }]);
     client.close();
     await stub.stop();
   });
@@ -308,6 +311,10 @@ describe("acting while dead: a corpse cannot move or fight, a ghost can walk", (
     await untilAction(stub, "move_to");
     push(stub, frame(91, "WB_MOVE_RESULT", { moveId: 1, status: "interrupted", pos: { x: -1230, y: 987, z: 42, o: 0 } }));
     expect((await pending).hint).toContain("the move stopped early (death, root, stun");
+    // Alive, it is a move that failed: a refusal like any other.
+    const [hint] = client.drainActionHints();
+    expect(hint).toMatchObject({ action: "moveTo", status: "interrupted" });
+    expect(hint!.nonFault).toBeUndefined();
     client.close();
     await stub.stop();
   });
