@@ -461,7 +461,9 @@ export class Gateway {
         if (t.host !== undefined && now - t.lastSeen > t.limits.idleMinutes * 60_000) await this.stopHost(t, "idle");
       }
       const health = await this.readHealth();
-      if (health?.actionRate === 0 && !(this.o.allowUnratedModule ?? false)) this.log(`WARNING: ${UNRATED}`);
+      if (health !== undefined && !((health.actionRate ?? 0) > 0) && !(this.o.allowUnratedModule ?? false)) {
+        this.log(`WARNING: ${health.actionRate === undefined ? "the module's /health does not say its request rate per lease (limits.actionRate)" : UNRATED}`);
+      }
       const started = health?.startedAtMs;
       if (started !== undefined && this.worldStartedAt !== undefined && started !== this.worldStartedAt) {
         this.log("the worldserver restarted: every lease is gone, so every host stops and opens again at its next call");

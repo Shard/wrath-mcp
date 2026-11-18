@@ -672,6 +672,9 @@ describe("hardening", () => {
       await gateway.sweep();
       await gateway.sweep();
       expect(lines.filter((l) => l.startsWith("WARNING") && l.includes("WrathBench.ActionRate 0")).length).toBe(2);
+      answer = () => rated(undefined);
+      await gateway.sweep();
+      expect(lines.at(-1)).toContain("WARNING: the module's /health does not say");
     });
   });
 });
