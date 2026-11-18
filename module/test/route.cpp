@@ -128,11 +128,44 @@ static void Lifted()
     Check(FirstRefused(wall, false) == 1, "a 5y wall on the mesh's own heights is still refused");
 }
 
+// Fix: a climb out of the water measured from its surface (Route::WaterZ).
+// The surface at 0, a bed 6y down, a swim depth of 1.6y; the core held the
+// swimmer's point 1.2y under the surface.
+static void Water()
+{
+    float const level = 0.0f, bed = -6.0f, swimDepth = 1.6f, held = -1.2f;
+    std::vector<WbVec> bank{ { 0, 0, held }, { 4, 0, held }, { 6, 0, 1.5f }, { 10, 0, 1.8f } };
+    Check(FirstRefused(bank, false) == 1, "before: a bank 1.5y over the surface reads as a 2.7y climb from 1.2y under it");
+    for (WbVec& p : bank)
+        p.z = Route::WaterZ(p.z, p.z < level, level, bed, swimDepth);
+    Check(bank[1].z == level, "a swimmer's point is judged at the surface");
+    Check(bank[2].z == 1.5f, "a point on the bank is not moved");
+    Check(FirstRefused(bank, false) == -1, "the climb out onto a bank 1.5y over the surface passes");
+
+    // The cove's own shape: a 47-50 degree bank, 3.0y up over 2.6y across
+    // from the surface, read from 1.2y under it.
+    std::vector<WbVec> cove{ { 0, 0, held }, { 2.6f, 0, 3.0f } };
+    Check(FirstRefused(cove, false) == 0, "before: the cove bank reads as a 4.2y climb");
+    cove[0].z = Route::WaterZ(cove[0].z, true, level, bed, swimDepth);
+    Check(FirstRefused(cove, false) == -1, "the cove bank, from the surface, passes");
+
+    // A dock face 3y over the water, straight up: still a climb.
+    std::vector<WbVec> dock{ { 0, 0, held }, { 1.0f, 0, 3.0f } };
+    dock[0].z = Route::WaterZ(dock[0].z, true, level, bed, swimDepth);
+    Check(FirstRefused(dock, true) == 0, "a dock face 3y over the water is refused, forced or not");
+
+    // Only water deep enough to swim, and only under its surface.
+    Check(Route::WaterZ(-0.8f, true, level, -1.0f, swimDepth) == -0.8f, "a wading point keeps the bed");
+    Check(Route::WaterZ(0.4f, true, level, bed, swimDepth) == 0.4f, "a point over the surface (a pier) is not moved");
+    Check(Route::WaterZ(held, false, level, bed, swimDepth) == held, "no liquid there, nothing moves");
+}
+
 int main()
 {
     Guard();
     End();
     Lifted();
+    Water();
     if (failures == 0)
         std::printf("ok\n");
     return failures;

@@ -2340,6 +2340,33 @@ namespace WrathBench
         return pose;
     }
 
+    // A route's points over water deep enough to swim, under its surface, at
+    // the surface (Route::WaterZ): a swimmer climbs out from there, and
+    // PlaceMover holds the body at its swim depth under it. The depth is the
+    // liquid's own, read as WaterPoseAt reads it. Returns how many were raised.
+    static uint32 OntoWater(Unit* mover, std::vector<WbVec>& points)
+    {
+        Map* map = mover->GetMap();
+        if (!map)
+            return 0;
+        float const height = mover->GetCollisionHeight();
+        float const swimDepth = height * SWIM_DEPTH_FRACTION + SWIM_DEPTH_MARGIN;
+        uint32 raised = 0;
+        for (WbVec& p : points)
+        {
+            LiquidData const liquid = map->GetLiquidData(mover->GetPhaseMask(), p.x, p.y, p.z, height, {});
+            bool const water = liquid.Status != LIQUID_MAP_NO_WATER && liquid.Level > INVALID_HEIGHT
+                && liquid.DepthLevel > INVALID_HEIGHT && liquid.Level > liquid.DepthLevel;
+            float const z = Route::WaterZ(p.z, water, liquid.Level, liquid.DepthLevel, swimDepth);
+            if (z != p.z)
+            {
+                p.z = z;
+                ++raised;
+            }
+        }
+        return raised;
+    }
+
     // How finely WalkEtaMs classifies a route: one WaterPoseAt per this many
     // yards of polyline (at least one per segment), at the middle of each
     // stretch. TickMover reclassifies every tick, so a stretch's pace can be
@@ -3311,6 +3338,11 @@ namespace WrathBench
             r.points.front() = { r.levelFromX, r.levelFromY, r.levelFromZ };
         if (r.hasSnap)
             r.points.insert(r.points.begin(), { mover->GetPositionX(), mover->GetPositionY(), mover->GetPositionZ() });
+        // Points in water deep enough to swim are judged and walked at its
+        // surface (OntoWater); the end's z as the core settled it is still
+        // what meshZ compares with the request, below.
+        float const endZ = r.points.back().z;
+        r.waterPoints = OntoWater(mover, r.points);
         // Per-segment drop guard over the whole polyline (the main path and,
         // when spliced, the leg2 continuation): the walk is not dispatched.
         // `points` is kept so the move_path audit shows the route that fell.
@@ -3350,7 +3382,6 @@ namespace WrathBench
         }
         if (r.status)
             return;
-        float endZ = r.points.back().z;
         if (Route::ReportsMeshZ(endZ, reqZ))
         {
             r.hasMeshZ = true;
@@ -4450,6 +4481,8 @@ namespace WrathBench
                 .Add("pointCount", (uint64_t)r.points.size()).Add("truncated", r.points.size() > 64);
             if (r.meshPoints)
                 a.Add("meshPoints", r.meshPoints);
+            if (r.waterPoints)
+                a.Add("waterPoints", r.waterPoints);
             Audit(*s, "action", a.Raw("points", PathPointsJson(r.points)).Str());
         }
         if (r.status != nullptr)

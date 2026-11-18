@@ -575,6 +575,7 @@ namespace WrathBench
             bool hasEndLift{false};     // the endpoint's normalized z sat more than 2y under or over its mesh polygon and was settled onto it (Route::EndZ)
             float endLiftFrom{0};       // ... from this z (audit only)
             uint32 meshPoints{0};       // route points the core lifted over the mesh, judged and walked at the mesh's height (OntoMesh), audit only
+            uint32 waterPoints{0};      // route points under the surface of water deep enough to swim, judged and walked at the surface (OntoWater), audit only
             bool hasSnap{false};        // the start was off the mesh and was snapped to the nearest point
             float snapX{0}, snapY{0}, snapZ{0};
             // The start's own polygon is on a closed island that does not hold

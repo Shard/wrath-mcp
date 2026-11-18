@@ -2019,8 +2019,12 @@ at the top of this document.
   landing). A point lifted more than 1y over the mesh's own height under it —
   the polygon the route walked onto from the point before, never one looked
   up from the lifted z — is judged, and walked, at the mesh's height; one at
-  or under it keeps the core's. The route's end is the request's (`arrived`,
-  above). Before refusing, the module re-plans around the steep
+  or under it keeps the core's. A point over water deep enough to swim
+  (Swimming, above), which the core settles about 1.2y under the surface, is
+  judged and walked at the surface: a swimmer climbs out from there, so a
+  bank the mesh walks out of the water is not refused for the swimmer's
+  depth, while a dock face 3y over the water is still a climb. The route's
+  end is the request's (`arrived`, above). Before refusing, the module re-plans around the steep
   band, up to three times, with the mesh polygons under every refused segment
   barred, and walks the first re-planned route this same guard passes; when
   none does, what follows describes the mesh's own route. A `drop` can also
@@ -2876,7 +2880,9 @@ dispatch — `moveId`, `status` (`"ok"` when the walk was dispatched, else the
 `WB_MOVE_RESULT` status), `pointCount`, `points` (the resolved polyline,
 capped at 64 points with `truncated: true` when the cap bit) and, when any
 were, `meshPoints` (how many of its points the core's settling had lifted more
-than 1y over the mesh and were put back on it: `drop`, below) — so a route the
+than 1y over the mesh and were put back on it: `drop`, below) and
+`waterPoints` (how many lay under the surface of water deep enough to swim and
+were put on the surface) — so a route the
 mesh chose is read from the log, not reconstructed from heartbeats. Beside it,
 one `op: "move_eta"` record for each dispatched walk: `moveId`, `etaMs`,
 `pathLength`, `swimYards` (the stretches the walk-time estimate counted as

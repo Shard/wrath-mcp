@@ -112,6 +112,25 @@ namespace WrathBench
             return known && coreZ > meshZ + MESH_LIFT_MAX ? meshZ : coreZ;
         }
 
+        // A point over water. Where the water is deep enough to swim, the
+        // core settles a point to its surface less GetMinHeightInWater (about
+        // 1.2y for a player), and its swim test reads that depth as not
+        // swimming; the mesh's own polygons there are the surface. A swimmer
+        // leaves the water from the surface, as a client's character does,
+        // so a climb out measured from 1.2y under it reads 1.2y too tall (the
+        // Deadmines cove: a 47-50 degree bank the mesh walks read as a 4.9y
+        // climb). A point over water deeper than `swimDepth` (WaterPoseAt's
+        // own test: the liquid's Level over its bed) and under its surface
+        // is judged and walked at the surface (`water` when the server's
+        // liquid query has both; the walker holds the body at its swim depth
+        // under that surface, PlaceMover). Water too shallow to swim keeps the
+        // core's z, the bed a wading character walks on. A dock face 3y over
+        // the water is still a climb.
+        inline float WaterZ(float z, bool water, float level, float bed, float swimDepth)
+        {
+            return water && level - bed > swimDepth && z < level ? level : z;
+        }
+
         // A walk that ends more than this far from the z the request asked
         // for reports where it ended as `meshZ` (PROTOCOL.md, `arrived`): the
         // request's z was off, and the caller should quote `meshZ` next time.
