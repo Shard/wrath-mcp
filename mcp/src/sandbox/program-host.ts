@@ -36,7 +36,7 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { durationWords, LOAD_TIMEOUT_MS, RESTART_SETTLE_MS } from "./program";
-import type { ProgramBeat, ProgramErrorNote, ProgramEvent, ProgramLoadAnswer, ProgramLogLine, RoutineAnswer, RoutineNote } from "./ipc";
+import type { ProgramBeat, ProgramErrorNote, ProgramEvent, ProgramLoadAnswer, ProgramLogLine, ProgramRepeat, RepeatNewest, RoutineAnswer, RoutineNote } from "./ipc";
 import { API_MD_PATH } from "@wrathbench/sdk";
 import { isImportable, lineRange, MAIN_PATH, sameImportGraph, type LineRange, type Workspace, type WorkspaceResult } from "../workspace";
 
@@ -107,8 +107,8 @@ export interface ProgramFacts {
   facts: ProgramFact[];
   /** Facts that fell off the front of a full buffer. */
   factsDropped: number;
-  /** Repeats of error and refusal signatures since the last drain, by signature. */
-  repeats: { signature: string; count: number; ts: number }[];
+  /** Repeats of error and refusal signatures since the last drain, by signature, each with its newest occurrence. */
+  repeats: ProgramRepeat[];
   /** The routines' console since the last drain: its last lines, and how many lines there were in all. */
   console: { lines: ProgramLogLine[]; total: number };
 }
@@ -234,7 +234,7 @@ export class ProgramHost {
   private lastGraph: Map<string, string | null>;
   private readonly facts: ProgramFact[] = [];
   private factsDropped = 0;
-  private readonly repeats = new Map<string, { count: number; ts: number }>();
+  private readonly repeats = new Map<string, { count: number; ts: number; newest?: RepeatNewest }>();
   private consoleLines: ProgramLogLine[] = [];
   private consoleTotal = 0;
   /** Routine errors and values the model has been shown (`routineDetailKey`); not persisted, so a new process shows them whole. */
@@ -346,7 +346,7 @@ export class ProgramHost {
       routines: this.routines(),
       facts: this.facts.splice(0, this.facts.length),
       factsDropped: this.factsDropped,
-      repeats: [...this.repeats.entries()].map(([signature, r]) => ({ signature, count: r.count, ts: r.ts })),
+      repeats: [...this.repeats.entries()].map(([signature, r]) => ({ signature, count: r.count, ts: r.ts, ...(r.newest !== undefined ? { newest: r.newest } : {}) })),
       console: { lines: this.consoleLines, total: this.consoleTotal },
     };
     this.factsDropped = 0;
@@ -765,9 +765,11 @@ export class ProgramHost {
     }
     for (const r of beat.repeats) {
       const prev = this.repeats.get(r.signature);
-      if (prev === undefined) this.repeats.set(r.signature, { count: r.count, ts: r.ts });
+      if (prev === undefined) this.repeats.set(r.signature, { count: r.count, ts: r.ts, ...(r.newest !== undefined ? { newest: r.newest } : {}) });
       else {
         prev.count += r.count;
+        // The newest occurrence is the later beat's, so a later report names the signature as it last happened.
+        if (r.newest !== undefined && r.ts >= prev.ts) prev.newest = r.newest;
         prev.ts = Math.max(prev.ts, r.ts);
       }
     }

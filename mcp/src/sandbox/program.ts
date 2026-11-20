@@ -48,7 +48,7 @@ import { statSync } from "node:fs";
 import { posix } from "node:path";
 import { HarnessStop, isHarnessStop, Owner, type Ownership } from "./owners";
 import { MAIN_PATH, MEMORY_MAX_CHARS, MEMORY_PATH, resolveWorkspaceImport } from "./rewrite";
-import type { ChildToHost, LogEntry, MoveOwner, ProgramBeat, ProgramErrorNote, ProgramEvent, ProgramLoadAnswer, ProgramLogLine, RoutineAnswer, RoutineNote } from "./ipc";
+import type { ChildToHost, LogEntry, MoveOwner, ProgramBeat, ProgramErrorNote, ProgramEvent, ProgramLoadAnswer, ProgramLogLine, RepeatNewest, RoutineAnswer, RoutineNote } from "./ipc";
 
 /** How long an ended routine may still dispatch: long enough to unwind (a `finally` that stops an attack), no longer. */
 export const UNWIND_GRACE_MS = 250;
@@ -195,10 +195,11 @@ export class ProgramRuntime<S> {
   private memorySaved = "{}";
   /** Error signatures seen since the last load. */
   private readonly seen = new Set<string>();
-  private readonly repeats = new Map<string, { count: number; ts: number }>();
-  /** Refusal signatures seen in this sandbox's life, and their repeats since the last beat: neither is cleared by a load. */
+  /** Error repeats since the last beat, each with the newest one's text. */
+  private readonly repeats = new Map<string, { count: number; ts: number; newest: RepeatNewest }>();
+  /** Refusal signatures seen in this sandbox's life, and their repeats since the last beat with the newest one's hint: neither is cleared by a load. */
   private readonly refusalsSeen = new Set<string>();
-  private readonly refusalRepeats = new Map<string, { count: number; ts: number }>();
+  private readonly refusalRepeats = new Map<string, { count: number; ts: number; newest: RepeatNewest }>();
   private readonly log: ProgramLogLine[] = [];
   private logDropped = 0;
 
@@ -510,7 +511,7 @@ export class ProgramRuntime<S> {
     const error = this.errorNote(run.note.name, thrown.err);
     run.note.error = error;
     this.end(run, "threw", new RoutineEnded("the routine threw; what it left pending was stopped"), now);
-    const fresh = this.fresh(error.signature, now);
+    const fresh = this.fresh(error.signature, now, error);
     this.push({ kind: "ended", ts: now, routine: { ...run.note }, ...(fresh ? { fresh: true } : {}) });
   }
 
@@ -567,19 +568,21 @@ export class ProgramRuntime<S> {
 
   // ------------------------------------------------------ errors, refusals
 
-  /** Whether error `signature` is new since the last load; a repeat is counted for the next beat. */
-  private fresh(signature: string, ts: number): boolean {
+  /** Whether error `signature` is new since the last load; a repeat is counted for the next beat, `error` kept as the newest. */
+  private fresh(signature: string, ts: number, error: Pick<ProgramErrorNote, "text" | "frames">): boolean {
     if (!this.seen.has(signature)) {
       if (this.seen.size < SIGNATURES_MAX) {
         this.seen.add(signature);
         return true;
       }
     }
+    const newest = { text: error.text, frames: error.frames };
     const r = this.repeats.get(signature);
-    if (r === undefined) this.repeats.set(signature, { count: 1, ts });
+    if (r === undefined) this.repeats.set(signature, { count: 1, ts, newest });
     else {
       r.count++;
       r.ts = ts;
+      r.newest = newest;
     }
     return false;
   }
@@ -609,7 +612,7 @@ export class ProgramRuntime<S> {
     if (isHarnessStop(err)) return;
     const now = Date.now();
     const error = this.errorNote(run?.note.name, err);
-    if (!this.fresh(error.signature, now)) return;
+    if (!this.fresh(error.signature, now, error)) return;
     this.push({
       kind: "error",
       ts: now,
@@ -669,9 +672,10 @@ export class ProgramRuntime<S> {
     }
     if (count <= 0) return;
     const r = this.refusalRepeats.get(signature);
-    if (r === undefined) this.refusalRepeats.set(signature, { count, ts: h.ts });
+    if (r === undefined) this.refusalRepeats.set(signature, { count, ts: h.ts, newest: { text: h.hint } });
     else {
       r.count += count;
+      if (h.ts >= r.ts) r.newest = { text: h.hint };
       r.ts = Math.max(r.ts, h.ts);
     }
   }
@@ -745,7 +749,7 @@ export class ProgramRuntime<S> {
   private memoryError(text: string, what: string): void {
     const signature = `memory|${what}`;
     const now = Date.now();
-    if (!this.fresh(signature, now)) return;
+    if (!this.fresh(signature, now, { text, frames: [] })) return;
     this.push({ kind: "error", ts: now, deploy: this.loaded?.version ?? 0, error: { name: "MemoryError", text, frames: [], signature }, fresh: true });
   }
 
@@ -753,7 +757,7 @@ export class ProgramRuntime<S> {
 
   beat(): ProgramBeat {
     this.saveMemory();
-    const repeats = [...this.repeats.entries(), ...this.refusalRepeats.entries()].map(([signature, r]) => ({ signature, count: r.count, ts: r.ts }));
+    const repeats = [...this.repeats.entries(), ...this.refusalRepeats.entries()].map(([signature, r]) => ({ signature, count: r.count, ts: r.ts, newest: r.newest }));
     this.repeats.clear();
     this.refusalRepeats.clear();
     const dropped = this.logDropped;

@@ -167,6 +167,8 @@ export type {
   ProgramLoadAnswer,
   ProgramLogLine,
   ProgramOrigin,
+  ProgramRepeat,
+  RepeatNewest,
   RoutineAnswer,
   RoutineNote,
   RoutineState,
