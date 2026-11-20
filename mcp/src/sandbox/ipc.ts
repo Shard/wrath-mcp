@@ -357,6 +357,25 @@ export interface ProgramLogLine {
 }
 
 /**
+ * The newest occurrence of a repeated signature, in its fresh fact's words: a
+ * refusal's hint, or an error's text and frames. A refusal repeated elsewhere
+ * says another hint (another target, another point), so a harness that names
+ * the signature again can name it as it last happened, not as it first did.
+ */
+export interface RepeatNewest {
+  text: string;
+  frames?: string[];
+}
+
+/** Repeats of one error or refusal signature: how many, the newest one's time and the newest itself. */
+export interface ProgramRepeat {
+  signature: string;
+  count: number;
+  ts: number;
+  newest?: RepeatNewest;
+}
+
+/**
  * The program's heartbeat (`rpc` `program_beat`): answered synchronously, so
  * an answer is also proof the child's event loop turns. It drains what is too
  * frequent to push: each running routine's last action, the repeats of error
@@ -366,7 +385,7 @@ export interface ProgramBeat {
   /** The loaded version, or null with no program loaded. */
   deploy: number | null;
   routines: RoutineNote[];
-  repeats: { signature: string; count: number; ts: number }[];
+  repeats: ProgramRepeat[];
   console: { lines: ProgramLogLine[]; dropped: number };
 }
 

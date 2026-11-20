@@ -215,7 +215,7 @@ describe("routines", () => {
     const second = facts.filter((f) => f.kind === "ended")[1]!;
     expect(second.kind === "ended" && second.fresh).toBeUndefined();
     await p.beat();
-    expect(p.drainFacts().repeats).toEqual([{ signature: "grind|TypeError|main.ts:9", count: 1, ts: expect.any(Number) }]);
+    expect(p.drainFacts().repeats).toEqual([{ signature: "grind|TypeError|main.ts:9", count: 1, ts: expect.any(Number), newest: { text: expect.any(String), frames: expect.any(Array) } }]);
   }, 30_000);
 
   test("a start says what is wrong: no main.ts, no such export, already running and since when", async () => {
@@ -496,7 +496,7 @@ describe("who is told what", () => {
       expect(refusals[0]).toMatchObject({ routine: "walk", action: "moveTo", status: "too_far", signature: "walk||moveTo|too_far", fresh: true, deploy: 1 });
       await p.beat();
       const drained = p.drainFacts();
-      expect(drained.repeats).toEqual([{ signature: "walk||moveTo|too_far", count: 3, ts: expect.any(Number) }]);
+      expect(drained.repeats).toEqual([{ signature: "walk||moveTo|too_far", count: 3, ts: expect.any(Number), newest: { text: expect.any(String) } }]);
       expect(hints.every((h) => h.routine === "walk" && h.from === undefined)).toBe(true);
       const block = renderActionHints(hints)!;
       expect(block.split("\n").length).toBe(2);
@@ -1059,7 +1059,7 @@ describe("a save does not make a refusal new again (operator, 2026-11-18)", () =
       await p.beat();
       const refusals = facts.filter((f) => f.kind === "refusal");
       expect(refusals).toMatchObject([{ signature: "walk||moveTo|too_far", deploy: 1, fresh: true }]);
-      expect(p.drainFacts().repeats).toContainEqual({ signature: "walk||moveTo|too_far", count: expect.any(Number), ts: expect.any(Number) });
+      expect(p.drainFacts().repeats).toContainEqual({ signature: "walk||moveTo|too_far", count: expect.any(Number), ts: expect.any(Number), newest: { text: expect.any(String) } });
     } finally {
       stop();
     }

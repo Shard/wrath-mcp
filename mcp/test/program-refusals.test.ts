@@ -105,7 +105,7 @@ describe("a refusal is fresh once in the sandbox's life", () => {
     rt.noteRefusal(run(2), hint("out_of_range"));
     expect(refusals(events).length).toBe(1);
     // One counted before the load and one after: the load drops neither.
-    expect(rt.beat().repeats).toEqual([{ signature: "walk||castSpell|out_of_range", count: 2, ts: expect.any(Number) }]);
+    expect(rt.beat().repeats).toEqual([{ signature: "walk||castSpell|out_of_range", count: 2, ts: expect.any(Number), newest: { text: "a out_of_range hint" } }]);
   });
 
   test("a run of the replaced deploy, unwinding after the reload, mints nothing fresh; the new deploy's own first one is", async () => {
@@ -114,7 +114,7 @@ describe("a refusal is fresh once in the sandbox's life", () => {
     await rt.load(2, 0);
     rt.noteRefusal(run(1, true), hint("not_ready"));
     expect(refusals(events)).toEqual([]);
-    expect(rt.beat().repeats).toEqual([{ signature: "walk||castSpell|not_ready", count: 1, ts: expect.any(Number) }]);
+    expect(rt.beat().repeats).toEqual([{ signature: "walk||castSpell|not_ready", count: 1, ts: expect.any(Number), newest: { text: "a not_ready hint" } }]);
     rt.noteRefusal(run(2), hint("not_ready"));
     expect(refusals(events)).toMatchObject([{ signature: "walk||castSpell|not_ready", deploy: 2, fresh: true }]);
   });
@@ -136,5 +136,34 @@ describe("a refusal is fresh once in the sandbox's life", () => {
     await rt.load(2, 0);
     rt.noteError(run(2), new TypeError("x is undefined"));
     expect(events.filter((e) => e.kind === "error").length).toBe(2);
+  });
+});
+
+describe("a repeat carries its newest occurrence", () => {
+  test("a refusal's repeats name the newest hint, not the fresh one's", async () => {
+    const { rt, events } = runtime();
+    await rt.load(1, 0);
+    const at = (text: string, ts: number) => ({ action: "moveTo", status: "path_incomplete", hint: text, count: 1, ts });
+    rt.noteRefusal(run(1), at("ends at (1, 1)", 1_000));
+    rt.noteRefusal(run(1), at("ends at (2, 2)", 2_000));
+    rt.noteRefusal(run(1), at("ends at (3, 3)", 3_000));
+    expect(refusals(events)).toMatchObject([{ hint: "ends at (1, 1)" }]);
+    expect(rt.beat().repeats).toEqual([{ signature: "walk||moveTo|path_incomplete", count: 2, ts: 3_000, newest: { text: "ends at (3, 3)" } }]);
+  });
+
+  test("an error's repeats name the newest text", async () => {
+    const { rt } = runtime();
+    await rt.load(1, 0);
+    // One place in the code, two messages: the same signature.
+    const fail = (m: string): TypeError => {
+      const e = new TypeError(m);
+      e.stack = `TypeError: ${m}\n    at walk (/x/main.ts:3:1)`;
+      return e;
+    };
+    rt.noteError(run(1), fail("first"));
+    rt.noteError(run(1), fail("second"));
+    rt.noteError(run(1), fail("third"));
+    const [r] = rt.beat().repeats;
+    expect(r).toMatchObject({ count: 2, newest: { text: expect.stringContaining("third") } });
   });
 });
