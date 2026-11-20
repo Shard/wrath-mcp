@@ -373,6 +373,70 @@ describe("reclaimCorpse: a reclaim beside creatures says who stands there", () =
     push(stub, values(41, SELF_GUID, { health: 50, playerFlags: 0 }));
     const r = await pending;
     expect(r).toMatchObject({ ok: true, status: "reclaimed", note: "you came back with Defias Worker ×2, Defias Watchman within 20y of your corpse" });
+    // No creature's faction rows were served, so whether any is hostile is not said either way.
+    expect(r).not.toHaveProperty("corpseHostiles");
+    client.close();
+    await stub.stop();
+  });
+
+  // Invented FactionTemplate rows: ours (group 2), a camp that is the enemy of
+  // group 2, and a critter with no relation to anyone.
+  const row = (template: number, group: number, friendGroup: number, enemyGroup: number) => ({
+    faction: template,
+    factionRow: template,
+    factionRowFaction: template + 1,
+    factionRowGroup: group,
+    factionRowFriendGroup: friendGroup,
+    factionRowEnemyGroup: enemyGroup,
+  });
+  const OURS = row(900, 1 | 2, 2, 4 | 8);
+  const CAMP = row(910, 8, 0, 1 | 2);
+  const CRITTER = row(920, 0, 0, 0);
+
+  test("the result names the hostiles round the corpse as they stood before the reclaim, with their levels", async () => {
+    const stub = startStub({
+      onConnect: () =>
+        world([
+          ghost(20),
+          values(21, SELF_GUID, OURS),
+          corpseAt(22, -1234.5, 987.25, 42.125),
+          ...creature(23, "1001", 501, "Defias Worker", -1236, 989, CAMP),
+          ...creature(25, "1002", 501, "Defias Worker", -1231, 985, CAMP),
+          ...creature(27, "1003", 504, "Field Hare", -1235, 986, { ...CRITTER, level: 1 }),
+          ...creature(29, "1004", 503, "Far Wolf", -1294.5, 987.25, CAMP),
+        ]),
+    });
+    const client = await inWorld(stub);
+    await folded(client, "SMSG_CREATURE_QUERY_RESPONSE", 30);
+    const pending = client.reclaimCorpse(undefined, { timeout: 2000 });
+    await untilAction(stub, "reclaim_corpse");
+    push(stub, frame(40, "SMSG_DEATH_RELEASE_LOC", { map: -1, x: 0, y: 0, z: 0 }));
+    push(stub, values(41, SELF_GUID, { health: 50, playerFlags: 0 }));
+    const r = await pending;
+    expect(r).toMatchObject({
+      ok: true,
+      status: "reclaimed",
+      note: "you came back with Defias Worker ×2, Field Hare within 20y of your corpse",
+      corpseHostiles: "hostile within 20y of your corpse: Defias Worker L18 ×2",
+    });
+    client.close();
+    await stub.stop();
+  });
+
+  test("beside nothing hostile, inside the reclaim radius, a refused reclaim says there is none", async () => {
+    const stub = startStub({
+      onConnect: () =>
+        world([
+          ghost(20),
+          values(21, SELF_GUID, OURS),
+          corpseAt(22, -1234.5, 987.25, 42.125),
+          ...creature(23, "1003", 504, "Field Hare", -1235, 986, { ...CRITTER, level: 1 }),
+        ]),
+    });
+    const client = await inWorld(stub);
+    await folded(client, "SMSG_CREATURE_QUERY_RESPONSE", 24);
+    const r = await client.reclaimCorpse(undefined, { timeout: 300, attemptTimeout: 100 });
+    expect(r).toMatchObject({ ok: false, status: "not_reclaimed", corpseHostiles: "no hostile in view within 20y of your corpse" });
     client.close();
     await stub.stop();
   });

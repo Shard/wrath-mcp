@@ -4434,10 +4434,19 @@ export type ReclaimCorpseResult =
       /**
        * The living creatures in view within `RECLAIM_CROWD_YARDS` of the
        * corpse when you came back, by name and count — present only when
-       * there are any. A fact about what stands there; whether any is
-       * hostile is not observed.
+       * there are any, whatever their reaction; `corpseHostiles` names the
+       * hostile ones as they stood before the reclaim.
        */
       readonly note?: string;
+      /**
+       * The hostile creatures in view round the corpse when the call was
+       * made, before any reclaim went out, as one line:
+       * `"hostile within 20y of your corpse: Frostmane Shadowcaster L7 ×2"`,
+       * or `"no hostile in view within 20y of your corpse"` from inside the
+       * reclaim radius once every creature there has a reaction served.
+       * Absent when neither can be said (`corpseHostiles`).
+       */
+      readonly corpseHostiles?: string;
     }
   | {
       readonly ok: false;
@@ -4462,6 +4471,15 @@ export type ReclaimCorpseResult =
       readonly secondsLeft?: number;
       /** Where the corpse is, when known (`state.self.corpse`). */
       readonly corpse?: CorpseLocation;
+      /**
+       * The hostile creatures in view round the corpse when the call was
+       * made, before any reclaim went out, as one line:
+       * `"hostile within 20y of your corpse: Frostmane Shadowcaster L7 ×2"`,
+       * or `"no hostile in view within 20y of your corpse"` from inside the
+       * reclaim radius once every creature there has a reaction served.
+       * Absent when neither can be said (`corpseHostiles`).
+       */
+      readonly corpseHostiles?: string;
       readonly hint: string;
     };
 
@@ -4765,6 +4783,52 @@ function creaturesNear(
     .map(([name, n]) => (n === 1 ? name : `${name} ×${n}`))
     .join(", ");
 }
+
+/**
+ * "hostile within 20y of your corpse: Frostmane Shadowcaster L7 ×2, Rockjaw
+ * Raider L6": the living creatures in view whose `reaction` is hostile (the
+ * client's red name) within `RECLAIM_CROWD_YARDS` of the corpse, by name and
+ * level, most first, at most `CORPSE_HOSTILE_NAMES` named and the rest
+ * counted. A ghost is sent the units within sight of its corpse while it is
+ * within sight of it, so "no hostile in view within 20y of your corpse" is
+ * said only from inside the reclaim radius, and only when every living
+ * creature that could be there has a reaction and a position served;
+ * otherwise an empty list is undefined. Undefined too for a corpse on
+ * another map, or inside a dungeon asked about from outside it.
+ */
+function corpseHostiles(state: StateCache, corpse: CorpseLocation): string | undefined {
+  const here = state.self.position?.value;
+  if (here === undefined || here.map !== corpse.map) return undefined;
+  if (corpse.instanceMap !== undefined && here.map !== corpse.instanceMap) return undefined;
+  const counts = new Map<string, number>();
+  let unknown = false;
+  for (const u of state.units()) {
+    if (u.type !== "unit" || u.dead === true) continue;
+    if (u.x === undefined || u.y === undefined) {
+      unknown = true;
+      continue;
+    }
+    if (Math.hypot(u.x - corpse.x, u.y - corpse.y) > RECLAIM_CROWD_YARDS) continue;
+    if (u.reaction !== "hostile") {
+      if (u.reaction === undefined) unknown = true;
+      continue;
+    }
+    const name = u.name ?? `creature ${u.entry ?? u.guid}`;
+    const label = u.level === undefined ? name : `${name} L${u.level}`;
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  if (counts.size === 0) {
+    const near = !unknown && Math.hypot(here.x - corpse.x, here.y - corpse.y) <= CORPSE_RECLAIM_RADIUS;
+    return near ? `no hostile in view within ${RECLAIM_CROWD_YARDS}y of your corpse` : undefined;
+  }
+  const named = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  const shown = named.slice(0, CORPSE_HOSTILE_NAMES).map(([label, n]) => (n === 1 ? label : `${label} ×${n}`));
+  const rest = named.slice(CORPSE_HOSTILE_NAMES).reduce((sum, [, n]) => sum + n, 0);
+  return `hostile within ${RECLAIM_CROWD_YARDS}y of your corpse: ${shown.join(", ")}${rest > 0 ? ` +${rest} more` : ""}`;
+}
+
+/** How many distinct hostiles `corpseHostiles` names before it counts the rest. */
+const CORPSE_HOSTILE_NAMES = 4;
 
 /** How far own position may change in one observation before it reads as being moved rather than walking. */
 const OWN_JUMP_YARDS = 50;
@@ -7062,6 +7126,10 @@ export class WrathClient {
     // core's `corpse->IsInMap(_player)` drops every reclaim from another map.
     const corpseAt = this.state.self.corpse?.value;
     const here = this.state.self.position?.value;
+    // What stands round the corpse now, before anything is sent: a routine
+    // that reclaims and fights on at once reads it off whatever it is told.
+    const hostileWords = corpseAt === undefined ? undefined : corpseHostiles(this.state, corpseAt);
+    const hostiles = hostileWords === undefined ? {} : { corpseHostiles: hostileWords };
     if (
       (corpseAt?.instanceMap !== undefined && here?.map !== corpseAt.instanceMap) ||
       (corpseAt !== undefined &&
@@ -7069,7 +7137,7 @@ export class WrathClient {
         corpseAt.map === here.map &&
         distance3d(here, corpseAt) > CORPSE_RECLAIM_RADIUS + CORPSE_RECLAIM_SLACK)
     ) {
-      return { ok: false, status: "not_reclaimed", ...facts(0), ...this.reclaimRefusal(0, options) };
+      return { ok: false, status: "not_reclaimed", ...facts(0), ...this.reclaimRefusal(0, options), ...hostiles };
     }
 
     // The resurrect is announced by SMSG_DEATH_RELEASE_LOC clearing the marker
@@ -7147,6 +7215,7 @@ export class WrathClient {
         ...(crowd === undefined
           ? {}
           : { note: `you came back with ${crowd} within ${RECLAIM_CROWD_YARDS}y of your corpse` }),
+        ...hostiles,
       };
     }
     const after = health();
@@ -7159,9 +7228,10 @@ export class WrathClient {
         hint:
           `${attempts} reclaim${attempts === 1 ? "" : "s"} went out and nothing was observed either way — ` +
           "your own health has not been seen at all, so re-read state.self.health before trying again",
+        ...hostiles,
       };
     }
-    return { ok: false, status: "not_reclaimed", ...facts(attempts), ...this.reclaimRefusal(attempts, options) };
+    return { ok: false, status: "not_reclaimed", ...facts(attempts), ...this.reclaimRefusal(attempts, options), ...hostiles };
   }
 
   /**
