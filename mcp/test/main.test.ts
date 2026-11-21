@@ -107,6 +107,12 @@ describe("the session record's options", () => {
     for (const bad of ["0", "-1", "soon"]) expect(() => recordOption(["--record-retention-days", bad], "/x/y")).toThrow();
   });
 
+  test("a store named with --record-dir is kept unless a window is given; the default one beside an explicit --dir is not", () => {
+    expect(recordOption(["--record-dir", "/srv/sessions"], "/x/y")).toEqual({ root: "/srv/sessions", retentionMs: null });
+    expect(recordOption(["--record-retention-days", "2"], "/x/y")).toEqual({ root: "/x/sessions", retentionMs: 2 * 24 * 60 * 60_000 });
+    expect(recordOption(["--dir", "/home/pat/wrath/state"], "/home/pat/wrath/state")).toEqual({ root: "/home/pat/wrath/sessions", retentionMs: DEFAULT_RETENTION_MS });
+  });
+
   test("the module's identity is read from /health, and a module that does not answer is null", async () => {
     const seen: string[] = [];
     const ok = (async (url: URL | string) => {

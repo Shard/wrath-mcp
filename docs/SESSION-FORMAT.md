@@ -393,7 +393,8 @@ A store prunes whole sessions, by unlinking, and only closed ones: a session
 whose `ended` is older than the retention window, or one whose writer died
 and whose heartbeat (`live.json` `ts`, else `opened`) is older than it. A
 session someone is writing is never pruned. A session directory inside a
-harness's run is the harness's to keep.
+harness's run is the harness's to keep, and so is a store its user named
+(`mcp/README.md`, "The session record"), unless they gave it a window.
 
 ## Versioning
 

@@ -144,8 +144,11 @@ export interface HostOptions {
   /** Fan-out above 1, or null for the single-character host. */
   grant: FanoutGrant | null;
   program: boolean;
-  /** Where the sessions are recorded and for how long, or null to record nothing. */
-  record: { root: string; retentionMs: number } | null;
+  /**
+   * Where the sessions are recorded and for how long, or null to record
+   * nothing. `retentionMs` null keeps every session: nothing is pruned.
+   */
+  record: { root: string; retentionMs: number | null } | null;
   /** `session.json`'s `owner` on every record this host writes. */
   owner?: string | undefined;
   /** How leases are taken and given back; absent, with the port secret in the environment. */
@@ -226,8 +229,10 @@ async function openSingleHost(o: HostOptions): Promise<OpenedHost> {
   if (o.record !== null) {
     const store = new SessionStore(o.record.root);
     const id = tokenFingerprint(token);
-    const pruned = pruneSessions(store, o.record.retentionMs, { except: id });
-    if (pruned.length > 0) o.log(`removed ${pruned.length} session record(s) past retention from ${o.record.root}`);
+    if (o.record.retentionMs !== null) {
+      const pruned = pruneSessions(store, o.record.retentionMs, { except: id });
+      if (pruned.length > 0) o.log(`removed ${pruned.length} session record(s) past retention from ${o.record.root}`);
+    }
     record = new SessionWriter({ dir: store.sessionDir(id), id, stack: { version: MCP_PACKAGE_VERSION }, own: ownGuidIndex(() => store.dirs()), scrub: (text) => secrets.scrub(text), token, ...(o.owner !== undefined ? { owner: o.owner } : {}) });
     record.open();
     const writer = record;
@@ -316,7 +321,7 @@ async function openFanoutHost(o: HostOptions, grant: FanoutGrant): Promise<Opene
   const known = readRoster(rosterPath);
 
   const store = o.record !== null ? new SessionStore(o.record.root) : null;
-  if (store !== null && o.record !== null) {
+  if (store !== null && o.record !== null && o.record.retentionMs !== null) {
     const pruned = pruneSessions(store, o.record.retentionMs);
     if (pruned.length > 0) o.log(`removed ${pruned.length} session record(s) past retention from ${o.record.root}`);
   }

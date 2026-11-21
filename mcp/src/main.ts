@@ -24,8 +24,10 @@
  * The session is recorded by default (`docs/SESSION-FORMAT.md`): its trace,
  * events, tool calls and a live ring of nearby units go to
  * `<record-dir>/<fingerprint>/`, where `--record-dir` defaults to a `sessions`
- * directory beside the state directory. Sessions that closed more than
- * `--record-retention-days` ago (default 3) are removed at start; `--no-record`
+ * directory beside the state directory. In that default store, sessions that
+ * closed more than `--record-retention-days` ago (default 3) are removed at
+ * start; a store named with `--record-dir` is the user's to keep, and is
+ * pruned only when `--record-retention-days` is given too. `--no-record`
  * records nothing.
  *
  * `--max-characters <n>` above 1 is fan-out, the operator's grant as
@@ -153,22 +155,25 @@ export function resolveSession(o: { token?: string; tokenFile?: string; dir?: st
 /**
  * Where the session is recorded and for how long, from argv: null with
  * `--no-record`. The store is `--record-dir`, else `sessions` beside the
- * state directory; retention is `--record-retention-days`, else three days.
+ * state directory. Retention is `--record-retention-days`; without it, three
+ * days for the default store and none (null: nothing is pruned) for one named
+ * with `--record-dir`, which may be the only copy its user keeps.
  */
-export function recordOption(argv: readonly string[], stateDir: string): { root: string; retentionMs: number } | null {
+export function recordOption(argv: readonly string[], stateDir: string): { root: string; retentionMs: number | null } | null {
   if (argv.includes("--no-record")) return null;
   const flag = (name: string): string | undefined => {
     const i = argv.indexOf(`--${name}`);
     return i >= 0 ? argv[i + 1] : undefined;
   };
   const days = flag("record-retention-days");
-  let retentionMs = DEFAULT_RETENTION_MS;
+  const root = flag("record-dir");
+  let retentionMs: number | null = root === undefined ? DEFAULT_RETENTION_MS : null;
   if (days !== undefined) {
     const n = Number(days);
     if (!Number.isFinite(n) || n <= 0) throw new Error("--record-retention-days must be a number of days above 0");
     retentionMs = n * 24 * 60 * 60_000;
   }
-  return { root: flag("record-dir") ?? join(dirname(stateDir), "sessions"), retentionMs };
+  return { root: root ?? join(dirname(stateDir), "sessions"), retentionMs };
 }
 
 async function main(): Promise<void> {
