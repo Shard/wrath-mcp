@@ -99,9 +99,9 @@ after three days. A directory you name is kept until you delete it
 ("The session record").
 
 To check it, `claude mcp list` should show `wrath` connected, as should
-`/mcp` inside a session. Each start of the server leases and opens a session
-record, a check like these included, so expect short empty sessions in the
-store. Its stderr (in Claude Code, `claude --debug`) names the session, its
+`/mcp` inside a session. Every start of the server, each new client session
+and `claude mcp list` included, leases and opens a session record, so expect
+short empty sessions in the store. Its stderr (in Claude Code, `claude --debug`) names the session, its
 state directory and where it is recorded. Each start is a new session with a
 fresh state directory and scratchpad unless `--dir` names one, and two
 clients must not share one `--dir`.
