@@ -144,7 +144,7 @@ connects, creates or reuses a character, says a line, reads the echo off the
 event stream and checks the state cache against it:
 
 ```bash
-MODULE_HOST=127.0.0.1 MODULE_PORT=8086 \
+WRATHBENCH_MODULE_URL=http://127.0.0.1:8086 \
 WRATHBENCH_MODULE_SECRET=<the port secret> \
   bun sdk/examples/live-slice.ts
 ```
@@ -152,22 +152,12 @@ WRATHBENCH_MODULE_SECRET=<the port secret> \
 It uses the module's default account (`WrathBench.Account`). `live-move.ts`
 does the same for movement.
 
-Then serve the core tools to an MCP-capable agent:
-
-```bash
-WRATHBENCH_MODULE_URL=http://127.0.0.1:8086 \
-WRATHBENCH_MODULE_SECRET=<the port secret> \
-  bun mcp/src/main.ts --account <an allowed account>
-```
-
-It speaks MCP over stdio, so the agent launches it as its server command. It
-leases a session secret with the port secret and hands the sandbox only that,
-and when it exits cleanly it logs the character out and releases the lease.
-The session is recorded by default, into a `sessions` directory beside its
-state directory (`--record-dir`, `--no-record`).
-The sandbox needs Linux 6.7 or later (Landlock with TCP rules) and refuses to
-start without it. `mcp/README.md` has the options; `sdk/README.md` covers
-using the SDK directly.
+Then serve the core tools to an MCP-capable agent. `bun mcp/src/main.ts`
+speaks MCP over stdio, so the agent's client launches it as a server
+command; `mcp/README.md`, "Connect an MCP client", has the `claude mcp add`
+line, a generic client config, where the sessions are recorded and what to
+know first (it holds the port secret, runs beside the worldserver, and needs
+Linux 6.7 or later). `sdk/README.md` covers using the SDK directly.
 
 ## Development
 

@@ -77,7 +77,7 @@ bunx tsc --noEmit -p sdk     # strict typecheck of src, test and examples
 # live checks against a worldserver running the module; not part of bun test.
 # Both send WRATHBENCH_MODULE_SECRET, the port secret, as the bearer
 # credential — without it the module answers 401 unauthorized.
-export MODULE_HOST=127.0.0.1 MODULE_PORT=8086 WRATHBENCH_MODULE_SECRET=<the port secret>
+export WRATHBENCH_MODULE_URL=http://127.0.0.1:8086 WRATHBENCH_MODULE_SECRET=<the port secret>
 bun sdk/examples/live-slice.ts
 bun sdk/examples/live-move.ts
 ```
