@@ -70,7 +70,10 @@ And it should know up front:
 - **It runs on the worldserver's host.** The module listens on
   `127.0.0.1:8086` by default. Reaching it from another machine means
   setting `WrathBench.BindAddress` and keeping the port on a private
-  network: it is plain HTTP.
+  network: it is plain HTTP. A worldserver in a container is another
+  machine in this sense. Bind the module to `0.0.0.0` inside the container
+  and publish the port on the host's loopback only
+  (`127.0.0.1:8086:8086`).
 - **Linux 6.7 or later.** The sandbox needs Landlock with TCP rules and
   refuses to start without it, so the server does not run on macOS or
   Windows.
@@ -139,7 +142,12 @@ for example as a first prompt:
 > world.
 
 `race` and `class` are the game's numeric ids, needed only to create a new
-character; an existing one on the account is reused by name.
+character; an existing one on the account is reused by name. The races are
+1 Human, 2 Orc, 3 Dwarf, 4 Night Elf, 5 Undead, 6 Tauren, 7 Gnome, 8 Troll,
+10 Blood Elf and 11 Draenei. The classes are 1 Warrior, 2 Paladin, 3 Hunter,
+4 Rogue, 5 Priest, 6 Death Knight, 7 Shaman, 8 Mage, 9 Warlock and 11 Druid.
+Not every pair is legal, and a create that names an illegal pair is refused
+(`invalid_race_class`).
 
 ## The session record
 
