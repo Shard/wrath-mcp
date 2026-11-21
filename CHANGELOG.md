@@ -54,6 +54,13 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   whatever the bind, since a proxy on the same machine brings every visitor
   in from loopback. Give it grants or a secret, or `--allow-anonymous` to
   serve every tenant's sessions to whoever reaches the port.
+- **The SDK's live examples read `WRATHBENCH_MODULE_URL`,** as the MCP
+  server does, where they read `MODULE_HOST` and `MODULE_PORT`; the default
+  is `http://127.0.0.1:8086`, where it was `worldserver:8086`. Set
+  `WRATHBENCH_MODULE_URL` to run them against a module anywhere else.
+- **A store named with `--record-dir` is no longer pruned** by `main.ts`
+  unless `--record-retention-days` is given as well; only the default store
+  is pruned after three days. Pass the flag to keep the old behaviour.
 
 ### Added
 
@@ -468,8 +475,9 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
   tick; `ToolSet.call` writes every tool call and result through
   `CoreToolContext.record`. `bun mcp/src/main.ts` records by default into
   `--record-dir` (a `sessions` directory beside the state directory), prunes
-  sessions closed more than `--record-retention-days` ago (default 3), and
-  `--no-record` turns it off. Players who are not sessions of the same
+  sessions closed more than `--record-retention-days` ago (default 3) from
+  that default store, keeps a store named with `--record-dir` unless
+  `--record-retention-days` is given too, and `--no-record` turns it off. Players who are not sessions of the same
   deployment are never written (`mcp/src/record/gate.ts`), and free text is
   scrubbed of their guids and names, best-effort. New entry point
   `@wrathbench/mcp/record`.

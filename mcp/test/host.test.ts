@@ -10,7 +10,7 @@
  */
 
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FANOUT_TOOL_ORDER, fanoutTools, PLAIN_FANOUT_RENDER, type FanoutToolContext } from "../src/fanout";
@@ -18,6 +18,7 @@ import { hostToolDefs, hostToolSpecs, openHost, PLAIN_RENDER, type OpenedHost } 
 import { coreTools, programTools, ToolSet, type CoreToolRender, type ProgramToolContext } from "../src/tools";
 import { startStubModule, STUB_PORT_SECRET, type StubModule } from "./fixtures/stub-module";
 import { portSecretLeaser, type Leaser } from "../src/module-auth";
+import { SESSION_FILE, type SessionFile } from "../src/record/format";
 
 const shape = (specs: readonly { def: unknown; help?: string; aliases?: unknown }[]) => specs.map((s) => ({ def: s.def, help: s.help, aliases: s.aliases ?? null }));
 
@@ -184,6 +185,36 @@ describe("the single-character host's shutdown", () => {
     await host.shutdown({ logout: false });
     expect(seen).toEqual(["lease tok-abc", "stop"]);
     expect(JSON.parse(readFileSync(join(host.recordedIn!, "session.json"), "utf8")).ended).toBeNumber();
+  });
+});
+
+describe("the single-character host's retention", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  /** A store holding one session that closed a year ago, and a host opened over it with `retentionMs`. */
+  async function overOldSession(retentionMs: number | null): Promise<{ old: string; host: OpenedHost }> {
+    const dir = mkdtempSync(join(tmpdir(), "wrathbench-mcp-host-"));
+    dirs.push(dir);
+    const root = join(dir, "sessions");
+    const old = join(root, "aaaaaaaaaaaaaaaa");
+    mkdirSync(old, { recursive: true });
+    const yearAgo = Date.now() - 365 * 86_400_000;
+    const s: SessionFile = { format: "wrath-session/1", id: "aaaaaaaaaaaaaaaa", character: null, stack: { version: "t" }, module: null, started: yearAgo, opened: yearAgo, ended: yearAgo };
+    writeFileSync(join(old, SESSION_FILE), JSON.stringify(s));
+    const host = await openHost({ moduleUrl: "http://module:8086", dir: join(dir, "state"), token: "tok-abc", account: "ACCA", grant: null, program: false, record: { root, retentionMs }, module: null, leaser: recordingLeaser([]), log: () => {}, logSink: () => {} });
+    return { old, host };
+  }
+
+  test("a window prunes a session closed past it; null, a store named by its user, keeps it", async () => {
+    const pruned = await overOldSession(3_600_000);
+    expect(existsSync(pruned.old)).toBe(false);
+    await pruned.host.shutdown({ logout: false });
+    const kept = await overOldSession(null);
+    expect(existsSync(kept.old)).toBe(true);
+    await kept.host.shutdown({ logout: false });
   });
 });
 

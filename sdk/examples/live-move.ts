@@ -14,19 +14,17 @@
  * Not part of `bun test`: it needs a booted worldserver running the module.
  * Point it at the module's port and pass the port secret:
  *
- *   MODULE_HOST=127.0.0.1 MODULE_PORT=8086 \
+ *   WRATHBENCH_MODULE_URL=http://127.0.0.1:8086 \
  *   WRATHBENCH_MODULE_SECRET=<the port secret> bun sdk/examples/live-move.ts
  *
- * MODULE_HOST / MODULE_PORT default to worldserver:8086, a container
- * network's service name for the worldserver.
+ * WRATHBENCH_MODULE_URL defaults to http://127.0.0.1:8086, the module's own
+ * default bind, as it does for the MCP server.
  */
 
 import { randomBytes } from "node:crypto";
 import { connect, WrathRequestError, type NearbyObject, type WrathClient } from "../src/index";
 
-const HOST = process.env.MODULE_HOST ?? "worldserver";
-const PORT = process.env.MODULE_PORT ?? "8086";
-const BASE = `http://${HOST}:${PORT}`;
+const BASE = process.env.WRATHBENCH_MODULE_URL ?? "http://127.0.0.1:8086";
 // Random hex, not a timestamp: session tokens under 32 chars are rejected with
 // `weak_token`, and a per-session token must be unique anyway.
 const TOKEN = `sdk-move-${randomBytes(16).toString("hex")}`;

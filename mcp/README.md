@@ -47,6 +47,100 @@ rules — on x86-64 or arm64, and refuses to start without it; what it confines
 and what it leaves to the deployment's network policy is
 `docs/ARCHITECTURE.md` ("The sandbox").
 
+## Connect an MCP client
+
+Any MCP client that launches a stdio server can drive a character. Before
+connecting, a newcomer needs:
+
+- This repository checked out, with `bun install --frozen-lockfile` run at
+  its root, and Bun 1.4 (`.bun-version`).
+- A worldserver with the module built in and enabled, and its port secret
+  (root `README.md`, "Building the module into a worldserver").
+- A player account in `WrathBench.Accounts`. The module holds one live
+  session per account, so give each client its own: a second client on the
+  same account takes the character from the first.
+
+And it should know up front:
+
+- **The server holds the operator's key.** `WRATHBENCH_MODULE_SECRET` is the
+  module's port secret, which can lease any allowed account; stdio mode has
+  no lesser credential. The sandbox only ever gets a per-session secret
+  leased with it. To give someone else access without that key, run the
+  hosted gateway (below) and give them a grant.
+- **It runs on the worldserver's host.** The module listens on
+  `127.0.0.1:8086` by default. Reaching it from another machine means
+  setting `WrathBench.BindAddress` and keeping the port on a private
+  network: it is plain HTTP.
+- **Linux 6.7 or later.** The sandbox needs Landlock with TCP rules and
+  refuses to start without it, so the server does not run on macOS or
+  Windows.
+
+### Claude Code
+
+```bash
+claude mcp add wrath \
+  -e WRATHBENCH_MODULE_URL=http://127.0.0.1:8086 \
+  -e WRATHBENCH_MODULE_SECRET=<the module's port secret> \
+  -- "$(command -v bun)" /abs/path/to/wrath-mcp/mcp/src/main.ts \
+     --account <ACCOUNT> --record-dir /abs/path/to/wrath-sessions
+```
+
+The server's name comes before the `-e` flags and `--` separates them from the
+command. Use absolute paths: the client starts the server from its own
+working directory, maybe without your shell's `PATH`. `-e` stores the secret
+in plain text in the client's config (`~/.claude.json` at the default
+`local` scope), so do not use `--scope project` with a literal secret; a
+project's `.mcp.json` can say `"${WRATHBENCH_MODULE_SECRET}"` and take it
+from the environment instead.
+
+`--record-dir` matters. Without it the sessions go to
+`$TMPDIR/wrathbench-mcp/sessions/`, which a reboot may clear, and are pruned
+after three days. A directory you name is kept until you delete it
+("The session record").
+
+To check it, `claude mcp list` should show `wrath` connected, as should
+`/mcp` inside a session. Every start of the server, each new client session
+and `claude mcp list` included, leases and opens a session record, so expect
+short empty sessions in the store. Its stderr (in Claude Code, `claude --debug`) names the session, its
+state directory and where it is recorded. Each start is a new session with a
+fresh state directory and scratchpad unless `--dir` names one, and two
+clients must not share one `--dir`.
+
+### Any other stdio client
+
+The same server as an `mcpServers` entry:
+
+```json
+{
+  "mcpServers": {
+    "wrath": {
+      "command": "/abs/path/to/bun",
+      "args": ["/abs/path/to/wrath-mcp/mcp/src/main.ts", "--account", "<ACCOUNT>", "--record-dir", "/abs/path/to/wrath-sessions"],
+      "env": {
+        "WRATHBENCH_MODULE_URL": "http://127.0.0.1:8086",
+        "WRATHBENCH_MODULE_SECRET": "<the module's port secret>"
+      }
+    }
+  }
+}
+```
+
+### What the agent reads first
+
+The server announces nothing beyond its tools. The SDK reference, `sdk/API.md`,
+is how an agent learns the world, and a snippet reaches it at `API_MD_PATH`.
+It is larger than one tool result, so tell the agent to read it in slices,
+for example as a first prompt:
+
+> Use run_snippet. First read the SDK reference in parts: list its headings
+> with `(await Bun.file(API_MD_PATH).text()).split("\n").filter((l) => l.startsWith("## "))`,
+> then read each section you need. Then `await connect()` and
+> `await sdk.createSession({ character: "<Name>", race, class })` to enter the
+> world.
+
+`race` and `class` are the game's numeric ids, needed only to create a new
+character; an existing one on the account is reused by name.
+
 ## The session record
 
 Every session is recorded unless `--no-record` says otherwise, in the format
@@ -70,8 +164,13 @@ Every session is recorded unless `--no-record` says otherwise, in the format
   in view, removed when the session closes. A closed segment is compressed
   with zstd, and the one being written stays plain so it can be followed.
 - Players who are not sessions of the same store are never written.
-- At start, sessions that closed more than `--record-retention-days` ago
-  (default 3) are removed. One still being written never is.
+- At start, the default store drops sessions that closed more than
+  `--record-retention-days` ago (default 3). A store named with
+  `--record-dir` is its user's to keep and is pruned only when
+  `--record-retention-days` is given as well. A session still being written
+  is never removed.
+- Session directories are created mode 0700, so whatever reads the store
+  (wrath-inspector, a harness's viewer) runs as the same user.
 
 `mcp/src/record/` is the code: the writer a host holds, the reader, the store
 and `validateSession(dir)`, which says what a directory holds that the format
