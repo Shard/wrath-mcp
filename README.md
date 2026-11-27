@@ -152,12 +152,9 @@ WRATHBENCH_MODULE_SECRET=<the port secret> \
 It uses the module's default account (`WrathBench.Account`). `live-move.ts`
 does the same for movement.
 
-Then serve the core tools to an MCP-capable agent. `bun mcp/src/main.ts`
-speaks MCP over stdio, so the agent's client launches it as a server
-command; `mcp/README.md`, "Connect an MCP client", has the `claude mcp add`
-line, a generic client config, where the sessions are recorded and what to
-know first (it holds the port secret, runs beside the worldserver, and needs
-Linux 6.7 or later). `sdk/README.md` covers using the SDK directly.
+Then connect an agent. `bun mcp/src/main.ts` is an MCP server over stdio
+that the agent's client launches; `mcp/README.md`, "Connect an MCP client",
+is the walkthrough. `sdk/README.md` covers using the SDK directly.
 
 ## Development
 

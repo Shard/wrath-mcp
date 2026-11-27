@@ -21,13 +21,16 @@ repo root:
 ```bash
 WRATHBENCH_MODULE_URL=http://127.0.0.1:8086 \
 WRATHBENCH_MODULE_SECRET=<the module's port secret> \
-  bun mcp/src/main.ts --account <an allowed account> [--dir <state-dir>] [--token-file <path> | --token <t>] [--allow-gm] \
+  bun mcp/src/main.ts [--account <name>] [--dir <state-dir>] [--token-file <path> | --token <t>] [--allow-gm] \
     [--record-dir <store> | --no-record] [--record-retention-days <n>] \
-    [--max-characters <n> --accounts <a,b,…>]
+    [--max-characters <n> --accounts <a,b,…>] [--program]
 ```
 
-That is an MCP server over stdio serving the core tools: point an MCP-capable
-agent at it as its server command. It leases a session secret for its token
+That is an MCP server over stdio serving the core tools; "Connect an MCP
+client" below is how to point an agent at it. `WRATHBENCH_MODULE_URL`
+defaults to `http://127.0.0.1:8086`. `--account` is the game account the
+character lives on; without it the module uses its default account,
+`WrathBench.Account`. It leases a session secret for its token
 with the port secret and hands the sandbox only that. The scratchpad, the
 client cache and the token itself live in the state directory, `--dir`
 (default `$TMPDIR/wrathbench-mcp/<fingerprint>`, created mode 0700, the token
@@ -49,34 +52,43 @@ and what it leaves to the deployment's network policy is
 
 ## Connect an MCP client
 
-Any MCP client that launches a stdio server can drive a character. Before
-connecting, a newcomer needs:
+This is how an agent of your own drives a character: its MCP client launches
+`bun mcp/src/main.ts` as a stdio server, on the worldserver's host or a
+machine on the same private network. Any client that launches a stdio
+server can do it.
 
-- This repository checked out, with `bun install --frozen-lockfile` run at
-  its root, and Bun 1.4 (`.bun-version`).
-- A worldserver with the module built in and enabled, and its port secret
-  (root `README.md`, "Building the module into a worldserver").
-- A player account in `WrathBench.Accounts`. The module holds one live
-  session per account, so give each client its own: a second client on the
-  same account takes the character from the first.
+### What must be running
 
-And it should know up front:
+- **A worldserver with the module built in and enabled** (root `README.md`,
+  "Building the module into a worldserver"). Its log says
+  `wrathbench: HTTP/WS listening` once the module is up.
+- **The module's URL**, as `WRATHBENCH_MODULE_URL`:
+  `http://<WrathBench.BindAddress>:<WrathBench.Port>`, by default
+  `http://127.0.0.1:8086`, loopback only. To reach it from another machine,
+  set the bind address and keep the port on a private network: it is plain
+  HTTP. A worldserver in a container is another machine in this sense: bind
+  the module to `0.0.0.0` inside the container and publish the port on the
+  host's loopback only (`127.0.0.1:8086:8086`).
+- **The port secret**, as `WRATHBENCH_MODULE_SECRET`: the module's
+  `WrathBench.Secret` (`AC_WRATH_BENCH_SECRET`). It is the operator's key,
+  which can lease any allowed account, and stdio mode has no lesser
+  credential. The server keeps it and hands the sandbox only a per-session
+  secret leased with it.
+- **This repository** checked out, with Bun 1.4 (`.bun-version`) and
+  `bun install --frozen-lockfile` run at its root.
+- **Linux 6.7 or later**, x86-64 or arm64. The sandbox needs Landlock with
+  TCP rules and refuses to start without it, so the server does not run on
+  macOS or Windows.
 
-- **The server holds the operator's key.** `WRATHBENCH_MODULE_SECRET` is the
-  module's port secret, which can lease any allowed account; stdio mode has
-  no lesser credential. The sandbox only ever gets a per-session secret
-  leased with it. To give someone else access without that key, run the
-  hosted gateway (below) and give them a grant.
-- **It runs on the worldserver's host.** The module listens on
-  `127.0.0.1:8086` by default. Reaching it from another machine means
-  setting `WrathBench.BindAddress` and keeping the port on a private
-  network: it is plain HTTP. A worldserver in a container is another
-  machine in this sense. Bind the module to `0.0.0.0` inside the container
-  and publish the port on the host's loopback only
-  (`127.0.0.1:8086:8086`).
-- **Linux 6.7 or later.** The sandbox needs Landlock with TCP rules and
-  refuses to start without it, so the server does not run on macOS or
-  Windows.
+### One account per client
+
+Each client names its own game account with `--account`: one that exists in
+the auth database, is in `WrathBench.Accounts`, and is a player account
+unless the client opts in to GM use ("GM accounts"). The module holds one
+live session per account, so a second client on the same account takes the
+character from the first. Without `--account` the module uses its default
+account, `WrathBench.Account` (`RUNNER` in the shipped conf), so two clients
+that both leave it out collide the same way.
 
 ### Claude Code
 
@@ -88,26 +100,24 @@ claude mcp add wrath \
      --account <ACCOUNT> --record-dir /abs/path/to/wrath-sessions
 ```
 
-The server's name comes before the `-e` flags and `--` separates them from the
-command. Use absolute paths: the client starts the server from its own
-working directory, maybe without your shell's `PATH`. `-e` stores the secret
-in plain text in the client's config (`~/.claude.json` at the default
-`local` scope), so do not use `--scope project` with a literal secret; a
-project's `.mcp.json` can say `"${WRATHBENCH_MODULE_SECRET}"` and take it
-from the environment instead.
+The server's name, `wrath` here, comes before the `-e` flags, and `--`
+separates them from the command. Use absolute paths: the client starts the
+server from its own working directory, maybe without your shell's `PATH`.
+`-e` stores the secret in plain text in the client's config
+(`~/.claude.json` at the default `local` scope, which is per directory), so
+do not use `--scope project` with a literal secret; a project's `.mcp.json`
+can say `"${WRATHBENCH_MODULE_SECRET}"` and take it from the environment
+instead.
 
-`--record-dir` matters. Without it the sessions go to
-`$TMPDIR/wrathbench-mcp/sessions/`, which a reboot may clear, and are pruned
-after three days. A directory you name is kept until you delete it
-("The session record").
+Headless, `claude -p` cannot stop to ask before a tool call, so in the
+default permission mode it refuses every call to the server's tools until a
+rule allows them. `--allowedTools mcp__wrath` allows every tool of the
+server registered as `wrath` (the rule is `mcp__` and the name given to
+`claude mcp add`):
 
-To check it, `claude mcp list` should show `wrath` connected, as should
-`/mcp` inside a session. Every start of the server, each new client session
-and `claude mcp list` included, leases and opens a session record, so expect
-short empty sessions in the store. Its stderr (in Claude Code, `claude --debug`) names the session, its
-state directory and where it is recorded. Each start is a new session with a
-fresh state directory and scratchpad unless `--dir` names one, and two
-clients must not share one `--dir`.
+```bash
+claude -p "<a first prompt>" --allowedTools mcp__wrath
+```
 
 ### Any other stdio client
 
@@ -127,6 +137,30 @@ The same server as an `mcpServers` entry:
   }
 }
 ```
+
+Claude Code takes the same file for one session without registering it:
+`claude --mcp-config <file>`, with `--allowedTools mcp__wrath` when headless.
+
+### Where the sessions are recorded
+
+`--record-dir` matters. Without it the sessions go to a `sessions` directory
+beside the state directory, by default `$TMPDIR/wrathbench-mcp/sessions/`,
+which a reboot may clear, and each start prunes that default store of
+sessions closed more than three days ago. A directory you name is kept until
+you delete it. wrath-inspector reads it back
+(`bun inspector/src/bin.ts --store <dir>`), and "The session record" below
+is what it holds.
+
+### Check it
+
+`claude mcp list` should show `wrath` connected, as should `/mcp` inside a
+session. Every start of the server, each new client session and
+`claude mcp list` included, leases and opens a session record, so expect
+short empty sessions in the store. Its stderr (in Claude Code,
+`claude --debug`) names the session, its state directory and where it is
+recorded. Each start is a new session with a fresh state directory and
+scratchpad unless `--dir` names one, and two clients must not share one
+`--dir`.
 
 ### What the agent reads first
 
@@ -148,6 +182,14 @@ character; an existing one on the account is reused by name. The races are
 4 Rogue, 5 Priest, 6 Death Knight, 7 Shaman, 8 Mage, 9 Warlock and 11 Druid.
 Not every pair is legal, and a create that names an illegal pair is refused
 (`invalid_race_class`).
+
+### Over HTTP instead
+
+The stdio server is the way to connect an agent of your own. The hosted
+gateway ("The hosted gateway") serves the same tools over Streamable HTTP to
+people who hold a grant and a key of their own, never the port secret. The
+stack's own worker provider serves only grants that are the operator's own;
+serving anyone else takes a deployment's own provider.
 
 ## The session record
 
@@ -249,8 +291,8 @@ refused at start) in the server's entry in the client's `mcpServers`:
 {
   "mcpServers": {
     "wrath": {
-      "command": "bun",
-      "args": ["/path/to/wrath-mcp/mcp/src/main.ts", "--account", "GMACCOUNT", "--allow-gm"],
+      "command": "/abs/path/to/bun",
+      "args": ["/abs/path/to/wrath-mcp/mcp/src/main.ts", "--account", "GMACCOUNT", "--allow-gm"],
       "env": {
         "WRATHBENCH_MODULE_URL": "http://127.0.0.1:8086",
         "WRATHBENCH_MODULE_SECRET": "<the module's port secret>"
@@ -309,7 +351,10 @@ bun run grants list
 `bun run gateway --grants <file> --state <dir> --trusted-local-workers`
 serves the tools over Streamable HTTP at `/mcp` to the people the grants
 file names (`src/hosted/gateway-main.ts`; `docs/ARCHITECTURE.md`,
-"Hosted"). `--trusted-local-workers` says every grant is the operator's own
+"Hosted"), on `127.0.0.1:8095` unless `--host` and `--port` say otherwise;
+`--grants` may instead come from `WRATH_MCP_GRANTS_FILE`. It is for serving
+other people; an agent of your own connects to the stdio server ("Connect
+an MCP client"). `--trusted-local-workers` says every grant is the operator's own
 (below); without it, or a deployment's own worker provider through
 `runGateway`, the entry does not start. `--limit-as`, `--limit-cpu` and
 `--limit-fsize` set each credential's sandbox child's resource limits
