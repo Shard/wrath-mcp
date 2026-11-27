@@ -2166,6 +2166,8 @@ function answerSeatRpc(seat: Seat, method: string, params: { limit?: number }): 
   if (method === "recent_events") return recentEvents(seat, params.limit ?? 50);
   if (method === "state_brief") return stateBrief(seat);
   if (method === "record_drain") return seat.recorder === null ? null : seat.recorder.drain();
+  // The host's last drain before it stops the child (`SandboxHost.stop`): the recorder catches up with the cache first.
+  if (method === "record_drain_final") return seat.recorder === null ? null : seat.recorder.drain({ final: true });
   if (method !== "state_summary") {
     for (const ext of seat.extensions) {
       const fn = ext.rpc?.[method];
@@ -2256,7 +2258,7 @@ async function closeSeat(name: string, logout: boolean): Promise<SeatClosed> {
   seats.delete(name);
   delete chars[name];
   flushActions();
-  const drain = seat.recorder === null ? null : seat.recorder.drain();
+  const drain = seat.recorder === null ? null : seat.recorder.drain({ final: true });
   disposeSeat(seat);
   return { drain };
 }

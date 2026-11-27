@@ -126,8 +126,19 @@ export class SessionRecorder {
     return out;
   }
 
-  /** Everything latched since the last drain. Destructive: one caller, the host's writer, owns it. */
-  drain(): RecordDrain {
+  /**
+   * Everything latched since the last drain. Destructive: one caller, the
+   * host's writer, owns it. A `final` drain, the last before the session's
+   * client goes, first compares the cache once more, so what it took in since
+   * the last poll (a move's verdict a tool call has just returned on, a
+   * sample the trace held back) is in the record rather than lost with the
+   * process; the polls' own cadence is untouched.
+   */
+  drain(o: { final?: boolean } = {}): RecordDrain {
+    if (o.final === true) {
+      this.events.poll();
+      this.trace.poll();
+    }
     const players = this.players();
     return {
       ...(players.length > 0 ? { players } : {}),
