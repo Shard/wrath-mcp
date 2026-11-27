@@ -947,16 +947,22 @@ export class SandboxHost {
    * spawns a child: with none running the writer only beats its heartbeat. A
    * host that needs what was just recorded (a harness acting on a row) awaits
    * this rather than waiting for the timer. Never throws.
+   *
+   * A `final` drain is the last before the child goes (`stop`): it is never
+   * folded into a tick already in flight, whose answer predates it, and the
+   * child's recorder catches up with its cache before it answers, so what the
+   * cache took in since the recorder's last poll is written too.
    */
-  recordDrain(): Promise<void> {
-    if (this.fanout) return this.recordDrainSeats();
+  recordDrain(o: { final?: boolean } = {}): Promise<void> {
+    if (o.final === true && this.recordDraining !== null) return this.recordDraining.then(() => this.recordDrain(o));
+    if (this.fanout) return this.recordDrainSeats(o.final === true);
     const writer = this.opts.record?.writer;
     if (writer === undefined) return Promise.resolve();
     if (this.recordDraining !== null) return this.recordDraining;
     const p = (async () => {
       let drained: RecordDrain | null = null;
       try {
-        drained = ((await this.drain("record_drain"))?.value ?? null) as RecordDrain | null;
+        drained = ((await this.drain(o.final === true ? "record_drain_final" : "record_drain"))?.value ?? null) as RecordDrain | null;
       } catch {
         // A child that cannot answer now is drained on the next tick.
         return;
@@ -970,13 +976,13 @@ export class SandboxHost {
   }
 
   /** The record tick at fan-out above 1: one ask for every seat's recorder, each drained into its own writer. */
-  private recordDrainSeats(): Promise<void> {
+  private recordDrainSeats(final: boolean): Promise<void> {
     if (this.opts.record === undefined) return Promise.resolve();
     if (this.recordDraining !== null) return this.recordDraining;
     const p = (async () => {
       let drained: Record<string, RecordDrain | null> = {};
       try {
-        drained = ((await this.drain("record_drain_all"))?.value ?? {}) as Record<string, RecordDrain | null>;
+        drained = ((await this.drain(final ? "record_drain_final_all" : "record_drain_all"))?.value ?? {}) as Record<string, RecordDrain | null>;
       } catch {
         return;
       }
@@ -1314,7 +1320,7 @@ export class SandboxHost {
     // The last of the record, while there is still a child to ask.
     if (this.recordTimer !== undefined) clearInterval(this.recordTimer);
     this.recordTimer = undefined;
-    if (this.proc !== null) await Promise.race([this.recordDrain(), new Promise((r) => setTimeout(r, this.opts.pingGraceMs))]);
+    if (this.proc !== null) await Promise.race([this.recordDrain({ final: true }), new Promise((r) => setTimeout(r, this.opts.pingGraceMs))]);
     const proc = this.proc;
     this.proc = null;
     if (proc === null) {
