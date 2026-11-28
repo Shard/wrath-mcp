@@ -165,6 +165,12 @@ export interface GroupMember {
 export interface GroupState {
   readonly inGroup: boolean;
   readonly raid: boolean;
+  /**
+   * This character's own subgroup, 0-7, as `SMSG_GROUP_LIST` states it (a
+   * member's is on the member): in a raid, the members sharing it are its
+   * party. `undefined` out of a group.
+   */
+  readonly subGroup: number | undefined;
   readonly groupGuid: GuidKey | undefined;
   readonly leaderGuid: GuidKey | undefined;
   readonly leaderName: string | undefined;
@@ -312,6 +318,7 @@ const PARTY_RESULT_TEXT: Readonly<Record<number, string>> = {
   16: "party server unavailable",
   17: "the party is busy",
   18: "ambiguous player name",
+  25: "a member is below the level a raid group requires",
 };
 
 const MAIL_RESULT_TEXT: Readonly<Record<number, string>> = {
@@ -429,8 +436,13 @@ export interface ItemText {
 
 // ---------------------------- pets, group, mail, trade result text
 
-/** The client's text for a `SMSG_PARTY_COMMAND_RESULT` code; the code itself when the SDK does not name it. */
-export function partyResultText(result: number): string {
+/**
+ * The client's text for a `SMSG_PARTY_COMMAND_RESULT` code; the code itself
+ * when the SDK does not name it. Code 14 means one thing on a raid's subgroup
+ * swap (operation 4) and another on everything else, as the client reads it.
+ */
+export function partyResultText(result: number, operation?: number): string {
+  if (operation === 4 && result === 14) return "the subgroup swap failed";
   return PARTY_RESULT_TEXT[result] ?? `party result ${result}`;
 }
 /** The client's text for a `SMSG_SEND_MAIL_RESULT` result code. */

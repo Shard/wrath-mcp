@@ -1291,6 +1291,24 @@ namespace WrathBench
         { "CMSG_GROUP_UNINVITE_GUID", CMSG_GROUP_UNINVITE_GUID },
         { "CMSG_GROUP_DISBAND", CMSG_GROUP_DISBAND },
         { "CMSG_GROUP_SET_LEADER", CMSG_GROUP_SET_LEADER },
+        // raid: the party frame's "Convert to Raid" (empty body;
+        // GroupHandler.cpp HandleGroupRaidConvertOpcode: the leader of a
+        // group of two or more that is not a dungeon finder group, every
+        // member at or above Group.Raid.LevelRestriction or it answers
+        // SMSG_PARTY_COMMAND_RESULT result 25; done, it answers result 0
+        // and every member gets the SMSG_GROUP_LIST with the raid flag). A
+        // raid map refuses a group that is not a raid
+        // (MapMgr::PlayerCannotEnter, CANNOT_ENTER_NOT_IN_RAID). Then the
+        // raid frame's drag of a member into another subgroup (body cstring
+        // name, u8 subgroup 0-7; HandleGroupChangeSubGroupOpcode: a raid's
+        // leader or assistant, a subgroup with room, a name in the raid,
+        // else silence) and of one member onto another (body cstring name,
+        // cstring name; HandleGroupSwapSubGroupOpcode, refused with
+        // SMSG_PARTY_COMMAND_RESULT operation 4, result 14); a move is
+        // answered with SMSG_GROUP_LIST.
+        { "CMSG_GROUP_RAID_CONVERT", CMSG_GROUP_RAID_CONVERT },
+        { "CMSG_GROUP_CHANGE_SUB_GROUP", CMSG_GROUP_CHANGE_SUB_GROUP },
+        { "CMSG_GROUP_SWAP_SUB_GROUP", CMSG_GROUP_SWAP_SUB_GROUP },
         { "CMSG_LOOT_METHOD", CMSG_LOOT_METHOD },
         // the party frame's own refresh of one member (body u64 guid,
         // unpacked); answered with SMSG_PARTY_MEMBER_STATS_FULL, or with
