@@ -166,6 +166,22 @@ describe("the party watcher: kill", () => {
     expect(got.map((k) => k.ts)).toEqual(got.map((k) => 1000 + k.seq));
   });
 
+  test("in a ten-member raid a kill by a member of another subgroup is a member's, and the group counts ten", () => {
+    // The core broadcasts the kill log to the whole raid (Unit::Kill passes the
+    // killer's subgroup into BroadcastPacket's bool, leaving the subgroup -1),
+    // so a member outside the killer's subgroup reads it as any other.
+    const st = fakeState();
+    const w = new PartyWatcher(st);
+    const others = Array.from({ length: 9 }, (_, i) => String(11 + i));
+    st.g = inGroup(others);
+    w.observe(ev("SMSG_GROUP_LIST"));
+    const boss = unitGuid(BOSS, 0x52);
+    w.observe(ev("SMSG_PARTYKILLLOG", { killerGuid: "19", victimGuid: boss }));
+    const got = w.drain();
+    expect(got[0]).toMatchObject({ kind: "group", event: "joined", count: 10 });
+    expect(got[1]).toMatchObject({ kind: "kill", killerGuid: "19", entry: BOSS, self: false, member: true });
+  });
+
   test("an undrained backlog keeps the newest signals up to the cap", () => {
     const st = fakeState();
     const w = new PartyWatcher(st);

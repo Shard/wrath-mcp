@@ -3399,6 +3399,55 @@ describe("pets, group, mail, bank, trade", () => {
     expect(cache.group()!.inGroup).toBe(false);
   });
 
+  test("a ten-member raid folds with every other member, each subgroup and our own, and the raid's verdict codes", () => {
+    const cache = StateCache.replay(toEvents([...loginSequence]), { seed: SEED });
+    const fold = (f: unknown) => cache.apply(toEvents([f])[0]!);
+    // The leader converts a party of five, then invites five more: the core
+    // fills the first subgroup with room, so they land in subgroup 1.
+    const members = Array.from({ length: 9 }, (_, i) => ({
+      name: `Raider${String.fromCharCode(97 + i)}`,
+      guid: String(100 + i),
+      online: true,
+      subGroup: i < 4 ? 0 : 1,
+      flags: 0,
+      roles: 0,
+    }));
+    fold(
+      frame(30, "SMSG_GROUP_LIST", {
+        groupType: 0x02,
+        left: false,
+        raid: true,
+        subGroup: 0,
+        memberFlags: 0,
+        roles: 0,
+        groupGuid: "7",
+        counter: 9,
+        members,
+        leaderGuid: SELF_GUID,
+        lootMethod: 3,
+        looterGuid: "0",
+        lootThreshold: 2,
+        dungeonDifficulty: 0,
+        raidDifficulty: 0,
+      }),
+    );
+    const g = cache.group()!;
+    expect(g).toMatchObject({ inGroup: true, raid: true, subGroup: 0, leader: true, leaderGuid: SELF_GUID });
+    expect(g.members).toHaveLength(9);
+    expect(g.members.filter((m) => m.subGroup === g.subGroup).map((m) => m.name)).toEqual(["Raidera", "Raiderb", "Raiderc", "Raiderd"]);
+    expect(g.members.filter((m) => m.subGroup === 1)).toHaveLength(5);
+
+    fold(frame(31, "SMSG_PARTY_COMMAND_RESULT", { operation: 0, name: "", result: 25, value: 0 }));
+    expect(cache.group()!.lastResult?.text).toBe("a member is below the level a raid group requires");
+    fold(frame(32, "SMSG_PARTY_COMMAND_RESULT", { operation: 4, name: "Raidera", result: 14, value: 0 }));
+    expect(cache.group()!.lastResult?.text).toBe("the subgroup swap failed");
+    fold(frame(33, "SMSG_PARTY_COMMAND_RESULT", { operation: 0, name: "Raidera", result: 14, value: 0 }));
+    expect(cache.group()!.lastResult?.text).toBe("cannot invite while in combat");
+
+    fold(frame(34, "SMSG_GROUP_DESTROYED", {}));
+    expect(cache.group()).toMatchObject({ inGroup: false, raid: false, subGroup: undefined, members: [] });
+  });
+
   test("the mailbox frame, the inbox with joined names, new-mail, and the verdicts edit the list the way the client does", () => {
     const cache = StateCache.replay(
       toEvents([

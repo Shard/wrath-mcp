@@ -3568,6 +3568,7 @@ export class StateCache {
     this.groupState = {
       inGroup: !d.left,
       raid: d.raid,
+      subGroup: d.left ? undefined : d.subGroup,
       groupGuid: d.left ? undefined : d.groupGuid,
       leaderGuid,
       leaderName,
@@ -3636,6 +3637,7 @@ export class StateCache {
     const prev: StoredGroupState = this.groupState ?? {
       inGroup: false,
       raid: false,
+      subGroup: undefined,
       groupGuid: undefined,
       leaderGuid: undefined,
       leaderName: undefined,
@@ -4519,7 +4521,7 @@ export class StateCache {
       case "SMSG_GROUP_DESTROYED":
       case "SMSG_GROUP_UNINVITE": {
         this.partyStats.clear();
-        this.groupPatch({ inGroup: false, raid: false, groupGuid: undefined, leaderGuid: undefined, leaderName: undefined, leader: false, members: [], lootMethod: undefined }, event.seq, event.ts);
+        this.groupPatch({ inGroup: false, raid: false, subGroup: undefined, groupGuid: undefined, leaderGuid: undefined, leaderName: undefined, leader: false, members: [], lootMethod: undefined }, event.seq, event.ts);
         return;
       }
       case "SMSG_GROUP_SET_LEADER": {
@@ -4547,7 +4549,7 @@ export class StateCache {
       case "SMSG_PARTY_COMMAND_RESULT": {
         const d = event.data as PartyCommandResultData;
         this.groupPatch(
-          { lastResult: { operation: d.operation, name: d.name, result: d.result, text: partyResultText(d.result), seq: event.seq, ts: event.ts } },
+          { lastResult: { operation: d.operation, name: d.name, result: d.result, text: partyResultText(d.result, d.operation), seq: event.seq, ts: event.ts } },
           event.seq,
           event.ts,
         );

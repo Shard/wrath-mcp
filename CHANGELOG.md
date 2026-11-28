@@ -64,6 +64,18 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 
 ### Added
 
+- **Raids.** The raw allowlist takes `CMSG_GROUP_RAID_CONVERT` (the party
+  frame's "Convert to Raid"; a raid map refuses a group that is not one) and
+  the raid frame's subgroup moves, `CMSG_GROUP_CHANGE_SUB_GROUP` and
+  `CMSG_GROUP_SWAP_SUB_GROUP`. Their answers are the group packets already
+  served: `SMSG_PARTY_COMMAND_RESULT` and `SMSG_GROUP_LIST` with the raid
+  flag and up to 39 other members. `state.group()` gains `subGroup`, this
+  character's own (a member's was already on the member), and
+  `partyResultText` names result 25 (a member below the raid level) and,
+  given the operation, 14 on a swap (the swap failed). Nothing else needed
+  a change for a group past five: the list, the party frames, the kill log
+  and the party records held no five-member bound.
+
 - **`killTarget(guid, { range })`.** Fights from up to `range` yards with
   the ranged auto-attack a client's button fires for what the ranged slot
   holds, cast through the ordinary cast path: Auto Shot (75) for a bow, gun
@@ -704,6 +716,13 @@ Wire protocol: unchanged, `1`. Every wire change below is an addition.
 - `sdk/API.md` is headed "SDK reference"; it was "WrathBench SDK reference".
 
 ### Fixed
+
+- `module/PROTOCOL.md` said `SMSG_PARTYKILLLOG` reaches only the killer's
+  subgroup in a raid. The core sends it to every member: `Unit::Kill` passes
+  the subgroup where `Group::BroadcastPacket` takes its battleground flag,
+  and the subgroup argument stays "all". For a creature its
+  `killerGuid` is the loot recipient, not whoever landed the blow. Documentation only; nothing read
+  it the other way.
 
 - A stall of the world's updates no longer ends a walk `interrupted`. The
   walker runs on the world thread, so it stalls with it and sends nothing,

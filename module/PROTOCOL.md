@@ -1010,6 +1010,24 @@ whose handler does nothing a non-GM client could not do:
   `SMSG_LOOT_START_ROLL` opened; the SDK's `lootRoll` builds it),
   `CMSG_REQUEST_PARTY_MEMBER_STATS` (`u64 guid`, unpacked — the party frame's
   own refresh of one member; answered with `SMSG_PARTY_MEMBER_STATS_FULL`)
+- raid: `CMSG_GROUP_RAID_CONVERT` (empty — the party frame's "Convert to
+  Raid"; `HandleGroupRaidConvertOpcode` takes it from the leader of a group
+  of two or more that is not a dungeon finder group, answers
+  `SMSG_PARTY_COMMAND_RESULT` result 25 when a member is below
+  `Group.Raid.LevelRestriction` (10 by default), and otherwise result 0 and
+  the `SMSG_GROUP_LIST` with the raid flag to every member; a raid map
+  refuses a group that is not a raid, `MapMgr::PlayerCannotEnter`). A raid
+  takes 40, filling each new member into the first subgroup with room, so the
+  order of the invites sets the subgroups. Then the raid frame's moves:
+  `CMSG_GROUP_CHANGE_SUB_GROUP` (`cstring name, u8 subgroup` 0-7 — a raid's
+  leader or assistant moves a member into a subgroup with room; anything
+  else is silence) and `CMSG_GROUP_SWAP_SUB_GROUP` (`cstring name, cstring
+  name` — two members trade subgroups; refused with
+  `SMSG_PARTY_COMMAND_RESULT` operation 4, result 14). A move is answered
+  with the `SMSG_GROUP_LIST` to every member. The ready check and raid target
+  icons are not on the list, since their answers are packets no tap serves;
+  nor are assistants and the main tank and assist marks, which no raid led
+  from one seat has needed
 
 - trade: `CMSG_INITIATE_TRADE` (`u64 guid`), `CMSG_BEGIN_TRADE`, `CMSG_ACCEPT_TRADE`,
   `CMSG_UNACCEPT_TRADE`, `CMSG_CANCEL_TRADE`, `CMSG_BUSY_TRADE`,
@@ -2334,7 +2352,7 @@ Progress:
 | opcode | id | `data` fields |
 |---|---|---|
 | `SMSG_LOG_XPGAIN` | 0x1D0 | `{ "victimGuid" ("0" for non-kill), "amount", "fromKill": <bool> }` |
-| `SMSG_PARTYKILLLOG` | 0x1F5 | `{ "killerGuid", "victimGuid" }` — `Unit::Kill`: the player who landed the killing blow on a kill that rewards a player, broadcast to the killer's party (its subgroup in a raid), or sent to the killer alone when it has no group. `killerGuid` may be another member; nothing else about the kill is carried |
+| `SMSG_PARTYKILLLOG` | 0x1F5 | `{ "killerGuid", "victimGuid" }` — `Unit::Kill`: on a kill that rewards a player, the player it rewards — for a creature its loot recipient (the tapper, or a member of the tapping group within reward distance), not necessarily whoever landed the blow — sent to every member of that player's group wherever each stands, every subgroup of a raid included (the core passes the killer's subgroup where `Group::BroadcastPacket` takes its battleground-raid flag, so the subgroup filter stays "all"), or to that player alone when it has no group. `killerGuid` may be another member; nothing else about the kill is carried |
 | `SMSG_LEVELUP_INFO` | 0x1D4 | `{ "level", "healthGained" }` |
 | `SMSG_EXPLORATION_EXPERIENCE` | 0x1F8 | `{ "areaId", "areaName", "xp" }` — "Discovered <area>" (`Player::SendExplorationExperience`): the XP it gave, 0 at the level cap or for an area worth none; `areaName` is the client's `AreaTable.dbc` text, `""` when it has no row |
 | `SMSG_ITEM_PUSH_RESULT` | 0x166 | `{ "playerGuid", "itemId", "count", "totalCount", "bagSlot", "itemSlot", "looted": <bool>, "created": <bool> }` |
@@ -2490,8 +2508,8 @@ served as numbers; the SDK names them.
 | `SMSG_GROUP_SET_LEADER` | 0x079 | `{ "name" }` — the new leader, broadcast to the group |
 | `SMSG_GROUP_UNINVITE` | 0x077 | `{}` — this character was removed from the group |
 | `SMSG_GROUP_DESTROYED` | 0x07C | `{}` — the group was disbanded |
-| `SMSG_PARTY_COMMAND_RESULT` | 0x07F | `{ "operation": <u32>, "name", "result": <u32>, "value": <u32> }` — `WorldSession::SendPartyResult`: `operation` 0 invite, 1 uninvite, 2 leave, 4 swap; `result` `PartyResult` (0 ok, 1 bad player name, 2 not in your group, 4 group full, 5 already in a group, 6 not in a group, 7 not the leader, 8 wrong faction, 9 ignoring you, …) |
-| `SMSG_GROUP_LIST` | 0x07D | `{ "groupType": <u8>, "left": <bool>, "raid": <bool>, "subGroup", "memberFlags", "roles", "groupGuid", "counter", "members": [{ "name", "guid", "online": <bool>, "subGroup", "flags": <u8>, "roles" }], "leaderGuid", "lootMethod"?, "looterGuid"?, "lootThreshold"?, "dungeonDifficulty"?, "raidDifficulty"? }` — `Group::SendUpdateToPlayer`: the *other* members (self is never listed), the leader and, when there are any, the loot settings. `left` is the 0x10 group type the core sends with an empty list and a zero leader when this character leaves or the group is disbanded. `flags` 1 assistant, 2 main tank, 4 main assist; the LFG state/dungeon pair on LFG groups is consumed |
+| `SMSG_PARTY_COMMAND_RESULT` | 0x07F | `{ "operation": <u32>, "name", "result": <u32>, "value": <u32> }` — `WorldSession::SendPartyResult`: `operation` 0 invite, 1 uninvite, 2 leave, 4 swap; `result` `PartyResult` (0 ok, 1 bad player name, 2 not in your group, 4 group full, 5 already in a group, 6 not in a group, 7 not the leader, 8 wrong faction, 9 ignoring you, 14 a swap failed (operation 4; otherwise inviting in combat), 25 a member below the raid level on a raid convert, …) |
+| `SMSG_GROUP_LIST` | 0x07D | `{ "groupType": <u8>, "left": <bool>, "raid": <bool>, "subGroup", "memberFlags", "roles", "groupGuid", "counter", "members": [{ "name", "guid", "online": <bool>, "subGroup", "flags": <u8>, "roles" }], "leaderGuid", "lootMethod"?, "looterGuid"?, "lootThreshold"?, "dungeonDifficulty"?, "raidDifficulty"? }` — `Group::SendUpdateToPlayer`: the *other* members (self is never listed), the leader and, when there are any, the loot settings. A raid (`raid`, group type bit 0x02) lists up to 39 others, each with its `subGroup` 0-7, and the top-level `subGroup` is this character's own; a party's are all 0. `left` is the 0x10 group type the core sends with an empty list and a zero leader when this character leaves or the group is disbanded. `flags` 1 assistant, 2 main tank, 4 main assist; the LFG state/dungeon pair on LFG groups is consumed |
 | `SMSG_PARTY_MEMBER_STATS` | 0x07E | `{ "guid", "full": false, "mask": <u32>, "status"?: <u16>, "health"?, "maxHealth"?, "powerType"?: <u8>, "power"?, "maxPower"?, "level"?, "zoneId"?, "zoneName"?, "x"?: <i16>, "y"?: <i16>, "auras"?: [{ "slot", "spellId", "flags": <u8>, "name"? }] }` — the party frame of a member out of sight: `Group::UpdatePlayerOutOfRange` sends `WorldSession::BuildPartyMemberStatsChangedPacket` once per update of that member to every other member out of its sight range or on another map, carrying only the fields whose bit is set in `mask` (`GROUP_UPDATE_FLAG_*`: 0x1 status, 0x2 health, 0x4 max health, 0x8 power type, 0x10 power, 0x20 max power, 0x40 level, 0x80 zone, 0x100 position, 0x200 auras; 0x400–0x40000 the pet's, 0x80000 a vehicle seat). The core sets each bit when that value changes and sets every bit on a group join, on a zone change and on every teleport, map transfer and resurrection (`Player::UpdateZone`), so status arrives only with those. `status` is `MEMBER_STATUS_*`: 0x1 online, 0x2 PvP, 0x4 dead, 0x8 ghost, 0x10 FFA PvP, 0x40 AFK, 0x80 DND. `x`, `y` are the member's position truncated to whole yards in 16 bits, read signed; the packet names no map. `zoneName` is the client's `AreaTable.dbc` name for `zoneId`. In a delta an aura entry with `spellId` 0 clears that slot; `flags` is the `AFLAG_*` byte (the delta always writes 1 for the member's own auras); `name` is the Spell.dbc name, as on `SMSG_AURA_UPDATE`. The pet and vehicle fields are not decoded (`mask` still shows them). Nothing is sent to a member in sight: its unit update fields carry the same values |
 | `SMSG_PARTY_MEMBER_STATS_FULL` | 0x2F2 | same shape with `"full": true` — `HandleRequestPartyMemberStatsOpcode`'s answer to `CMSG_REQUEST_PARTY_MEMBER_STATS` (raw, above): every field, the auras as the complete list of visible ones with their real flags, and `powerType` only when the power is not mana (0). A guid the server cannot find in the party is answered `{ "mask": 1, "status": 0 }`, offline |
 | `SMSG_SHOW_MAILBOX` | 0x297 | `{ "guid" }` — the mailbox frame opened on that game object (after `CMSG_GAMEOBJ_USE` / the `interact` action on a mailbox) |
